@@ -331,7 +331,8 @@ TEST(minimax_h3_lora, runtime_adapter_is_off_at_zero_and_on_at_one)
     std::printf("[minimax_h3_lora] config: %s\n", cerr.c_str());
     return;
   }
-  cfg.n_layers = 4;
+  const bool oracle_full = std::getenv("VPIPE_H3_ORACLE_FULL") != nullptr;
+  cfg.n_layers = oracle_full ? 50 : 4;
 
   h3::PackedLayout L;
   const std::vector<int> tags(8, h3::kTextTag);
@@ -431,6 +432,34 @@ TEST(minimax_h3_lora, runtime_adapter_is_off_at_zero_and_on_at_one)
   MetalMiniMaxH3Transformer::LoraSpec one{lp, 1.0f};
   std::vector<float> v_off, v_zero, v_one, v_turned;
   int m_off = 0, m_zero = 0, m_one = 0, m_turned = 0;
+  if (oracle_full) {
+    ASSERT_TRUE(arm(nullptr, &v_off, &m_off));
+    ASSERT_TRUE(arm(&one, &v_one, &m_one));
+    const char* dump = std::getenv("VPIPE_H3_ORACLE_DUMP_DIR");
+    if (dump != nullptr && *dump != '\0') {
+      auto wr = [&](const char* name, const std::vector<float>& v) {
+        std::string path = std::string(dump) + "/" + name;
+        FILE* f = std::fopen(path.c_str(), "wb");
+        ASSERT_TRUE(f != nullptr);
+        ASSERT_TRUE(std::fwrite(v.data(), sizeof(float), v.size(), f) == v.size());
+        std::fclose(f);
+      };
+      wr("vpipe_base_video.f32", v_off);
+      wr("vpipe_turbo_video.f32", v_one);
+      wr("vpipe_input_video_rows.f32", vin);
+      wr("vpipe_input_audio_rows.f32", ain);
+      wr("vpipe_input_text.f32", tin);
+    }
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < v_one.size(); ++i) {
+      const double d = (double)v_one[i] - (double)v_off[i];
+      num += d*d; den += (double)v_off[i]*(double)v_off[i];
+    }
+    std::printf("[minimax_h3_lora] ORACLE full %d blocks, %d modules, adapter rel-L2 %.9e\n",
+                cfg.n_layers, m_one, den > 0.0 ? std::sqrt(num/den) : std::sqrt(num));
+    ::unsetenv("VPIPE_H3_NO_FUSED_FF");
+    return;
+  }
   ASSERT_TRUE(arm(nullptr, &v_off, &m_off));
   ASSERT_TRUE(arm(&zero, &v_zero, &m_zero));
   ASSERT_TRUE(arm(&one, &v_one, &m_one));
