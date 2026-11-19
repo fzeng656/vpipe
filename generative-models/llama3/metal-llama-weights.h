@@ -19,11 +19,17 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <map>
 #include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe::metal_compute { class MetalCompute; }
 
@@ -42,6 +48,7 @@ public:
     std::uint64_t        offset;   // bytes from the start of the data blob
     std::uint64_t        nbytes;
     int                  shard = 0;  // index into _shards; -2 => GGUF-backed
+                                     // -3 => Draw Things, converted
   };
 
   // Open a model directory. Three layouts are recognised, in order:
@@ -92,9 +99,48 @@ public:
   Alignment alignment() const;
   const TensorInfo* info(const std::string& name) const;
 
+  // The safetensors `__metadata__` object, string -> string (the format
+  // permits no other value type).
+  //
+  // Worth exposing because for a LoRA it is not decoration: a
+  // peft/diffusers export states its `alpha` ONCE here rather than as a
+  // per-module tensor, and an adapter read without it applies at
+  // alpha == rank -- 16x its trained strength on the lightx2v files,
+  // with nothing to see but a bad video. Empty when the file carries
+  // none; for a sharded model it is the FIRST shard that carried one,
+  // the field being a file-level annotation rather than a model-level
+  // one.
+  const std::map<std::string, std::string>& metadata() const;
+
   // All tensor names in the checkpoint (unordered). Used by the model
   // quantizer to enumerate + classify every tensor.
   std::vector<std::string> tensor_names() const;
+
+  // RENAME the checkpoint's tensors in place: the name table only, never
+  // a byte -- every offset, size and dtype stays exactly as the file
+  // holds it, so load / load_mapped / pread_into keep reading the same
+  // bytes under the new names.
+  //
+  // For a checkpoint published in a layout other than the one its loader
+  // reads (a Krea-2 fine-tune in Krea's own naming): translating once
+  // here means every reader above -- a WeightSet, the block-slot refill,
+  // the streaming planner, the quantizer -- sees one namespace, instead
+  // of each carrying a map it could forget.
+  //
+  // `fn` gets each (name, info) and returns the new name, having edited
+  // the info's SHAPE if the layout needs a reshape (the bytes are
+  // row-major either way); an EMPTY return drops the tensor. It is all or
+  // nothing: two tensors mapping to one name leaves the table untouched
+  // and returns false.
+  //
+  // What was translated is NOT recorded on this object, deliberately:
+  // plugins receive a MetalLlamaWeights BY VALUE (open_model returns an
+  // optional of one), so a data member added here moves its layout under
+  // them. A caller that needs to know asks the file (open() does not
+  // translate).
+  using RenameFn = std::function<std::string(const std::string& name,
+                                             TensorInfo& info)>;
+  bool rename_tensors(const RenameFn& fn);
 
   // Where a load's wall time went. The two halves answer different
   // questions for a streaming model: `alloc` is the SharedBuffer, which
@@ -136,6 +182,13 @@ public:
   // tensors: 27 us at 10 KB, so a block's norms and scales can come the
   // same way as its matrices.
   //
+  // A tensor is read in 1 MB pieces, four in flight (VPIPE_PREAD_THREADS
+  // the A/B): one read at a time left an M4 Pro's internal SSD and a
+  // Thunderbolt 5 one 1.2x and 1.4x short of their rates. An uncached
+  // read whose file offset or destination is off a 4 KB boundary -- a
+  // misaligned checkpoint, as every large Hub file checked was -- is staged
+  // through page-aligned buffers, since F_NOCACHE caches it otherwise.
+  //
   // `uncached` sets F_NOCACHE, which does NOT make the read faster (a
   // cached pread measured identically) -- it keeps the read from growing
   // the file cache. For a model that re-reads its whole checkpoint every
@@ -154,6 +207,15 @@ public:
   // agree.
   bool pread_into(const std::string& name, void* dst, std::size_t cap,
                   bool uncached = true) const;
+  // The bytes [at, at + bytes) of a tensor's data, read as pread_into reads
+  // a whole one (pieces, staging off the grid) -- a split model's share of
+  // a weight's rows, the rest never read. False, as pread_into, where the
+  // tensor is not a plain safetensors one or the range runs past it.
+  // Host-only, as GenerativeModelManager's own: no symbol, the class's
+  // layout unchanged (plugin ABI 8 untouched).
+  __attribute__((visibility("hidden"))) bool
+  pread_range_into(const std::string& name, std::uint64_t at,
+                   std::size_t bytes, void* dst, bool uncached = true) const;
 
   // Allocate a SharedBuffer and copy the tensor's bytes into it.
   // Returns an empty SharedBuffer if the tensor is missing. `cost`, when
@@ -227,12 +289,19 @@ private:
   // noise. `mutable` for the same reason as _shard_maps: load_mapped is
   // const and this is bookkeeping, not state a caller can observe.
   mutable std::vector<bool>                       _shard_unmappable_said;
+  // Shards larger than the device's maxBufferLength, which cannot be
+  // wrapped WHOLE and are mapped a window at a time instead. Latched so
+  // the explanation is said once rather than per tensor.
+  mutable std::vector<bool>                       _shard_over_max_said;
   std::unordered_map<std::string, TensorInfo> _tensors;
+  std::map<std::string, std::string> _metadata;
   // Non-null when this checkpoint was loaded from a `.gguf`; owns the
   // GgufFile + converter and backs the shard==-2 tensors in load().
   std::unique_ptr<GgufBacking>                _gguf;
 };
 
 }  // namespace vpipe::genai
+
+VPIPE_API_END
 
 #endif

@@ -1,8 +1,11 @@
 #ifndef VPIPE_STAGES_MINIMAX_H3_MODEL_CONFIG_STAGE_H
 #define VPIPE_STAGES_MINIMAX_H3_MODEL_CONFIG_STAGE_H
 
+#include "stages/latent-preview.h"
+#include "stages/lora-slots.h"
 #include "stages/model-config-source.h"
 
+#include <array>
 #include <string>
 #include <vector>
 
@@ -42,6 +45,23 @@ namespace vpipe {
 //   audio_seconds (real) -- soundtrack duration; 0 derives it from the
 //                              video's frames / fps, which is what keeps
 //                              the two modalities the same length
+//   sigmas (string) -- the VIDEO's sigmas as run, comma-separated, in
+//                              place of `steps` and the shifts' grid; the
+//                              audio's mapped through the two shifts, as
+//                              ComfyUI's DiT maps them
+//   linear_branch (string) -- VDN-H3 release root; turns every main
+//                              block's attention into the hybrid. A
+//                              SECOND checkpoint beside the DiT, not a
+//                              replacement for it
+//   lora / lora2 .. lora8 (+ _scale, _qkv_layout) -- EIGHT runtime
+//                              LoRA slots, applied together: the usual
+//                              pairing is a few-step Turbo distillation
+//                              and style or identity adapters, with
+//                              independent, live strengths
+//   preview_vae (+ preview_every, preview_max_edge, preview_frames) --
+//                              a tiny autoencoder for LIVE previews on
+//                              generate-video's `preview` oport; see
+//                              stages/latent-preview.h
 class MiniMaxH3ModelConfigStage final
   : public ModelConfigSourceStage<MiniMaxH3ModelConfigStage> {
 public:
@@ -67,8 +87,30 @@ private:
   double _cond_timestep = 1.0;
   double _cond_audio_timestep = 1.0;
   double _audio_seconds = 0.0;
-  std::string _lora;
-  double _lora_scale = 1.0;
+  std::int64_t _min_generation_area = 0;
+  double _refine_start  = -1.0;
+  double _refine_shift  = 6.0;
+  // The video's sigmas as run (`sigmas`); empty for the model's own grid.
+  std::vector<double> _sigmas;
+  // The VDN-H3 release root, or empty for the stock attention.
+  std::string _linear_branch;
+  // The runtime-LoRA slots, `lora` .. `lora8` (stages/lora-slots.h).
+  struct LoraSlot {
+    std::string path;
+    double      scale = 1.0;
+    // "auto" | "flat" | "per_head"; empty keeps the beat silent. See the
+    // key's doc -- it decides whether a FUSED qkv adapter's rows are
+    // permuted into a per-head DiT's order.
+    std::string qkv;
+  };
+  std::array<LoraSlot, lora_slots::kSlots> _lora;
+  // TaoMate-H3's streaming method: "auto" (run it when an adapter slot
+  // holds the TaoMate adapter), "on", "off".
+  std::string _taomate;
+  // Where its clean-K/V cache lives: "auto" (on disk, 8-bit with
+  // i8_gemm), "bf16", "int8" (on disk), "memory".
+  std::string _taomate_kv;
+  LatentPreviewSpec _preview;
 };
 
 }  // namespace vpipe

@@ -4,6 +4,8 @@
 #include "common/flex-data.h"
 
 #include <algorithm>
+#include <fstream>
+#include <filesystem>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -219,6 +221,72 @@ TEST(model_catalog, moss_tts_pair_present) {
   EXPECT_TRUE(codec->model_type == "moss-codec");
   EXPECT_TRUE(codec->files.empty());
   EXPECT_FALSE(codec->needs_tokenizer_json);
+
+  // MOSS-TTS-v1.5: the delay-pattern model's successor, same model_type,
+  // fetched whole -- its normalizer script is how the stage knows to run
+  // the v1.5 text clean-up.
+  const ModelCatalogEntry* v15 =
+      catalog_by_path("OpenMOSS-Team/MOSS-TTS-v1.5");
+  EXPECT_TRUE(v15 != nullptr);
+  if (v15 != nullptr) {
+    EXPECT_TRUE(v15->family == "MOSS");
+    EXPECT_TRUE(v15->model_type == "moss-tts");
+    EXPECT_TRUE(v15->files.empty());
+    EXPECT_FALSE(v15->needs_tokenizer_json);
+  }
+}
+
+// Fish Audio Drama 3: one repo carries the LM and its codec (codec.pth),
+// pinned to what the text-to-speech stage reads -- every shard the index
+// names, the tokenizer and the codec.
+TEST(model_catalog, drama3_present) {
+  const ModelCatalogEntry* e = catalog_by_path("fishaudio/drama-3");
+  EXPECT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Fish Audio");
+  EXPECT_TRUE(e->model_type == "fish-drama3");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  for (const char* f : {"config.json", "model.safetensors.index.json",
+                        "model-00001-of-00015.safetensors",
+                        "model-00015-of-00015.safetensors",
+                        "tokenizer.json", "codec.pth"}) {
+    EXPECT_TRUE(has_(e->files, f));
+  }
+  // Re-sharded upstream (2026-10-29): none of the eight left pinned.
+  for (const auto& f : e->files) {
+    EXPECT_TRUE(f.find("-of-00008") == std::string::npos);
+  }
+  // The int4 copy: the same type, its twelve shards, no eval clips.
+  const ModelCatalogEntry* q = catalog_by_path("fishaudio/drama-3-int4");
+  EXPECT_TRUE(q != nullptr);
+  if (q == nullptr) { return; }
+  EXPECT_TRUE(q->model_type == "fish-drama3");
+  EXPECT_TRUE(has_(q->files, "model-00012-of-00012.safetensors"));
+  EXPECT_TRUE(has_(q->files, "codec.pth"));
+  for (const auto& f : q->files) {
+    EXPECT_TRUE(f.rfind("eval", 0) != 0 && f.rfind("media", 0) != 0);
+  }
+}
+
+// Ternary-Bonsai: the MLX pack whole, the GGUF repo's two packings of one
+// model each pinned with the BF16 projector, told apart by variant.
+TEST(model_catalog, ternary_bonsai_present) {
+  const ModelCatalogEntry* m =
+      catalog_by_path("prism-ml/Ternary-Bonsai-27B-mlx-2bit");
+  EXPECT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(m->model_type == "qwen3.5" && m->files.empty());
+  const auto all = catalog_all_by_path("prism-ml/Ternary-Bonsai-2-27B-gguf");
+  EXPECT_TRUE(all.size() == 2);
+  for (const char* v : {"PTQ1_0", "PQ2_0"}) {
+    const ModelCatalogEntry* e = catalog_pick_variant(all, v);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->model_type == "qwen3.5" && e->files.size() == 2);
+    EXPECT_TRUE(e->files[0] ==
+                std::string("Ternary-Bonsai-2-27B-") + v + ".gguf");
+    EXPECT_TRUE(e->files[1] == "Ternary-Bonsai-2-27B-mmproj-BF16.gguf");
+  }
 }
 
 // OptiQ 4-bit MLX variants for 2B/4B/9B; whole-repo fetch (no pin).
@@ -303,16 +371,30 @@ TEST(model_catalog, qwen36_optiq_variants_present) {
 TEST(model_catalog, qwen38_27b_family) {
   EXPECT_TRUE(has_(catalog_versions("Qwen"), "3.8"));
   auto p = catalog_param_classes("Qwen", "3.8");
-  EXPECT_TRUE(p.size() == 1);
+  // 27B and Flash-Next (its own runtime tag, below).
+  EXPECT_TRUE(p.size() == 2);
   EXPECT_TRUE(has_(p, "27B"));
-  EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 4);
+  EXPECT_TRUE(has_(p, "Flash-Next"));
+  {
+    const ModelCatalogEntry* e = catalog_by_path(
+        "mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp");
+    EXPECT_TRUE(e != nullptr);
+    if (e != nullptr) {
+      EXPECT_TRUE(e->model_type == "qwen3.8-flash");
+      EXPECT_TRUE(catalog_category(*e) == "model");
+    }
+  }
+  EXPECT_TRUE(catalog_variants("Qwen", "3.8", "27B").size() == 5);
 
   struct Row { const char* path; const char* variant; };
   const Row rows[] = {
       {"Qwen/Qwen3.8-27B", "bf16 (Qwen)"},
       {"lmstudio-community/Qwen3.8-27B-MLX-4bit",
        "MLX 4-bit (lmstudio-community)"},
-      {"unsloth/Qwen3.8-27B-GGUF", "Q4_K_M GGUF +mmproj (unsloth)"},
+      {"mlx-community/Qwen3.8-27B-4bit", "MLX 4-bit (mlx-community)"},
+      {"mlx-community/Qwen3.8-27B-OptiQ-4bit",
+       "MLX OptiQ 4-bit (mlx-community)"},
+      {"unsloth/Qwen3.8-27B-GGUF", "Q8_0 GGUF +mmproj (unsloth)"},
   };
   for (const Row& r : rows) {
     const ModelCatalogEntry* e = catalog_by_path(r.path);
@@ -329,20 +411,23 @@ TEST(model_catalog, qwen38_27b_family) {
     EXPECT_FALSE(e->needs_tokenizer_json);
   }
 
-  // Only the GGUF entry pins files; the two safetensors repos fetch whole.
+  // Only the GGUF entry pins files; the safetensors repos fetch whole --
+  // the OptiQ pack's optiq/ companions (its MTP head) with it.
   EXPECT_TRUE(catalog_by_path("Qwen/Qwen3.8-27B")->files.empty());
   EXPECT_TRUE(
       catalog_by_path("lmstudio-community/Qwen3.8-27B-MLX-4bit")
           ->files.empty());
-  // TWO GGUF rows share the repo -- one per quantization point -- so the
-  // by-path lookup answers with the first (documented) and the caller
-  // that must not take the wrong one asks for all of them.
+  EXPECT_TRUE(
+      catalog_by_path("mlx-community/Qwen3.8-27B-OptiQ-4bit")
+          ->files.empty());
+  // ONE GGUF row: the Q4_K_M file it once pinned is gone upstream
+  // (2026-08-19), and a pin to a file the repo lacks fails every fetch.
   auto gs = catalog_all_by_path("unsloth/Qwen3.8-27B-GGUF");
-  EXPECT_TRUE(gs.size() == 2);
+  EXPECT_TRUE(gs.size() == 1);
   const ModelCatalogEntry* g = catalog_by_path("unsloth/Qwen3.8-27B-GGUF");
-  EXPECT_TRUE(g == gs[0]);
-  const char* quants[] = {"Qwen3.8-27B-Q4_K_M.gguf", "Qwen3.8-27B-Q8_0.gguf"};
-  for (std::size_t i = 0; i < gs.size() && i < 2; ++i) {
+  EXPECT_TRUE(!gs.empty() && g == gs[0]);
+  const char* quants[] = {"Qwen3.8-27B-Q8_0.gguf"};
+  for (std::size_t i = 0; i < gs.size() && i < 1; ++i) {
     EXPECT_TRUE(gs[i]->files.size() == 2);
     EXPECT_TRUE(gs[i]->files[0] == quants[i]);
     // The F16 projector, NOT the BF16 one: they differ in how
@@ -434,10 +519,6 @@ TEST(model_catalog, qwen36_27b_pins_multimodal_files) {
   EXPECT_TRUE(has_(e->files, "imatrix_unsloth.gguf_file"));
 }
 
-// The Mage-Flow family: six 4B entries in two instantiations -- Gen
-// (t2i, "mage-flow", text-in) and Edit ("mage-flow-edit", text+image-in),
-// each in Base / RL-aligned / Turbo. All six pin the SAME 18-file
-// non-asset layout.
 TEST(model_catalog, boogu_image_family_present) {
   struct Row { const char* path; const char* ver; const char* mt; };
   const Row rows[] = {
@@ -487,55 +568,150 @@ TEST(model_catalog, boogu_image_family_present) {
   EXPECT_FALSE(has_(tin, "image"));
 }
 
-TEST(model_catalog, mage_flow_family_present) {
-  struct Row { const char* path; const char* ver; const char* mt; };
-  const Row rows[] = {
-      {"microsoft/Mage-Flow-Base", "Gen", "mage-flow"},
-      {"microsoft/Mage-Flow", "Gen", "mage-flow"},
-      {"microsoft/Mage-Flow-Turbo", "Gen", "mage-flow"},
-      {"microsoft/Mage-Flow-Edit-Base", "Edit", "mage-flow-edit"},
-      {"microsoft/Mage-Flow-Edit", "Edit", "mage-flow-edit"},
-      {"microsoft/Mage-Flow-Edit-Turbo", "Edit", "mage-flow-edit"}};
-  for (const Row& r : rows) {
-    const ModelCatalogEntry* e = catalog_by_path(r.path);
-    EXPECT_TRUE(e != nullptr);
-    if (e == nullptr) { continue; }
-    EXPECT_TRUE(e->family == "Mage-Flow");
-    EXPECT_TRUE(e->version == r.ver);
-    EXPECT_TRUE(e->param_class == "4B");
-    EXPECT_TRUE(e->model_type == r.mt);
-    EXPECT_FALSE(e->needs_tokenizer_json);
-    // Pinned layout: the split-stage sub-models, no assets/.
-    EXPECT_TRUE(e->files.size() == 18);
-    EXPECT_TRUE(has_(e->files, "model_index.json"));
-    EXPECT_TRUE(has_(e->files,
-                     "transformer/diffusion_pytorch_model.safetensors"));
-    EXPECT_TRUE(has_(e->files, "vae/diffusion_pytorch_model.safetensors"));
-    EXPECT_TRUE(has_(e->files,
-                     "text_encoder/model-00002-of-00002.safetensors"));
-    EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
-  }
-  // Both variants of each instantiation drill down under one family.
-  auto gen = catalog_variants("Mage-Flow", "Gen", "4B");
-  EXPECT_TRUE(gen.size() == 3);
-  EXPECT_TRUE(has_(gen, "Turbo 4-step distilled bf16 (microsoft)"));
-  auto edit = catalog_variants("Mage-Flow", "Edit", "4B");
-  EXPECT_TRUE(edit.size() == 3);
-  EXPECT_TRUE(has_(edit, "Turbo 4-step distilled bf16 (microsoft)"));
-
-  // Modalities: Edit is image-conditioned, Gen is not; both emit images.
-  FlexData ef = catalog_entry_to_flex(
-      *catalog_by_path("microsoft/Mage-Flow-Edit-Turbo"));
-  auto ein = flex_arr_(ef, "inputs");
-  EXPECT_TRUE(has_(ein, "text"));
-  EXPECT_TRUE(has_(ein, "image"));
-  EXPECT_TRUE(has_(flex_arr_(ef, "outputs"), "image"));
-  FlexData tf = catalog_entry_to_flex(
-      *catalog_by_path("microsoft/Mage-Flow-Turbo"));
+TEST(model_catalog, qwen_image_pair_present) {
+  // The two Qwen-Image checkpoints are the same architecture -- verified
+  // tensor by tensor -- and DIFFERENT recipes: 2512 is the text-to-image
+  // pipeline, Edit-2511 the multi-reference edit one, and they condition
+  // through different system prompts. So they carry different
+  // model_types, and this asserts that rather than leaving it to whoever
+  // next tidies the table: typing 2512 as the edit model would load, run
+  // and quietly condition it on the wrong prompt.
+  const ModelCatalogEntry* t2i = catalog_by_path("Qwen/Qwen-Image-2512");
+  const ModelCatalogEntry* edt =
+      catalog_by_path("Qwen/Qwen-Image-Edit-2511");
+  ASSERT_TRUE(t2i != nullptr);
+  ASSERT_TRUE(edt != nullptr);
+  EXPECT_TRUE(t2i->family == "Qwen-Image");
+  EXPECT_TRUE(edt->family == "Qwen-Image");
+  EXPECT_TRUE(t2i->version == "2512");
+  EXPECT_TRUE(edt->version == "Edit-2511");
+  EXPECT_TRUE(t2i->param_class == "20B");
+  EXPECT_TRUE(t2i->model_type == "qwen-image");
+  EXPECT_TRUE(edt->model_type == "qwen-image-edit");
+  // 2512 ships vocab.json + merges.txt under tokenizer/ and no
+  // consolidated tokenizer.json, so it needs the synthesis step; the
+  // edit repo carries one in processor/ and does not.
+  EXPECT_TRUE(t2i->needs_tokenizer_json);
+  EXPECT_FALSE(edt->needs_tokenizer_json);
+  // The 20B DiT ships in nine shards here against Edit-2511's five, so a
+  // copied file list would fetch a partial checkpoint that still has an
+  // index pointing at the shards it lacks.
+  EXPECT_TRUE(has_(t2i->files,
+                   "transformer/diffusion_pytorch_model-00009-of-00009."
+                   "safetensors"));
+  EXPECT_FALSE(has_(t2i->files,
+                    "transformer/diffusion_pytorch_model-00001-of-00005."
+                    "safetensors"));
+  EXPECT_TRUE(has_(t2i->files,
+                   "transformer/diffusion_pytorch_model.safetensors.index."
+                   "json"));
+  EXPECT_TRUE(has_(t2i->files, "vae/diffusion_pytorch_model.safetensors"));
+  EXPECT_TRUE(has_(t2i->files, "scheduler/scheduler_config.json"));
+  // No processor/ here: a model that takes no reference image needs no
+  // image preprocessor, and its chat template sits in tokenizer/.
+  EXPECT_TRUE(has_(t2i->files, "tokenizer/chat_template.jinja"));
+  EXPECT_FALSE(has_(t2i->files, "processor/preprocessor_config.json"));
+  EXPECT_TRUE(has_(edt->files, "processor/preprocessor_config.json"));
+  // Text in and image out, where the edit sibling also takes an image:
+  // a picker that filters on need_inputs must not offer this one to a
+  // stage wanting an image input, since it has nowhere to put one.
+  FlexData tf = catalog_entry_to_flex(*t2i);
   auto tin = flex_arr_(tf, "inputs");
   EXPECT_TRUE(tin.size() == 1);
   EXPECT_TRUE(has_(tin, "text"));
   EXPECT_TRUE(has_(flex_arr_(tf, "outputs"), "image"));
+  FlexData ef = catalog_entry_to_flex(*edt);
+  EXPECT_TRUE(has_(flex_arr_(ef, "inputs"), "image"));
+  EXPECT_TRUE(catalog_category(*t2i) == "model");
+}
+
+TEST(model_catalog, qwen_image_21_present) {
+  // 2.1 carries its own model_type despite the shared family name: it is
+  // a single-stream 7B DiT with an RGBA /16 VAE, sharing neither the
+  // transformer nor the autoencoder with the 20B pair above. Typing it
+  // as either of those would load a config that does not describe it.
+  const ModelCatalogEntry* e = catalog_by_path("Qwen/Qwen-Image-2.1");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Qwen-Image");
+  EXPECT_TRUE(e->version == "2.1");
+  EXPECT_TRUE(e->param_class == "7B");
+  EXPECT_TRUE(e->model_type == "qwen-image-21");
+  // The consolidated tokenizer.json ships in processor/, so no synthesis
+  // step -- unlike 2512, which has only vocab.json + merges.txt.
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  // Two DiT shards here against 2512's nine and Edit-2511's five: a
+  // copied file list fetches an index pointing at shards it lacks.
+  EXPECT_TRUE(has_(e->files,
+                   "transformer/diffusion_pytorch_model-00002-of-00002."
+                   "safetensors"));
+  EXPECT_FALSE(has_(e->files,
+                    "transformer/diffusion_pytorch_model-00003-of-00009."
+                    "safetensors"));
+  EXPECT_TRUE(has_(e->files,
+                   "transformer/diffusion_pytorch_model.safetensors.index."
+                   "json"));
+  EXPECT_TRUE(has_(e->files, "text_encoder/model-00004-of-00004.safetensors"));
+  EXPECT_TRUE(has_(e->files, "vae/diffusion_pytorch_model.safetensors"));
+  EXPECT_TRUE(has_(e->files, "processor/tokenizer.json"));
+  EXPECT_TRUE(has_(e->files, "processor/preprocessor_config.json"));
+  EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
+  // There is no tokenizer/ subdir in this repo at all.
+  EXPECT_FALSE(has_(e->files, "tokenizer/vocab.json"));
+  // ONE checkpoint answers both tasks, so unlike the qwen-image /
+  // qwen-image-edit split this takes an OPTIONAL image input and must
+  // still be offered to a stage that wants one.
+  FlexData f = catalog_entry_to_flex(*e);
+  auto in = flex_arr_(f, "inputs");
+  EXPECT_TRUE(in.size() == 2);
+  EXPECT_TRUE(has_(in, "text"));
+  EXPECT_TRUE(has_(in, "image"));
+  EXPECT_TRUE(has_(flex_arr_(f, "outputs"), "image"));
+  EXPECT_TRUE(catalog_category(*e) == "model");
+}
+
+// The Turbo checkpoint is the same family, model_type and code path as
+// the base -- and its own packing: ONE text-encoder file where the base
+// has four shards, and the transformers-5 processor/ with a consolidated
+// processor_config.json and no preprocessor_config.json. A file list
+// copied from the base row would fetch an index and shards that are not
+// there. It is a second VARIANT of the same version, offered beside the
+// base in the browser rather than replacing it.
+TEST(model_catalog, qwen_image_21_turbo_present) {
+  const ModelCatalogEntry* e = catalog_by_path("Qwen/Qwen-Image-2.1-Turbo");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Qwen-Image");
+  EXPECT_TRUE(e->version == "2.1");
+  EXPECT_TRUE(e->param_class == "7B");
+  EXPECT_TRUE(e->model_type == "qwen-image-21");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  // model_index.json carries the schedule (`sample_sigmas`), so it is not
+  // just packaging here.
+  EXPECT_TRUE(has_(e->files, "model_index.json"));
+  EXPECT_TRUE(has_(e->files, "scheduler/scheduler_config.json"));
+  EXPECT_TRUE(has_(e->files, "text_encoder/model.safetensors"));
+  EXPECT_FALSE(has_(e->files, "text_encoder/model.safetensors.index.json"));
+  EXPECT_FALSE(has_(e->files,
+                    "text_encoder/model-00001-of-00004.safetensors"));
+  EXPECT_TRUE(has_(e->files,
+                   "transformer/diffusion_pytorch_model-00002-of-00002."
+                   "safetensors"));
+  EXPECT_TRUE(has_(e->files, "processor/tokenizer.json"));
+  EXPECT_TRUE(has_(e->files, "processor/processor_config.json"));
+  EXPECT_FALSE(has_(e->files, "processor/preprocessor_config.json"));
+  // Showcase assets are 40 MB the model does not need.
+  for (const std::string& f : e->files) {
+    EXPECT_TRUE(f.rfind("assets/", 0) != 0);
+  }
+  // Two variants of one version: the base and the Turbo.
+  const auto vs = catalog_variants("Qwen-Image", "2.1", "7B");
+  EXPECT_TRUE(vs.size() == 2);
+  FlexData f = catalog_entry_to_flex(*e);
+  auto in = flex_arr_(f, "inputs");
+  EXPECT_TRUE(has_(in, "text"));
+  EXPECT_TRUE(has_(in, "image"));
+  EXPECT_TRUE(has_(flex_arr_(f, "outputs"), "image"));
 }
 
 // Input/output modalities + derived category are exposed via
@@ -630,6 +806,22 @@ TEST(model_catalog, supplement_parent_linkage) {
     EXPECT_TRUE(e->parent_model_type == "krea2");
   }
 
+  // VOSR's DINOv2 tower. This link is what the fetch stage reads to
+  // say, at the end of a VOSR fetch, that a second checkpoint is still
+  // missing -- so the key it names has to be the one the conditioner
+  // then looks up, and with no `name` override that is the hf path.
+  const ModelCatalogEntry* dino = catalog_by_path("facebook/dinov2-large");
+  ASSERT_TRUE(dino != nullptr);
+  EXPECT_TRUE(catalog_category(*dino) == "supplement");
+  EXPECT_TRUE(dino->parent_model_type == "vosr");
+  EXPECT_TRUE(dino->parent_param_class.empty());
+  EXPECT_TRUE(dino->name.empty());
+  EXPECT_TRUE(has_(dino->files, "model.safetensors"));
+  EXPECT_TRUE(has_(dino->files, "config.json"));
+  const ModelCatalogEntry* vosr = catalog_by_name("VOSR-2.0");
+  ASSERT_TRUE(vosr != nullptr);
+  EXPECT_TRUE(vosr->model_type == "vosr");
+
   // A plain model has no parent linkage.
   const ModelCatalogEntry* lm =
       catalog_by_path("lmstudio-community/Qwen3.5-4B-MLX-4bit");
@@ -638,6 +830,38 @@ TEST(model_catalog, supplement_parent_linkage) {
 
   EXPECT_TRUE(catalog_by_name("nope") == nullptr);
   EXPECT_TRUE(catalog_by_name("") == nullptr);
+}
+
+// FlashVSR is fetched AS PUBLISHED and read in place: three of its files
+// are torch.save() archives that map as shards, so the entry pins those
+// files rather than a conversion of them. The one thing the model page
+// lacks is the fixed context, which the reference keeps on GitHub; a
+// companion can only name a HuggingFace repo, so it names a copy verified
+// byte-identical to GitHub's.
+TEST(model_catalog, flashvsr_fetches_the_published_files) {
+  const ModelCatalogEntry* e = catalog_by_path("JunhaoZhuang/FlashVSR-v1.1");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->model_type == "flashvsr");
+  EXPECT_TRUE(e->parent_model_type.empty());
+  EXPECT_TRUE(catalog_category(*e) != "supplement");
+  // ...the reference's tiny decoder among them, which vae-decode runs.
+  for (const char* f : {"diffusion_pytorch_model_streaming_dmd.safetensors",
+                        "LQ_proj_in.ckpt", "Wan2.1_VAE.pth",
+                        "TCDecoder.ckpt"}) {
+    EXPECT_TRUE(has_(e->files, f));
+  }
+  ASSERT_TRUE(e->companion_files.size() == 1);
+  if (e->companion_files.size() != 1) { return; }
+  EXPECT_TRUE(e->companion_files[0].repo == "deAPI-ai/flashvsr-v1-1");
+  EXPECT_TRUE(e->companion_files[0].file == "posi_prompt.pth");
+  EXPECT_TRUE(e->companion_files[0].dest == "posi_prompt.pth");
+  // A copy registered from disk reads the same modalities as a fetch.
+  std::vector<std::string> in, out;
+  catalog_default_io("flashvsr", in, out);
+  EXPECT_TRUE(in == e->inputs && out == e->outputs);
+  EXPECT_TRUE(in == std::vector<std::string>({"video"}));
+  EXPECT_TRUE(out == std::vector<std::string>({"video"}));
 }
 
 TEST(model_catalog, normalize_paths) {
@@ -849,6 +1073,66 @@ TEST(model_catalog, comfy_org_minimax_h3_fetches_a_runnable_set) {
   EXPECT_TRUE(tok);
 }
 
+// The standalone Krea2-HD VAE, and the three things about it that a
+// wrong catalogue entry gets silently wrong.
+//
+// It lives in a repo that also publishes ten DiT quantizations totalling
+// ~100 GB, ships no config.json of its own, and is offered to a stage
+// that filters on model_type. Miss the first and a `vae` selection
+// downloads a hundred gigabytes; miss the second and the decode has no
+// latents_mean/std to un-whiten with; miss the third and the entry
+// exists but nothing can pick it.
+TEST(model_catalog, krea2_hd_vae_is_a_standalone_vae) {
+  const ModelCatalogEntry* e = nullptr;
+  for (const ModelCatalogEntry& c : model_catalog()) {
+    if (c.hf_path == "wikeeyang/Krea2-Turbo-HD-V1") { e = &c; }
+  }
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+
+  EXPECT_TRUE(e->model_type == "krea2-vae");
+  // A supplement to Krea-2, not a Krea-2: catalog_category reads the
+  // parent link, and the pickers that offer a WHOLE model must not offer
+  // this one.
+  EXPECT_TRUE(e->parent_model_type == "krea2");
+  EXPECT_TRUE(catalog_category(*e) == "supplement");
+
+  // ONE file, and it is the VAE. The repo's other members are DiT
+  // quantizations of 7-15 GB each; an unpinned entry fetches the lot.
+  EXPECT_TRUE(e->files.size() == 1);
+  bool vae_only = !e->files.empty();
+  for (const std::string& f : e->files) {
+    if (f.find("vae") == std::string::npos ||
+        f.find(".gguf") != std::string::npos) {
+      vae_only = false;
+    }
+  }
+  EXPECT_TRUE(vae_only);
+
+  // The config it does not ship, landing at the checkpoint's own root --
+  // there is no `vae/` subdirectory here for it to sit in, because the
+  // checkpoint IS the root.
+  //
+  // FROM AN UNGATED REPO, and that is the assertion with teeth. This VAE
+  // needs no licence, so nobody fetching it has a reason to hold a
+  // Krea-2 token -- and krea/Krea-2-Turbo answers an anonymous request
+  // with 401. Sourcing a companion from a gated repo makes an ungated
+  // download fail for everyone who has not separately accepted someone
+  // else's licence, and it fails late: the weights land, the companion
+  // warns, and the decode stage goes inert about latents_mean.
+  bool cfg = false;
+  for (const auto& c : e->companion_files) {
+    EXPECT_TRUE(!c.repo.empty() && !c.file.empty() && !c.dest.empty());
+    if (c.dest == "config.json") {
+      cfg = true;
+      EXPECT_TRUE(c.repo == "Qwen/Qwen-Image");
+      EXPECT_TRUE(c.repo != "krea/Krea-2-Turbo");   // gated; see above
+      EXPECT_TRUE(c.file == "vae/config.json");
+    }
+  }
+  EXPECT_TRUE(cfg);
+}
+
 // Both MiniMax-H3 partitions, and that they are two ENTRIES rather than
 // one. They share a repo, an encoder and both VAEs, and their DiTs are
 // byte-identical in every respect but the weights -- so nothing about a
@@ -978,9 +1262,13 @@ TEST(model_catalog, minimaxai_publishes_both_partitions_too) {
 // key is what a consumer resolves, and two records over ONE directory
 // can only be told apart by it.
 TEST(model_catalog, several_models_can_share_one_repo) {
+  // MiniMaxAI's repo publishes a third: its text encoder alone, which
+  // MiniMax-H3-Image conditions on.
   for (const char* repo : {"Comfy-Org/MiniMax-H3", "MiniMaxAI/MiniMax-H3"}) {
     const auto h3 = catalog_all_by_path(repo);
-    EXPECT_TRUE(h3.size() == 2);
+    EXPECT_TRUE(h3.size() == (std::string(repo) == "MiniMaxAI/MiniMax-H3"
+                                  ? 3u
+                                  : 2u));
     bool fl = false, ref = false;
     std::vector<std::string> keys;
     for (const auto* e : h3) {
@@ -1024,4 +1312,348 @@ TEST(model_catalog, several_models_can_share_one_repo) {
 
   std::printf("[model_catalog] Comfy-Org/MiniMax-H3 publishes %zu models, "
               "vpipe-supplement %zu\n", h3.size(), sup.size());
+}
+
+// THE SHIPPED PREPARE PIPELINES NAME A MODEL THAT WILL EXIST.
+//
+// docs/pipelines/prepare-*.vpipeline fetch a model and then quantize it,
+// and the second stage names the first stage's result by its DB KEY. The
+// key is not the repo path: model-fetch registers under `model_key` when
+// set, else the catalogue entry's `name`, else the hf path -- so for any
+// repo publishing more than one model, where the catalogue gives each a
+// distinct name, the repo path is exactly the string that will NOT
+// resolve.
+//
+// prepare-minimax-h3-8bit shipped that way. Its fetch pulled
+// Comfy-Org/MiniMax-H3 with model_variant=fl2va, which registers as
+// "Comfy-Org/MiniMax-H3-FL2VA", and its quantize asked for
+// "Comfy-Org/MiniMax-H3" -- so the fetch succeeded and the quantize
+// could not find its input. Both Ref2VA siblings had it right, which is
+// what made it a one-file slip rather than a misunderstanding.
+//
+// Nothing else reads these files: they are documentation, so a wrong key
+// is invisible until a user runs one. This walks them instead.
+TEST(model_catalog, shipped_prepare_pipelines_name_a_resolvable_model)
+{
+#ifndef VPIPE_DOCS_PIPELINES_DIR
+  std::printf("[catalog] no docs dir defined; skipped\n");
+#else
+  namespace fs = std::filesystem;
+  const fs::path dir(VPIPE_DOCS_PIPELINES_DIR);
+  if (!fs::is_directory(dir)) {
+    std::printf("[catalog] %s is not a directory; skipped\n",
+                dir.string().c_str());
+    return;
+  }
+  // The key a model-fetch stage will register under, through the SAME
+  // resolver the stage calls. The first cut of this re-implemented the
+  // variant match as a plain substring scan taking the first hit, which
+  // agreed with the stage on every shipped pipeline while disagreeing
+  // about exact-beats-substring and about ambiguity being an error --
+  // so it would have kept passing while drifting away from the thing it
+  // is here to check.
+  auto fetch_key = [](const std::string& path, const std::string& key,
+                      const std::string& variant) {
+    if (!key.empty()) { return key; }
+    const ModelCatalogEntry* hit =
+        catalog_pick_variant(catalog_all_by_path(path), variant);
+    if (hit != nullptr && !hit->name.empty()) { return hit->name; }
+    return path;
+  };
+
+  int checked = 0;
+  for (const fs::directory_entry& de : fs::directory_iterator(dir)) {
+    const std::string fn = de.path().filename().string();
+    if (fn.rfind("prepare-", 0) != 0) { continue; }
+    if (de.path().extension() != ".vpipeline") { continue; }
+    std::string txt, line;
+    {
+      std::ifstream in(de.path());
+      while (std::getline(in, line)) { txt += line + "\n"; }
+    }
+    FlexData fd = FlexData::from_json(txt);
+    auto root = fd.as_object();
+    // A malformed example pipeline is its own failure, and a silent
+    // `continue` here would let one hide the rest of the file's checks.
+    EXPECT_TRUE(root.contains("stages"));
+    if (!root.contains("stages")) { continue; }
+    const FlexData stages = root.at("stages");
+    // Keys a stage in THIS pipeline produces, so a later src_model may
+    // name an intermediate that does not exist on disk yet.
+    std::vector<std::string> produced;
+    for (const FlexData& st : stages.as_array()) {
+      auto o = st.as_object();
+      if (!o.contains("config")) { continue; }
+      const FlexData cfg = o.at("config");
+      auto c = cfg.as_object();
+      auto str = [&](const char* k) {
+        return c.contains(k) ? std::string(c.at(k).as_string("")) : "";
+      };
+      const std::string type = std::string(o.at("type").as_string(""));
+      if (type == "model-fetch") {
+        produced.push_back(fetch_key(str("model_path"), str("model_key"),
+                                     str("model_variant")));
+        continue;
+      }
+      if (type != "model-quantize") { continue; }
+      const std::string src = str("src_model");
+      if (src.empty()) { continue; }
+      const bool from_pipeline =
+          std::find(produced.begin(), produced.end(), src) != produced.end();
+      if (!from_pipeline) {
+        std::printf("[catalog] %s: quantize src_model '%s' is neither a key "
+                    "an earlier stage registers nor its output\n",
+                    fn.c_str(), src.c_str());
+      }
+      EXPECT_TRUE(from_pipeline);
+      ++checked;
+      if (!str("output_name").empty()) {
+        produced.push_back(str("output_name"));
+      }
+    }
+  }
+  std::printf("[catalog] %d quantize stages across the shipped prepare "
+              "pipelines name a model an earlier stage produces\n", checked);
+  EXPECT_TRUE(checked > 0);
+#endif
+}
+
+// THE VARIANT RULE, stated as tests rather than as a comment.
+//
+// catalog_pick_variant decides WHICH model one repo's several entries a
+// `model_variant` string means. Two of its properties are easy to
+// re-implement wrongly, and both were, in the first version of the
+// pipeline check above: an exact hit outranks a substring hit, and an
+// ambiguous match is refused rather than resolved by catalogue order.
+// Getting either wrong downloads a different model and registers it
+// under the right name, which is the failure the rule exists to prevent.
+TEST(model_catalog, variant_resolution_is_exact_before_substring)
+{
+  // Synthetic, so the properties are pinned independently of what the
+  // shipped catalogue happens to contain today.
+  ModelCatalogEntry a, b;
+  a.version = "turbo";
+  a.name    = "x/turbo";
+  b.version = "turbo-8step";
+  b.name    = "x/turbo-8step";
+  const std::vector<const ModelCatalogEntry*> both = {&a, &b};
+  const std::vector<const ModelCatalogEntry*> rev  = {&b, &a};
+  const std::vector<const ModelCatalogEntry*> one  = {&a};
+
+  // "turbo" is EXACT on a's version and a substring of b's. The exact hit
+  // wins, and it wins from either order -- a first-match scan would have
+  // returned b from `rev`.
+  EXPECT_TRUE(catalog_pick_variant(both, "turbo") == &a);
+  EXPECT_TRUE(catalog_pick_variant(rev, "turbo") == &a);
+
+  // A substring hitting both is AMBIGUOUS, and ambiguity is nullptr --
+  // never the first one.
+  EXPECT_TRUE(catalog_pick_variant(both, "turb") == nullptr);
+  EXPECT_TRUE(catalog_pick_variant(rev, "turb") == nullptr);
+
+  // An empty variant selects only when there is nothing to choose.
+  EXPECT_TRUE(catalog_pick_variant(both, "") == nullptr);
+  EXPECT_TRUE(catalog_pick_variant(one, "") == &a);
+  EXPECT_TRUE(catalog_pick_variant({}, "turbo") == nullptr);
+
+  // A miss is a miss, however close.
+  EXPECT_TRUE(catalog_pick_variant(both, "turbot") == nullptr);
+
+  // `matched` carries the hit set so a refusing caller can name it: the
+  // tie on an ambiguous match, and nothing on a miss.
+  std::vector<const ModelCatalogEntry*> hits;
+  EXPECT_TRUE(catalog_pick_variant(both, "turb", &hits) == nullptr);
+  EXPECT_TRUE(hits.size() == 2);
+  EXPECT_TRUE(catalog_pick_variant(both, "nope", &hits) == nullptr);
+  EXPECT_TRUE(hits.empty());
+  EXPECT_TRUE(catalog_pick_variant(both, "turbo", &hits) == &a);
+  EXPECT_TRUE(hits.size() == 1);
+}
+
+// And the shipped case the prepare pipelines depend on: one repo, two
+// partitions, and the variant string each pipeline passes.
+TEST(model_catalog, minimax_h3_partitions_resolve_from_their_variant)
+{
+  const std::vector<const ModelCatalogEntry*> cands =
+      catalog_all_by_path("Comfy-Org/MiniMax-H3");
+  if (cands.size() < 2) {
+    std::printf("[catalog] Comfy-Org/MiniMax-H3 publishes %zu entries; "
+                "the two-partition check needs both\n", cands.size());
+    return;
+  }
+  const ModelCatalogEntry* fl = catalog_pick_variant(cands, "fl2va");
+  const ModelCatalogEntry* rf = catalog_pick_variant(cands, "ref2va");
+  ASSERT_TRUE(fl != nullptr);
+  ASSERT_TRUE(rf != nullptr);
+  if (fl == nullptr || rf == nullptr) { return; }
+  EXPECT_TRUE(fl != rf);
+  // The NAME is what model-fetch registers under with no model_key, and
+  // therefore what a downstream `src_model` has to say.
+  EXPECT_TRUE(fl->name == "Comfy-Org/MiniMax-H3-FL2VA");
+  EXPECT_TRUE(rf->name == "Comfy-Org/MiniMax-H3-Ref2VA");
+  // Bare "h3" cannot choose between them, and must not pretend to.
+  EXPECT_TRUE(catalog_pick_variant(cands, "h3") == nullptr);
+  // Neither may an empty variant, which is the case that sends the fetch
+  // stage to its "publishes N models" refusal.
+  EXPECT_TRUE(catalog_pick_variant(cands, "") == nullptr);
+}
+
+// The MiniMax-H3 single-image VAE, which is what makes a still out of a
+// one-latent-frame H3 latent. Its own entry rather than a supplement:
+// it is a COMPLETE autoencoder (H3's frozen encoder plus a decoder
+// retrained to read one latent frame), and the same file serves both H3
+// partitions, so pinning a parent would either be wrong for one of them
+// or duplicate a 5.2 GB fetch under two names.
+TEST(model_catalog, minimax_h3_image_vae_entry) {
+  const ModelCatalogEntry* e =
+      catalog_by_path("Mamad8/MiniMax-H3-Image-VAE");
+  ASSERT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->model_type == "minimax-h3-image-vae");
+  EXPECT_TRUE(e->name == "Mamad8/MiniMax-H3-Image-VAE");
+  // Its repo publishes exactly ONE model, so a fetch needs no
+  // model_variant -- the single-candidate path in ModelFetchStage
+  // resolves it from model_path alone.
+  auto cands = catalog_all_by_path("Mamad8/MiniMax-H3-Image-VAE");
+  EXPECT_TRUE(cands.size() == 1);
+  // Weights-only Comfy packing: the config rides the safetensors
+  // __metadata__, so there is no config.json to fetch and no tokenizer
+  // to synthesize.
+  EXPECT_TRUE(e->weight_format == "comfyui");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  // The ONE file, pinned by name. It must not be fetched as a whole
+  // repo: the repo also carries a 980 KB example PNG.
+  EXPECT_TRUE(e->files.size() == 1);
+  if (e->files.size() == 1) {
+    EXPECT_TRUE(e->files[0] == "minimax_h3_t1_image_vae_step1597.safetensors");
+    // The filename carries no "video_vae", which is load-bearing: the
+    // component resolver PREFERS that substring, so this file loses to
+    // the real video VAE when both sit in one vae/ directory and can
+    // only be selected by naming it.
+    EXPECT_TRUE(e->files[0].find("video_vae") == string::npos);
+  }
+  // Pixels in, pixels out -- no prompt, no denoise.
+  EXPECT_TRUE(has_(e->inputs, "image"));
+  EXPECT_TRUE(has_(e->outputs, "image"));
+  EXPECT_TRUE(e->inputs.size() == 1 && e->outputs.size() == 1);
+}
+
+// The DFlash drafters are SUPPLEMENTS of the target they were trained
+// for: no modality of their own, and a parent pinned by type and size so
+// a picker offers each beside the right model only.
+TEST(model_catalog, dflash_drafters) {
+  struct Row {
+    const char* path;
+    const char* type;
+    const char* version;
+    const char* parent_type;
+    const char* parent_class;
+  };
+  const Row rows[] = {
+      {"incoai/Qwen3.8-27B-DFlash2", "dflash2", "2", "qwen3.5", "27B"},
+      {"incoai/Qwen3.8-Flash-Next-DFlash2", "dflash2", "2",
+       "qwen3.8-flash", "Flash-Next"},
+      {"z-lab/Qwen3.5-4B-DFlash", "dflash", "1", "qwen3.5", "4B"},
+  };
+  for (const Row& r : rows) {
+    const ModelCatalogEntry* e = catalog_by_path(r.path);
+    EXPECT_TRUE(e != nullptr);
+    if (e == nullptr) { continue; }
+    EXPECT_TRUE(e->family == "DFlash");
+    EXPECT_TRUE(e->version == r.version);
+    EXPECT_TRUE(e->model_type == r.type);
+    EXPECT_TRUE(e->parent_model_type == r.parent_type);
+    EXPECT_TRUE(e->parent_param_class == r.parent_class);
+    EXPECT_TRUE(e->inputs.empty() && e->outputs.empty());
+    EXPECT_FALSE(e->needs_tokenizer_json);
+  }
+}
+
+// Ministral-3 14B: catalogued under its own family, whole-repo fetch,
+// and a mistral3 registration (from disk or the catalogue) takes images
+// as well as text -- the Pixtral tower -- and answers in text.
+TEST(model_catalog, ministral3_present_with_vision) {
+  EXPECT_TRUE(has_(catalog_families(), "Ministral"));
+  const ModelCatalogEntry* e = catalog_by_path(
+      "mlx-community/Ministral-3-14B-Instruct-2512-4bit");
+  EXPECT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "Ministral" && e->version == "3");
+  EXPECT_TRUE(e->param_class == "14B");
+  EXPECT_TRUE(e->model_type == "mistral3");
+  EXPECT_FALSE(e->needs_tokenizer_json);
+  EXPECT_TRUE(e->files.empty());
+  std::vector<std::string> in, out;
+  catalog_default_io("mistral3", in, out);
+  EXPECT_TRUE(has_(in, "text") && has_(in, "image"));
+  EXPECT_FALSE(has_(in, "audio"));
+  EXPECT_TRUE(out.size() == 1 && out[0] == "text");
+}
+
+// LFM3-VL: catalogued with its file list (the repo's Python is not
+// fetched), text / image / video in, text out.
+TEST(model_catalog, lfm3_vl_present_with_vision) {
+  EXPECT_TRUE(has_(catalog_families(), "LFM"));
+  const ModelCatalogEntry* e = catalog_by_path("LiquidAI/LFM3-VL-2B");
+  EXPECT_TRUE(e != nullptr);
+  if (e == nullptr) { return; }
+  EXPECT_TRUE(e->family == "LFM" && e->version == "3-VL");
+  EXPECT_TRUE(e->param_class == "2B");
+  EXPECT_TRUE(e->model_type == "lfm3-vl");
+  EXPECT_TRUE(has_(e->files, "model.safetensors"));
+  EXPECT_TRUE(has_(e->files, "processor_config.json"));
+  for (const auto& f : e->files) {
+    EXPECT_TRUE(f.find(".py") == std::string::npos);
+  }
+  std::vector<std::string> in, out;
+  catalog_default_io("lfm3-vl", in, out);
+  EXPECT_TRUE(has_(in, "text") && has_(in, "image"));
+  EXPECT_FALSE(has_(in, "audio"));
+  EXPECT_TRUE(out.size() == 1 && out[0] == "text");
+}
+
+// FlashVSR+ publishes Turbo and Base as FOLDERS of one repository around
+// files they share, and the folder is the model -- the two are the same
+// tensors and differ only in how the family drives them. So each entry
+// pins its own folder's two files plus the shared ones, registers under
+// its own key, and names its folder as `local_subdir`, which is what
+// model-fetch registers as the record's local_path.
+TEST(model_catalog, flashvsr_plus_variants_register_their_folders) {
+  const auto cands = catalog_all_by_path("ruchangyao/FlashVSR_plus");
+  ASSERT_TRUE(cands.size() == 2);
+  if (cands.size() != 2) { return; }
+  std::vector<std::string> subs, names;
+  for (const ModelCatalogEntry* e : cands) {
+    EXPECT_TRUE(e->model_type == "flashvsr");
+    FlexData extra = e->extra;
+    ASSERT_TRUE(extra.is_object() &&
+                extra.as_object().contains(catalog_extra::kLocalSubdir));
+    if (!extra.is_object() ||
+        !extra.as_object().contains(catalog_extra::kLocalSubdir)) {
+      return;
+    }
+    const std::string sub(
+        extra.as_object().at(catalog_extra::kLocalSubdir).as_string(""));
+    subs.push_back(sub);
+    names.push_back(e->name);
+    auto pinned = [&](const std::string& f) {
+      return std::find(e->files.begin(), e->files.end(), f) != e->files.end();
+    };
+    EXPECT_TRUE(pinned(sub + "/dit.safetensors"));
+    EXPECT_TRUE(pinned(sub + "/lq_proj_in.safetensors"));
+    EXPECT_TRUE(pinned("Wan2.1_VAE.pth") && pinned("config.json"));
+    // The reference's default decoder, shared at the root like the VAE.
+    EXPECT_TRUE(pinned("TCDecoder.ckpt"));
+    // The other variant's weights are not this one's download.
+    const std::string other = sub == "turbo" ? "base" : "turbo";
+    EXPECT_FALSE(pinned(other + "/dit.safetensors"));
+    // The fixed context is not in the repository; it is v1.1's.
+    ASSERT_TRUE(e->companion_files.size() == 1);
+    if (e->companion_files.size() == 1) {
+      EXPECT_TRUE(e->companion_files[0].file == "posi_prompt.pth");
+    }
+  }
+  std::sort(subs.begin(), subs.end());
+  EXPECT_TRUE(subs == (std::vector<std::string>{"base", "turbo"}));
+  EXPECT_TRUE(names[0] != names[1] && !names[0].empty() && !names[1].empty());
 }

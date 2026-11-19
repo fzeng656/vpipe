@@ -24,17 +24,27 @@
 //     whichever mrope section owns it -- but that is an argument, and
 //     this is the measurement.
 //
-// Env: VPIPE_MINIMAX_H3_TEXT_ENC_PATH, VPIPE_MINIMAX_H3_TEXT_ENC_GOLDEN.
+// Env: VPIPE_MINIMAX_H3_TEXT_ENC_PATH, VPIPE_MINIMAX_H3_TEXT_ENC_GOLDEN;
+// VPIPE_DRAWTHINGS_QWEN3VL_CKPT (Draw Things' qwen_3_vl_32b_50_i8x.ckpt)
+// for the weights-from-a-.ckpt test.
 
 #include "minitest.h"
+#include "tests/unit-tests/residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "stages/model-quantize-stage.h"
+#include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/llama3/metal-llama-weights.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/shared/stream-sizing.h"
+#include "stages/model-memory.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -43,6 +53,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace vpipe;
@@ -611,6 +622,166 @@ TEST(minimax_h3_text_enc, config_from_json)
   EXPECT_TRUE(cfg.lm.backbone_only);
 }
 
+// A `ref2va` request with NO references -- the prompt-only form -- is
+// presented as the prompt alone and conditions BYTE-IDENTICALLY to
+// the t2va path. That is what makes it the same request text-to-video
+// makes, read by different DiT weights, rather than a near relative:
+// diffusion-conditioner calls encode(), video-ref-encoder calls
+// encode_references(), and for an empty list the two must agree to the
+// bit or "prompt only" quietly means two different conditionings
+// depending on which stage a graph used.
+//
+// Truncated depth like the rest of this file: two layers are enough to
+// put the rotary layout, the tap and the embedding through the forward,
+// and the claim is equality, not accuracy against a reference. Env:
+// VPIPE_MINIMAX_H3_TEXT_ENC_PATH only -- no golden is involved.
+TEST(minimax_h3_text_enc, prompt_only_presentation_is_the_prompt)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, cfg, &cerr));
+  cfg.tap = 2;
+  cfg.lm.n_layers = 2;
+  auto m = MiniMaxH3TextEncoder::load(root, mc, &sess, cfg);
+  if (m == nullptr) { std::printf("[minimax_h3_text_enc] load failed\n"); }
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  // The presentation: the prompt verbatim, every row text, no vision
+  // run, and a rotary layout whose three axes all carry the row index.
+  MiniMaxH3TextEncoder::Presentation P;
+  std::string perr;
+  const bool built = m->build_presentation({}, kPrompt, &P, &perr);
+  if (!built) { std::printf("[minimax_h3_text_enc] %s\n", perr.c_str()); }
+  ASSERT_TRUE(built);
+  if (!built) { return; }
+  const std::vector<std::int32_t> ids = m->tokenize(kPrompt);
+  const int n = P.size();
+  ASSERT_TRUE(n > 0 && P.ids == ids);
+  EXPECT_TRUE(P.runs.empty());
+  bool all_text = (int)P.tags.size() == n;
+  for (int t : P.tags) { all_text = all_text && t == minimax_h3::kTextTag; }
+  EXPECT_TRUE(all_text);
+  bool flat = (int)P.mrope.size() == 3 * n;
+  for (int i = 0; flat && i < n; ++i) {
+    flat = P.mrope[(std::size_t)i] == i &&
+           P.mrope[(std::size_t)n + i] == i &&
+           P.mrope[(std::size_t)2 * n + i] == i;
+  }
+  EXPECT_TRUE(flat);
+
+  // The conditioning: the same bytes encode() returns.
+  std::vector<int> tags;
+  int rn = 0, tn = 0;
+  std::string rerr, terr;
+  SharedBuffer r = m->encode_references({}, kPrompt, &tags, &rn, &rerr);
+  SharedBuffer t = m->encode(kPrompt, &tn, &terr);
+  if (r.empty()) { std::printf("[minimax_h3_text_enc] %s\n", rerr.c_str()); }
+  if (t.empty()) { std::printf("[minimax_h3_text_enc] %s\n", terr.c_str()); }
+  ASSERT_TRUE(!r.empty() && !t.empty());
+  if (r.empty() || t.empty()) { return; }
+  EXPECT_TRUE(rn == tn && rn == n);
+  EXPECT_TRUE(tags == P.tags);
+  const std::size_t bytes = (std::size_t)n * cfg.text_dim * 2;
+  ASSERT_TRUE(r.byte_size() >= bytes && t.byte_size() >= bytes);
+  const bool same =
+      r.byte_size() >= bytes && t.byte_size() >= bytes &&
+      std::memcmp(r.contents(), t.contents(), bytes) == 0;
+  EXPECT_TRUE(same);
+  std::printf("[minimax_h3_text_enc] prompt-only ref2va: %d tokens, %s the "
+              "t2va conditioning\n", n,
+              same ? "byte-identical to" : "DIFFERS from");
+}
+
+// A request of SOUNDTRACKS ALONE, no picture or clip: each is its
+// "<Audio j>: " label ahead of the prompt, tokenized piece by piece as
+// every label is, no vision run, every row text on a flat rotary
+// layout -- and conditioned by the plain-text path over those ids, as
+// ComfyUI's tokenizer presents it (audio never enters Qwen). Same
+// truncated encoder as above; VPIPE_MINIMAX_H3_TEXT_ENC_PATH only.
+TEST(minimax_h3_text_enc, soundtracks_alone_are_labels_and_the_prompt)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, cfg, &cerr));
+  cfg.tap = 2;
+  cfg.lm.n_layers = 2;
+  auto m = MiniMaxH3TextEncoder::load(root, mc, &sess, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  using Ref = MiniMaxH3TextEncoder::Reference;
+  Ref sound;
+  sound.kind = Ref::Kind::kAudio;
+  sound.has_audio = true;        // as encode_references sets it
+  for (int count = 1; count <= 2; ++count) {
+    const std::vector<Ref> refs((std::size_t)count, sound);
+    std::vector<std::int32_t> want;
+    for (int j = 1; j <= count; ++j) {
+      const std::vector<std::int32_t> l =
+          m->tokenize("<Audio " + std::to_string(j) + ">: ");
+      want.insert(want.end(), l.begin(), l.end());
+    }
+    const std::vector<std::int32_t> p = m->tokenize(kPrompt);
+    want.insert(want.end(), p.begin(), p.end());
+
+    MiniMaxH3TextEncoder::Presentation P;
+    std::string perr;
+    const bool built = m->build_presentation(refs, kPrompt, &P, &perr);
+    if (!built) { std::printf("[minimax_h3_text_enc] %s\n", perr.c_str()); }
+    ASSERT_TRUE(built);
+    if (!built) { return; }
+    const int n = P.size();
+    EXPECT_TRUE(P.ids == want);
+    EXPECT_TRUE(P.runs.empty());
+    bool all_text = (int)P.tags.size() == n;
+    for (int t : P.tags) {
+      all_text = all_text && t == minimax_h3::kTextTag;
+    }
+    EXPECT_TRUE(all_text);
+    bool flat = (int)P.mrope.size() == 3 * n;
+    for (int i = 0; flat && i < n; ++i) {
+      flat = P.mrope[(std::size_t)i] == i &&
+             P.mrope[(std::size_t)n + i] == i &&
+             P.mrope[(std::size_t)2 * n + i] == i;
+    }
+    EXPECT_TRUE(flat);
+
+    std::vector<int> tags;
+    int rn = 0;
+    std::string rerr, ierr;
+    SharedBuffer r = m->encode_references(refs, kPrompt, &tags, &rn, &rerr);
+    SharedBuffer t = m->encode_ids(want, &ierr);
+    if (r.empty()) { std::printf("[minimax_h3_text_enc] %s\n", rerr.c_str()); }
+    if (t.empty()) { std::printf("[minimax_h3_text_enc] %s\n", ierr.c_str()); }
+    ASSERT_TRUE(!r.empty() && !t.empty());
+    if (r.empty() || t.empty()) { return; }
+    EXPECT_TRUE(rn == n);
+    EXPECT_TRUE(tags == P.tags);
+    const std::size_t bytes = (std::size_t)n * cfg.text_dim * 2;
+    const bool same =
+        r.byte_size() >= bytes && t.byte_size() >= bytes &&
+        std::memcmp(r.contents(), t.contents(), bytes) == 0;
+    EXPECT_TRUE(same);
+    std::printf("[minimax_h3_text_enc] %d soundtrack(s) alone: %d tokens "
+                "(%d of labels), %s the labelled text's conditioning\n",
+                count, n, n - (int)p.size(),
+                same ? "byte-identical to" : "DIFFERS from");
+  }
+}
+
 namespace {
 
 // Whether the golden's reference was built ONE LAYER AT A TIME. The
@@ -834,6 +1005,101 @@ TEST(minimax_h3_text_enc, streaming_matches_resident)
   std::printf("[minimax_h3_text_enc] streamed re-encode: %zu words differ\n",
               diff2);
   EXPECT_TRUE(diff2 == 0);
+  sm.reset();
+
+  // THE PATH THE STAGES TAKE: the raw-source slot pair, with a resident
+  // set grown by measurement in place of the pinned prefix (asked for,
+  // and ignored). Three encodes: growth off (no reserve), then on, then
+  // again against what was kept -- each the resident answer exactly.
+  MiniMaxH3TextEncoder::Config rcfg = base;
+  rcfg.lm.stream_layers = true;
+  rcfg.lm.stream_decode = true;
+  rcfg.lm.pin_frac      = 0.5;
+  auto rm = MiniMaxH3TextEncoder::load(root, mc, &sess, rcfg);
+  ASSERT_TRUE(rm != nullptr);
+  if (rm == nullptr) { return; }
+  EXPECT_TRUE(rm->streams_resident_set());
+  EXPECT_TRUE(rm->pinned_layers() == 0);
+  std::size_t rdiff = 0;
+  int kept[3] = {0, 0, 0};
+  for (int pass = 0; pass < 3; ++pass) {
+    if (pass == 1) {
+      rm->set_residency_reserve(0);
+      rm->set_residency_schedule(4);
+    }
+    SharedBuffer r = rm->encode_ids(ids, &serr);
+    ASSERT_TRUE(!r.empty() && r.byte_size() == sh.byte_size());
+    if (r.empty() || r.byte_size() != sh.byte_size()) { return; }
+    const auto* g3 = static_cast<const std::uint16_t*>(r.contents());
+    for (std::size_t i = 0; i < want.size(); ++i) {
+      if (g3[i] != want[i]) { ++rdiff; }
+    }
+    kept[pass] = rm->resident_layer_count();
+  }
+  std::printf("[minimax_h3_text_enc] through the slots, three encodes: %zu "
+              "words differ; %d / %d / %d of %d layers kept\n", rdiff,
+              kept[0], kept[1], kept[2], gtap);
+  EXPECT_TRUE(rdiff == 0);
+  EXPECT_TRUE(kept[0] == 0);
+  EXPECT_TRUE(kept[1] > 0);
+}
+
+// THE WEIGHTS FROM A DRAW THINGS .ckpt (Config::weights), the config and
+// tokenizer from the release: the same ids through both, at a shallow
+// tap. Draw Things stores the 32B's linears as i8x (dequantized here)
+// and its embedding table in f16 -- whose rows, copied raw into the bf16
+// backbone input as a bf16 table's are, were noise until the table was
+// converted. So the bar is the int8 floor, and the failure it guards
+// against is O(1).
+TEST(minimax_h3_text_enc, a_drawthings_checkpoint_encodes_as_the_release)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  const char* ck   = std::getenv("VPIPE_DRAWTHINGS_QWEN3VL_CKPT");
+  if (root == nullptr || *root == '\0' || ck == nullptr || *ck == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config base;
+  std::string cerr;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, base, &cerr));
+  base.tap = 4;
+  base.lm.n_layers = 4;
+  std::vector<std::int32_t> ids;
+  for (int i = 0; i < 48; ++i) { ids.push_back(1000 + 977 * i % 60000); }
+  auto run = [&](const std::string& weights, std::vector<float>* out) {
+    MiniMaxH3TextEncoder::Config c = base;
+    c.weights = weights;
+    auto m = MiniMaxH3TextEncoder::load(root, mc, &sess, c);
+    if (m == nullptr) { return false; }
+    std::string e;
+    SharedBuffer h = m->encode_ids(ids, &e);
+    if (h.empty()) {
+      std::printf("[minimax_h3_text_enc] %s\n", e.c_str());
+      return false;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(h.contents());
+    out->resize(h.byte_size() / 2);
+    for (std::size_t i = 0; i < out->size(); ++i) {
+      (*out)[i] = bf16_to_f32_(p[i]);
+    }
+    return true;
+  };
+  std::vector<float> rel, dt;
+  ASSERT_TRUE(run({}, &rel));
+  ASSERT_TRUE(run(ck, &dt));
+  ASSERT_TRUE(rel.size() == dt.size() && !rel.empty());
+  if (rel.size() != dt.size() || rel.empty()) { return; }
+  double e2 = 0, r2 = 0;
+  for (std::size_t i = 0; i < rel.size(); ++i) {
+    e2 += ((double)dt[i] - rel[i]) * ((double)dt[i] - rel[i]);
+    r2 += (double)rel[i] * rel[i];
+  }
+  const double r = std::sqrt(e2 / std::max(r2, 1e-30));
+  std::printf("[minimax_h3_text_enc] the .ckpt's tap %d vs the release's: "
+              "rel-L2 %.4f over %zu values\n", base.tap, r, rel.size());
+  EXPECT_TRUE(std::isfinite(r) && r < 0.05);
 }
 
 // The REAL tap, at the production depth, with no reference to compare
@@ -977,4 +1243,350 @@ TEST(minimax_h3_text_enc, quantized_reloads)
               std::sqrt(sq / (double)((std::size_t)n * cfg.text_dim)), n);
   EXPECT_TRUE(finite);
   EXPECT_TRUE(sq > 0.0);
+}
+
+// A reference NOT PRESENTED is the DiT's alone: no label, no tower run,
+// the tags after it numbered without it, its rows laid out as ever. Two
+// pictures, the first not presented, must present EXACTLY as the second
+// alone -- its "<Picture 1>", the same ids, tags and conditioning bytes
+// -- while both presented present more; the tower must not run for the
+// first (the encoder's own progress labels say which ran). A carried
+// latent with no pixels: presented, refused up front ("not presented"
+// in the reason); not presented, the prompt alone is presented.
+//
+// Truncated to two layers as the prompt-only test is: the claim is
+// equality. No VAE is loaded, so a picture's rows are not encoded --
+// the presentation is what is under test. Env:
+// VPIPE_MINIMAX_H3_TEXT_ENC_PATH only.
+TEST(minimax_h3_text_enc, an_unpresented_reference_is_the_dits_alone)
+{
+  namespace h3 = minimax_h3;
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, cfg, &err));
+  cfg.tap = 2;
+  cfg.lm.n_layers = 2;
+  auto enc = MiniMaxH3TextEncoder::load(root, mc, &sess, cfg);
+  auto tower = MiniMaxH3TextEncoder::load_vision(root, mc, cfg, &err);
+  if (!tower) { std::printf("[minimax_h3_text_enc] tower: %s\n", err.c_str()); }
+  ASSERT_TRUE(enc != nullptr && tower != nullptr);
+  if (enc == nullptr || tower == nullptr) { return; }
+
+  // Two different pictures, already on the 32-grid, kept at that size.
+  auto picture = [](int H, int W, int seed) {
+    h3::MediaReference m;
+    m.kind = h3::MediaReference::Kind::kImage;
+    m.num_frames = 1;
+    m.height = H;
+    m.width = W;
+    m.short_edge = 0;
+    m.rgb.resize((std::size_t)3 * H * W);
+    for (int c = 0; c < 3; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          m.rgb[((std::size_t)c * H + y) * W + x] =
+              (std::uint8_t)((x * (c + seed) + y * (2 * seed + 1)) & 255);
+        }
+      }
+    }
+    return m;
+  };
+  const h3::MediaReference a = picture(96, 128, 1);
+  const h3::MediaReference b = picture(128, 96, 3);
+  h3::MediaReference a_alone = a;
+  a_alone.presented = false;
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  h3::ReferenceEncoders models;
+  models.mc = mc;
+  models.vision = tower.get();
+  models.text = enc.get();
+  std::vector<std::string> details;
+  models.progress = [&details](std::uint64_t, std::uint64_t,
+                               const std::string& d) {
+    details.push_back(d);
+  };
+  auto run = [&](std::vector<h3::MediaReference> refs,
+                 h3::EncodedReferences* out, std::string* e) {
+    details.clear();
+    e->clear();
+    const bool ok = h3::encode_references(refs, kPrompt, plan, models, out, e);
+    if (!ok) { std::printf("[minimax_h3_text_enc] %s\n", e->c_str()); }
+    return ok;
+  };
+  auto ran = [&details](const std::string& what) {
+    for (const std::string& d : details) {
+      if (d == what) { return true; }
+    }
+    return false;
+  };
+
+  h3::EncodedReferences e_ab, e_b, e_both, e_none;
+  std::string e1, e2, e3, e4;
+  ASSERT_TRUE(run({a_alone, b}, &e_ab, &e1));
+  const bool tower_a = ran("reference 1/2 (image): vision tower");
+  const bool tower_b = ran("reference 2/2 (image): vision tower");
+  ASSERT_TRUE(run({b}, &e_b, &e2));
+  ASSERT_TRUE(run({a, b}, &e_both, &e3));
+  ASSERT_TRUE(run({}, &e_none, &e4));
+
+  const std::size_t row = (std::size_t)cfg.text_dim * 2;
+  auto same_rows = [&](const h3::EncodedReferences& x,
+                       const h3::EncodedReferences& y) {
+    const std::size_t n = (std::size_t)x.n_tokens * row;
+    return x.n_tokens == y.n_tokens && x.token_tags == y.token_tags &&
+           x.conditioning.byte_size() >= n &&
+           y.conditioning.byte_size() >= n &&
+           std::memcmp(x.conditioning.contents(), y.conditioning.contents(),
+                       n) == 0;
+  };
+  const bool as_b = same_rows(e_ab, e_b);
+  std::printf("[minimax_h3_text_enc] presentation: the prompt %d tokens, "
+              "b alone %d, a unpresented + b %d (%s b's), a + b %d; tower "
+              "run for a: %s, for b: %s\n", e_none.n_tokens, e_b.n_tokens,
+              e_ab.n_tokens, as_b ? "IDENTICAL to" : "DIFFERS from",
+              e_both.n_tokens, tower_a ? "yes" : "no",
+              tower_b ? "yes" : "no");
+  EXPECT_TRUE(as_b);
+  EXPECT_TRUE(e_both.n_tokens > e_b.n_tokens);
+  EXPECT_TRUE(e_b.n_tokens > e_none.n_tokens);
+  EXPECT_TRUE(!tower_a && tower_b);
+  // Both laid out: the presentation is all that left it.
+  EXPECT_TRUE(e_ab.layout.size() == 2 && e_b.layout.size() == 1);
+
+  // A still's latent with no pixels. Presented, the tower has nothing to
+  // read, and it is refused before the conditioner runs.
+  h3::MediaReference lat;
+  lat.kind = h3::MediaReference::Kind::kImage;
+  lat.latent_z = 4;
+  lat.latent_frames = 1;
+  lat.latent_height = 4;
+  lat.latent_width = 6;
+  lat.video_latent.assign((std::size_t)4 * 4 * 6, 0.25f);
+  h3::EncodedReferences e_lat;
+  std::string el;
+  details.clear();
+  EXPECT_FALSE(h3::encode_references({lat}, kPrompt, plan, models, &e_lat,
+                                     &el));
+  EXPECT_TRUE(el.find("not presented") != std::string::npos);
+  // Not presented: the prompt alone, the latent's rows laid out.
+  lat.presented = false;
+  ASSERT_TRUE(run({lat}, &e_lat, &el));
+  EXPECT_TRUE(same_rows(e_lat, e_none));
+  EXPECT_TRUE(e_lat.layout.size() == 1 &&
+              e_lat.layout[0].kind == h3::Reference::Kind::kImage &&
+              e_lat.video_rows.size() == lat.video_latent.size());
+}
+
+// Comfy-Org's NVFP4 AWQ repack of the encoder (`qwen3vl_32b_minimax_h3_
+// nvfp4_awq.safetensors`: the projections NVFP4 in ComfyUI's spelling, an
+// AWQ scale on o_proj and down_proj, the token table int8, no header)
+// against the bf16 encoder it was made from: the tap, token by token,
+// within what four-bit weights keep -- and not a model that merely loads.
+// Env: VPIPE_MINIMAX_H3_TEXT_ENC_NVFP4 (the file),
+// VPIPE_MINIMAX_H3_TEXT_ENC_PATH (the bf16 encoder).
+TEST(minimax_h3_text_enc, nvfp4_awq_repack_reads_as_its_bf16_encoder)
+{
+  const char* nv = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_NVFP4");
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_PATH");
+  if (nv == nullptr || *nv == '\0' || root == nullptr || *root == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config qc, bc;
+  std::string err;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(nv, qc, &err));
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(root, bc, &err));
+  // The repack is pruned to the tap; the bf16 one is read to the same.
+  bc.tap = qc.tap;
+  bc.lm.n_layers = qc.tap;
+  std::printf("[minimax_h3_text_enc] NVFP4 repack: %d layers, hidden %d, "
+              "ffn %d\n", qc.tap, qc.lm.hidden, qc.lm.ffn_inner);
+  // A prompt's worth of ordinary token ids.
+  std::vector<std::int32_t> ids;
+  for (int i = 0; i < 96; ++i) { ids.push_back(1000 + (i * 7919) % 90000); }
+  auto encode = [&](const std::string& dir,
+                    const MiniMaxH3TextEncoder::Config& c,
+                    double* secs) -> std::vector<float> {
+    std::vector<float> out;
+    const auto t0 = std::chrono::steady_clock::now();
+    auto m = MiniMaxH3TextEncoder::load(dir, mc, &sess, c);
+    if (m == nullptr) { return out; }
+    std::string e;
+    SharedBuffer h = m->encode_ids(ids, &e);
+    if (h.empty()) {
+      std::printf("[minimax_h3_text_enc] %s\n", e.c_str());
+      return out;
+    }
+    *secs = std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          t0).count();
+    const auto* p = static_cast<const std::uint16_t*>(h.contents());
+    for (std::size_t i = 0; i < h.byte_size() / 2; ++i) {
+      out.push_back(bf16_to_f32_(p[i]));
+    }
+    return out;
+  };
+  double tq = 0, tb = 0;
+  const std::vector<float> q = encode(nv, qc, &tq);
+  ASSERT_TRUE(!q.empty());
+  const std::vector<float> b = encode(root, bc, &tb);
+  ASSERT_TRUE(!b.empty() && b.size() == q.size());
+  const std::size_t H = (std::size_t)qc.lm.hidden;
+  const std::size_t T = q.size() / H;
+  double worst = 1.0, mean = 0.0;
+  bool finite = true;
+  for (std::size_t t = 0; t < T; ++t) {
+    double dot = 0, nq = 0, nb = 0;
+    for (std::size_t i = 0; i < H; ++i) {
+      const double x = q[t * H + i], y = b[t * H + i];
+      finite = finite && std::isfinite(x);
+      dot += x * y;
+      nq += x * x;
+      nb += y * y;
+    }
+    const double c = dot / std::sqrt(nq * nb + 1e-30);
+    worst = std::min(worst, c);
+    mean += c / (double)T;
+  }
+  std::printf("[minimax_h3_text_enc] NVFP4 AWQ vs bf16 at the tap: cosine "
+              "mean %.4f, worst token %.4f over %zu tokens (load + encode "
+              "%.1f s against %.1f s)\n", mean, worst, T, tq, tb);
+  EXPECT_TRUE(finite);
+  EXPECT_TRUE(mean > 0.95);
+  EXPECT_TRUE(worst > 0.85);
+}
+
+// The NVFP4 AWQ repack STREAMS as the conditioner asks it to
+// (stream_layers + stream_decode, a pin_frac it ignores): through the
+// raw-source slots -- the codes and block scales placed as they sit, the
+// served super-blocks built on the GPU -- never a pinned prefix. The
+// conditioning is the resident load's BYTE FOR BYTE at the tap with growth
+// off (every layer streamed), on, and once the slots are given back. Held
+// at the floor: the floor's slot pair and the final norm. Booked: the
+// floor's trunk counts the int8 token table at the bf16 the encoder holds
+// it in, and the whole (dir_weights_bytes) is that trunk and every layer
+// as kept, to the byte.
+TEST(minimax_h3_text_enc, nvfp4_awq_repack_streams_as_it_holds)
+{
+  const char* nv = std::getenv("VPIPE_MINIMAX_H3_TEXT_ENC_NVFP4");
+  if (nv == nullptr || *nv == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MiniMaxH3TextEncoder::Config c;
+  std::string err;
+  ASSERT_TRUE(MiniMaxH3TextEncoder::config_from_json(nv, c, &err));
+  std::vector<std::int32_t> ids;
+  for (int i = 0; i < 96; ++i) { ids.push_back(1000 + (i * 7919) % 90000); }
+  auto bytes_of = [](const SharedBuffer& h) {
+    const auto* p = static_cast<const std::uint8_t*>(h.contents());
+    return h.empty() ? std::vector<std::uint8_t>{}
+                     : std::vector<std::uint8_t>(p, p + h.byte_size());
+  };
+  auto same = [](const std::vector<std::uint8_t>& a,
+                 const std::vector<std::uint8_t>& b) {
+    return !a.empty() && a == b;
+  };
+  std::vector<std::uint8_t> want;
+  {
+    auto m = MiniMaxH3TextEncoder::load(nv, mc, &sess, c);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    EXPECT_TRUE(!m->streams_resident_set());
+    want = bytes_of(m->encode_ids(ids, &err));
+  }
+  ASSERT_TRUE(!want.empty());
+  (void)mc->memory_budget_settled();
+
+  MiniMaxH3TextEncoder::Config s = c;
+  s.lm.stream_layers = true;
+  s.lm.stream_decode = true;
+  s.lm.pin_frac = 0.5;
+  auto m = MiniMaxH3TextEncoder::load(nv, mc, &sess, s);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(m->streams_resident_set());
+  EXPECT_TRUE(m->pinned_layers() == 0);
+  auto wts = MetalLlamaWeights::open_model(nv);
+  ASSERT_TRUE(wts.has_value());
+  if (!wts.has_value()) { return; }
+  const std::string stem = c.lm.weight_prefix + c.lm.model_seg + "layers.";
+  const MetalQwenModel::RawSizes rs =
+      MetalQwenModel::raw_sizes(*wts, stem, c.lm.n_layers, 0);
+  EXPECT_TRUE(rs.nv && rs.n_layers == c.lm.n_layers);
+  // The final norm where the file has one (this repack, pruned to the
+  // tap, does not).
+  const std::size_t final_norm =
+      wts->info(c.lm.weight_prefix + c.lm.model_seg + "norm.weight") !=
+              nullptr
+          ? (std::size_t)c.lm.hidden * 2
+          : 0;
+
+  // 1. Growth off: every layer streamed, the floor's slot pair held.
+  const auto g1 = bytes_of(m->encode_ids(ids, &err));
+  EXPECT_TRUE(same(g1, want));
+  EXPECT_TRUE(m->resident_layer_count() == 0);
+  const std::size_t held0 = (std::size_t)m->resident_bytes();
+  EXPECT_TRUE(held0 == 2 * rs.slot + final_norm);
+  // The floor's trunk: the int8 token table at bf16, the rest as stored.
+  const std::size_t floor = MiniMaxH3TextEncoder::streaming_floor_bytes(nv);
+  std::size_t stored = 0, table = 0, table_n = 0;
+  for (const std::string& nm : wts->tensor_names()) {
+    if (genai::stream_sizing_alias(nm) || nm.rfind(stem, 0) == 0) {
+      continue;
+    }
+    const auto* ti = wts->info(nm);
+    if (ti == nullptr) { continue; }
+    stored += (std::size_t)ti->nbytes;
+    if (ti->dtype == "I8") {
+      table = (std::size_t)ti->nbytes;
+      table_n = 1;
+      for (auto d : ti->shape) { table_n *= (std::size_t)d; }
+    }
+  }
+  const std::size_t trunk = floor - 2 * rs.slot;
+  EXPECT_TRUE(table > 0 && trunk == stored - table + 2 * table_n);
+  // 2. Growth on, then the prompt again against what was kept.
+  m->set_residency_reserve(test_residency_reserve(1ull << 30));
+  m->set_residency_schedule(4);
+  const auto g2 = bytes_of(m->encode_ids(ids, &err));
+  const auto g3 = bytes_of(m->encode_ids(ids, &err));
+  EXPECT_TRUE(same(g2, want) && same(g3, want));
+  const int kept = m->resident_layer_count();
+  EXPECT_TRUE(kept > 0);
+  // 3. The slots given back where every layer is kept.
+  m->release_idle_slots();
+  const auto g4 = bytes_of(m->encode_ids(ids, &err));
+  EXPECT_TRUE(same(g4, want));
+  const std::size_t held = (std::size_t)m->resident_bytes();
+  const bool all = kept == c.lm.n_layers;
+  EXPECT_TRUE(held == (std::size_t)kept * rs.layer + final_norm +
+                          (all ? 0 : 2 * rs.slot));
+  // The whole, as dir_weights_bytes books it: the trunk and every layer.
+  std::size_t raw = 0;
+  const std::size_t whole = MetalQwenModel::nvfp4_held_bytes(*wts, &raw);
+  EXPECT_TRUE(whole == trunk + (std::size_t)c.lm.n_layers * rs.layer);
+  std::error_code ec;
+  const std::size_t file = (std::size_t)fs::file_size(nv, ec);
+  EXPECT_TRUE(model_memory::dir_weights_bytes(nv) == file + whole - raw);
+  std::printf("[minimax_h3_text_enc] NVFP4 streamed: floor %zu MB (trunk "
+              "%zu, the int8 table at bf16 %zu; slot pair %zu), held at it "
+              "%zu MB; %d of %d layers kept (%zu MB a layer), held %zu MB; "
+              "booked whole %zu MB (file %zu); the tap byte-identical to "
+              "resident: %d %d %d %d\n",
+              floor >> 20, trunk >> 20, (2 * table_n) >> 20,
+              (2 * rs.slot) >> 20, held0 >> 20, kept, c.lm.n_layers,
+              rs.layer >> 20, held >> 20,
+              model_memory::dir_weights_bytes(nv) >> 20, file >> 20,
+              (int)same(g1, want), (int)same(g2, want), (int)same(g3, want),
+              (int)same(g4, want));
 }

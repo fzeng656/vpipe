@@ -1,4 +1,7 @@
+#include "stages/minimax-h3-image-host.h"
 #include "stages/video-ref-encoder-stage.h"
+#include "generative-models/gen-input.h"
+#include "generative-models/generative-model-manager.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
@@ -8,17 +11,23 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "common/flex-bag.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-references.h"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #endif
 
 #include <memory>
@@ -33,9 +42,65 @@ namespace {
 // The model iport (a model-select source) overrides hf_dir. It follows
 // the prompt. (Referenced only from the Apple-gated code.)
 [[maybe_unused]] constexpr unsigned kModelPort = 1;
+// The tensor reference iports sit after it, so a graph written against
+// the two original ports keeps working unchanged.
+[[maybe_unused]] constexpr unsigned kFirstRefPort = 2;
+[[maybe_unused]] constexpr unsigned kNumRefPorts  = 6;
 
+// The reference iports all carry the same contract, so it is written
+// once. It is long because every one of these is a silent failure when
+// it is guessed at instead of stated.
+constexpr const char* kRefPortDoc =
+    "OPTIONAL reference media as a tensor, ONE BEAT PER REFERENCE, "
+    "numbered AFTER the `references` list. The KIND is the tensor's rank: "
+    "[N] or [channels, N] f32 is audio, [3, H, W] u8 is a picture, "
+    "[frames, 3, H, W] u8 is a clip -- which also settles the case a file "
+    "cannot state, since a one-frame clip is [1, 3, H, W] and a still is "
+    "[3, H, W]. The SIDEBAND carries the rates, and their absence is an "
+    "error rather than a default: `fps` for a clip, `sr` (or "
+    "`sample_rate`) for audio -- a soundtrack arriving at a rate other "
+    "than the audio VAE's is RESAMPLED onto it, which is what stating the "
+    "rate is for, so set the producer's rate to the VAE's (32000 for the "
+    "released checkpoint) to be resampled once instead of twice. Optional "
+    "sideband keys: `short_edge` for this one reference's canvas (0, the "
+    "default here, encodes it at the size it arrived), `attach` on an "
+    "audio beat to override the stage's `attach_audio` for that beat -- "
+    "true to make it the SOUNDTRACK "
+    "of the preceding reference, false to decline where the config asked "
+    "-- and `present: false` on any beat to give the DiT this reference "
+    "ALONE: its rows packed and on the clock as ever, but no label in the "
+    "prompt and no vision tower, the tags after it numbered without it "
+    "(what ComfyUI's RefMod \"Apply\" does with a stored reference). "
+    "`latent: true` says the beat is ALREADY ENCODED -- generate-video's "
+    "own oports, cut by a load-tensor, or a stored reference's latent: "
+    "f32 [z, frames, h, w] video rows (with `attach: true` it folds onto "
+    "the clip before it, whose pixels still feed the conditioner; with "
+    "`present: false` it is a reference of its own, and `image: true` "
+    "makes a one-frame latent a STILL, one slot on the clock, rather than "
+    "a one-frame clip) or f32 [2, channels, latents] soundtrack rows "
+    "(attached: that clip's soundtrack; else an audio reference) -- the "
+    "VAE skipped, the latent taken at its own length. "
+    "A WIRED port must beat every request -- an empty tensor is how "
+    "you say \"nothing this time\", because a silent port would renumber "
+    "every reference after it and quietly change the request";
+
+// What THIS stage implements: a two-way decision (destroy or keep, else
+// resolve from the box). "park" is doubly wrong here -- it would land in
+// the `auto` branch, and this encoder reads UNCACHED, so parking it
+// would release 0 bytes even if the policy reached it (see the claim
+// comment below). The legacy "always" / "never" stay accepted.
+constexpr SpecExtra kUnloadChoices[] = {
+  {spec_key::kChoices, "auto,destroy,keep"},
+};
 const ConfigKey kAttrs[] = {
-  {.key = "references", .type = ConfigType::Any, .required = true,
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
+  {.key = "references", .type = ConfigType::Any, .required = false,
    .doc = "the reference files IN THE ORDER THE MODEL SHOULD READ THEM: one "
           "path, or an array of paths. The order labels them in the "
           "presentation (<Picture 1>, <Video 2>, ...) and lays them out on "
@@ -43,33 +108,158 @@ const ConfigKey kAttrs[] = {
           "request. WHAT each file is -- image, video or audio -- is read "
           "from the FILE, not from its name: a container with one frame is "
           "an image reference, an .mp4 with no video stream is an audio one. "
-          "At most 9 images, 3 videos and 3 audios, 12 in total, and audio "
-          "cannot be the only kind",
+          "At most 9 images, 3 videos and 3 audios, 12 in total. Audio "
+          "may be the only kind: one soundtrack alone is labelled "
+          "<Audio 1> ahead of the prompt and its rows reach the DiT, "
+          "with no picture or clip. An EMPTY list, `[]`, is a "
+          "prompt-only request: the conditioning is the prompt alone "
+          "and no reference rows are packed -- the same sequence "
+          "text-to-video builds, through whichever partition is "
+          "resident. Leaving the key out "
+          "is NOT that: with no reference iport wired either, the request "
+          "is skipped as an unwired graph",
    .is_path = true, .path_filter = "image,video,audio"},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "the MiniMax-H3 model dir (text_encoder/, video_vae/, audio_vae/). "
           "OPTIONAL: a model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "minimax-h3-ref2va"},
+   // BOTH partitions, and FL2VA is not an oversight in the list.
+   // References are Ref2VA's trained task, but upstream's Ref2VA-like
+   // mode runs them on the FL2VA weights, and that graph wires this
+   // stage exactly the same way. Offering Ref2VA alone would hide the
+   // mode from the composer entirely -- the picker would filter out the
+   // only checkpoint it runs on.
+   .suggest_db_type = "minimax-h3-ref2va,minimax-h3-fl2va,minimax-h3-image"},
+  {.key = "seed", .type = ConfigType::Int, .required = false,
+   .doc = "MiniMax-H3-Image only: the REQUEST's seed -- the generator each "
+          "picture's VAE posterior is sampled from, in picture order, "
+          "before generate-video draws the request's noise from it. Set it "
+          "to generate-video's `seed` (both default 0) and an edit draws "
+          "the release's noise; another value only changes the pictures' "
+          "samples. Other models ignore it",
+   .def_int = 0},
+  {.key = "encoder_dir", .type = ConfigType::String, .required = false,
+   .doc = "the text encoder's WEIGHTS, when they are not hf_dir's own: a "
+          "directory, a registry key, or a single file -- a Draw Things "
+          ".ckpt (MiniMax-H3's Qwen3-VL-32B, vision tower included), read "
+          "under the release's names. The config and tokenizer still come "
+          "from hf_dir",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
+  {.key = "vae_dir", .type = ConfigType::String, .required = false,
+   .doc = "the video and audio VAEs' WEIGHTS, when they are not hf_dir's "
+          "own: a Draw Things .ckpt carrying both (MiniMax-H3's), read "
+          "under the release's names. The configs still come from hf_dir",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "frames", .type = ConfigType::Int, .required = false,
    .doc = "the GENERATED frame count at 24 fps, snapped up to the next "
           "17n+5. MUST MATCH the generate-video stage's `frames`: it is the "
-          "duration every reference is truncated to, and the layout the DiT "
-          "builds is sized from the same number",
+          "duration every reference is truncated to (but those "
+          "`whole_references` keeps), and the layout the DiT builds is "
+          "sized from the same number",
    .def_int = 121},
   {.key = "reference_image_short_edge", .type = ConfigType::Int,
    .required = false,
    .doc = "what an image reference's short edge is scaled to (2048 for the "
-          "released checkpoint). Unlike the target canvas this has NO area "
-          "cap and upscales a small picture -- an image reference is read at "
-          "high detail and never binds the generated geometry",
+          "released Ref2VA checkpoint). Unlike the target canvas this has NO "
+          "area cap and upscales a small picture -- an image reference is "
+          "read at high detail and never binds the generated geometry. LEFT "
+          "UNSET ON THE FL2VA PARTITION IT IS 768, not 2048: references on "
+          "FL2VA weights are upstream's Ref2VA-like mode, whose published "
+          "recipe is 768, and 2048 would be four times the tokens per "
+          "reference in a sequence the DiT re-reads every step. Setting it "
+          "is always taken as said",
    .def_int = 2048},
+  {.key = "reference_image_max_pixels", .type = ConfigType::Int,
+   .required = false,
+   .doc = "an area cap for image references, in pixels. 0 (the default) is "
+          "UNCAPPED, which is the released checkpoint's rule -- an image is "
+          "read at high detail and `reference_image_short_edge` is its only "
+          "bound. That stops being a bound the moment a short edge of 0 says "
+          "to take a picture at the size it arrived, so a graph feeding raw "
+          "pictures through the reference iports wants this set: an uncapped "
+          "4K still is ~220 VAE tiles and 8160 DiT rows, half the packed "
+          "sequence of a typical request, plus the vision tokens to match",
+   .def_int = 0},
+  {.key = "reference_video_short_edge", .type = ConfigType::Int,
+   .required = false,
+   .doc = "what a video reference's short edge is scaled to before it is "
+          "encoded (768 for the released checkpoint), capped by "
+          "`reference_video_max_pixels`. 0 means THE CLIP'S OWN short edge -- "
+          "the same rule, started from what the file carries, so a clip "
+          "keeps its own size and aspect instead of being resampled onto "
+          "the checkpoint's. At 768 a 960x544 reference lands on a 1344x768 "
+          "canvas, 1.98x the pixels with no more information in them. "
+          "Lowering it moves THREE things: the VAE encode, the reference "
+          "rows the DiT attends to on every step, and -- the one that is "
+          "easy to miss -- the CONDITIONER, since the vision tower is given "
+          "these same pixels and so contributes fewer tokens for the clip. "
+          "MEASURED on the two-reference example, 768 -> 0: 13120 -> 7144 "
+          "reference rows, 3115 -> 2119 conditioning rows, 23 m 07 s -> "
+          "14 m 17 s. It is a fidelity decision on both channels and not a "
+          "free speed one, so compare before keeping it",
+   .def_int = 768},
+  {.key = "reference_video_max_pixels", .type = ConfigType::Int,
+   .required = false,
+   .doc = "the area cap a video reference's canvas is held under, in pixels "
+          "(768 * 1344 for the released checkpoint). Applied after the short "
+          "edge and before the rounding, so it is what binds a reference "
+          "LARGER than the canvas whatever `reference_video_short_edge` says",
+   .def_int = 768 * 1344},
+  {.key = "attach_audio", .type = ConfigType::Array, .required = false,
+   .doc = "reference iport numbers (1..6) whose AUDIO is the soundtrack of "
+          "the reference before it rather than a reference of its own -- so "
+          "a clip demuxed into frames and PCM arrives on two ports and stays "
+          "ONE reference, labelled <Video k> and <Audio j> together, exactly "
+          "as a file with a soundtrack is. Positional: it folds onto "
+          "whichever reference immediately precedes it, which may be one "
+          "from the `references` LIST, since those are read first. Per port "
+          "and not a single switch, because a request may legitimately carry "
+          "both an attached soundtrack and a standalone piece of music. A "
+          "beat's own `attach` sideband overrides this for that beat",
+   .def_str = ""},
+  {.key = "attach_latent", .type = ConfigType::Array, .required = false,
+   .doc = "reference iport numbers (1..6) whose beat is an ALREADY-ENCODED "
+          "video latent -- f32 [z, frames, h, w], e.g. vae-encode's latent "
+          "of the very clip the port before it carries -- that folds onto "
+          "the reference before it: its rows replace that reference's VAE "
+          "encode, while the pixels still feed the conditioner. The same "
+          "as the beat saying `latent: true` and `attach: true`, for a "
+          "producer that does not say so. Open-H3-Regenerate-2K-IC "
+          "encodes its draft ONCE this way: one latent is both the "
+          "reference the DiT holds clean and the upscaler's input",
+   .def_str = ""},
+  {.key = "whole_references", .type = ConfigType::Array, .required = false,
+   .doc = "references kept WHOLE, by their number in the request (1..12: "
+          "the `references` list first, then the iports in order, a "
+          "soundtrack attached to a clip counting with it): NOT truncated "
+          "to the generated duration, frames and soundtrack alike. Every "
+          "other reference is, as the released recipe truncates them all, "
+          "so this is off that recipe -- a song drawn on as a whole, say. "
+          "A kept clip is a block of rows the DiT attends to on every step "
+          "and moves the generated rows on along the shared clock. A list "
+          "file kept whole is read to at most 4096 frames (its soundtrack "
+          "cut to match) and refused, before it is read, when decoding it "
+          "whole would not fit in memory; a long one that does is refused "
+          "later by the prompt cap or the denoise's scratch preflight. A "
+          "picture has no duration to keep and is ignored",
+   .def_str = ""},
   {.key = "video_sample_fps", .type = ConfigType::Real, .required = false,
    .doc = "the rate the CONDITIONER reads a video reference at -- every "
           "24/this-th of the normalized frames, merged in pairs into "
           "timestamped vision blocks. Not the rate the VAE encodes it at, "
           "which is the full 24",
    .def_real = 2.0},
+  {.key = "condition_noise_aug", .type = ConfigType::Real, .required = false,
+   .doc = "how much of a video condition row SURVIVES the augmentation: a "
+          "row is packed as this*z + (1-this)*noise. The checkpoint was "
+          "trained with its anchors very slightly noised, so handing them "
+          "over exactly clean is off-distribution -- the reference "
+          "implementations noise them and 0.999 is the number they use. "
+          "1.0 disables it. This is the SAME quantity as the denoise's "
+          "`condition_timestep` (rows placed at t are correspondingly "
+          "noised), so the two must AGREE; they are separate keys only "
+          "because the packing and the denoise are separate stages",
+   .def_real = 0.999},
   {.key = "max_prompt_tokens", .type = ConfigType::Int, .required = false,
    .doc = "the conditioner's sequence pool. A ref2va presentation is FAR "
           "longer than a text-only prompt -- a single 2048-short-edge image "
@@ -84,9 +274,12 @@ const ConfigKey kAttrs[] = {
           "and reload them for the next request. The 32B conditioner is the "
           "largest resident block in a ref2va graph and is idle for the whole "
           "denoise, which on this model is minutes. \"auto\" (default) decides "
-          "from physical RAM vs the pipeline's weight bytes; \"always\" / "
-          "\"never\" force it",
-   .def_str = "auto"},
+          "from physical RAM vs the pipeline's weight bytes; \"destroy\" / "
+          "\"keep\" force it (legacy spellings: \"always\" / \"never\"). "
+          "\"park\" is NOT offered: it resolves as \"auto\" here, and this "
+          "encoder reads uncached, so parking it would release 0 bytes and "
+          "leave it entirely resident",
+   .def_str = "auto", .extra = kUnloadChoices},
 };
 
 const PortSpec kIports[] = {
@@ -98,6 +291,18 @@ const PortSpec kIports[] = {
    .doc = "OPTIONAL shared model reference from a model-select source; "
           "overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
+  {.name = "ref1", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref2", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref3", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref4", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref5", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
+  {.name = "ref6", .doc = kRefPortDoc,
+   .type = &typeid(TensorBeatPayload), .clock_group = 0},
 };
 
 const PortSpec kOports[] = {
@@ -129,7 +334,13 @@ const StageSpec kSpec = {
                "them, and each is decoded here so its frame rate and sample "
                "rate reach the model that resamples onto 24 fps. Pair it "
                "with a generate-video stage on the same hf_dir and the same "
-               "`frames`.",
+               "`frames`. EITHER PARTITION: references are Ref2VA's trained "
+               "task, and the FL2VA weights take them too as upstream's "
+               "Ref2VA-like mode -- images only there, and at a 768 short "
+               "edge rather than 2048. The prompt and reference ports pair "
+               "the way generate-video's inputs do: one beat and the end of "
+               "its stream serves every request, a stream that keeps "
+               "sending is consumed a beat per request.",
   .display_name = "Video Reference Encoder",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -172,6 +383,31 @@ prompt_of_(const FlexData& d)
   return {};
 }
 
+// Read one number out of a beat's sideband object.
+bool
+sideband_num_(const FlexData& sb, const char* key, double* out)
+{
+  FlexData v;
+  if (!obj_get_(sb, key, &v)) { return false; }
+  if (v.is_int())  { *out = (double)v.as_int(0);  return true; }
+  if (v.is_real()) { *out = v.as_real(0.0);       return true; }
+  return false;
+}
+
+// Tri-state: did the beat SAY anything about `key`, and if so what.
+// The distinction matters for `attach`, where absent means "defer to the
+// stage's config" and an explicit false means "not this one" -- a beat
+// cannot override a config it cannot tell itself apart from.
+bool
+sideband_bool_(const FlexData& sb, const char* key, bool* out)
+{
+  FlexData v;
+  if (!obj_get_(sb, key, &v)) { return false; }
+  if (v.is_bool()) { *out = v.as_bool(false); return true; }
+  if (v.is_int())  { *out = v.as_int(0) != 0; return true; }
+  return false;
+}
+
 #endif  // VPIPE_BUILD_APPLE_SILICON
 
 }  // namespace
@@ -187,6 +423,10 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
   // "no model at all" is reported at initialize()/process() time, when
   // iport connectivity is known, rather than at construction.
   _hf_dir           = attr_str("hf_dir");
+  _enc_weights      = attr_str("encoder_dir");
+  _posterior_seed   = attr_int("seed");
+  _vae_weights      = attr_str("vae_dir");
+  _autotune         = attr_bool("autotune");
   // One path or a list of them. The composer's file browser appends
   // into a JSON array, and a single pick left as a bare string is what
   // a hand-written pipeline looks like -- both are the same request, so
@@ -195,6 +435,7 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
     auto o = this->config().as_object();
     FlexData refs = o.contains("references") ? o.at("references")
                                              : FlexData::make_null();
+    _references_said = refs.is_array();
     if (refs.is_string()) {
       _references.push_back(std::string(refs.as_string("")));
     } else if (refs.is_array()) {
@@ -213,19 +454,124 @@ VideoRefEncoderStage::VideoRefEncoderStage(const SessionContextIntf* s,
           "VideoRefEncoderStage('{}'): references must be a path or an array "
           "of paths", this->id()));
     }
-    // Empty is a config error and not a runtime warning: a `ref2va`
-    // checkpoint with no references generates video conditioned on
-    // nothing, at full cost. Better to refuse the graph at launch.
-    if (_references.empty() && config_error().empty()) {
-      fail_config(fmt(
-          "VideoRefEncoderStage('{}'): references is required and must name "
-          "at least one file", this->id()));
+    // CONFINE every reference to the session file sandbox, the way
+    // load-image and load-text do with their own path arrays. This key
+    // declares itself a path (.is_path, so the composer's file browser
+    // fills it in) and was the only such key that never resolved one.
+    //
+    // A RELATIVE path was therefore left relative and opened against the
+    // process CWD, which under the web-ui sandbox is not the sandbox
+    // root -- so a path the file browser had just produced did not
+    // exist, while an absolute one worked. That asymmetry was the bug.
+    //
+    // An absolute path inside a granted prefix still passes through
+    // unchanged, so what worked keeps working; one outside it is
+    // re-rooted, which is the confinement this key already claimed and
+    // did not apply.
+    for (auto& p : _references) {
+      p = confine_local_(p, /*for_write=*/false);
     }
+    // An empty list is no longer a config error, because it is no
+    // longer the only source: a graph may feed every reference through
+    // the tensor iports instead, and whether those are wired is not
+    // knowable here -- iport_connected() is a RuntimeContext question.
+    // The "conditioned on nothing" check therefore moved to process(),
+    // where the combined list is known. It costs a load before the
+    // refusal, which is the price of the ports being optional. And an
+    // EXPLICIT `[]` is not refused there either: it is the prompt-only
+    // form, which is why `_references_said` is kept.
   }
   _frames           = attr_int("frames");
   _ref_short_edge   = attr_int("reference_image_short_edge");
+  // Whether the graph SAID it, as opposed to taking the schema default.
+  // An absent key is "no opinion", and here the two published recipes
+  // hold different ones -- see ref_image_short_edge_().
+  _ref_short_edge_set =
+      this->config().is_object() &&
+      this->config().as_object().contains("reference_image_short_edge");
   _video_sample_fps = attr_real("video_sample_fps");
+  _cond_noise_aug   = attr_real("condition_noise_aug");
   _max_prompt_tokens = attr_int("max_prompt_tokens");
+  _vid_short_edge   = attr_int("reference_video_short_edge");
+  _vid_max_pixels   = attr_int("reference_video_max_pixels");
+  _img_max_pixels   = attr_int("reference_image_max_pixels");
+  {
+    auto c = this->config().as_object();
+    // A list of reference iport numbers, 1..kNumRefPorts.
+    auto ports = [&](const char* key, std::vector<int>* out) {
+      if (!c.contains(key)) { return; }
+      FlexData v = c.at(key);
+      if (v.is_array()) {
+        auto arr = v.as_array();
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+          const FlexData& e = arr[i];
+          const long long n = e.is_int()  ? e.as_int(0)
+                            : e.is_uint() ? (long long)e.as_uint(0) : -1;
+          if (n < 1 || n > (long long)kNumRefPorts) {
+            fail_config(fmt(
+                "VideoRefEncoderStage('{}'): {}[{}] is {}; it must be a "
+                "reference iport number, 1..{}", this->id(), key, i,
+                e.is_int() || e.is_uint() ? std::to_string(n)
+                                          : std::string("not a number"),
+                kNumRefPorts));
+            break;
+          }
+          out->push_back((int)n);
+        }
+      } else if (!v.is_null()) {
+        fail_config(fmt(
+            "VideoRefEncoderStage('{}'): {} must be an array of reference "
+            "iport numbers", this->id(), key));
+      }
+    };
+    ports("attach_audio", &_attach_audio);
+    ports("attach_latent", &_attach_latent);
+    if (c.contains("whole_references")) {
+      FlexData v = c.at("whole_references");
+      if (v.is_array()) {
+        auto arr = v.as_array();
+        for (std::size_t i = 0; i < arr.size(); ++i) {
+          const FlexData& e = arr[i];
+          const long long n = e.is_int()  ? e.as_int(0)
+                            : e.is_uint() ? (long long)e.as_uint(0) : -1;
+          if (n < 1) {
+            fail_config(fmt(
+                "VideoRefEncoderStage('{}'): whole_references[{}] is {}; it "
+                "must be a reference's number in the request, from 1",
+                this->id(), i,
+                e.is_int() || e.is_uint() ? std::to_string(n)
+                                          : std::string("not a number")));
+            break;
+          }
+          _whole_refs.push_back((int)n);
+        }
+      } else if (!v.is_null()) {
+        fail_config(fmt(
+            "VideoRefEncoderStage('{}'): whole_references must be an array "
+            "of reference numbers", this->id()));
+      }
+    }
+  }
+  if (_img_max_pixels < 0) {
+    fail_config(fmt(
+        "VideoRefEncoderStage('{}'): reference_image_max_pixels is {}; it "
+        "must be positive, or 0 for uncapped", this->id(), _img_max_pixels));
+  }
+  // Refused at launch rather than warned at the first request: a
+  // non-positive cap or a negative short edge reaches resolve_canvas_size,
+  // which reports EVERY failure as an aspect-ratio one -- so the graph
+  // would run to the first reference and then blame the clip.
+  if (_vid_short_edge < 0) {
+    fail_config(fmt(
+        "VideoRefEncoderStage('{}'): reference_video_short_edge is {}; it "
+        "must be positive, or 0 for the clip's own short edge", this->id(),
+        _vid_short_edge));
+  }
+  if (_vid_max_pixels <= 0) {
+    fail_config(fmt(
+        "VideoRefEncoderStage('{}'): reference_video_max_pixels is {}; it "
+        "must be positive", this->id(), _vid_max_pixels));
+  }
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -268,6 +614,8 @@ Job VideoRefEncoderStage::process(RuntimeContext&) { co_return; }
 void VideoRefEncoderStage::reset_run_state() {}
 std::vector<ResourceClaim>
 VideoRefEncoderStage::declare_resources() const { return {}; }
+std::vector<ResourceClaim>
+VideoRefEncoderStage::decide_resources() const { return {}; }
 
 #else
 
@@ -279,6 +627,14 @@ VideoRefEncoderStage::reset_run_state()
   // beat is never latched and the stage keeps the previous run's model.
   _model_latched   = false;
   _unload_resolved = false;
+  // A run's beats pair among themselves, never with the last run's.
+  static_assert(kNumRefPorts == (unsigned)kRefInputs);
+  _prompt_in.reset();
+  _prompt_beat.reset();
+  for (int i = 0; i < kRefInputs; ++i) {
+    _ref_in[i].reset();
+    _ref_beat[i].reset();
+  }
 }
 
 StageMemory
@@ -286,30 +642,25 @@ VideoRefEncoderStage::declare_memory() const
 {
   StageMemory m;
   if (_hf_dir.empty()) { return m; }
-  namespace fs = std::filesystem;
-  const std::string root = resolve_model_dir(session(), _hf_dir);
-  std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
-  if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
-  std::string vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
-  if (vvae.empty()) { vvae = (fs::path(root) / "video_vae").string(); }
-  // ONLY what this stage HOLDS.
-  //
-  // declare_resources also names the DiT, because a claim is what every
-  // peer sizes itself against and a 66 GB component nobody declared is
-  // the silent under-count the planning phase exists to prevent. This
-  // is a different question: StageMemory describes one stage's own
-  // holdings, and the DiT belongs to generate-video, which declares it.
-  // Counting it here as well would charge the graph for it twice --
-  // this plan dedups by nothing, since it deliberately knows bytes and
-  // not checkpoints.
+  // Weights named apart are what loads, so they are what is held.
+  const auto [enc, vvae, avae] = claimed_dirs_();
+  // ONLY what this stage HOLDS. The DiT belongs to generate-video, which
+  // declares it -- here as in declare_resources -- and counting it here
+  // as well would charge the graph for it twice: this plan dedups by
+  // nothing, since it deliberately knows bytes and not checkpoints.
   const bool destroys = _unload_cfg == model_memory::UnloadPolicy::kDestroy;
   const bool reclaims  = _unload_cfg == model_memory::UnloadPolicy::kAuto;
-  // The encoder streams its layers here (ecfg.lm.stream_layers), so it
-  // has a real floor; the VAE has none and counts at its size.
+  // The encoder streams its layers here (ecfg.lm.stream_decode, or
+  // stream_layers where that path cannot serve it), so it has a real
+  // floor; the VAE has none and counts at its size.
   m.hold(enc, model_memory::dir_weights_bytes(enc),
          genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc),
          destroys, reclaims);
   m.hold(vvae, model_memory::dir_weights_bytes(vvae), 0, destroys, reclaims);
+  if (!avae.empty()) {
+    m.hold(avae, model_memory::dir_weights_bytes(avae), 0, destroys,
+           reclaims);
+  }
   return m;
 }
 
@@ -317,26 +668,252 @@ std::vector<ResourceClaim>
 VideoRefEncoderStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  namespace fs = std::filesystem;
+  const auto [enc, vvae, avae] = claimed_dirs_();
+
+  // THE ENCODER IS CLAIMED WITH ITS FLOOR, and that is not the same
+  // thing as declare_memory() already knowing the floor.
+  //
+  // Two ledgers: a floor in declare_memory() is what a run REPORTS, and
+  // a floor on a ResourceClaim is what phase_footprint_floor() and
+  // phase_peak() read -- the only figures a graph is ever judged
+  // against. This stage stated the first and not the second, so its 32B
+  // encoder was judged at full on-disk size while the plan described its
+  // floor correctly, which is the quietest version of this bug because
+  // the number is merely large. Same defect the image path had, and the
+  // same fix; `diffusion-conditioner` has always claimed it this way.
+  std::vector<ResourceClaim> out;
+  out.push_back(model_memory::weight_claim_streamable(
+      enc, genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc)));
+  // The video VAE is UNPHASED here: pass one describes. This stage holds
+  // it during the CONDITION phase (references are encoded through it)
+  // and vae-decode during the DECODE; decide_resources() says which of
+  // the two this stage's own is, when it lets go between them.
+  //
+  // NOT THE DiT: generate-video declares the one it loads (its
+  // partition, or its `dit_dir`), and naming the release's copy here put
+  // a DiT nothing loads in the plan whenever the two differ.
+  // At what it holds: the VAE builds each half at its first use, and this
+  // stage only encodes -- the encoder half (0.36 GB of a 9.9 GB F32
+  // file). Not a store `vae_dir` names, which carries the audio VAE too.
+  const std::size_t enc_half =
+      weights_path_(_vae_weights).empty()
+          ? genai::MetalMiniMaxH3VideoVae::held_bytes(
+                vvae, genai::MetalMiniMaxH3VideoVae::Half::kEncoder)
+          : 0;
+  for (auto& c : model_memory::weight_claims({vvae})) {
+    if (enc_half > 0) {
+      bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                       (std::int64_t)enc_half);
+    }
+    out.push_back(std::move(c));
+  }
+  // THE AUDIO VAE, every soundtrack reference's encoder -- a request of
+  // soundtracks alone has nothing else. Loaded through the manager, so
+  // audio-vae-decode's copy of the same checkpoint is this one and the
+  // plan counts it once; claimed whole, as audio-vae-decode claims it
+  // (this stage builds the encoder half beside the decoder load() makes).
+  //
+  // Its lifetime is STATED HERE, never decided below. audio-vae-decode
+  // holds this checkpoint all run unless it destroys, and says so by
+  // claiming it unphased and deciding nothing -- which the manager
+  // cannot tell from "not decided yet", so a condition phase decided
+  // here replaced it and the denoise and decode counted 0 bytes of a
+  // VAE that was resident (model_memory.h3_ref2va_leaves_the_denoise_
+  // room_for_its_ane_module caught it). A phase declared is kept as an
+  // ASSERTION: a peer's unphased claim still widens it to the whole
+  // run, a peer's own phase widens it to cover both. So: `condition`
+  // where the release is certain from config, unphased otherwise.
+  if (!avae.empty()) {
+    for (auto& c : model_memory::weight_claims({avae})) {
+      if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+        c.phase = std::string(model_memory::kPhaseCondition);
+      }
+      out.push_back(std::move(c));
+    }
+  }
+  // And what ENCODING a soundtrack allocates (25 MB a second): at the
+  // generated duration, which every soundtrack is cut to unless kept
+  // whole -- process() revises it to the request's longest before the
+  // encode. Booked whenever the model has an audio VAE, since a
+  // reference port can carry a soundtrack the plan cannot see.
+  {
+    const std::string root0 = resolve_model_dir(session(), _hf_dir);
+    const std::string adir =
+        genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root0);
+    genai::MetalMiniMaxH3AudioVae::Config ac;
+    if (genai::MetalMiniMaxH3AudioVae::config_from_json(
+            adir.empty() ? root0 : adir, ac, nullptr)) {
+      const double secs =
+          (double)h3::align_num_frames(_frames, 17, 5) / h3::kFps;
+      const std::size_t eb =
+          genai::MetalMiniMaxH3AudioVae::encode_scratch_bytes(
+              ac, (int)(secs * (double)ac.sample_rate));
+      for (auto& c : model_memory::scratch_claims(
+               audio_encode_label_(), eb, model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
   const std::string root = resolve_model_dir(session(), _hf_dir);
-  std::string enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
-  if (enc.empty()) { enc = (fs::path(root) / "text_encoder").string(); }
-  std::string vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
-  if (vvae.empty()) { vvae = (fs::path(root) / "video_vae").string(); }
-  // The DiT is declared here as well, exactly as the conditioner
-  // declares the DiT it is paired with: this claim is what every peer
-  // sizes itself against, and a 66 GB component nobody declared is the
-  // silent under-count the resource-planning phase exists to prevent.
-  // Which partition the reference names, from the models DB: a repo
-  // holding both resolves to fl2va by filename, and this claim is what
-  // every peer sizes itself against.
-  const std::string part =
-      genai::MetalMiniMaxH3Transformer::partition_of_model_type(
-          resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit.empty()) { dit = (fs::path(root) / "transformer").string(); }
-  return model_memory::weight_claims({enc, vvae, dit});
+  // THE VISION TOWER'S WORK over one reference CLIP: the clip at this
+  // stage's canvas cap (`reference_video_max_pixels`; 1344 x 768 the
+  // release's) for the generated duration, sampled at `video_sample_fps`
+  // and sized by the tower's video rule -- encode_video_scratch_bytes.
+  // Open-H3-Regenerate-2K-IC's draft is exactly that, and it is always
+  // presented. One reference at a time, so one is booked; wherever a
+  // clip can arrive (a reference port wired, or a `references` list).
+  // A picture's presentation, at the 2048 short edge, is not.
+  bool can_clip = !_references.empty();
+  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
+    can_clip = can_clip ||
+               (iport_edges().size() > p && iport_edges()[p].v != nullptr);
+  }
+  if (can_clip && !genai::ph3::is_root(root)) {
+    genai::MiniMaxH3TextEncoder::Config ec;
+    std::vector<int> idx;
+    std::vector<float> secs;
+    if (genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr) &&
+        h3::condition_frame_indices(h3::align_num_frames(_frames, 17, 5),
+                                    h3::kFps, _video_sample_fps,
+                                    ec.vision.temporal_patch, &idx, &secs)) {
+      const double s =
+          std::sqrt((double)std::max<std::int64_t>(_vid_max_pixels, 1) /
+                    (1344.0 * 768.0));
+      const std::size_t vb =
+          genai::MetalQwenVisionEncoder::encode_video_scratch_bytes(
+              ec.vision, (int)idx.size(), (int)std::lround(768.0 * s),
+              (int)std::lround(1344.0 * s));
+      for (auto& c : model_memory::scratch_claims(
+               "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
+  // P-H3-Image's connector beside the encoder (f32, held whole), phased
+  // and released with it -- and the tower's work: it reads its own copy
+  // of each picture at about the manifest's vision_pixels (at most 1.2x:
+  // size_at_area keeps a gridded picture within 20%), one at a time.
+  if (const std::string cd = genai::ph3::connector_dir(root); !cd.empty()) {
+    for (auto& c : model_memory::weight_claims({cd})) {
+      out.push_back(std::move(c));
+    }
+    genai::ph3::Manifest man;
+    genai::MiniMaxH3TextEncoder::Config ec;
+    if (genai::ph3::read_manifest(root, &man, nullptr) &&
+        genai::MiniMaxH3TextEncoder::config_from_json(enc, ec, nullptr)) {
+      const std::size_t vb = genai::MetalQwenVisionEncoder::
+          encode_scratch_bytes(ec.vision, man.vision_pixels * 6 / 5);
+      for (auto& c : model_memory::scratch_claims(
+               "vision:" + this->id(), vb, model_memory::kPhaseCondition)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
+  return out;
+}
+
+// The encoder is charged to the CONDITION phase when this stage will
+// certainly let go of it, and left persistent when it might not.
+//
+// Without this every graph on this stage carried its 32B encoder through
+// the DENOISE, where it is not resident -- and a peak reported at
+// 'denoise' is exactly the reading an operator cannot fix by setting
+// unload_when_idle, because the policy was already right and the PLAN
+// was what did not know.
+//
+// The rules are `diffusion-conditioner`'s, and they are its rules
+// because neither is checkable by the planner. `destroy` qualifies;
+// `auto` only when it will resolve to destroy; `park` releases NOTHING
+// here, because park_weights() walks a weight set's CACHED entries and
+// this encoder reads uncached into the model's own members, so it parks
+// 0 bytes and stays entirely resident. A peer that subtracted it would
+// be short by the encoder's whole size.
+//
+// bounded() is unphased on purpose and is COMPLETE by this point: every
+// stage has declared and no refinement has been applied, so every stage
+// deciding gets the same answer.
+//
+// THE VIDEO VAE GOES WITH IT, by the same rule: unload_models_() drops
+// both, so this stage holds the VAE in the condition only -- and
+// vae-decode, which loads it at its first latent, in the decode. Left
+// unphased it was counted through the DENOISE as well, the largest term
+// beside the DiT there (4966 MB, Comfy-Org's fp16): on a 16 GB box that
+// pushed the phase past what the DiT's ANE module could be granted, and
+// the tier stayed off. The manager keeps the two claims apart
+// (_phase_bits), so condition + decode does not read as condition..decode.
+//
+// Not a VAE `vae_dir` names: that is a Draw Things store carrying the
+// AUDIO VAE too, which audio-vae-decode claims for the whole run.
+std::vector<ResourceClaim>
+VideoRefEncoderStage::decide_resources() const
+{
+  if (_hf_dir.empty()) { return {}; }
+  // The encoder this stage LOADS -- `encoder_dir` when set, as
+  // declare_resources claims it. Phasing the release's copy left the
+  // claimed one (a 32B Draw Things .ckpt) persistent through the denoise.
+  const auto [enc, vvae, avae] = claimed_dirs_();
+
+  const bool releases =
+      _unload_cfg == model_memory::UnloadPolicy::kDestroy ||
+      (_unload_cfg == model_memory::UnloadPolicy::kAuto &&
+       model_memory::bounded(session(), {enc}, model_memory::kHeadroom));
+  if (!releases) { return {}; }
+  std::vector<std::string> dirs{enc};
+  if (weights_path_(_vae_weights).empty()) { dirs.push_back(vvae); }
+  // NOT the audio VAE, though unload_models_() drops it too: its
+  // lifetime is declared (declare_resources says why).
+  (void)avae;
+  if (const std::string cd =
+          genai::ph3::connector_dir(resolve_model_dir(session(), _hf_dir));
+      !cd.empty()) {
+    dirs.push_back(cd);
+  }
+  return model_memory::weight_claims_in_phase(
+      dirs, model_memory::kPhaseCondition);
+}
+
+VideoRefEncoderStage::ClaimedDirs
+VideoRefEncoderStage::claimed_dirs_() const
+{
+  namespace fs = std::filesystem;
+  ClaimedDirs d;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  d.enc = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+  if (d.enc.empty()) { d.enc = (fs::path(root) / "text_encoder").string(); }
+  d.vvae = genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
+  if (d.vvae.empty()) { d.vvae = (fs::path(root) / "video_vae").string(); }
+  // MiniMax-H3-Image's encoder is MiniMax-H3's, outside its root
+  // (`encoder_dir` names where it is, not weights apart).
+  const bool h3i = genai::h3i::is_root(root);
+  if (h3i) {
+    const std::string e =
+        minimax_h3_image_encoder_dir(session(), root, _enc_weights);
+    if (!e.empty()) { d.enc = e; }
+  } else if (const std::string w = weights_path_(_enc_weights);
+             !w.empty()) {
+    d.enc = w;
+  }
+  if (const std::string w = weights_path_(_vae_weights); !w.empty()) {
+    d.vvae = w;
+  } else {
+    // The audio VAE's own dir, by the test the load and audio-vae-encode
+    // use: resolved, and its config readable. Not the root fallback the
+    // load also tries -- claiming the root would book the whole model.
+    const std::string a =
+        genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+    genai::MetalMiniMaxH3AudioVae::Config probe;
+    if (!a.empty() &&
+        genai::MetalMiniMaxH3AudioVae::config_from_json(a, probe, nullptr)) {
+      d.avae = a;
+    }
+  }
+  return d;
+}
+
+std::string
+VideoRefEncoderStage::audio_encode_label_() const
+{
+  return "audio-encode:" + this->id();
 }
 
 Job
@@ -353,6 +930,43 @@ VideoRefEncoderStage::initialize(RuntimeContext& ctx)
       ctx.num_iports() > kModelPort && ctx.iport_connected(kModelPort);
   if (!model_from_iport) { ensure_loaded_(); }
   co_return;
+}
+
+// See the declaration. Deliberately outside the Apple-Silicon guard
+// that wraps most of this file's model work: the rule is a property of
+// the two partitions' published recipes.
+int
+VideoRefEncoderStage::ref_image_short_edge(int configured,
+                                           bool configured_set,
+                                           const std::string& partition)
+{
+  // Upstream's Ref2VA-like recipe. Not a rounded-down default: it is the
+  // size the published example renders at, and the one the mode's own
+  // encoder defaults to.
+  constexpr int kRef2VaLikeShortEdge = 768;
+  if (configured_set || partition != "fl2va") { return configured; }
+  return kRef2VaLikeShortEdge;
+}
+
+// See the declaration.
+int
+VideoRefEncoderStage::ref_image_short_edge_()
+{
+  const int e =
+      ref_image_short_edge(_ref_short_edge, _ref_short_edge_set, _partition);
+  if (e != _ref_short_edge && !_ref_short_edge_said) {
+    _ref_short_edge_said = true;
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): FL2VA partition, so an image "
+        "reference that does not state its own size goes on a {}-pixel "
+        "short edge -- upstream's Ref2VA-like recipe, not the Ref2VA "
+        "checkpoint's {}, which is four times the tokens per reference in "
+        "a sequence the DiT re-reads every step. Set "
+        "`reference_image_short_edge` to say otherwise; a reference on a "
+        "tensor iport states its own and is unaffected",
+        this->id(), e, _ref_short_edge));
+  }
+  return e;
 }
 
 void
@@ -379,11 +993,41 @@ VideoRefEncoderStage::ensure_loaded_()
     _partition = genai::MetalMiniMaxH3Transformer::partition_of_model_type(
         rm.model_type);
   }
+  // P-H3-Image's EDIT, by its manifest: the same encoders (its Qwen3-VL-4B
+  // with the connector, H3's VAE encoder), its own picture rules.
+  // MiniMax-H3-Image's EDIT: up to 16 pictures, its own size rules.
+  _h3i = genai::h3i::is_root(_root);
+  if (_h3i) {
+    _limits.max_images = genai::h3i::kMaxReferences;
+    _limits.max_videos = 0;
+    _limits.max_audios = 0;
+    _limits.max_references = genai::h3i::kMaxReferences;
+  }
+  _ph3 = genai::ph3::is_root(_root);
+  if (_ph3) {
+    std::string merr;
+    if (!genai::ph3::read_manifest(_root, &_ph3_manifest, &merr)) {
+      session()->error(fmt("VideoRefEncoderStage('{}'): {}; inert",
+                           this->id(), merr));
+      return;
+    }
+    _limits.max_images = genai::ph3::kMaxEditImages;
+    _limits.max_videos = 0;
+    _limits.max_audios = 0;
+    _limits.max_references = genai::ph3::kMaxEditImages;
+  }
   if (!load_models_(mc)) {
     session()->error(fmt(
         "VideoRefEncoderStage('{}'): reference encoders failed to load; "
         "inert", this->id()));
   }
+}
+
+std::string
+VideoRefEncoderStage::weights_path_(const std::string& ref) const
+{
+  if (ref.empty()) { return {}; }
+  return resolve_model_dir(session(), ref);
 }
 
 bool
@@ -392,6 +1036,19 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   // ---- the conditioner + its vision tower ---------------------------
   _enc_dir = genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root);
   if (_enc_dir.empty()) { _enc_dir = _root; }
+  // MiniMax-H3-Image's is MiniMax-H3's (minimax-h3-image-host.h).
+  if (_h3i) {
+    _enc_dir = minimax_h3_image_encoder_dir(session(), _root, _enc_weights);
+    if (_enc_dir.empty()) {
+      session()->error(fmt(
+          "VideoRefEncoderStage('{}'): MiniMax-H3-Image conditions on "
+          "MiniMax-H3's text encoder, which '{}' does not carry and no "
+          "local copy answers for: fetch MiniMaxAI/MiniMax-H3-text-encoder "
+          "(or MiniMax-H3 itself), or name its text_encoder/ in "
+          "encoder_dir", this->id(), _root));
+      return false;
+    }
+  }
   genai::MiniMaxH3TextEncoder::Config ecfg;
   std::string eerr;
   if (!genai::MiniMaxH3TextEncoder::config_from_json(_enc_dir, ecfg, &eerr)) {
@@ -405,6 +1062,22 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   // globally, because the pool is KV for 50 layers of a 32B model and a
   // text-only conditioner should not pay for it.
   if (_max_prompt_tokens > 0) { ecfg.lm.max_seq = _max_prompt_tokens; }
+  ecfg.lm.autotune = _autotune;
+  // MiniMax-H3-Image: "Picture i: " labels, 4096 tokens a piece.
+  if (_h3i) {
+    ecfg.bare_picture_labels = true;
+    ecfg.max_tokens = genai::h3i::kMaxSequenceLength;
+  }
+  // The weights from `encoder_dir` when it names them; the config above
+  // and the tokenizer from the model's own encoder either way.
+  const std::string enc_w =
+      _h3i ? std::string() : weights_path_(_enc_weights);
+  if (!enc_w.empty()) {
+    ecfg.weights = enc_w;
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): the text encoder's weights from '{}', "
+        "its config and tokenizer from '{}'", this->id(), enc_w, _enc_dir));
+  }
   {
     // The 50 tapped layers are ~48 GB bf16 (~26 GB at w8), and this
     // stage holds two VAEs beside them. Same streaming rule the DiTs
@@ -412,13 +1085,29 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
     // whatever the config named -- a repack root holds the 66 GB DiT
     // next to the encoder, and summing the tree would decide to stream
     // on the DiT's bytes.
+    // kPhaseCondition: decide_resources() claims this encoder in that
+    // phase, and asking about `denoise` -- where it no longer exists --
+    // drops its own bytes from its own verdict. See plan_streaming.
     const auto plan = model_memory::plan_streaming(
-        session(), _enc_dir, std::string(), model_memory::kStreamHeadroom);
-    ecfg.lm.stream_layers = plan.stream;
+        session(), enc_w.empty() ? _enc_dir : enc_w, std::string(),
+        model_memory::kStreamHeadroom, 0, model_memory::kPhaseCondition);
+    // ALWAYS STREAM -- see StreamPlan::stream. One prefill per request,
+    // then dropped. Through the raw-source slot pair, keeping what free
+    // memory allows (sized before every request, below); the plan's
+    // pin_frac is read only where the loader cannot take that path and
+    // pins a prefix instead -- as the conditioner's encoder does.
+    ecfg.lm.stream_layers = true;
+    ecfg.lm.stream_decode = true;
     ecfg.lm.pin_frac      = plan.pin_frac;
+    if (const char* e = std::getenv("VPIPE_ENC_RESIDENCY")) {
+      ecfg.lm.stream_decode = std::atoi(e) != 0;
+    }
     if (const char* e = std::getenv("VPIPE_H3_ENC_STREAM")) {
-      ecfg.lm.stream_layers = (std::atoi(e) != 0);
-      if (!ecfg.lm.stream_layers) { ecfg.lm.pin_frac = 0.0; }
+      if (std::atoi(e) == 0) {
+        ecfg.lm.stream_layers = false;
+        ecfg.lm.stream_decode = false;
+        ecfg.lm.pin_frac = 0.0;
+      }
     }
     session()->log_debug(fmt(
         "VideoRefEncoderStage('{}'): conditioner footprint {} GB (others {} "
@@ -458,8 +1147,14 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
                          vcerr));
     return false;
   }
-  _video_vae = genai::MetalMiniMaxH3VideoVae::load(
-      vdir.empty() ? _root : vdir, mc, vcfg);
+  const std::string vae_w = weights_path_(_vae_weights);
+  vcfg.autotune = _autotune;
+  _video_vae =
+      vae_w.empty()
+          ? genai::MetalMiniMaxH3VideoVae::load(vdir.empty() ? _root : vdir,
+                                                mc, vcfg)
+          : genai::MetalMiniMaxH3VideoVae::load(
+                genai::open_weight_set(vae_w, session()), mc, vcfg);
   if (!_video_vae) {
     session()->error(fmt(
         "VideoRefEncoderStage('{}'): video VAE load failed: {}", this->id(),
@@ -473,10 +1168,16 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
   std::string acerr;
   if (genai::MetalMiniMaxH3AudioVae::config_from_json(
           adir.empty() ? _root : adir, acfg, &acerr)) {
+    // Through the MANAGER, as audio-vae-decode loads the same VAE: the
+    // dir overload built a private set beside its copy -- the decoder
+    // twice, and neither half of this one in any plan.
     _audio_vae = genai::MetalMiniMaxH3AudioVae::load(
-        adir.empty() ? _root : adir, mc, acfg);
+        genai::open_weight_set(
+            vae_w.empty() ? (adir.empty() ? _root : adir) : vae_w,
+            session()),
+        mc, acfg);
   }
-  if (!_audio_vae) {
+  if (!_audio_vae && !_ph3 && !_h3i) {
     // NOT fatal: a request of images and silent clips never touches it.
     // A soundtrack that then arrives is refused by name rather than
     // dropped, which is what encode_references does.
@@ -485,17 +1186,17 @@ VideoRefEncoderStage::load_models_(metal_compute::MetalCompute* mc)
         "carry a soundtrack will be refused", this->id(),
         acerr.empty() ? "load failed" : acerr));
   }
-  // What the idle-unload heuristic weighs: this stage's own components
-  // plus the DiT it is paired with. Same dirs declare_resources() named,
-  // so the declaration and the estimate cannot disagree.
+  // What the idle-unload heuristic weighs: this stage's own components.
+  // Same dirs declare_resources() named, so the declaration and the
+  // estimate cannot disagree; the DiT is counted from generate-video's
+  // declaration, which the manager holds.
   _peer_dirs.clear();
-  _peer_dirs.push_back(_enc_dir);
-  if (!vdir.empty()) { _peer_dirs.push_back(vdir); }
-  if (!adir.empty()) { _peer_dirs.push_back(adir); }
-  {
-    const std::string d =
-        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root, _partition);
-    if (!d.empty()) { _peer_dirs.push_back(d); }
+  _peer_dirs.push_back(enc_w.empty() ? _enc_dir : enc_w);
+  if (!vae_w.empty()) {
+    _peer_dirs.push_back(vae_w);
+  } else {
+    if (!vdir.empty()) { _peer_dirs.push_back(vdir); }
+    if (!adir.empty()) { _peer_dirs.push_back(adir); }
   }
   session()->info(fmt(
       "VideoRefEncoderStage('{}'): MiniMax-H3 ref2va encoders ready "
@@ -590,8 +1291,39 @@ VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
 
     // A video reference conditions on its own soundtrack when it has
     // one: the two came out of ONE open container, which is the only
-    // way their clocks stay in sync.
-    auto v = decode_video_file(libs, path, max_seconds,
+    // way their clocks stay in sync. One kept whole is read whole (the
+    // list comes first: its number is its place in it).
+    const bool whole = std::find(_whole_refs.begin(), _whole_refs.end(),
+                                 (int)i + 1) != _whole_refs.end();
+    if (whole) {
+      // READ WHOLE, NOTHING ELSE BOUNDS IT: the frames at the file's own
+      // size to the decoder's backstop, and the canvas copy beside them
+      // -- 25 GB of 1080p before the denoise's preflight or the prompt
+      // cap could refuse the rows. Sized from the probe, before a frame
+      // is read, against the box as it is now (a transient: freed once
+      // the reference is encoded) and never more than half of what it
+      // is believed to have (VPIPE_RAM_LIMIT_MB), the models beside it.
+      const std::size_t need = whole_decode_bytes(
+          *probe, _vid_short_edge, (std::int64_t)_vid_max_pixels,
+          probe->has_audio ? audio_rate : 0);
+      std::size_t room = model_memory::phys_ram() / 2;
+      if (auto* mc = session()->services()->metal_compute()) {
+        const std::size_t avail = mc->memory_budget().available_physical;
+        if (avail > 0) { room = room > 0 ? std::min(room, avail) : avail; }
+      }
+      if (room > 0 && need > room) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference {} ('{}') is kept whole "
+            "(whole_references), and decoding it whole would hold ~{} MB "
+            "({}x{}, {:.1f} s) against the {} MB this box can spare for "
+            "it; trim the file, or leave it out of whole_references to cut "
+            "it to the generated {:.2f} s", this->id(), i + 1, path,
+            need >> 20, probe->width, probe->height,
+            probe->duration_seconds, room >> 20, max_seconds));
+        return false;
+      }
+    }
+    auto v = decode_video_file(libs, path, whole ? 0.0 : max_seconds,
                                probe->has_audio ? audio_rate : 0, &derr);
     if (!v) {
       session()->warn(fmt(
@@ -624,6 +1356,21 @@ VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
           "frame at {} frames; conditioning on it as a still", this->id(),
           i + 1, aligned));
     }
+    // Kept whole, but the frames stopped at the decoder's backstop: the
+    // soundtrack (decoded to the file's end) is cut to the frames' span,
+    // or it would run on past the last frame along the shared clock.
+    if (whole && v->cut_short && m.kind == h3::MediaReference::Kind::kVideo) {
+      const double kept = m.fps > 0.0 ? (double)m.num_frames / m.fps : 0.0;
+      const bool cut = trim_soundtrack_to_frames(&m);
+      if (cut || probe->duration_seconds > kept + 0.5) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference {} ('{}') is kept whole, "
+            "but the decoder stops at {} frames: {:.2f} s of {:.2f} s{}",
+            this->id(), i + 1, path, m.num_frames, kept,
+            probe->duration_seconds,
+            cut ? "; its soundtrack is cut to match" : ""));
+      }
+    }
     out->push_back(std::move(m));
   }
   return true;
@@ -631,6 +1378,377 @@ VideoRefEncoderStage::decode_references_(std::vector<h3::MediaReference>* out)
 
 
 // ---- idle unload ----------------------------------------------------
+
+// A reference iport beat -> a MediaReference.
+//
+// The KIND is the tensor's RANK, which is the one thing a tensor states
+// about itself that a container does not. It also settles the case the
+// file path has to infer from content -- a single-frame clip is
+// [1, 3, H, W] and a still is [3, H, W], and those are different
+// requests to this model.
+//
+// The RATES come from the sideband and their absence is an ERROR, never
+// a default. A clip conditioned at the wrong speed generates video with
+// nothing to complain about; that failure is what this stage's whole
+// decode-it-here design exists to prevent, and guessing 24 one port over
+// would put it straight back.
+//
+// U8 for pixels and F32 for audio, matching every producer in the tree
+// (`rgb-frames` is planar u8 [3,H,W]; `pcm-samples` is f32). A float
+// image is refused rather than guessed at, because 0..1 and -1..1 are
+// both plausible and picking wrong is a brightness bug nothing reports.
+bool
+VideoRefEncoderStage::media_from_beat(const TensorBeatPayload& tb, int n,
+                                      h3::MediaReference* out,
+                                      std::string* err, bool latent)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = "reference iport " + std::to_string(n) +
+                                 ": " + std::move(m); }
+    return false;
+  };
+  const auto& sh = tb.shape;
+  const int rank = (int)sh.size();
+  if (rank < 1 || rank > 4) {
+    return fail("a reference tensor must be rank 1..4, got rank " +
+                std::to_string(rank));
+  }
+  for (long long d : sh) {
+    if (d < 0) { return fail("a reference tensor has a negative extent"); }
+  }
+
+  double v = 0.0;
+  if (sideband_num_(tb.sideband, "short_edge", &v) && v >= 0.0) {
+    out->short_edge = (int)v;
+  } else {
+    // The port default is 0 -- encode it at the size it arrived. A
+    // caller reaching for a tensor port has already decided the size
+    // (a resample stage, a crop, a generator), so re-resolving it
+    // against a per-kind default would undo exactly that decision.
+    out->short_edge = 0;
+  }
+
+  // ALREADY-ENCODED rows, said so by the beat itself. Rank cannot
+  // settle this on its own -- a video latent is rank 4 like pixels and
+  // an audio latent rank 3 like nothing else here -- so the producer
+  // states it and this port believes it. `load-tensor` sets it from its
+  // `sideband` key; `generate-video`'s latent oports are where such a
+  // tensor comes from.
+  bool is_latent = false;
+  sideband_bool_(tb.sideband, "latent", &is_latent);
+  is_latent = is_latent || latent;
+  // Presented to the conditioner, or the DiT's alone (MediaReference::
+  // presented); any reference may say so.
+  sideband_bool_(tb.sideband, "present", &out->presented);
+  if (is_latent) {
+    if (tb.dtype != TensorBeat::DType::F32) {
+      return fail("a carried latent must be f32, got " +
+                  std::string(TensorBeat::name_of(tb.dtype)));
+    }
+    // A SOUNDTRACK latent: [2, channels, latents], as generate-video's
+    // audio_latent oport writes it -- an audio reference of its own, or
+    // (attached) the soundtrack of the clip before it.
+    if (rank == 3) {
+      const int st = (int)sh[0], ac = (int)sh[1], na = (int)sh[2];
+      if (st != 2 || ac <= 0 || na <= 0) {
+        return fail("a carried soundtrack latent is [2, channels, "
+                    "latents]; got [" + std::to_string(st) + ", " +
+                    std::to_string(ac) + ", " + std::to_string(na) + "]");
+      }
+      out->kind                  = h3::MediaReference::Kind::kAudio;
+      out->audio_latent_channels = ac;
+      out->audio_latent_frames   = na;
+      out->audio_latent.assign(tb.as_f32(),
+                               tb.as_f32() + (std::size_t)st * ac * na);
+      return true;
+    }
+    if (rank != 4) {
+      return fail("a carried latent is rank 4 [z, frames, h, w] (video) "
+                  "or rank 3 [2, channels, latents] (a soundtrack); got "
+                  "rank " + std::to_string(rank));
+    }
+    const int z = (int)sh[0], lt = (int)sh[1];
+    const int lh = (int)sh[2], lw = (int)sh[3];
+    if (z <= 0 || lt <= 0 || lh <= 0 || lw <= 0) {
+      return fail("a carried latent is empty");
+    }
+    // A STILL's latent -- one frame, said so (`image`) -- is a picture
+    // on the clock, one integer slot, not a one-frame clip's 5/3 units:
+    // what it is when its pixels come with it.
+    bool still = false;
+    sideband_bool_(tb.sideband, "image", &still);
+    if (still && lt != 1) {
+      return fail("a carried latent said to be an image has " +
+                  std::to_string(lt) + " latent frames; a still has 1");
+    }
+    out->kind          = still ? h3::MediaReference::Kind::kImage
+                               : h3::MediaReference::Kind::kVideo;
+    out->latent_z      = z;
+    out->latent_frames = lt;
+    out->latent_height = lh;
+    out->latent_width  = lw;
+    const std::size_t n = (std::size_t)z * lt * lh * lw;
+    out->video_latent.assign(tb.as_f32(), tb.as_f32() + n);
+    // The rates still come from the sideband: the rotary clock is laid
+    // out in SECONDS whatever the rows were made of.
+    if (sideband_num_(tb.sideband, "fps", &v) && v > 0.0) { out->fps = v; }
+    return true;
+  }
+
+  if (rank <= 2) {                       // audio
+    const int ch = rank == 2 ? (int)sh[0] : 1;
+    const int ns = rank == 2 ? (int)sh[1] : (int)sh[0];
+    if (ch <= 0 || ns <= 0) { return fail("an audio reference is empty"); }
+    if (tb.dtype != TensorBeat::DType::F32) {
+      return fail("audio must be f32 PCM, got " +
+                  std::string(TensorBeat::name_of(tb.dtype)));
+    }
+    if (!sideband_num_(tb.sideband, "sr", &v) &&
+        !sideband_num_(tb.sideband, "sample_rate", &v)) {
+      return fail("audio carries no `sr` in its sideband, and a sample rate "
+                  "cannot be guessed -- a soundtrack read at the wrong rate "
+                  "conditions on the wrong sound");
+    }
+    if (!(v > 0.0)) { return fail("`sr` must be positive"); }
+    out->kind        = h3::MediaReference::Kind::kAudio;
+    out->channels    = ch;
+    out->sample_rate = (int)v;
+    out->pcm.assign(tb.as_f32(), tb.as_f32() + (std::size_t)ch * ns);
+    return true;
+  }
+
+  const int frames = rank == 4 ? (int)sh[0] : 1;
+  const int c      = rank == 4 ? (int)sh[1] : (int)sh[0];
+  const int h      = (int)sh[(std::size_t)rank - 2];
+  const int w      = (int)sh[(std::size_t)rank - 1];
+  if (c != 3) {
+    return fail("pixels must be planar RGB with 3 channels, got " +
+                std::to_string(c));
+  }
+  if (frames <= 0 || h <= 0 || w <= 0) {
+    return fail("a picture reference is empty");
+  }
+  if (tb.dtype != TensorBeat::DType::U8) {
+    return fail("pixels must be planar u8 RGB (the `rgb-frames` contract), "
+                "got " + std::string(TensorBeat::name_of(tb.dtype)));
+  }
+  out->kind       = rank == 4 ? h3::MediaReference::Kind::kVideo
+                              : h3::MediaReference::Kind::kImage;
+  out->num_frames = frames;
+  out->height     = h;
+  out->width      = w;
+  const std::size_t n_px = (std::size_t)frames * 3 * h * w;
+  out->rgb.assign(tb.as_u8(), tb.as_u8() + n_px);
+  if (rank == 4) {
+    if (!sideband_num_(tb.sideband, "fps", &v) || !(v > 0.0)) {
+      return fail("a clip carries no positive `fps` in its sideband, and a "
+                  "frame rate cannot be guessed -- MiniMax-H3 resamples every "
+                  "reference onto its own 24 fps, so a wrong rate is a "
+                  "reference conditioned at the wrong speed");
+    }
+    out->fps = v;
+  } else {
+    out->fps = h3::kFps;
+  }
+  return true;
+}
+
+std::size_t
+VideoRefEncoderStage::whole_decode_bytes(const MediaProbe& p, int short_edge,
+                                         std::int64_t max_pixels,
+                                         int audio_rate)
+{
+  if (p.width <= 0 || p.height <= 0) { return 0; }
+  // The frames the decoder will read: what the container claims, else
+  // its length at its rate, never past the backstop -- and the backstop
+  // itself when it says neither.
+  long long n = kMaxDecodedVideoFrames;
+  if (p.nb_frames > 0) {
+    n = p.nb_frames;
+  } else if (p.fps > 0.0 && p.duration_seconds > 0.0) {
+    n = (long long)std::ceil(p.duration_seconds * p.fps);
+  }
+  n = std::clamp<long long>(n, 1, kMaxDecodedVideoFrames);
+  const std::size_t px = (std::size_t)p.width * (std::size_t)p.height;
+  std::size_t bytes = (std::size_t)n * 3 * px;
+  // The canvas copy, by the resize's own rule: every frame at 24 fps.
+  const double fps = p.fps > 0.0 ? p.fps : h3::kFps;
+  int nf = 0, th = 0, tw = 0;
+  if (h3::video_reference_geometry((int)n, p.height, p.width, fps,
+                                   std::numeric_limits<int>::max(),
+                                   h3::ReferencePlan{}.canvas_multiple,
+                                   short_edge, max_pixels, &nf, &th, &tw)) {
+    bytes += (std::size_t)nf * 3 * (std::size_t)th * (std::size_t)tw;
+  }
+  // The soundtrack: stereo f32, decoded and then normalized.
+  if (p.has_audio && audio_rate > 0) {
+    const double secs = (double)n / fps;
+    bytes += (std::size_t)(secs * audio_rate) * 2 * sizeof(float) * 2;
+  }
+  return bytes;
+}
+
+bool
+VideoRefEncoderStage::trim_soundtrack_to_frames(h3::MediaReference* m)
+{
+  if (m == nullptr || m->channels <= 0 || m->sample_rate <= 0 ||
+      m->fps <= 0.0 || m->num_frames <= 0) {
+    return false;
+  }
+  const std::size_t C = (std::size_t)m->channels;
+  const std::size_t S = m->pcm.size() / C;
+  // The truncation's own rule: int(seconds * rate).
+  const std::size_t keep = (std::size_t)(
+      (double)m->num_frames / m->fps * (double)m->sample_rate);
+  if (keep >= S) { return false; }
+  // Planar: channel c moves from c * S to c * keep, in order, so no
+  // channel is overwritten before it is read.
+  for (std::size_t c = 1; c < C; ++c) {
+    std::memmove(m->pcm.data() + c * keep, m->pcm.data() + c * S,
+                 keep * sizeof(float));
+  }
+  m->pcm.resize(C * keep);
+  return true;
+}
+
+VideoRefEncoderStage::CarriedLatent
+VideoRefEncoderStage::carried_latent_route(const h3::MediaReference& m,
+                                           bool attach)
+{
+  if (!m.has_video_latent() || !m.rgb.empty()) { return CarriedLatent::kNone; }
+  if (attach) { return CarriedLatent::kAttach; }
+  return m.presented ? CarriedLatent::kRefused : CarriedLatent::kOwn;
+}
+
+// The audio VAE's rate is the only rate a reference soundtrack may be
+// encoded at, and a beat is the one path that can arrive at another one.
+// See the declaration for what the mismatch did.
+//
+// Resampling here is a SECOND pass over a waveform its producer already
+// resampled once, so it is warned rather than done quietly: the fix is
+// one config key on the producer, and a graph that takes it pays for one
+// conversion instead of two.
+bool
+VideoRefEncoderStage::conform_audio_rate(h3::MediaReference* m, int n)
+{
+  if (m == nullptr || m->kind != h3::MediaReference::Kind::kAudio) {
+    return true;
+  }
+  const int want = _audio_vae ? _audio_vae->config().sample_rate : 32000;
+  if (m->sample_rate == want || m->pcm.empty() || m->channels <= 0) {
+    return true;
+  }
+  const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
+  if (libs == nullptr || !libs->valid()) {
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): reference iport {} carries {} Hz audio "
+        "but the VAE reads {} Hz, and FFmpeg is unavailable to resample it; "
+        "skipping", this->id(), n, m->sample_rate, want));
+    return false;
+  }
+  const int samples = (int)(m->pcm.size() / (std::size_t)m->channels);
+  std::vector<float> pcm;
+  int got = 0;
+  std::string rerr;
+  if (!resample_pcm(libs, m->pcm.data(), m->channels, samples,
+                    m->sample_rate, want, m->channels, &pcm, &got, &rerr)) {
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): reference iport {} carries {} Hz audio "
+        "but the VAE reads {} Hz, and the resample failed: {}; skipping",
+        this->id(), n, m->sample_rate, want, rerr));
+    return false;
+  }
+  session()->warn(fmt(
+      "VideoRefEncoderStage('{}'): reference iport {} carries {} Hz audio "
+      "and the audio VAE reads {} Hz -- resampled ({} -> {} samples). Set "
+      "the producing stage's rate to {} so the waveform is resampled ONCE; "
+      "an unconformed soundtrack would be encoded {:.2f}x too fast and "
+      "{:.2f}x too long against the clip it is conditioning",
+      this->id(), n, m->sample_rate, want, samples, got, want,
+      (double)m->sample_rate / (double)want,
+      (double)m->sample_rate / (double)want));
+  m->pcm         = std::move(pcm);
+  m->sample_rate = want;
+  return true;
+}
+
+void
+VideoRefEncoderStage::report_fits_(const h3::EncodedReferences& enc)
+{
+  // What the encoder had to do to each reference to make it fit.
+  //
+  // WARN and not debug when something was actually lost, because none of
+  // it is visible anywhere else: the canvas is resolved from the
+  // reference rather than configured, the rate resample and the
+  // truncation happen inside one call, and the result is a generation
+  // that is merely different rather than broken. A user who handed this
+  // stage a 4K 60 fps clip and got a 1344x768 24 fps one deserves to be
+  // told which of those the model asked for.
+  //
+  // Percentages are what was KEPT -- spatially by area, temporally by
+  // frame count -- which is the shape of the question people ask.
+  for (std::size_t i = 0; i < enc.fits.size(); ++i) {
+    const auto& f = enc.fits[i];
+    std::vector<std::string> notes;
+    // fmt() is a LAZY formatter, so it is rendered here rather than
+    // stored.
+    auto add = [&notes](const VpipeFormat& v) { notes.push_back(v()); };
+
+    if (f.rescaled() && f.src_h > 0 && f.src_w > 0) {
+      const double kept = (double)f.canvas_h * f.canvas_w /
+                          ((double)f.src_h * f.src_w) * 100.0;
+      add(fmt("{} {}x{} -> {}x{} ({:.0f}% of the pixels)",
+              f.upscaled() ? "UPSCALED" : "rescaled", f.src_w, f.src_h,
+              f.canvas_w, f.canvas_h, kept));
+    }
+    if (f.rate_frames > 0 && f.src_frames > 0 &&
+        f.rate_frames != f.src_frames) {
+      const int d = f.src_frames - f.rate_frames;
+      add(fmt("resampled {:.4g} -> {:.0f} fps ({} frame(s) {})", f.src_fps,
+              h3::kFps, d < 0 ? -d : d, d > 0 ? "dropped" : "held"));
+    }
+    if (f.used_frames > 0 && f.rate_frames > f.used_frames) {
+      const double kept =
+          (double)f.used_frames / (double)f.rate_frames * 100.0;
+      add(fmt("truncated {} -> {} frames ({:.0f}% of the clip)",
+              f.rate_frames, f.used_frames, kept));
+    }
+    if (f.vae_frames > 0 && f.used_frames > f.vae_frames) {
+      add(fmt("{} of {} frames encoded (a whole number of 17n+5 chunks)",
+              f.vae_frames, f.used_frames));
+    }
+    if (f.audio_src_seconds > 0.0 &&
+        f.audio_kept_seconds < f.audio_src_seconds - 1e-3) {
+      add(fmt("soundtrack cut {:.2f}s -> {:.2f}s", f.audio_src_seconds,
+              f.audio_kept_seconds));
+    }
+
+    if (notes.empty()) {
+      session()->log_debug(fmt(
+          "VideoRefEncoderStage('{}'): reference {} taken as given ({}x{})",
+          this->id(), i + 1, f.canvas_w, f.canvas_h));
+      continue;
+    }
+    std::string joined;
+    for (std::size_t k = 0; k < notes.size(); ++k) {
+      if (k > 0) { joined += ", "; }
+      joined += notes[k];
+    }
+    // P-H3-Image sizes its pictures by its own area rules -- the one to
+    // edit scaled up to the canvas floor is the recipe, not a loss -- so
+    // what it did is said, not warned about.
+    if (_ph3 || _h3i) {
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): picture {} sized by {}'s rules -- "
+          "{}", this->id(), i + 1, _h3i ? "MiniMax-H3-Image" : "P-H3-Image",
+          joined));
+      continue;
+    }
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): reference {} fitted -- {}", this->id(),
+        i + 1, joined));
+  }
+}
 
 void
 VideoRefEncoderStage::resolve_unload_policy_()
@@ -672,6 +1790,25 @@ VideoRefEncoderStage::unload_models_()
   _video_vae.reset();
   _audio_vae.reset();
   _unloaded = true;
+  // The phase claims' other half (decide_resources): the release they
+  // promised, which the manager audits at the end of the launch. A dir
+  // left unphased is not audited, so naming it costs nothing.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    const ClaimedDirs d = claimed_dirs_();
+    mgr->note_phase_released(d.enc);
+    mgr->note_phase_released(d.vvae);
+    if (!d.avae.empty()) {
+      // The bytes back now where no peer holds the set; borrowed by
+      // audio-vae-decode, it settles when that stage lets go.
+      mgr->drop_weights(d.avae);
+      mgr->note_phase_released(d.avae);
+    }
+    if (const std::string cd = genai::ph3::connector_dir(
+            resolve_model_dir(session(), _hf_dir));
+        !cd.empty()) {
+      mgr->note_phase_released(cd);
+    }
+  }
 }
 
 bool
@@ -700,13 +1837,41 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     ensure_loaded_();
   }
 
-  auto pb = co_await ctx.read(0);
-  if (!pb) { ctx.signal_done(); co_return; }
-  const auto* pfd = dynamic_cast<const FlexDataPayload*>(pb.get());
+  // ONE CALL, ONE REQUEST. The prompt and every reference port are read
+  // here, up front, and paired by the generation rule -- before anything
+  // can end the request early, because pairing is by position in each
+  // stream. No prompt at all ends the run.
+  using Took = GenerationInput::Took;
+  GenerationRound round;
+  if (_prompt_in.wants()) {
+    auto pb = co_await ctx.read(0);
+    const Took took = _prompt_in.took(pb != nullptr);
+    if (round.note(took) || took == Took::kNone) {
+      ctx.signal_done();
+      co_return;
+    }
+    if (took == Took::kFresh) { _prompt_beat = std::move(pb); }
+  }
+  if (!_prompt_beat) { ctx.signal_done(); co_return; }
+  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
+    const unsigned i = p - kFirstRefPort;
+    if (ctx.num_iports() <= p || !ctx.iport_connected(p) ||
+        !_ref_in[i].wants()) {
+      continue;
+    }
+    auto rb = co_await ctx.read(p);
+    const Took took = _ref_in[i].took(rb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took == Took::kFresh) { _ref_beat[i] = std::move(rb); }
+  }
+  // Nothing new on any input: this request would repeat the last one.
+  if (round.idle()) { ctx.signal_done(); co_return; }
+
+  const auto* pfd = dynamic_cast<const FlexDataPayload*>(_prompt_beat.get());
   if (pfd == nullptr) {
     session()->warn(fmt(
         "VideoRefEncoderStage('{}'): expected a FlexData prompt, got {}; "
-        "skipping", this->id(), pb->describe()));
+        "skipping", this->id(), _prompt_beat->describe()));
     co_return;
   }
   const std::string prompt = prompt_of_(pfd->data);
@@ -727,6 +1892,256 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
 
   std::vector<h3::MediaReference> refs;
   if (!decode_references_(&refs)) { co_return; }
+  // Whether a wired reference port said "nothing this time" with an
+  // empty tensor -- the port contract's declared way of saying it, and
+  // so as deliberate a prompt-only request as `references: []`.
+  bool port_said_none = false;
+
+  // ---- the tensor reference iports ----------------------------------
+  // What each WIRED port holds for this request (read above), in port
+  // order, appended after the config list. Read with a blocking read,
+  // never polled: a producer that beats every request (an empty tensor
+  // is how it says "nothing this time") would race a poll -- the same
+  // rule generate-video applies to the reference-row ports it reads from
+  // this stage. It is also what keeps the NUMBERING static, and the
+  // numbering is the request: a port that could fall silent would
+  // renumber every reference after it.
+  for (unsigned p = kFirstRefPort; p < kFirstRefPort + kNumRefPorts; ++p) {
+    if (ctx.num_iports() <= p || !ctx.iport_connected(p)) { continue; }
+    const BeatPayloadIntf* rb = _ref_beat[p - kFirstRefPort].get();
+    const auto* tb = dynamic_cast<const TensorBeatPayload*>(rb);
+    if (tb == nullptr) {
+      if (rb) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} carried {}, "
+            "expected a tensor; skipping", this->id(),
+            p - kFirstRefPort + 1, rb->describe()));
+      }
+      continue;
+    }
+    // An empty tensor is the declared way to say "no reference here".
+    // byte_size(), not `data`: a Shared (Metal-buffer) beat leaves
+    // `data` empty and holds its bytes externally, so reading `data`
+    // would take a full picture for an absent one -- and absent
+    // renumbers every reference after it.
+    if (tb->shape.empty() || tb->byte_size() == 0) {
+      port_said_none = true;
+      continue;
+    }
+    const int refno = (int)(p - kFirstRefPort + 1);
+    const bool as_latent =
+        std::find(_attach_latent.begin(), _attach_latent.end(), refno) !=
+        _attach_latent.end();
+    h3::MediaReference m;
+    std::string merr;
+    if (!media_from_beat(*tb, refno, &m, &merr, as_latent)) {
+      session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
+                          this->id(), merr));
+      co_return;
+    }
+    // A beat's rate is its producer's, and the audio VAE reads one
+    // rate only. Conformed BEFORE the attach fold below, so a
+    // soundtrack folded onto a clip gets the same treatment as a
+    // standalone one.
+    if (!conform_audio_rate(&m, (int)(p - kFirstRefPort + 1))) {
+      co_return;
+    }
+    // `attach` folds a soundtrack onto the reference before it instead
+    // of adding one of its own -- a clip demuxed into frames and pcm
+    // arrives on two ports but is ONE reference, labelled <Video k> and
+    // <Audio j> together, exactly as a file with a soundtrack is.
+    //
+    // The stage's config decides it, so the switch is reachable from the
+    // stage whose behaviour it is; a beat may still override for itself,
+    // which is how a producer that knows better than the graph says so.
+    bool attach = as_latent ||
+                  std::find(_attach_audio.begin(), _attach_audio.end(),
+                            refno) != _attach_audio.end();
+    {
+      bool said = false;
+      if (sideband_bool_(tb->sideband, "attach", &said)) { attach = said; }
+    }
+    // A CARRIED LATENT folds onto the reference before it, the way an
+    // attached soundtrack does. It has to: the conditioner builds the
+    // presentation (`<Video 1>`) out of the vision tower's tokens, so a
+    // visual reference with no pixels is a request it refuses. The
+    // pixels therefore still arrive on their own port and still feed
+    // the tower; the latent only replaces what the VAE would have
+    // produced for the DiT -- which is the round trip worth removing,
+    // since encode(decode(z)) recovers z at correlation 0.875 with a
+    // systematic 0.86 gain. NOT PRESENTED (`present: false`), a latent
+    // is a reference of its own, the DiT's alone: the prompt never reads
+    // it, as ComfyUI's RefMod "Apply" hands a stored latent over.
+    const CarriedLatent route = carried_latent_route(m, attach);
+    if (route == CarriedLatent::kOwn) {
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): reference iport {} is a carried "
+          "latent [{}x{}x{}x{}] for the DiT alone -- not presented to the "
+          "conditioner", this->id(), refno, m.latent_z, m.latent_frames,
+          m.latent_height, m.latent_width));
+      refs.push_back(std::move(m));
+      continue;
+    }
+    if (route != CarriedLatent::kNone) {
+      if (route == CarriedLatent::kRefused) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} carries a "
+            "latent but no pixels and does not ask to attach. A visual "
+            "reference needs pixels for the conditioner; set `attach: "
+            "true` in its sideband so the latent folds onto the picture "
+            "reference before it, or `present: false` to give the DiT its "
+            "rows alone; skipping", this->id(), refno));
+        co_return;
+      }
+      if (refs.empty()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its latent but nothing precedes it; skipping", this->id(),
+            refno));
+        co_return;
+      }
+      h3::MediaReference& prev = refs.back();
+      if (prev.kind == h3::MediaReference::Kind::kAudio) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its latent to an AUDIO reference, which has no video rows to "
+            "replace; skipping", this->id(), refno));
+        co_return;
+      }
+      if (prev.has_video_latent()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its latent but reference {} already carries one; skipping",
+            this->id(), refno, refs.size()));
+        co_return;
+      }
+      prev.video_latent  = std::move(m.video_latent);
+      prev.latent_z      = m.latent_z;
+      prev.latent_frames = m.latent_frames;
+      prev.latent_height = m.latent_height;
+      prev.latent_width  = m.latent_width;
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): reference {} takes its video rows "
+          "from a carried latent [{}x{}x{}x{}] -- the VAE encode is "
+          "skipped", this->id(), refs.size(), prev.latent_z,
+          prev.latent_frames, prev.latent_height, prev.latent_width));
+      // `continue`, NOT `co_return`: this is one port of a loop over
+      // them, and returning here abandons the ports after it AND the
+      // encode itself -- which is exactly what it did the first time.
+      continue;
+    }
+
+    // A carried SOUNDTRACK latent attached: the soundtrack of the clip
+    // before it, as attached PCM is -- its rows from the latent, the
+    // audio VAE skipped. Unattached it is an audio reference of its own.
+    if (m.has_audio_latent() && attach) {
+      if (refs.empty() ||
+          refs.back().kind == h3::MediaReference::Kind::kAudio) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its soundtrack latent but {}; skipping", this->id(), refno,
+            refs.empty() ? "nothing precedes it"
+                         : "the reference before it is a sound"));
+        co_return;
+      }
+      h3::MediaReference& prev = refs.back();
+      if (prev.has_soundtrack()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its soundtrack latent but reference {} already carries a "
+            "soundtrack; skipping", this->id(), refno, refs.size()));
+        co_return;
+      }
+      prev.audio_latent          = std::move(m.audio_latent);
+      prev.audio_latent_channels = m.audio_latent_channels;
+      prev.audio_latent_frames   = m.audio_latent_frames;
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): reference {} takes its soundtrack "
+          "rows from a carried latent [2x{}x{}] -- the audio VAE is "
+          "skipped", this->id(), refs.size(), prev.audio_latent_channels,
+          prev.audio_latent_frames));
+      continue;
+    }
+
+    if (m.kind == h3::MediaReference::Kind::kAudio && attach) {
+      if (refs.empty()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its audio but nothing precedes it; skipping", this->id(),
+            refno));
+        co_return;
+      }
+      h3::MediaReference& prev = refs.back();
+      if (prev.has_soundtrack()) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} asks to attach "
+            "its audio but reference {} already carries a soundtrack; "
+            "skipping", this->id(), refno, refs.size()));
+        co_return;
+      }
+      // Warned, not refused, when the target is not a clip. A still
+      // with a soundtrack is almost always a wiring slip -- but it is
+      // reachable from the `references` list too, where a one-frame
+      // .mp4 with an audio track is classified as an image and keeps
+      // its PCM, so refusing it here would make the same media legal
+      // through one door and not the other.
+      if (prev.kind != h3::MediaReference::Kind::kVideo) {
+        session()->warn(fmt(
+            "VideoRefEncoderStage('{}'): reference iport {} attached its "
+            "audio to reference {}, which is a STILL, not a clip. That is "
+            "a valid request and probably not the one you meant -- a "
+            "soundtrack usually belongs to the clip it was demuxed from, "
+            "so check the port order", this->id(), refno, refs.size()));
+      }
+      prev.pcm         = std::move(m.pcm);
+      prev.channels    = m.channels;
+      prev.sample_rate = m.sample_rate;
+      continue;
+    }
+    refs.push_back(std::move(m));
+  }
+
+  // NO REFERENCES is two different requests, and only one of them is a
+  // mistake. `references: []` (or a wired port beating an empty tensor)
+  // SAYS "prompt only" -- Ref2VA's weights denoise from the prompt alone
+  // through the same layout text-to-video builds, so a graph that
+  // varies per request need not swap checkpoints to drop its last
+  // reference. An ABSENT key with nothing wired says nothing: that is an
+  // unwired graph, and running it would spend a full 33B denoise on a
+  // request nobody made. A prompt-only request goes out with
+  // `references: []` on its sideband, which is how generate-video tells
+  // it from a conditioning that never came from here.
+  const bool prompt_only = refs.empty();
+  if (prompt_only && !_references_said && !port_said_none) {
+    session()->warn(fmt(
+        "VideoRefEncoderStage('{}'): no references -- `references` is not "
+        "set and no reference iport is wired, which is what an unwired "
+        "graph looks like. A Ref2VA request with nothing to condition on "
+        "denoises at full cost from the prompt alone; if that is the "
+        "intent, say so with `references: []`. Skipping", this->id()));
+    co_return;
+  }
+
+  // Those kept WHOLE, by their number in this request; every other one
+  // is truncated to the generated duration.
+  for (int n : _whole_refs) {
+    if (n > (int)refs.size()) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): whole_references names reference {} "
+          "but the request has {}; ignored", this->id(), n, refs.size()));
+      continue;
+    }
+    h3::MediaReference& r = refs[(std::size_t)n - 1];
+    if (r.kind == h3::MediaReference::Kind::kImage) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): whole_references names reference "
+          "{}, a picture: it has no duration to keep; ignored", this->id(),
+          n));
+      continue;
+    }
+    r.whole = true;
+  }
+
   std::string verr;
   if (!h3::validate_reference_request(refs, _limits, &verr)) {
     session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
@@ -736,8 +2151,12 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
 
   h3::ReferencePlan plan;
   plan.target_frames = h3::align_num_frames(_frames, 17, 5);
-  plan.reference_image_short_edge = _ref_short_edge;
+  plan.reference_image_short_edge = ref_image_short_edge_();
+  plan.canvas_short_edge = _vid_short_edge;
+  plan.canvas_max_pixels = (std::int64_t)_vid_max_pixels;
+  plan.reference_image_max_pixels = (std::int64_t)_img_max_pixels;
   plan.video_sample_fps = _video_sample_fps;
+  plan.condition_noise_aug = _cond_noise_aug;
   {
     // The DiT's patch, from the checkpoint rather than assumed: the
     // rows this stage packs are read by a transformer that reshapes
@@ -751,6 +2170,23 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     }
   }
 
+  // The conditioner's measured residency, for this request's one pass --
+  // and the requests after it when the encoder is kept between them. The
+  // reserve is what the plan's other phases book (the DiT's forward, the
+  // decodes), which may allocate while the set is held.
+  if (_enc->streams_resident_set()) {
+    _enc->set_residency_reserve(model_memory::residency_reserve_beside(
+        session(), model_memory::kPhaseCondition));
+    _enc->set_residency_schedule(_unload_idle ? 1 : 4);
+  }
+
+  // The audio encode's arena at THIS request's longest soundtrack (a
+  // whole one can be minutes: 25 MB a second), or 0 with none to encode.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->revise_scratch(audio_encode_label_(),
+                        h3::audio_encode_bytes(refs, plan, _audio_vae.get()));
+  }
+
   h3::ReferenceEncoders models;
   models.mc        = session()->services()->metal_compute();
   models.vision    = _vision.get();
@@ -760,41 +2196,110 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
   // The phase the user actually waits through. The conditioner is loaded
   // and streamed, and every reference is read TWICE -- once by the vision
   // tower at its own canvas, once by the video VAE at MiniMax-H3's -- so
-  // on a memory-bounded box this is minutes. It reported to the debug log
-  // and nowhere else, which left a default run silent between "encoders
-  // ready" and the conditioning beat, over the longest stretch in the
-  // graph that is not the denoise.
+  // on a memory-bounded box this is minutes, nearly all of it the VAE.
   //
   // Opened BEFORE the encode rather than on the first report, which is
-  // the opposite of the lazy bars in the two VAE stages and for a reason
-  // particular to this one: the first report does not arrive until the
-  // first reference is FINISHED, so a lazy bar would still be invisible
-  // through exactly the stretch it exists to cover. The counts are set
-  // here too -- an un-updated handle reads as indeterminate, and the
-  // number of references is already known.
+  // the opposite of the lazy bars in the two VAE stages: the encoder
+  // plans the request and reports straight away, but a bar opened only
+  // then would still miss whatever ran before it. The encoder weighs
+  // the references by the VAE work each will cost and moves the bar per
+  // VAE tile, so a long clip no longer sits at one number for minutes;
+  // the detail names the reference and the phase. See
+  // ReferenceEncoders::progress.
   UiProgress bar = session()->open_progress("encoding references");
-  bar.update(0, (std::uint64_t)refs.size() + 1);
+  bar.update(0, 0, prompt_only ? std::string("prompt only")
+                               : std::to_string(refs.size()) +
+                                     " reference(s)");
   {
     auto* ui = session();
-    const std::string label = "encoding " + std::to_string(refs.size()) +
-                              " reference(s)";
-    // The debug line stays: a bar leaves nothing behind, and this phase
-    // is one people come back to a log about.
-    models.progress = [&bar, ui, label](int done, int total) {
-      bar.update(done < 0 ? 0 : (std::uint64_t)done,
-                 total < 0 ? 0 : (std::uint64_t)total);
-      ui->log_debug(fmt("{}: {}/{}", label, done, total));
+    models.progress = [&bar](std::uint64_t done, std::uint64_t total,
+                             const std::string& detail) {
+      bar.update(done, total, detail);
     };
+    // PER-PHASE timing, at NORMAL: a bar leaves nothing behind, and this
+    // is a phase people come back to a log about. A reference encode is
+    // four models deep, so the line names each one's share.
+    models.log = [ui](const std::string& line) {
+      ui->log_normal(fmt("{}", line));
+    };
+    // A STOP HAS TO REACH IN HERE. This is the longest stretch in the
+    // graph that is not the denoise -- the conditioner is loaded and
+    // streamed and every reference is read twice, so on a
+    // memory-bounded box it is minutes -- and it had no stop check at
+    // all, so a stop was served whenever the whole request happened to
+    // finish. The encoder checks at every phase boundary and, through
+    // the video VAE, between its tiles.
+    models.stopping = [&ctx]() { return ctx.stop_requested(); };
   }
 
+  // P-H3-Image's edit: its pictures by the manifest's area rules (the
+  // first, the one edited, at least at the canvas floor -- it IS the
+  // canvas when the generator names none), the tower's own ~1 MP copy,
+  // the posterior sampled at the reference's seed, the rows noised to
+  // the level they are held at, and the instruction as the encoder reads
+  // it. A request naming no picture is not an edit and is refused.
+  // MiniMax-H3-Image's edit: each picture at its own size within short
+  // edges [1024, 2048] (cut to whole VAE cells), the tower's copy at a
+  // 1024 short edge, the posteriors SAMPLED off one generator at
+  // `posterior_seed` in picture order -- the request's, when it is
+  // generate-video's `seed` -- and the rows left clean: generate-video
+  // noises them with the same generator after the picture's noise.
+  if (_h3i) {
+    if (refs.empty()) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): a MiniMax-H3-Image edit needs a "
+          "picture to edit; text-to-image goes through "
+          "diffusion-conditioner. Skipping", this->id()));
+      co_return;
+    }
+    plan.edge_min    = genai::h3i::kReferenceMinShortEdge;
+    plan.edge_max    = genai::h3i::kReferenceMaxShortEdge;
+    plan.vision_edge = genai::h3i::kVisionShortEdge;
+    plan.canvas_multiple = genai::h3i::kCanvasMultiple;
+    plan.posterior_seed  = std::max<std::int64_t>(0, _posterior_seed);
+    plan.posterior_one_stream = true;
+    plan.condition_noise_aug  = 1.0;
+  }
+  std::string ph3_prompt;
+  if (_ph3) {
+    if (refs.empty()) {
+      session()->warn(fmt(
+          "VideoRefEncoderStage('{}'): a P-H3-Image edit needs a picture "
+          "to edit; text-to-image goes through diffusion-conditioner. "
+          "Skipping", this->id()));
+      co_return;
+    }
+    plan.area_min_pixels  = _ph3_manifest.reference_min_pixels;
+    plan.area_max_pixels  = _ph3_manifest.reference_max_pixels;
+    plan.first_min_pixels = _ph3_manifest.canvas_min_pixels;
+    plan.vision_pixels    = _ph3_manifest.vision_pixels;
+    plan.canvas_multiple  = genai::ph3::kCanvasMultiple;
+    plan.posterior_seed   = (std::int64_t)genai::ph3::kConditionEncodeSeed;
+    if (!this->config().as_object().contains("condition_noise_aug")) {
+      plan.condition_noise_aug = genai::ph3::kConditionNoiseAug;
+    }
+    ph3_prompt = genai::ph3::edit_prompt(prompt);
+  }
   h3::EncodedReferences enc;
   std::string eerr;
-  const bool encoded = h3::encode_references(refs, prompt, plan, models,
-                                             &enc, &eerr);
+  const bool encoded = h3::encode_references(
+      refs, _ph3 ? std::string_view(ph3_prompt) : std::string_view(prompt),
+      plan, models, &enc, &eerr);
   // Before the warn, so a failure does not leave a part-filled bar
   // sitting under the message that explains it.
   bar.finish();
   if (!encoded) {
+    // A STOP IS NOT A FAILURE, and must not be reported as one: the
+    // encoder returns false with an EMPTY reason for it, which is the
+    // signal, so nothing here has to recognise a message. Asking the
+    // context again rather than trusting the empty string alone keeps a
+    // genuine failure that forgot its reason from being filed as a stop.
+    if (eerr.empty() && ctx.stop_requested()) {
+      session()->info(fmt(
+          "VideoRefEncoderStage('{}'): stopped during the reference "
+          "encode; no conditioning emitted", this->id()));
+      co_return;
+    }
     session()->warn(fmt("VideoRefEncoderStage('{}'): {}; skipping",
                         this->id(), eerr));
     co_return;
@@ -857,36 +2362,56 @@ VideoRefEncoderStage::process(RuntimeContext& ctx)
     for (int v : enc.token_tags) {
       tags.as_array().push_back(FlexData::make_int(v));
     }
-    o.insert_or_assign("token_tags", std::move(tags));
+    namespace ck = genai::cond_sideband;
+    o.insert_or_assign(ck::kTokenTags, std::move(tags));
     FlexData rl = FlexData::make_array();
     for (const auto& L : enc.layout) {
       FlexData r = FlexData::make_object();
       auto ro = r.as_object();
       ro.insert_or_assign(
-          "kind",
+          ck::kKind,
           FlexData::make_string(
-              L.kind == h3::Reference::Kind::kImage   ? "image"
-              : L.kind == h3::Reference::Kind::kVideo ? "video"
-                                                      : "audio"));
-      ro.insert_or_assign("latent_frames",
+              L.kind == h3::Reference::Kind::kImage   ? ck::kImage
+              : L.kind == h3::Reference::Kind::kVideo ? ck::kVideo
+                                                      : ck::kAudio));
+      ro.insert_or_assign(ck::kLatentFrames,
                           FlexData::make_int(L.num_latent_frames));
-      ro.insert_or_assign("latent_height",
+      ro.insert_or_assign(ck::kLatentHeight,
                           FlexData::make_int(L.latent_height));
-      ro.insert_or_assign("latent_width",
+      ro.insert_or_assign(ck::kLatentWidth,
                           FlexData::make_int(L.latent_width));
-      ro.insert_or_assign("audio_latents",
+      ro.insert_or_assign(ck::kAudioLatents,
                           FlexData::make_int(L.num_audio_latents));
+      const std::size_t li = (std::size_t)(&L - enc.layout.data());
+      if (li < enc.posterior_draws.size() && enc.posterior_draws[li] > 0) {
+        ro.insert_or_assign(ck::kPosteriorDraws,
+                            FlexData::make_int(enc.posterior_draws[li]));
+      }
       rl.as_array().push_back(std::move(r));
     }
-    o.insert_or_assign("references", std::move(rl));
+    o.insert_or_assign(ck::kReferences, std::move(rl));
     t->sideband = std::move(sb);
     co_await ctx.write(0, std::move(t));
   }
 
-  session()->info(fmt(
-      "VideoRefEncoderStage('{}'): {} reference(s) -> {} conditioning rows, "
-      "{} reference video rows, {} reference audio rows", this->id(),
-      refs.size(), enc.n_tokens, vrows, arows));
+  if (prompt_only) {
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): prompt only (an explicitly empty "
+        "reference list) -> {} conditioning rows, no reference rows",
+        this->id(), enc.n_tokens));
+  } else {
+    session()->info(fmt(
+        "VideoRefEncoderStage('{}'): {} reference(s) -> {} conditioning "
+        "rows, {} reference video rows, {} reference audio rows",
+        this->id(), refs.size(), enc.n_tokens, vrows, arows));
+  }
+  // What each visual reference was actually encoded at. The canvas is
+  // resolved from the reference's own aspect and never appears in the
+  // config, so an upscale -- which costs here AND in every denoise step,
+  // since these rows lead the DiT's video buffer -- is otherwise
+  // invisible. Reported as pixels, from the latent geometry the layout
+  // carries, so it says what ran rather than what was asked for.
+  report_fits_(enc);
   ++_emitted;
   if (_unload_idle) { unload_models_(); }
 }

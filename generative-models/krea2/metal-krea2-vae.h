@@ -3,13 +3,18 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/flex-data.h"
+#include "generative-models/shared/dit-flops.h"
+#include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace vpipe {
@@ -33,14 +38,72 @@ class MetalKrea2Vae {
  public:
   struct Config {
     int base_dim       = 96;
+    // Decoder width when it differs from the encoder's: Qwen-Image-2.1 is
+    // base_dim 96 against decoder_base_dim 144. 0 means "same as
+    // base_dim", which is every checkpoint that came before it -- a
+    // sentinel rather than a real default because Config is
+    // aggregate-initialized all over the tree and an in-class
+    // initializer cannot name another member.
+    int decoder_base_dim = 0;
     int z_dim          = 16;
-    int dim_mult[4]    = {1, 2, 4, 4};
+    // One entry per LEVEL, so the vector's size is the level count and
+    // the spatial factor follows from it. A fixed int[4] until
+    // Qwen-Image-2.1 arrived with five levels ({1,2,4,8,8}, /16).
+    std::vector<int> dim_mult = {1, 2, 4, 4};
     int num_res_blocks = 2;
+    // Image channels. 3 on both sides everywhere until Qwen-Image-2.1,
+    // which is natively RGBA and reads/writes 4.
+    int in_channels    = 3;
+    int out_channels   = 3;
+    // Whether its kernel tuners MEASURE (the 3x3 conv route, the mid-block
+    // attention, the int8 split): false takes the choice believed fastest
+    // on this GPU, timing nothing -- the accel key `autotune`.
+    bool autotune = true;
+    // The parameter-free residual shortcut AutoencoderKLQwenImage21 puts
+    // around each down/up block: group-average the channels after a
+    // space-to-depth on the way down, repeat them before a depth-to-space
+    // on the way up. It carries NO weights, so a checkpoint cannot be
+    // told from its tensors -- it comes from the config only.
+    bool is_residual   = false;
+    // Which levels compress TIME. The image path skips every temporal
+    // conv (one frame, so only the kt=2 slice contributes), which is why
+    // this was never needed before -- but the is_residual shortcut is a
+    // channel REGROUPING whose arithmetic includes the temporal factor,
+    // so on a single frame it decides which of its output channels are
+    // real and which are the zero-padded frame. Empty means "no level
+    // does", which is the right reading for a checkpoint without the key.
+    // int rather than bool: std::vector<bool>'s proxy reference is a
+    // trap for no benefit at this size.
+    std::vector<int> temperal_downsample;
     // Per-channel latent statistics (config latents_mean / latents_std) used
     // by unwhiten(); the pipeline applies latents = latents * std + mean.
     std::vector<float> latents_mean;
     std::vector<float> latents_std;
+
+    // Levels, and what follows from the level count. Every downsample but
+    // the last level's contributes a factor of 2.
+    int levels() const { return static_cast<int>(dim_mult.size()); }
+    int spatial_factor() const { return 1 << (levels() - 1); }
+    // The decoder's base width, resolving the sentinel above.
+    int dec_base() const
+    {
+      return decoder_base_dim > 0 ? decoder_base_dim : base_dim;
+    }
   };
+
+  // Fill a Config from a parsed diffusers vae/config.json object.
+  //
+  // It exists because the two VAE stages each grew their own copy of the
+  // same four-key reader, so a key added for one was silently missing
+  // from the other -- and the keys that arrived with
+  // AutoencoderKLQwenImage21 (dim_mult, decoder_base_dim, is_residual,
+  // in/out_channels) are exactly the ones a half-read config gets wrong
+  // QUIETLY: a five-level checkpoint read as four levels asks for
+  // tensors that exist, at widths that do not.
+  //
+  // Absent keys leave `out` alone, so it layers over defaults. Mirrors
+  // MetalWanVae::config_from_json.
+  static void config_from_json(const FlexData& cfg_obj, Config* out);
 
   // `with_encoder` also loads the encoder weights (for the img2img encode
   // path); the decode-only path (text-to-image) leaves it false to save RAM.
@@ -76,9 +139,14 @@ class MetalKrea2Vae {
          std::string* err = nullptr);
 
   // Conservative estimate of the peak GPU memory (bytes) a decode() at the
-  // given latent size needs: the reused im2col scratch plus the held
-  // intermediate activations. For a preflight memory_budget() check.
+  // given latent size needs: the held intermediate activations, plus the
+  // im2col scratch when some conv has to gather (no hardware conv, or a
+  // latent grid that is not a multiple of 8). For a preflight
+  // memory_budget() check.
   std::size_t decode_peak_bytes(int h8, int w8) const noexcept;
+  // What every decode adds beside its level-sized tensors (see
+  // decode_peak_bytes).
+  static constexpr std::size_t kDecodeFixedBytes = 256u << 20;
 
   // Encode an RGB image [3, H, W] (channel-first, in [-1,1]) into the WHITENED
   // latent [z_dim, H/8, W/8] (channel-first) -- the posterior mode (mean),
@@ -87,12 +155,53 @@ class MetalKrea2Vae {
   encode(const metal_compute::SharedBuffer& img, int H, int W);
   bool has_encoder() const { return _has_encoder; }
 
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every 3x3 conv, 1x1
+  // conv and the mid-block attention, counted as encoded and credited
+  // as each command buffer retires. For a test to hold against shapes.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
   // In-place per-channel un-whiten of a channel-first latent [z_dim, h8, w8]:
   // z[c] = z[c] * latents_std[c] + latents_mean[c]. Returns a fresh buffer.
   metal_compute::SharedBuffer
   unwhiten(const metal_compute::SharedBuffer& z, int h8, int w8);
 
   const Config& config() const { return _cfg; }
+
+  // ACCELERATED MODE (LOSSY), the stages' `i8_gemm` / `i8_gemm_tier`:
+  // the int8 matrix units for the codec's two kinds of big product.
+  //
+  //   THE 3x3 CONVS, on the hardware int8 convolution
+  //   (conv2d_hw_3x3_*_i8): an activation channel at a step of its own,
+  //   folded into a per-call int8 copy of the weight -- a 3x3 window sums
+  //   nine pixels in one pass, so no finer scale is possible there -- by
+  //   SmoothQuant's migration (vae_i8_steps_f16, alpha 0.25). A resnet's
+  //   conv reads RMS-norm -> SiLU, its pixels' magnitude already even,
+  //   and its SiLU goes into the quantizer.
+  //   THE MID-BLOCK ATTENTION, when it is materialized (kMat): Q.K^T and
+  //   P.V are ordinary GEMMs, and run on I8GemmContext.
+  //
+  //   THE TIER (0 accurate, 1 fast, 2 token, Hadamard-256 rotated, 3
+  //   token unrotated) is the DiTs' vocabulary. Accurate takes only the
+  //   resnet convs and runs the attention's GEMMs at the accurate tier;
+  //   every other tier takes each 3x3 the route fits -- conv_in and the
+  //   up / downsamples, which read the unnormalized residual stream --
+  //   and runs the GEMMs at itself. A GEMM whose depth a tier's layout
+  //   cannot take stays accurate (Qwen-Image-2.1's 1152-wide Q.K^T: no
+  //   fast group, no rotated token block; I8GemmContext::fast_group).
+  //   MEASURED in set_accel: accurate 1.14x the decode, fast 1.25x.
+  //
+  // Off by default and for the reason vae-decode-stage gives: a codec is
+  // the last step before the pixels, with nothing after it to absorb an
+  // approximation. Set before decode() / encode(); cheap, and a GPU
+  // without matrix cores (or the kernels) quietly keeps f16.
+  struct Accel {
+    bool i8_gemm = false;
+    int  i8_tier = 0;
+  };
+  void set_accel(const Accel& a);
+  // What set_accel turned on, for the stage's log line ("" for nothing).
+  std::string accel_note() const;
 
  private:
   MetalKrea2Vae() = default;
@@ -121,13 +230,28 @@ class MetalKrea2Vae {
   struct UpBlock {
     std::vector<ResBlock> resnets;
     bool has_up = false;
-    Conv up;                        // resample.1: 3x3 conv (dim -> dim/2)
+    // resample.1: 3x3 conv. dim -> dim/2 normally; dim -> dim under
+    // is_residual, where the narrowing moves into the next level's first
+    // resnet instead. Either way the cout comes from the weight's shape.
+    Conv up;
     int up_dim = 0;                 // channels feeding the upsample conv
+    // The parameter-free DupUp3D shortcut (is_residual only): the
+    // block's INPUT, channel-regrouped and spatially doubled, added to
+    // its output. No weights -- the widths and the temporal factor are
+    // all it needs. res_ft is 2 on a level that upsamples TIME, which
+    // still decides the channel mapping on a single frame.
+    bool has_res = false;
+    int res_in = 0, res_out = 0, res_ft = 1;
   };
   struct DownStage {                // encoder down_blocks stage
     std::vector<ResBlock> resnets;  // num_res_blocks per stage
     bool has_down = false;
     Conv down;                      // resample.1: 3x3 STRIDE-2 conv (dim->dim)
+    // The AvgDown3D twin of UpBlock::has_res. res_fs is 1 on the last
+    // level, which has no downsample -- there the shortcut collapses to
+    // a plain residual add rather than vanishing.
+    bool has_res = false;
+    int res_in = 0, res_out = 0, res_ft = 1, res_fs = 1;
   };
 
   Conv load_conv3x3_(WeightSet& ws, const std::string& nm,
@@ -137,6 +261,20 @@ class MetalKrea2Vae {
                                         const std::string& nm);
   bool load_resblock_(WeightSet& ws, const std::string& pre,
                       ResBlock& rb, int cin, int cout);
+
+  // The checkpoint's own spelling of a diffusers tensor name.
+  //
+  // The Qwen-Image VAE is also published NATIVELY named (ComfyUI's
+  // single-file VAEs, and wikeeyang's Krea2-HD fine-tune of this exact
+  // model) -- same architecture, same shapes, different names. EVERY
+  // read of `ws.src()` goes through here so the loaders below keep
+  // reading one spelling; `_names` is empty for a diffusers checkpoint
+  // and wname_ is then the identity. See shared/wan-vae-names.h.
+  //
+  // Note what does NOT go through it: the `derived()` cache keys stay in
+  // the diffusers spelling, because they name a TRANSFORM of a tensor
+  // and the transform does not change with the file's naming.
+  const std::string& wname_(const std::string& diffusers_name) const;
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -165,6 +303,18 @@ class MetalKrea2Vae {
   static constexpr int kTileOvDen = 4;
   // Largest square latent window whose decode peak fits `budget` (0 if none).
   int decode_tile_side_(std::size_t budget) const noexcept;
+  // Does any 3x3 in a decode at this latent size have to GATHER -- i.e. is
+  // the im2col band allocated at all? (No hardware conv on this GPU, or a
+  // grid the hardware conv declines.) The preflight and the band sizing
+  // must agree on this, so they ask the same question here.
+  bool decode_gathers_(int h8, int w8) const noexcept;
+  // Bytes of im2col band scratch a decode at this latent size allocates
+  // when it gathers. CAPPED, and the cap is the whole point -- see the
+  // definition.
+  std::size_t decode_band_bytes_(int h8, int w8) const noexcept;
+  // The cap. A band is a GEMM M-dimension and nothing else, so it needs to
+  // be big enough to keep the GEMM efficient and not one byte more.
+  static constexpr std::size_t kDecodeBandMax = 128ull << 20;
   metal_compute::SharedBuffer decode_tiled_(
       const metal_compute::SharedBuffer& z, int h8, int w8, int tile8,
       std::string* err);
@@ -173,14 +323,15 @@ class MetalKrea2Vae {
   Conv _conv_in;                    // 3x3 conv z_dim -> dims[0]
   ResBlock _mid_res0, _mid_res1;
   Attn _mid_attn;
-  std::vector<UpBlock> _up_blocks;  // 4
+  std::vector<UpBlock> _up_blocks;  // cfg.levels()
   metal_compute::SharedBuffer _norm_out_g;
-  Conv _conv_out;                   // 3x3 conv base_dim -> 3
+  Conv _conv_out;                   // 3x3 conv dec_base -> out_channels
 
   // ---- encoder (loaded only when with_encoder) ----
   bool _has_encoder = false;
-  Conv _enc_conv_in;                // 3x3 conv 3 -> base
-  std::vector<DownStage> _enc_down; // 4 stages (3 with a stride-2 downsample)
+  Conv _enc_conv_in;                // 3x3 conv in_channels -> base
+  // cfg.levels() stages, all but the last with a stride-2 downsample.
+  std::vector<DownStage> _enc_down;
   ResBlock _enc_mid_res0, _enc_mid_res1;
   Attn _enc_mid_attn;
   metal_compute::SharedBuffer _enc_norm_out_g;
@@ -193,6 +344,9 @@ class MetalKrea2Vae {
   // life: the cached tensors are aliases into buffers it owns (and
   // mapped ones alias its mmap), so it has to outlive them.
   std::shared_ptr<WeightSet> _ws;
+  // Diffusers name -> this checkpoint's name; EMPTY when the checkpoint
+  // is diffusers-named, which is every krea/, Qwen/ and quantized pack.
+  std::unordered_map<std::string, std::string> _names;
   // Part the loaders currently attribute their tensors to; "" is the
   // always-resident trunk, "encoder" the half release_part() can drop.
   std::string _part;
@@ -263,7 +417,7 @@ class MetalKrea2Vae {
   // Tune from decode()/encode(), once the resolution is known: which shapes
   // reach the fallback at all depends on it. Runs on every call but only ever
   // ADDS shapes -- the encoder half can arrive after the first decode.
-  void maybe_tune_conv_(int H, int W, const metal_compute::SharedBuffer& col,
+  void maybe_tune_conv_(int H, int W, metal_compute::SharedBuffer& col,
                         std::size_t cap);
 
   // NAX hardware convolution2d (M5+, probe-established semantics): the op
@@ -279,6 +433,13 @@ class MetalKrea2Vae {
                    int stride);
   metal_compute::ComputeLibrary _lib_convhw;
   metal_compute::ComputeFunction _fn_conv_hw_s1, _fn_conv_hw_s2;
+  // The same op over a 32-channel destination tile, for a stride-1 conv
+  // whose cout is a multiple of 32 but not of 64: this VAE's base_dim is
+  // 96, so every full-resolution conv -- the ones that dominate a decode --
+  // could reach the hardware conv only through this tile. The stride-2 twin
+  // serves the encoder's first downsample (96 -> 96).
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c32, _fn_conv_hw_s2_c32;
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c16, _fn_conv_hw_s2_c16;
   // Direct 3x3 for a small output-channel count. The hardware conv needs
   // cout % 64 == 0, so this VAE's final convs -- decoder.conv_out (-> 3) and
   // encoder.conv_out (-> 2*z_dim) -- drop to im2col AT FULL RESOLUTION and pay
@@ -298,12 +459,51 @@ class MetalKrea2Vae {
                            int H, int W, int stride);
   bool _use_hwconv = false;
 
+  // The int8 resnet conv (set_accel). The conv and its three quantizers,
+  // loaded with the hardware conv; `_i8_conv` is set_accel's switch.
+  metal_compute::ComputeFunction _fn_conv_i8_s1, _fn_conv_i8_s1_c32,
+      _fn_conv_i8_s1_c16, _fn_conv_i8_s2, _fn_conv_i8_s2_c32,
+      _fn_conv_i8_s2_c16, _fn_i8_zero, _fn_i8_amax, _fn_i8_steps,
+      _fn_i8_quant, _fn_i8_fold;
+  bool _i8_conv = false;
+  // SmoothQuant's alpha for the activation steps (vae_i8_steps_f16 has
+  // the measurement); VPIPE_VAE_I8_ALPHA overrides it, for an A/B.
+  float _i8_alpha = 0.25f;
+  // VPIPE_VAE_I8_ALL_CONVS: every 3x3 the route fits, the residual
+  // stream's included -- for measuring what keeping them f16 is worth.
+  bool _i8_all_convs = false;
+  // A 3x3 at stride 1 or 2 through the int8 route, `silu` applied to its
+  // input on the way in. False with nothing encoded where the route is
+  // off or the shape does not fit it; `alloc` / `release` are the
+  // caller's pool, which lends the int8 copies.
+  using PoolAlloc = std::function<metal_compute::SharedBuffer&(std::size_t)>;
+  using PoolRelease = std::function<void(const metal_compute::SharedBuffer&)>;
+  bool conv3x3_i8_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& in, const Conv& c,
+                   const metal_compute::SharedBuffer& out, int H, int W,
+                   int stride, bool silu, const PoolAlloc& alloc,
+                   const PoolRelease& release);
+  // The mid-block attention's int8 GEMMs (set_accel); null when off.
+  std::unique_ptr<I8GemmContext> _i8;
+
   // Libraries + kernel functions (all reused from the LM path except the VAE
   // kernels im2col_hwc_3x3{,_s2} / upsample_nearest2x_hwc in llm_elementwise).
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa;
   metal_compute::ComputeFunction _fn_gemm_bias, _fn_rms, _fn_mul_sigmoid,
       _fn_residual, _fn_clamp, _fn_sdpa, _fn_im2col, _fn_im2col_s2, _fn_upsample,
+      // The wide-head scalar attention (sdpa_full_wide_f16). The ordinary
+      // one indexes its per-thread registers with ceil(D/32) against a
+      // fixed 16, so it cannot carry a head dim past 512 -- and it
+      // OVERFLOWS rather than failing there. Selected by width in
+      // encode_mid_attn_.
+      _fn_sdpa_wide,
       _fn_im2col_tiled, _fn_im2col_s2_tiled;
+  // AutoencoderKLQwenImage21's parameter-free residual shortcuts. Loaded
+  // best-effort and only USED when cfg.is_residual, so a checkpoint
+  // without them is unaffected; validated at load for the ones that need
+  // them, since an unvalidated ComputeFunction is a silent no-op and a
+  // missing shortcut is a plausible picture rather than a failure.
+  metal_compute::ComputeFunction _fn_res_dup_up, _fn_res_avg_down;
   // Matrix-core FULL flash-attention for the mid-block self-attention (D = the
   // mid channel dim). Replaces the scalar O(N^2) sdpa_full_f16 that dominates
   // decode at high res. Loaded best-effort (matrix cores only, D in {384,512});
@@ -324,21 +524,51 @@ class MetalKrea2Vae {
   metal_compute::ComputeFunction _fn_sdpa_full_wide16, _fn_sdpa_full_wide32,
       _fn_sdpa_full_wide64;
   void load_wide_attn_(int mid_d);
+  // The MATERIALIZED member (kMat): Q.K^T -> a row softmax -> P.V, the
+  // two products dense GEMMs on the matrix units (or int8, set_accel), in
+  // query bands whose scores fit kMatAttnScoreBytes. Qwen-Image-2.1's mid
+  // is 1152 wide -- past every flash kernel's head -- so before this its
+  // only member was the scalar one: 503 of a 1676 ms 1024^2 decode.
+  // The scores are stored f16, which is the trap vae-mid-attn-tune.h's
+  // correctness gate is built for: unscaled they overflow it, and a
+  // positive-mean K adds one offset to a whole row (1.4e4 in the gate's
+  // probe), at which f16's steps are 8 apart and the differences between
+  // keys are gone (the gate measured it at rel-L2 1.0). So K is CENTRED
+  // over the tokens first -- exact: softmax ignores a row's constant --
+  // and carries the softmax's 1/sqrt(C), in a copy.
+  // VPIPE_VAE_NO_MAT_ATTN leaves it out.
+  metal_compute::ComputeFunction _fn_softmax_rows, _fn_transpose,
+      _fn_attn_colsum, _fn_attn_colsum_reduce, _fn_attn_center;
+  static constexpr std::size_t kMatAttnScoreBytes = 256u << 20;
+  int mat_attn_band_(std::size_t hw) const noexcept;
+  // The attention's two GEMMs, y[M,N] = x[M,K] @ w[N,K]^T: int8 at the
+  // tier where set_accel turned it on and the shape takes it, else f16.
+  // `probs`: x is the softmax's probabilities (P.V), which the accurate
+  // tier quantizes with its groups unrotated (I8GemmContext::
+  // gemm_unrotated).
+  void attn_gemm_(metal_compute::ComputeEncoder& enc,
+                  const metal_compute::SharedBuffer& x, std::size_t xe,
+                  const metal_compute::SharedBuffer& w,
+                  const metal_compute::SharedBuffer& y, std::size_t ye,
+                  int M, int N, int K, bool probs, const PoolAlloc& alloc,
+                  const PoolRelease& release);
   // The interchangeable mid-block attention kernels, picked by MEASUREMENT at
   // load rather than from supports_matrix_cores(). See vae-mid-attn-tune.h:
   // which member wins is a property of the GPU, and a query tile chosen by a
-  // sweep on one machine is not the tile the next one wants. This VAE has no
-  // materialized banded path (no gemm_t/softmax_rows/transpose here), so it
-  // never lists kMat.
+  // sweep on one machine is not the tile the next one wants. kMat is the
+  // materialized member above.
   using MidAttn = vae_mid_attn::Kind;
   MidAttn _attn_pick = MidAttn::kScalar;
-  bool mid_attn_available_(MidAttn k) const;
+  // `C` is the head width the candidate would run at: the scalar
+  // path's two forms differ only in how wide a head they can index.
+  bool mid_attn_available_(MidAttn k, int C) const;
   void encode_mid_attn_(metal_compute::ComputeEncoder& enc, MidAttn kind,
                         const metal_compute::SharedBuffer& q,
                         const metal_compute::SharedBuffer& k,
                         const metal_compute::SharedBuffer& v,
                         const metal_compute::SharedBuffer& att,
-                        std::size_t hw, int C, float scale);
+                        std::size_t hw, int C, float scale,
+                        const PoolAlloc& alloc, const PoolRelease& release);
   void autotune_mid_attn_(metal_compute::MetalCompute* mc, int C);
   // Simdgroup count the kernel of query tile `bq` was instantiated with; the
   // dispatch has to match it exactly (matmul2d's execution scope is UB
@@ -356,6 +586,7 @@ class MetalKrea2Vae {
   metal_compute::ComputeLibrary _lib_dense_mma;
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep, _fn_bias_add;
   bool _use_mma2 = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   int  _mma_min_m = 64;   // matmul2d only wins once M amortizes the 128-row tile
   // Min output cols for the matmul2d path: a tiny N (e.g. the 3-channel
   // conv_out) wastes the 128/256-wide tile, so route N < _mma_min_n to steel.

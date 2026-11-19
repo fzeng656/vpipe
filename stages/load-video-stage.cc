@@ -1,8 +1,12 @@
+#include "common/encoded-segment.h"
 #include "stages/load-video-stage.h"
 #include "common/beat-payload-intf.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include <algorithm>
+#include <chrono>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -55,14 +59,85 @@ LoadVideoStage::LoadVideoStage
   // missing because there's no graceful default.
   // Attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
-  _input_url          = attr_path("input_url", false);
+  // ONE path or an ARRAY of them, the spelling load-image, load-text and
+  // video-ref-encoder already use -- and the reason the composer's file
+  // browser offers multi-select here at all (it reads the key's declared
+  // type, not a flag of its own: anything but `string` picks several).
+  //
+  // Two or more are JOINED, in the order given, into one stream. That is
+  // what a caller wants from a video source handed several files, and it
+  // is the same join `format: "concat"` spells by hand -- so this key now
+  // covers the common case and the list file stays for the uncommon one
+  // (per-clip `inpoint`/`outpoint` trims, which a bare path cannot carry).
+  {
+    const FlexData& cfg = this->config();
+    if (cfg.is_object()) {
+      auto root = cfg.as_object();
+      if (root.contains("input_url")) {
+        FlexData u = root.at("input_url");
+        if (u.is_string()) {
+          _inputs.emplace_back(string(u.as_string("")));
+        } else if (u.is_array()) {
+          for (FlexData e : u.as_array()) {
+            if (e.is_string()) {
+              _inputs.emplace_back(string(e.as_string("")));
+            } else {
+              fail_config(fmt(
+                  "LoadVideoStage('{}'): config.input_url array entries "
+                  "must be path strings", this->id()));
+            }
+          }
+        } else {
+          fail_config(fmt(
+              "LoadVideoStage('{}'): config.input_url must be a string or "
+              "an array of strings", this->id()));
+        }
+      }
+    }
+    if (_inputs.empty()) {
+      fail_config(fmt(
+          "LoadVideoStage('{}'): config.input_url is required (a path/URL "
+          "or an array of them)", this->id()));
+    }
+    // Confine each to the session file sandbox exactly as the single
+    // path did (attr_path's core); network URLs pass through unchanged.
+    for (auto& u : _inputs) {
+      u = confine_local_(u, /*for_write=*/false);
+    }
+    for (const auto& u : _inputs) {
+      if (u.empty()) {
+        fail_config(fmt(
+            "LoadVideoStage('{}'): config.input_url contains an empty "
+            "entry", this->id()));
+      }
+    }
+    // The single-input spelling stays byte-for-byte what it was: one
+    // entry opens its own URL and never reaches the concat demuxer.
+    _input_url = _inputs.empty() ? string() : _inputs.front();
+  }
   _format             = attr_str("format");
   _enable_video       = attr_bool("enable_video");
   _enable_audio       = attr_bool("enable_audio");
   _video_stream_index = static_cast<int>(attr_int("video_stream_index"));
   _audio_stream_index = static_cast<int>(attr_int("audio_stream_index"));
   _read_timeout_ms    = static_cast<int>(attr_int("read_timeout_ms"));
+  _start_s            = attr_real("start_s");
+  _duration_s         = attr_real("duration_s");
   _open_options       = attr("options");
+
+  if (_start_s < 0.0) {
+    fail_config(fmt("LoadVideoStage('{}'): start_s must be >= 0, got {}",
+                    this->id(), _start_s));
+  }
+  if (_duration_s < 0.0) {
+    fail_config(fmt("LoadVideoStage('{}'): duration_s must be >= 0 (0 = to "
+                    "the end of the file), got {}", this->id(), _duration_s));
+  }
+  _start_us = static_cast<std::int64_t>(_start_s * 1e6);
+  _has_stop = _duration_s > 0.0;
+  _stop_us  = _has_stop
+                  ? _start_us + static_cast<std::int64_t>(_duration_s * 1e6)
+                  : 0;
 
   // Validation is deferred to launch (see Stage::fail_config).
   if (_input_url.empty()) {
@@ -90,11 +165,25 @@ LoadVideoStage::LoadVideoStage
 
 namespace {
 constexpr ConfigKey kAttrs[] = {
-  {.key = "input_url", .type = ConfigType::String, .required = true,
-   .doc = "file path or network URL (rtsp/http/...)",
+  {.key = "input_url", .type = ConfigType::Any, .required = true,
+   .doc = "file path or network URL (rtsp/http/...), or an ARRAY of them. "
+          "An array is JOINED into one stream in the order given -- the "
+          "clips play back to back, both oports run over the join, and "
+          "`start_s`/`duration_s` address the joined timeline. Pick "
+          "several files at once in the composer's file browser. Only "
+          "local files can be joined this way; a network URL belongs on "
+          "its own",
    .is_path = true, .path_filter = "video"},
   {.key = "format", .type = ConfigType::String,
-   .doc = "forced demuxer; \"\" = autodetect", .def_str = ""},
+   .doc = "forced demuxer by name, \"\" = autodetect. Joining clips does "
+          "NOT need this any more -- give `input_url` an array instead. "
+          "`concat` remains for what an array cannot say: a LIST file of "
+          "`file` / `inpoint` / `outpoint` lines, which trims each clip as "
+          "it joins it (it then needs `options: {\"safe\": \"0\"}` for "
+          "absolute paths). Setting it alongside an array is an error, not "
+          "a silent winner. A name no demuxer answers to is an error too, "
+          "not a silent fall back to probing",
+   .def_str = ""},
   {.key = "enable_video", .type = ConfigType::Bool,
    .doc = "emit video oport", .def_bool = true},
   {.key = "enable_audio", .type = ConfigType::Bool,
@@ -103,6 +192,18 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "stream to use; -1 = first video", .def_int = -1},
   {.key = "audio_stream_index", .type = ConfigType::Int,
    .doc = "stream to use; -1 = first audio", .def_int = -1},
+  {.key = "start_s", .type = ConfigType::Real,
+   .doc = "seek to this media time (seconds from the start of the file) "
+          "before reading the first packet; 0 (default) starts at the "
+          "beginning. KEYFRAME-accurate: the packets between the keyframe "
+          "and start_s are emitted, because the frames after it are "
+          "decoded from them",
+   .def_real = 0.0},
+  {.key = "duration_s", .type = ConfigType::Real,
+   .doc = "stop this many seconds past start_s; 0 (default) reads to the "
+          "end of the file. Each enabled stream stops when it passes the "
+          "end, and the run ends when both have",
+   .def_real = 0.0},
   {.key = "read_timeout_ms", .type = ConfigType::Int,
    .doc = "network read timeout ms; 0 = none", .def_int = 0},
   {.key = "options", .type = ConfigType::Object,
@@ -110,20 +211,32 @@ constexpr ConfigKey kAttrs[] = {
 };
 // Canonical oports (video first, audio second); either may be disabled
 // via config, so the live count is assigned dynamically in the ctor.
-// Each port carries a StreamParams header then FrameRef beats, so the
-// payload type is mixed (untyped). Clock groups are authoritatively
-// reported by oport_clock_group() (video 0, audio 1).
+// The payload is rtsp-capture's, so a file and a camera are the same
+// input to everything downstream. Clock groups are authoritatively
+// reported by oport_clock_group() (video 0, audio 1) -- unlike the
+// camera's single capture clock, a file's two streams advance
+// independently.
 const PortSpec kOports[] = {
-  {.name = "video", .doc = "VideoStreamParams header then video FrameRefs",
-   .type = nullptr, .clock_group = 0},
-  {.name = "audio", .doc = "AudioStreamParams header then audio FrameRefs",
-   .type = nullptr, .clock_group = 1},
+  {.name = "video", .doc = "ONE EncodedSegment per video packet, carrying "
+                           "the stream's codec_id / width / height / "
+                           "fps_num / fps_den / extradata. Wire it to "
+                           "video-to-rgb, which owns the decode",
+   .type = &typeid(EncodedSegmentPayload),
+   .tags = "video-encoder-segments", .clock_group = 0},
+  {.name = "audio", .doc = "ONE EncodedSegment per audio packet, carrying "
+                           "the stream's codec_id / sample_rate / channels "
+                           "/ extradata. Wire it to audio-to-pcm, which "
+                           "owns the decode and the resample",
+   .type = &typeid(EncodedSegmentPayload),
+   .tags = "audio-encoder-segments", .clock_group = 1},
 };
 const StageSpec kSpec = {
   .type_name = "load-video",
-  .doc       = "Source: demuxes + decodes a video file or network URL "
-               "and emits decoded video/audio frames (header + FrameRefs) "
-               "on independent per-stream clocks.",
+  .doc       = "Source: demuxes a video file or network URL and emits its "
+               "encoded video/audio packets on independent per-stream "
+               "clocks -- the file-based sibling of rtsp-capture. Feeds "
+               "video-to-rgb / audio-to-pcm, which own the decode. Given "
+               "SEVERAL files it joins them into one stream, in order.",
   .display_name = "Load Video",
   .category  = StageCategory::Visual,
   .iports    = {},
@@ -143,15 +256,55 @@ LoadVideoStage::~LoadVideoStage()
   if (_pkt) {
     _libs->avcodec().api.packet_free(&_pkt);
   }
-  if (_vctx) {
-    _libs->avcodec().api.free_context(&_vctx);
-  }
-  if (_actx) {
-    _libs->avcodec().api.free_context(&_actx);
-  }
   if (_fctx) {
     _libs->avformat().api.close_input(&_fctx);
   }
+  // A preset `pb` sets AVFMT_FLAG_CUSTOM_IO, so close_input left the
+  // AVIOContext alone -- free it here, and its CURRENT buffer first
+  // (FFmpeg may have reallocated it, so this is not the pointer we
+  // handed in).
+  if (_avio) {
+    _libs->avutil().api.freep(&_avio->buffer);
+    _libs->avformat().api.avio_context_free(&_avio);
+  }
+}
+
+int
+LoadVideoStage::concat_read_(void* opaque, std::uint8_t* buf, int size)
+{
+  auto* self = static_cast<LoadVideoStage*>(opaque);
+  if (self->_concat_pos >= self->_concat_list.size()) {
+    return AVERROR_EOF;
+  }
+  const size_t n = std::min(static_cast<size_t>(size),
+                            self->_concat_list.size()
+                              - self->_concat_pos);
+  std::memcpy(buf, self->_concat_list.data() + self->_concat_pos, n);
+  self->_concat_pos += n;
+  return static_cast<int>(n);
+}
+
+std::int64_t
+LoadVideoStage::concat_seek_(void* opaque, std::int64_t offset, int whence)
+{
+  auto* self = static_cast<LoadVideoStage*>(opaque);
+  const auto size = static_cast<std::int64_t>(self->_concat_list.size());
+  if (whence & AVSEEK_SIZE) {
+    return size;
+  }
+  std::int64_t base = 0;
+  switch (whence & ~AVSEEK_FORCE) {
+  case SEEK_SET: base = 0; break;
+  case SEEK_CUR: base = static_cast<std::int64_t>(self->_concat_pos); break;
+  case SEEK_END: base = size; break;
+  default:       return AVERROR(EINVAL);
+  }
+  const std::int64_t np = base + offset;
+  if (np < 0 || np > size) {
+    return AVERROR(EINVAL);
+  }
+  self->_concat_pos = static_cast<size_t>(np);
+  return np;
 }
 
 string
@@ -185,42 +338,218 @@ LoadVideoStage::pick_stream_(int media_type,
 }
 
 void
-LoadVideoStage::open_codec_(int stream_idx, AVCodecContext** out)
+LoadVideoStage::cache_stream_(int stream_idx, bool video)
 {
-  AVStream* s = _fctx->streams[stream_idx];
-  const AVCodec* codec =
-    _libs->avcodec().api.find_decoder(s->codecpar->codec_id);
-  if (!codec) {
-    session()->error(fmt(
-        "LoadVideoStage('{}'): no decoder for codec_id {}",
-        this->id(),
-        static_cast<int>(s->codecpar->codec_id)));
+  if (_fctx == nullptr || stream_idx < 0) { return; }
+  AVStream* st = _fctx->streams[stream_idx];
+  StreamMeta& m = video ? _vmeta : _ameta;
+  m.codec_id  = (unsigned)st->codecpar->codec_id;
+  m.time_base = st->time_base;
+  if (st->codecpar->extradata != nullptr &&
+      st->codecpar->extradata_size > 0) {
+    m.extradata.assign(
+        st->codecpar->extradata,
+        st->codecpar->extradata + st->codecpar->extradata_size);
   }
-  AVCodecContext* cctx = _libs->avcodec().api.alloc_context3(codec);
-  if (!cctx) {
-    session()->error(fmt(
-        "LoadVideoStage('{}'): avcodec_alloc_context3 failed",
-        this->id()));
+  if (video) {
+    m.width  = (unsigned)st->codecpar->width;
+    m.height = (unsigned)st->codecpar->height;
+    // THE CONTAINER'S COLOUR DESCRIPTION, carried so a decoder built
+    // from `extradata` alone is not left with only the bitstream's. An
+    // H.264 SPS may carry a VUI and when it does it wins, but a file
+    // tagged only in the `colr` box has nothing in the bitstream at all
+    // -- and reading that as untagged costs a 601-for-709 hue tilt that
+    // nothing downstream reports. See EncodedSegment.
+    m.color_range     = (int)st->codecpar->color_range;
+    m.colorspace      = (int)st->codecpar->color_space;
+    m.color_primaries = (int)st->codecpar->color_primaries;
+    m.color_trc       = (int)st->codecpar->color_trc;
+    m.video_delay     = st->codecpar->video_delay;
+    // avg_frame_rate first, r_frame_rate as the fallback, 0/0 when the
+    // container advertises neither -- the same three-way answer
+    // rtsp-capture gives, so video-to-rgb's sideband means one thing
+    // whichever source it is reading.
+    AVRational fr = st->avg_frame_rate;
+    if (fr.num <= 0 || fr.den <= 0) { fr = st->r_frame_rate; }
+    if (fr.num > 0 && fr.den > 0) {
+      m.fps_num = (unsigned)fr.num;
+      m.fps_den = (unsigned)fr.den;
+    }
+  } else {
+    m.sample_rate = (unsigned)st->codecpar->sample_rate;
+    m.channels    = (unsigned)st->codecpar->ch_layout.nb_channels;
+    // The encoder's priming, which the container knows, and the TRUE
+    // length, which it does not -- an mp4's audio duration counts the
+    // block codec's padding at both ends. A file vpipe wrote records
+    // the real count under kAudioSamplesMetaKey; see EncodedSegment.
+    m.skip_head = st->codecpar->initial_padding > 0
+                      ? (std::int64_t)st->codecpar->initial_padding
+                      : 0;
+    m.total_samples = 0;
+    {
+      const auto& avu = _libs->avutil().api;
+      for (AVDictionary* d : {st->metadata,
+                              _fctx != nullptr ? _fctx->metadata : nullptr}) {
+        if (d == nullptr) { continue; }
+        AVDictionaryEntry* e =
+            avu.dict_get(d, kAudioSamplesMetaKey, nullptr, 0);
+        if (e != nullptr && e->value != nullptr) {
+          const long long v = std::strtoll(e->value, nullptr, 10);
+          if (v > 0) { m.total_samples = (std::int64_t)v; break; }
+        }
+      }
+    }
   }
-  int rc = _libs->avcodec().api.parameters_to_context(cctx,
-                                                     s->codecpar);
-  if (rc < 0) {
-    _libs->avcodec().api.free_context(&cctx);
-    session()->error(fmt(
-        "LoadVideoStage('{}'): parameters_to_context failed: "
-        "{}", this->id(), av_err_(rc)));
-  }
-  rc = _libs->avcodec().api.open2(cctx, codec, nullptr);
-  if (rc < 0) {
-    _libs->avcodec().api.free_context(&cctx);
-    session()->error(fmt(
-        "LoadVideoStage('{}'): avcodec_open2 failed: {}",
-        this->id(), av_err_(rc)));
-  }
-  *out = cctx;
 }
 
+bool
+LoadVideoStage::advance_to_next_input_()
+{
+  // The joined timeline continues where this part ended. Both streams
+  // are considered: they do not end together, and rewinding the clock
+  // to the shorter one would overlap the next part on that port.
+  const std::int64_t end_us = std::max(_vmeta.last_us, _ameta.last_us);
+  ++_seq_index;
+  _libs->avformat().api.close_input(&_fctx);
+  _fctx = nullptr;
+  if (!open_input_()) {
+    session()->warn(fmt(
+        "LoadVideoStage('{}'): joining stopped at part {} of {}: '{}' "
+        "could not be opened", this->id(), _seq_index + 1, _inputs.size(),
+        _inputs[_seq_index]));
+    return false;
+  }
+  _seq_base_us = end_us;
+  // A fresh file restarts its own clock at zero; the per-stream cursors
+  // have to restart with it or a packet without a pts would be dated
+  // from the previous part.
+  _vmeta.last_us = 0;
+  _ameta.last_us = 0;
+  session()->info(fmt(
+      "LoadVideoStage('{}'): joined part {} of {} -- '{}' continues at "
+      "{:.3f} s", this->id(), _seq_index + 1, _inputs.size(),
+      _inputs[_seq_index], (double)_seq_base_us / 1e6));
+  return true;
+}
+
+std::unique_ptr<EncodedSegmentPayload>
+LoadVideoStage::segment_(bool video)
+{
+  StreamMeta& m = video ? _vmeta : _ameta;
+  auto seg = std::make_unique<EncodedSegmentPayload>();
+  seg->kind = video ? EncodedSegment::Kind::Video
+                    : EncodedSegment::Kind::Audio;
+  seg->path      = _input_url;
+  seg->codec_id  = m.codec_id;
+  seg->extradata = m.extradata;
+  if (video) {
+    seg->width   = m.width;
+    seg->height  = m.height;
+    seg->fps_num = m.fps_num;
+    seg->fps_den = m.fps_den;
+    seg->color_range     = m.color_range;
+    seg->colorspace      = m.colorspace;
+    seg->color_primaries = m.color_primaries;
+    seg->color_trc       = m.color_trc;
+    seg->video_delay     = m.video_delay;
+  } else {
+    seg->sample_rate = m.sample_rate;
+    seg->channels    = m.channels;
+    seg->skip_head     = m.skip_head;
+    seg->total_samples = m.total_samples;
+    seg->part_index    = (unsigned)_seq_index;
+  }
+  // The container's own answer to "can a decoder start here", which is
+  // the only one a non-H.264 codec has -- nothing in an FFV1 packet
+  // says it. Audio ignores it.
+  seg->key_frame = (_pkt->flags & AV_PKT_FLAG_KEY) != 0;
+  seg->data.assign(_pkt->data, _pkt->data + _pkt->size);
+
+  const AVRational us = {1, 1000000};
+  std::int64_t t = m.last_us;
+  if (_pkt->pts != AV_NOPTS_VALUE) {
+    t = _libs->avutil().api.rescale_q(_pkt->pts, m.time_base, us);
+  }
+  std::int64_t d = 0;
+  if (_pkt->duration > 0) {
+    d = _libs->avutil().api.rescale_q(_pkt->duration, m.time_base, us);
+  }
+  m.last_us = t + d;
+  // `t` is this PART's own clock; the beat carries the joined one.
+  const std::int64_t jt = t + _seq_base_us;
+  seg->duration_us = d;
+  seg->start_utc =
+      std::chrono::system_clock::time_point(std::chrono::microseconds(jt));
+  seg->end_utc =
+      std::chrono::system_clock::time_point(
+          std::chrono::microseconds(jt + d));
+  return seg;
+}
+
+// EVERY JOINED INPUT MUST DECODE THE SAME WAY, and nothing downstream
+// can cope if they do not: a decoder is opened once, from the FIRST
+// segment's parameters, and packets from a segment that disagrees are
+// rejected one by one. The symptom is silent and asymmetric -- the
+// stream that changed simply stops after the first file, while the
+// other one plays to the end -- so it reads as "the second clip has no
+// sound" rather than as a mismatch. Measured on an ALAC part joined to
+// an AAC one: 13.9 s of video against 10.2 s of audio and a WARN per
+// packet.
+//
+// The concat demuxer will not tell us: it presents ONE stream set, the
+// first file's. So each input is opened here and compared before any of
+// them is read.
 void
+LoadVideoStage::check_inputs_agree_()
+{
+  if (_inputs.size() < 2) { return; }
+  struct Sig { int vid = -1, aud = -1, rate = 0, ch = 0; };
+  Sig first;
+  for (std::size_t i = 0; i < _inputs.size(); ++i) {
+    AVFormatContext* f = nullptr;
+    if (_libs->avformat().api.open_input(&f, _inputs[i].c_str(),
+                                         nullptr, nullptr) < 0) {
+      continue;    // the join itself will fail on it, with a better message
+    }
+    if (_libs->avformat().api.find_stream_info(f, nullptr) < 0) {
+      _libs->avformat().api.close_input(&f);
+      continue;
+    }
+    Sig sig;
+    for (unsigned k = 0; k < f->nb_streams; ++k) {
+      const AVCodecParameters* cp = f->streams[k]->codecpar;
+      if (cp->codec_type == AVMEDIA_TYPE_VIDEO && sig.vid < 0) {
+        sig.vid = (int)cp->codec_id;
+      } else if (cp->codec_type == AVMEDIA_TYPE_AUDIO && sig.aud < 0) {
+        sig.aud  = (int)cp->codec_id;
+        sig.rate = cp->sample_rate;
+        sig.ch   = cp->ch_layout.nb_channels;
+      }
+    }
+    _libs->avformat().api.close_input(&f);
+    if (i == 0) { first = sig; continue; }
+    auto name = [&](int id) {
+      const AVCodec* c = id < 0 ? nullptr
+          : _libs->avcodec().api.find_decoder((AVCodecID)id);
+      return c && c->name ? c->name : "none";
+    };
+    if (sig.vid != first.vid || sig.aud != first.aud
+        || sig.rate != first.rate || sig.ch != first.ch) {
+      session()->error(fmt(
+          "LoadVideoStage('{}'): the joined inputs do not agree on how "
+          "they decode, so everything after the first would be dropped. "
+          "'{}' is video {} / audio {} at {} Hz x{}, but '{}' is video "
+          "{} / audio {} at {} Hz x{}. Re-encode them to one format "
+          "before joining", this->id(),
+          _inputs.front(), name(first.vid), name(first.aud), first.rate,
+          first.ch, _inputs[i], name(sig.vid), name(sig.aud), sig.rate,
+          sig.ch));
+      return;
+    }
+  }
+}
+
+bool
 LoadVideoStage::open_input_()
 {
   AVDictionary* opts = nullptr;
@@ -232,17 +561,52 @@ LoadVideoStage::open_input_()
   }
 
   AVFormatContext* fctx = nullptr;
-  // Forced input format support is intentionally minimal here: we
-  // ignore _format unless explicitly extended later. Demuxer
-  // autodetection covers all the formats the curated symbol set
-  // exercises in practice.
-  int rc = _libs->avformat().api.open_input(&fctx, _input_url.c_str(),
-                                            nullptr, &opts);
+  // A FORCED demuxer, when `format` names one. Autodetection covers every
+  // ordinary file, and there is one family it cannot cover at all: a
+  // demuxer whose input is a LIST rather than media. `format: "concat"`
+  // over a text file of `file` / `outpoint` lines is how a graph joins
+  // clips without a stage that re-encodes them one by one -- and probing
+  // decides that same file is ANSI art (a 640x400 `tty` stream), because
+  // that is what a text file looks like to a prober. So the key has to
+  // reach the open, and an unknown name is a clean failure here rather
+  // than a mystery stream later.
+  const AVInputFormat* forced = nullptr;
+  if (!_format.empty()) {
+    forced = _libs->avformat().api.find_input_format(_format.c_str());
+    if (forced == nullptr) {
+      session()->error(fmt(
+          "LoadVideoStage('{}'): no demuxer named '{}'; leaving the format "
+          "to autodetection", this->id(), _format));
+    }
+  }
+
+  int rc = 0;
+  if (_inputs.size() > 1) {
+    // SEVERAL inputs are opened ONE AT A TIME rather than handed to the
+    // concat demuxer. The demuxer would present them as a single
+    // flattened stream, and a block codec's padding is then only
+    // visible for the first file -- every interior seam keeps its
+    // encoder priming, which is audible as a gap at every join. Opening
+    // each part in turn keeps its own gapless metadata; `_seq_base_us`
+    // carries the joined timeline across the boundary.
+    if (forced != nullptr) {
+      session()->error(fmt(
+          "LoadVideoStage('{}'): `format: \"{}\"` cannot be combined with "
+          "an array of inputs -- an array IS the join. Give one path to "
+          "force a demuxer, or drop `format`", this->id(), _format));
+    }
+    _input_url = _inputs[_seq_index];
+  }
+  {
+    rc = _libs->avformat().api.open_input(&fctx, _input_url.c_str(),
+                                          forced, &opts);
+  }
   _libs->avutil().api.dict_free(&opts);
   if (rc < 0) {
     session()->error(fmt(
-        "LoadVideoStage('{}'): avformat_open_input('{}') "
-        "failed: {}", this->id(), _input_url, av_err_(rc)));
+        "LoadVideoStage('{}'): avformat_open_input({}) "
+        "failed: {}", this->id(), input_doc_(), av_err_(rc)));
+    return false;
   }
   _fctx = fctx;
 
@@ -251,6 +615,7 @@ LoadVideoStage::open_input_()
     session()->error(fmt(
         "LoadVideoStage('{}'): find_stream_info failed: {}",
         this->id(), av_err_(rc)));
+    return false;
   }
 
   if (_video_port >= 0) {
@@ -258,11 +623,11 @@ LoadVideoStage::open_input_()
                                  _video_stream_index);
     if (_v_stream_idx < 0) {
       session()->warn(fmt(
-        "LoadVideoStage('{}'): no video stream in '{}'; "
+        "LoadVideoStage('{}'): no video stream in {}; "
         "video oport will be closed immediately",
-        this->id(), _input_url));
+        this->id(), input_doc_()));
     } else {
-      open_codec_(_v_stream_idx, &_vctx);
+      cache_stream_(_v_stream_idx, /*video=*/true);
     }
   }
   if (_audio_port >= 0) {
@@ -270,95 +635,109 @@ LoadVideoStage::open_input_()
                                  _audio_stream_index);
     if (_a_stream_idx < 0) {
       session()->warn(fmt(
-        "LoadVideoStage('{}'): no audio stream in '{}'; "
+        "LoadVideoStage('{}'): no audio stream in {}; "
         "audio oport will be closed immediately",
-        this->id(), _input_url));
+        this->id(), input_doc_()));
     } else {
-      open_codec_(_a_stream_idx, &_actx);
+      cache_stream_(_a_stream_idx, /*video=*/false);
     }
   }
 
-  _pkt = _libs->avcodec().api.packet_alloc();
-  if (!_pkt) {
-    session()->error(fmt(
-        "LoadVideoStage('{}'): av_packet_alloc failed",
-        this->id()));
-  }
-}
-
-VideoStreamParams
-LoadVideoStage::make_video_params_() const noexcept
-{
-  VideoStreamParams p;
-  if (_v_stream_idx < 0) {
-    return p;
-  }
-  AVStream* s = _fctx->streams[_v_stream_idx];
-  p.width      = s->codecpar->width;
-  p.height     = s->codecpar->height;
-  p.pix_fmt    = s->codecpar->format;
-  p.time_base  = s->time_base;
-  p.frame_rate = s->avg_frame_rate;
-  return p;
-}
-
-AudioStreamParams
-LoadVideoStage::make_audio_params_() const noexcept
-{
-  AudioStreamParams p;
-  if (_a_stream_idx < 0) {
-    return p;
-  }
-  AVStream* s = _fctx->streams[_a_stream_idx];
-  p.sample_rate = s->codecpar->sample_rate;
-  p.sample_fmt  = s->codecpar->format;
-  // For AV_CHANNEL_ORDER_NATIVE the layout is value-typed (a u64
-  // mask). For CUSTOM the u.map pointer aliases _fctx-owned memory;
-  // safe as long as the stage outlives the consumer's read of this
-  // header, which is true for every sensible pipeline shape.
-  p.ch_layout   = s->codecpar->ch_layout;
-  p.time_base   = s->time_base;
-  return p;
-}
-
-Job
-LoadVideoStage::drain_codec_(RuntimeContext& ctx,
-                                    AVCodecContext* cctx,
-                                    unsigned        port,
-                                    AVPacket*       pkt)
-{
-  int rc = _libs->avcodec().api.send_packet(cctx, pkt);
-  if (rc < 0 && rc != AVERROR(EAGAIN) && rc != AVERROR_EOF) {
-    session()->warn(fmt(
-      "decoder('{}'): send_packet on port {}: {}",
-      this->id(), port, av_err_(rc)));
-    co_return;
-  }
-  while (true) {
-    AVFrame* f = _libs->avutil().api.frame_alloc();
-    if (!f) {
+  // Seek AFTER the streams are chosen: the target is in a stream's own
+  // time base, and it is the VIDEO stream's when there is one -- seeking
+  // on the audio stream would land between video keyframes and hand the
+  // decoder a stream that starts mid-GOP.
+  if (_start_us > 0 && (_v_stream_idx >= 0 || _a_stream_idx >= 0)) {
+    const bool on_video = _v_stream_idx >= 0;
+    const int  sidx     = on_video ? _v_stream_idx : _a_stream_idx;
+    const AVRational stb = on_video ? _vmeta.time_base : _ameta.time_base;
+    const AVRational us  = {1, 1000000};
+    const std::int64_t ts =
+        _libs->avutil().api.rescale_q(_start_us, us, stb);
+    const int srr = _libs->avformat().api.seek_frame(_fctx, sidx, ts,
+                                                     AVSEEK_FLAG_BACKWARD);
+    if (srr < 0) {
+      // Not fatal: a stream with no index refuses the seek, and reading
+      // from the start still produces the right WINDOW -- `duration_s`
+      // still ends it, and only the work to reach it is wasted.
       session()->warn(fmt(
-        "decoder('{}'): frame_alloc returned null", this->id()));
-      co_return;
+          "LoadVideoStage('{}'): seek to {:.3f}s failed ({}); reading from "
+          "the start instead", this->id(), _start_s, av_err_(srr)));
     }
-    rc = _libs->avcodec().api.receive_frame(cctx, f);
-    if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
-      _libs->avutil().api.frame_free(&f);
-      break;
-    }
-    if (rc < 0) {
-      _libs->avutil().api.frame_free(&f);
-      session()->warn(fmt(
-        "decoder('{}'): receive_frame on port {}: {}",
-        this->id(), port, av_err_(rc)));
-      break;
-    }
-    auto sp = FrameRef(f, [api = &_libs->avutil().api](AVFrame* x) {
-      api->frame_free(&x);
-    });
-    co_await ctx.write(port,
-        make_payload<FrameRefPayload>(std::move(sp)));
   }
+  _vmeta.last_us = _start_us;
+  _ameta.last_us = _start_us;
+  if (_start_us > 0 || _has_stop) {
+    session()->info(fmt("LoadVideoStage('{}'): {}{}", this->id(),
+                        input_doc_(), window_doc_()));
+  }
+
+  if (_pkt == nullptr) {
+    // One packet for the whole run: re-opening for the next joined part
+    // must not leak the previous one.
+    _pkt = _libs->avcodec().api.packet_alloc();
+    if (!_pkt) {
+      session()->error(fmt(
+          "LoadVideoStage('{}'): av_packet_alloc failed",
+          this->id()));
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string
+LoadVideoStage::input_doc_() const
+{
+  if (_inputs.size() <= 1) {
+    return "'" + _input_url + "'";
+  }
+  return fmt("{} inputs joined, '{}' … '{}'", _inputs.size(),
+             _inputs.front(), _inputs.back())();
+}
+
+std::string
+LoadVideoStage::window_doc_() const
+{
+  if (_start_us <= 0 && !_has_stop) { return std::string(); }
+  if (!_has_stop) {
+    return fmt(", from {:.3f}s to the end", _start_s)();
+  }
+  return fmt(", window [{:.3f}s, {:.3f}s)", _start_s,
+             _start_s + _duration_s)();
+}
+
+bool
+LoadVideoStage::all_past_end_() const noexcept
+{
+  if (_video_port >= 0 && _v_stream_idx >= 0 && !_vmeta.past_end) {
+    return false;
+  }
+  if (_audio_port >= 0 && _a_stream_idx >= 0 && !_ameta.past_end) {
+    return false;
+  }
+  return true;
+}
+
+void
+LoadVideoStage::reset_run_state()
+{
+  if (_pkt != nullptr && _libs != nullptr) {
+    _libs->avcodec().api.packet_free(&_pkt);
+  }
+  if (_fctx != nullptr && _libs != nullptr) {
+    _libs->avformat().api.close_input(&_fctx);
+  }
+  _pkt          = nullptr;
+  _fctx         = nullptr;
+  _v_stream_idx = -1;
+  _a_stream_idx = -1;
+  _vmeta        = StreamMeta{};
+  _ameta        = StreamMeta{};
+  _eof          = false;
+  _lead_in_logged = false;
+  _v_packets    = 0;
+  _a_packets    = 0;
 }
 
 Job
@@ -373,77 +752,112 @@ LoadVideoStage::initialize(RuntimeContext& ctx)
     co_return;
   }
 
-  // Emit StreamParams headers on each enabled port that actually
-  // has a matching stream in the input.
-  if (_video_port >= 0 && _v_stream_idx >= 0) {
-    co_await ctx.write(static_cast<unsigned>(_video_port),
-      make_payload<VideoStreamParamsPayload>(make_video_params_()));
-  }
-  if (_audio_port >= 0 && _a_stream_idx >= 0) {
-    co_await ctx.write(static_cast<unsigned>(_audio_port),
-      make_payload<AudioStreamParamsPayload>(make_audio_params_()));
-  }
+  // No header beat. Every field a StreamParams header used to carry --
+  // geometry, cadence, rate, channels -- rides on EVERY segment, which
+  // is what lets a consumer join a stream late and what makes this
+  // interchangeable with rtsp-capture. A header would also have to be
+  // distinguished by try_get<T> from the beats after it, and a consumer
+  // that forgot would read it as a packet.
+  co_return;
 }
 
 Job
 LoadVideoStage::process(RuntimeContext& ctx)
 {
-  if (!_fctx) {
+  if (!_fctx || !_pkt) {
     // initialize() failed earlier; nothing to do.
     ctx.signal_done();
     co_return;
   }
-  if (_eof) {
-    // No more packets to read; let the driver fall through to
-    // drain() which flushes the decoders.
-    ctx.signal_done();
-    co_return;
-  }
+  if (_eof) { ctx.signal_done(); co_return; }
 
-  int rc = _libs->avformat().api.read_frame(_fctx, _pkt);
+  const int rc = _libs->avformat().api.read_frame(_fctx, _pkt);
   if (rc == AVERROR_EOF) {
+    // The end of ONE part is not the end of the run when several inputs
+    // are being joined: carry the timeline forward and open the next.
+    if (_seq_index + 1 < _inputs.size()) {
+      if (advance_to_next_input_()) { co_return; }
+    }
     _eof = true;
+    session()->info(fmt(
+        "LoadVideoStage('{}'): end of {} after {} video + {} audio "
+        "packet(s)", this->id(), input_doc_(), _v_packets, _a_packets));
+    ctx.signal_done();
     co_return;
   }
   if (rc < 0) {
     session()->warn(fmt(
-      "decoder('{}'): read_frame: {}", this->id(), av_err_(rc)));
+      "LoadVideoStage('{}'): read_frame: {}", this->id(), av_err_(rc)));
     ctx.signal_done();
     co_return;
   }
 
-  if (_pkt->stream_index == _v_stream_idx
-      && _video_port >= 0
-      && _vctx)
-  {
-    co_await drain_codec_(ctx, _vctx,
-                          static_cast<unsigned>(_video_port), _pkt);
-  } else if (_pkt->stream_index == _a_stream_idx
-             && _audio_port >= 0
-             && _actx)
-  {
-    co_await drain_codec_(ctx, _actx,
-                          static_cast<unsigned>(_audio_port), _pkt);
+  // Which port, if any. A packet from a stream nobody asked for -- a
+  // second language, a cover image, the video track when enable_video
+  // is off -- is dropped, and the driver calls again.
+  int port = -1;
+  bool video = false;
+  if (_pkt->stream_index == _v_stream_idx && _video_port >= 0) {
+    port = _video_port;
+    video = true;
+  } else if (_pkt->stream_index == _a_stream_idx && _audio_port >= 0) {
+    port = _audio_port;
   }
-  _libs->avcodec().api.packet_unref(_pkt);
-}
+  if (port < 0 || _pkt->size <= 0) {
+    _libs->avcodec().api.packet_unref(_pkt);
+    co_return;
+  }
 
-Job
-LoadVideoStage::drain(RuntimeContext& ctx)
-{
-  // Flush each decoder once (NULL packet) so any frames buffered
-  // inside the codec are emitted downstream before the driver
-  // closes our output edges.
-  if (_vctx && _video_port >= 0) {
-    co_await drain_codec_(ctx, _vctx,
-                          static_cast<unsigned>(_video_port),
-                          nullptr);
+  // Past the end of the window? Tested per STREAM, on the packet's
+  // start: the two do not interleave evenly, so ending the run on the
+  // first stream to get there would truncate its partner. The packet
+  // straddling the end is kept whole -- this stage does not decode and
+  // so cannot cut inside one.
+  //
+  // Nothing is dropped at the START. The seek landed on the keyframe at
+  // or before `start_s` and the frames after it are decoded from the
+  // packets in between, so they are emitted; see the header.
+  StreamMeta& m = video ? _vmeta : _ameta;
+  if (_has_stop) {
+    const AVRational us = {1, 1000000};
+    std::int64_t t = m.last_us;
+    if (_pkt->pts != AV_NOPTS_VALUE) {
+      t = _libs->avutil().api.rescale_q(_pkt->pts, m.time_base, us);
+    }
+    if (t >= _stop_us) {
+      m.past_end = true;
+      _libs->avcodec().api.packet_unref(_pkt);
+      if (all_past_end_()) {
+        _eof = true;
+        session()->info(fmt(
+            "LoadVideoStage('{}'): reached {:.3f}s of {} after {} video + "
+            "{} audio packet(s)", this->id(), _start_s + _duration_s,
+            input_doc_(), _v_packets, _a_packets));
+        ctx.signal_done();
+      }
+      co_return;
+    }
   }
-  if (_actx && _audio_port >= 0) {
-    co_await drain_codec_(ctx, _actx,
-                          static_cast<unsigned>(_audio_port),
-                          nullptr);
+
+  auto seg = segment_(video);
+  if (!_lead_in_logged && _start_us > 0) {
+    _lead_in_logged = true;
+    const std::int64_t first_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            seg->start_utc.time_since_epoch()).count();
+    session()->info(fmt(
+        "LoadVideoStage('{}'): seek for start_s={:.3f}s landed at {:.3f}s "
+        "-- {:.3f}s of lead-in emitted so the decoder has its keyframe",
+        this->id(), _start_s, first_us / 1e6,
+        (_start_us - first_us) / 1e6));
   }
+  if (video) { ++_v_packets; } else { ++_a_packets; }
+  _libs->avcodec().api.packet_unref(_pkt);
+  // The payload is bound to its own local before the suspend: a
+  // temporary built inside the co_await argument has its lifetime
+  // tangled with the frame layout across the resume.
+  co_await ctx.write(static_cast<unsigned>(port), std::move(seg));
+  co_return;
 }
 
 VPIPE_REGISTER_STAGE(LoadVideoStage)

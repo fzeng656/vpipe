@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_VAE_ENCODE_STAGE_H
 #define VPIPE_STAGES_VAE_ENCODE_STAGE_H
 
+#include "apple-silicon/tensor-beat.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
@@ -12,18 +13,34 @@
 #include "stages/model-memory.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
-#include "generative-models/mage/metal-mage-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #endif
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace vpipe {
+
+// Map an `input_range` name to the (scale, offset) that take a raw F32
+// sample to the VAE's [-1, 1]: `value * scale + offset`.
+//
+// EXPOSED FOR TESTING, and it is worth a test of its own. The dtype does
+// not say what an f32 RGB beat's numbers mean, and this stage assumed
+// [-1, 1] while the tree's only f32 RGB producer (`video-to-rgb`, whose
+// `normalize` defaults ON) emits [0, 1]. The result encoded `p` where
+// `2p - 1` was meant: every latent came back at half contrast with its
+// blacks at mid grey, which still decodes to a recognisable picture --
+// so nothing failed, and a round trip that should have scored 43 dB
+// scored 8.
+//
+// False on an unknown name, which the stage turns into a config failure.
+bool vae_input_range_scale(const std::string& name, float* scale,
+                           float* offset);
 
 // VAE encode stage: the mirror of vae-decode -- it turns an RGB image into a
 // latent. Runs the Qwen-Image VAE encoder (AutoencoderKLQwenImage) on the
@@ -31,9 +48,11 @@ namespace vpipe {
 // stage's `latent` port consumes for img2img (and that vae-decode round-trips
 // back to an image).
 //
-//   iport0  TensorBeatPayload, a U8 or f32 RGB image [3, H, W] (channel-first,
-//           U8 0..255 or f32 [-1,1]) -- the format load-image / vae-decode
-//           emit. Converted to [-1,1] and encoded to the posterior mode.
+//   iport0  TensorBeatPayload, U8 or f32 RGB, channel-first. [3, H, W] is one
+//           picture; [frames, 3, H, W] is a CLIP (what temporal-stack emits),
+//           encoded in ONE call because a video VAE is causal. U8 is 0..255;
+//           an f32 beat is read per the `input_range` config, [0,1] by
+//           default. Converted to [-1,1] and encoded to the posterior mode.
 //
 //   iport1  OPTIONAL FlexDataPayload model reference (from a `model-select`
 //           source). Latched on the first beat; OVERRIDES the hf_dir config so
@@ -83,11 +102,17 @@ public:
                  FlexData                  config);
   ~VaeEncodeStage() override;
 
+  // The settled acceleration bag (i8_gemm, i8_gemm_tier, ...): what a
+  // registered family is handed and the Qwen-Image codec is set from. A
+  // test seam, as GenerateImageStage's.
+  const FlexData& accel_settings() const noexcept { return _accel; }
+
   Job initialize(RuntimeContext& ctx) override;
 
   // The VAE this stage loads. Small next to the DiT and the encoder,
   // but it is resident during a decode and nothing else declares it.
   std::vector<ResourceClaim> declare_resources() const override;
+  std::vector<ResourceClaim> decide_resources() const override;
   // See Stage::declare_memory.
   StageMemory declare_memory() const override;
 
@@ -110,7 +135,35 @@ public:
   std::uint64_t      latents_emitted() const noexcept { return _latents_emitted; }
 
 private:
+  // One picture (or clip) -> one latent; null, having said why, when it
+  // cannot be. Serves both the `image` port and each item of `images`.
+  // `release`, when given, is called once the picture's pixels are in
+  // the buffer the VAE encodes from -- `in` is not read after it.
+  std::unique_ptr<TensorBeatPayload>
+  encode_one_(const TensorBeat& in, const std::string& what,
+              const std::function<void()>& release = {});
+
+  // ---- the stage's own working set, in the plan ---------------------
+  // What it allocates to encode a picture beside the VAE's weights: the
+  // copy of the pixels the VAE encodes from, a float picture where one
+  // has to be built (a letterbox resample, a registered family's float
+  // API), and the latent. Not the encoder's own working set, which is
+  // the VAE class's. Claimed as `scratch_label_()` at a planned size --
+  // the picture is not known at launch -- and revised by every beat
+  // BEFORE it allocates.
+  std::string scratch_label_() const;
+  // The VAE's weight claims (declare_resources adds the scratch).
+  std::vector<ResourceClaim> declare_weights_() const;
+  std::size_t planned_scratch_() const;
+  void revise_scratch_(std::size_t bytes);
+  std::size_t _scratch_stated = 0;
+
   std::string _hf_dir;
+  // `vae_dir`: the VAE's WEIGHTS when they are not the model's own (a
+  // Draw Things .ckpt); the config is still the model's. Empty: none.
+  std::string _vae_weights;
+  // `_vae_weights` resolved (a registry key or a path); empty when unset.
+  std::string vae_weights_() const;
   // Optional letterbox resize target (both > 0 => enabled). Multiples of 8.
   int _target_w = 0;
   int _target_h = 0;
@@ -118,13 +171,21 @@ private:
   int _pad_r = 0;
   int _pad_g = 0;
   int _pad_b = 0;
-  std::string _family;   // "krea2" | "flux2" | "mage" | "wan"
+  std::string _family;   // "krea2" | "flux2" | "wan" | ... | a plugin's
   // Video frames the wan conditioning clip spans. Must match the
   // generate-video stage's `frames`: the conditioning latent is
   // the VAE encoding of image-then-blanks over exactly that many
   // frames, and the DiT concatenates it channel-wise onto a noise
   // latent of that shape.
   int _frames = 81;
+  // `posterior: sample` (a MiniMax-H3 clip) and its seed.
+  bool _posterior_sample = false;
+  std::uint64_t _posterior_seed = 42;
+  // How to read an F32 RGB beat's values -- see kInputRangeDoc. Held as
+  // the scale/offset that map a raw sample to the VAE's [-1, 1], so the
+  // string is parsed once at config time and never at a pixel.
+  float _f32_scale = 2.0f;
+  float _f32_offset = -1.0f;
   std::uint64_t _latents_emitted = 0;
 
   // Parse the `pad_color` config attr into _pad_r/_pad_g/_pad_b (0..255).
@@ -145,7 +206,6 @@ private:
   // (process() warns + emits nothing).
   std::unique_ptr<genai::MetalKrea2Vae> _vae;
   std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
-  std::unique_ptr<genai::MetalMageVae>  _mage_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
   // MiniMax-H3's video VAE, encoder half: a keyframe anchor for FL2VA.
   std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
@@ -169,13 +229,23 @@ private:
   // the same rule the DiT and conditioner stages use.
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   bool _unload_idle   = false;
+  bool _autotune      = true;     // kernel tuners measure (kAutotune)
+  // The pictures say they are a series (beat::kBatch in the sideband):
+  // hold the VAE until end of stream rather than per beat.
+  bool _batch         = false;
   bool _unload_resolved = false;
   bool _unloaded      = false;
   bool _quiet_reload  = false;   // reload logs at debug, not info
   void load_note_(const VpipeFormat& msg) const;
   void unload_vae_();
+  std::size_t h3_held_bytes_(const std::string& vae_dir) const;
   void reload_vae_();
 #endif
+  // The acceleration settings as a BAG, for a registered VAE family.
+  // See generative-models/shared/accel-settings.h. Every tier in it is
+  // off unless a graph asks: a codec's output is looked at directly, so
+  // an approximation here has nowhere to be absorbed.
+  FlexData _accel{};
 };
 
 }

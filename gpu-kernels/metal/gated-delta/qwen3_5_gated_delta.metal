@@ -130,12 +130,19 @@ kernel void qwen3_5_gated_delta_step_f16(
 // ~2x slower, masking any amortization. Math per dv is byte-identical to v1
 // (same accumulation + simd_sum) -> token-exact.
 //   ...buffers 0-10 as v1...   Dispatch: grid {32, Dv/NDV, Hv}, tg {32,4,1}.
-template <int NDV>
+// RING (the speculative verify's GDN ring): the state after row t goes to
+// state_out of row t -- state_out, so1, so2, so3 for t = 0..3 (T <= 4) --
+// so every intermediate state survives for a rollback by cursor, as T
+// one-row dispatches over the ring's slots leave them; read once, each row's
+// arithmetic theirs (the state round-trips f32 there).
+template <int NDV, bool RING = false>
 static inline void gdn_step_ndv_impl(
     const device VPIPE_ELT* q, const device VPIPE_ELT* k,
     const device VPIPE_ELT* v, const device float* g, const device float* beta,
     const device float* state_in, device VPIPE_ELT* y, device float* state_out,
-    int T, int Hk, int Hv, uint3 tpig, uint3 tpit, uint silid)
+    int T, int Hk, int Hv, uint3 tpig, uint3 tpit, uint silid,
+    device float* so1 = nullptr, device float* so2 = nullptr,
+    device float* so3 = nullptr)
 {
   const uint Hku = (uint)(Hk < 0 ? -Hk : Hk), Hvu = (uint)Hv;
   const uint n = tpig.z;
@@ -188,11 +195,22 @@ static inline void gdn_step_ndv_impl(
       out = simd_sum(out);
       if (silid == 0) { y_[dv_base + d] = (VPIPE_ELT)out; }
     }
+    if (RING) {
+      device float* sot =
+          t == 0 ? state_out : (t == 1 ? so1 : (t == 2 ? so2 : so3));
+      for (int d = 0; d < NDV; ++d) {
+        device float* os = sot + (n * GDN_DV + dv_base + d) * GDN_DK;
+        for (int i = 0; i < GDN_NPT; ++i) {
+          os[GDN_NPT * dk_idx + i] = state[d][i];
+        }
+      }
+    }
     q_ += Hku * GDN_DK; k_ += Hku * GDN_DK;
     v_ += Hvu * GDN_DV; y_ += Hvu * GDN_DV;
     g_ += Hvu; beta_ += Hvu;
   }
 
+  if (RING) { return; }
   for (int d = 0; d < NDV; ++d) {
     device float* os = state_out + (n * GDN_DV + dv_base + d) * GDN_DK;
     for (int i = 0; i < GDN_NPT; ++i) {
@@ -223,6 +241,29 @@ static inline void gdn_step_ndv_impl(
 GDN_STEP_NDV(qwen3_5_gated_delta_step_ndv2_f16, 2)
 GDN_STEP_NDV(qwen3_5_gated_delta_step_ndv4_f16, 4)
 GDN_STEP_NDV(qwen3_5_gated_delta_step_ndv8_f16, 8)
+
+// ndv4 over a verify's T <= 4 rows on the GDN ring: buffer 7 takes the
+// state after row 0, 11..13 after rows 1..3 (gdn_step_ndv_impl's RING).
+kernel void qwen3_5_gated_delta_step_ndv4_ring_f16(
+    const device VPIPE_ELT* q [[buffer(0)]],
+    const device VPIPE_ELT* k [[buffer(1)]],
+    const device VPIPE_ELT* v [[buffer(2)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
+    const device float* state_in [[buffer(5)]],
+    device VPIPE_ELT* y [[buffer(6)]],
+    device float* state_out [[buffer(7)]],
+    constant int& T [[buffer(8)]], constant int& Hk [[buffer(9)]],
+    constant int& Hv [[buffer(10)]],
+    device float* so1 [[buffer(11)]],
+    device float* so2 [[buffer(12)]],
+    device float* so3 [[buffer(13)]],
+    uint3 tpig [[thread_position_in_grid]],
+    uint3 tpit [[thread_position_in_threadgroup]],
+    uint silid [[thread_index_in_simdgroup]]) {
+  gdn_step_ndv_impl<4, true>(q, k, v, g, beta, state_in, y, state_out,
+                             T, Hk, Hv, tpig, tpit, silid, so1, so2, so3);
+}
 
 // Depthwise causal conv1d + SiLU for the GDN block, with the conv_state
 // concat AND the state shift folded in -- no inwin materialization, no
@@ -292,6 +333,135 @@ kernel void qwen3_5_gdn_conv1d_silu_f16(
   // New conv_state = last k-1 window rows window(n .. n+k-2). Read into
   // registers before writing (for decode n=1 the read/write indices
   // overlap, and conv_state_out may alias conv_state for in-place callers).
+  float ns[8];
+  for (int i = 0; i < k - 1; ++i) {
+    const int r = n + i;
+    ns[i] = (r < k - 1) ? (float)conv_state[(uint)r * C + c]
+                        : (float)x[(uint)(r - (k - 1)) * x_stride + c];
+  }
+  for (int i = 0; i < k - 1; ++i) {
+    conv_state_out[(uint)i * C + c] = (VPIPE_ELT)ns[i];
+  }
+}
+
+// qwen3_5_gdn_conv1d_silu_f16 over a verify's n <= 4 rows on the GDN
+// ring: the outputs as there, and the state after row t -- the last k - 1
+// window rows through it -- into conv_state_out (buffer 9) for t = 0 and
+// buffers 10..12 for t = 1..3, as n one-row calls over the ring's slots
+// leave them (the same values, the same sums).
+kernel void qwen3_5_gdn_conv1d_silu_ring_f16(
+    device VPIPE_ELT*        conv_state [[buffer(0)]],
+    const device VPIPE_ELT*  x          [[buffer(1)]],
+    const device VPIPE_ELT*  w          [[buffer(2)]],
+    device VPIPE_ELT*        out        [[buffer(3)]],
+    constant int&       n          [[buffer(4)]],
+    constant int&       C          [[buffer(5)]],
+    constant int&       k          [[buffer(6)]],
+    constant int&       x_stride   [[buffer(7)]],
+    constant int&       keyd       [[buffer(8)]],
+    device VPIPE_ELT*        cs0 [[buffer(9)]],
+    device VPIPE_ELT*        cs1 [[buffer(10)]],
+    device VPIPE_ELT*        cs2 [[buffer(11)]],
+    device VPIPE_ELT*        cs3 [[buffer(12)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)C) { return; }
+  const uint c = gid;
+  const int vald = C - 2 * keyd;
+  uint o_base, o_stride;
+  if (keyd <= 0) {
+    o_base = c; o_stride = (uint)C;
+  } else if ((int)c < keyd) {
+    o_base = c; o_stride = (uint)keyd;
+  } else if ((int)c < 2 * keyd) {
+    o_base = (uint)n * keyd + (c - keyd); o_stride = (uint)keyd;
+  } else {
+    o_base = 2u * (uint)n * keyd + (c - 2 * keyd); o_stride = (uint)vald;
+  }
+  for (int t = 0; t < n; ++t) {
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+      const int r = t + j;
+      const float v = (r < k - 1)
+          ? (float)conv_state[(uint)r * C + c]
+          : (float)x[(uint)(r - (k - 1)) * x_stride + c];
+      acc += v * (float)w[c * (uint)k + j];
+    }
+    out[o_base + (uint)t * o_stride] =
+        (VPIPE_ELT)(acc / (1.0f + metal::exp(-acc)));
+  }
+  for (int t = 0; t < n; ++t) {
+    device VPIPE_ELT* cs = t == 0 ? cs0 : (t == 1 ? cs1 : (t == 2 ? cs2 : cs3));
+    for (int i = 0; i < k - 1; ++i) {
+      const int r = t + 1 + i;
+      cs[(uint)i * C + c] =
+          (r < k - 1) ? conv_state[(uint)r * C + c]
+                      : x[(uint)(r - (k - 1)) * x_stride + c];
+    }
+  }
+}
+
+// qwen3_5_gdn_conv1d_silu_f16 for a PREFILL: a thread a (token, channel)
+// output where the kernel above walks a channel's n tokens alone (C
+// threads: 40 threadgroups at Qwen3.8-Flash-Next's 10240 channels, 1.5 ms
+// a 2048-token layer on an M5 Ultra). Each output is the same sum as
+// there (its rounding the compiler's: a build has moved its last bit);
+// the state tail is NOT written here -- qwen3_5_gdn_conv1d_tail_f16
+// writes it after, so an in-place caller's window reads stay ahead of it.
+// Buffers as above but 9. grid {C, n}.
+kernel void qwen3_5_gdn_conv1d_silu_rows_f16(
+    device VPIPE_ELT*        conv_state [[buffer(0)]],
+    const device VPIPE_ELT*  x          [[buffer(1)]],
+    const device VPIPE_ELT*  w          [[buffer(2)]],
+    device VPIPE_ELT*        out        [[buffer(3)]],
+    constant int&       n          [[buffer(4)]],
+    constant int&       C          [[buffer(5)]],
+    constant int&       k          [[buffer(6)]],
+    constant int&       x_stride   [[buffer(7)]],
+    constant int&       keyd       [[buffer(8)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= (uint)C || gid.y >= (uint)n) { return; }
+  const uint c = gid.x;
+  const int t = (int)gid.y;
+  const int vald = C - 2 * keyd;
+  uint o_base, o_stride;
+  if (keyd <= 0) {
+    o_base = c; o_stride = (uint)C;
+  } else if ((int)c < keyd) {
+    o_base = c; o_stride = (uint)keyd;
+  } else if ((int)c < 2 * keyd) {
+    o_base = (uint)n * keyd + (c - keyd); o_stride = (uint)keyd;
+  } else {
+    o_base = 2u * (uint)n * keyd + (c - 2 * keyd); o_stride = (uint)vald;
+  }
+  float acc = 0.0f;
+  for (int j = 0; j < k; ++j) {
+    const int r = t + j;
+    const float v = (r < k - 1) ? (float)conv_state[(uint)r * C + c]
+                                : (float)x[(uint)(r - (k - 1)) * x_stride + c];
+    acc += v * (float)w[c * (uint)k + j];
+  }
+  out[o_base + (uint)t * o_stride] =
+      (VPIPE_ELT)(acc / (1.0f + metal::exp(-acc)));
+}
+
+// The conv state after n tokens (the last k - 1 window rows), as the
+// kernel above it writes it: run after qwen3_5_gdn_conv1d_silu_rows_f16.
+//   0:conv_state (in) 1:x 4:n 5:C 6:k 7:x_stride 9:conv_state_out.
+// grid {C}.
+kernel void qwen3_5_gdn_conv1d_tail_f16(
+    device VPIPE_ELT*        conv_state [[buffer(0)]],
+    const device VPIPE_ELT*  x          [[buffer(1)]],
+    constant int&       n          [[buffer(4)]],
+    constant int&       C          [[buffer(5)]],
+    constant int&       k          [[buffer(6)]],
+    constant int&       x_stride   [[buffer(7)]],
+    device VPIPE_ELT*        conv_state_out [[buffer(9)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)C) { return; }
+  const uint c = gid;
   float ns[8];
   for (int i = 0; i < k - 1; ++i) {
     const int r = n + i;
@@ -415,4 +585,223 @@ kernel void qwen3_5_gdn_g_beta_f32(
   const float sp = fmax(x, 0.0f) + metal::log(1.0f + metal::exp(-fabs(x)));
   g[gid] = metal::exp(-metal::exp(A_log[hv]) * sp);
   beta[gid] = 1.0f / (1.0f + metal::exp(-(float)b[gid]));
+}
+
+// ---------------------------------------------------------------------
+// A DECODE step's and a VERIFY's GDN layer between its two projections in
+// TWO launches (it was ten: three slices of the in-projection, the conv,
+// the q and k norms, g / beta, the step, the gated norm's norm and its
+// gate). Each value is computed by the code that computed it there -- the
+// conv's sums, rms_norm_fast_f16's (a head's 128 values: its simdgroups'
+// sums those of the 256-thread kernel, whose idle simdgroups added zeros),
+// g / beta's, the ndv4 step's -- so a decode keeps its tokens and a
+// verify's rows are a decode's. n <= 8; Dk = Dv = 128; a sigmoid gate.
+
+// qwen3_5_gdn_prework_f16: threadgroup i (128 threads) -- i < 2 Hk the q
+// (then k) head i: the conv of its 128 channels over the n rows, then each
+// row's RMS (qscale / kscale); 2 Hk + j v head j's channels conved, and
+// thread t < n its row's g / beta. The in-projection's rows [n, Nf] are
+// read where they lie: qkv at 0, a at Cd + vald, b at Cd + vald + Hv.
+// Buffers 0-9 as qwen3_5_gdn_conv1d_silu_f16's (x_stride = Nf, keyd > 0).
+// grid {128 (2 Hk + Hv)}, tg {128}.
+kernel void qwen3_5_gdn_prework_f16(
+    device VPIPE_ELT*        conv_state [[buffer(0)]],
+    const device VPIPE_ELT*  x          [[buffer(1)]],
+    const device VPIPE_ELT*  w          [[buffer(2)]],
+    device VPIPE_ELT*        out        [[buffer(3)]],
+    constant int&       n          [[buffer(4)]],
+    constant int&       C          [[buffer(5)]],
+    constant int&       k          [[buffer(6)]],
+    constant int&       x_stride   [[buffer(7)]],
+    constant int&       keyd       [[buffer(8)]],
+    device VPIPE_ELT*        conv_state_out [[buffer(9)]],
+    const device VPIPE_ELT*  qscale     [[buffer(10)]],
+    const device VPIPE_ELT*  kscale     [[buffer(11)]],
+    const device float*      A_log      [[buffer(12)]],
+    const device float*      dt_bias    [[buffer(13)]],
+    device float*            g          [[buffer(14)]],
+    device float*            beta       [[buffer(15)]],
+    constant int&       Hv         [[buffer(16)]],
+    constant float&     eps        [[buffer(17)]],
+    uint tgi  [[threadgroup_position_in_grid]],
+    uint tid  [[thread_index_in_threadgroup]],
+    uint sid  [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  threadgroup float partial[8][4];
+  const int vald = C - 2 * keyd;
+  const uint c = tgi * 128u + tid;
+  const bool qk = (int)c < 2 * keyd;
+  // g / beta's inputs first (they wait on nothing).
+  const int hv = (int)tgi - 2 * keyd / 128;
+  const bool gb = !qk && (int)tid < n;
+  float av = 0.0f, bv = 0.0f;
+  if (gb) {
+    const device VPIPE_ELT* xr = x + (uint)tid * (uint)x_stride + (uint)C +
+                                 (uint)vald;
+    av = (float)xr[hv];
+    bv = (float)xr[Hv + hv];
+  }
+  uint o_base, o_stride;
+  if ((int)c < keyd) {
+    o_base = c; o_stride = (uint)keyd;
+  } else if ((int)c < 2 * keyd) {
+    o_base = (uint)n * keyd + (c - keyd); o_stride = (uint)keyd;
+  } else {
+    o_base = 2u * (uint)n * keyd + (c - 2 * keyd); o_stride = (uint)vald;
+  }
+  float cv[8];
+  for (int t = 0; t < n; ++t) {
+    float acc = 0.0f;
+    for (int j = 0; j < k; ++j) {
+      const int r = t + j;
+      const float v = (r < k - 1) ? (float)conv_state[(uint)r * C + c]
+                                  : (float)x[(uint)(r - (k - 1)) * x_stride
+                                               + c];
+      acc += v * (float)w[c * (uint)k + j];
+    }
+    const VPIPE_ELT o = (VPIPE_ELT)(acc / (1.0f + metal::exp(-acc)));
+    if (qk) {
+      cv[t] = (float)o;
+    } else {
+      out[o_base + (uint)t * o_stride] = o;
+    }
+  }
+  float ns[8];
+  for (int i = 0; i < k - 1; ++i) {
+    const int r = n + i;
+    ns[i] = (r < k - 1) ? (float)conv_state[(uint)r * C + c]
+                        : (float)x[(uint)(r - (k - 1)) * x_stride + c];
+  }
+  for (int i = 0; i < k - 1; ++i) {
+    conv_state_out[(uint)i * C + c] = (VPIPE_ELT)ns[i];
+  }
+  if (gb) {
+    const uint gi = tid * (uint)Hv + (uint)hv;
+    const float xx = av + dt_bias[hv];
+    const float sp = fmax(xx, 0.0f) + metal::log(1.0f + metal::exp(-fabs(xx)));
+    g[gi] = metal::exp(-metal::exp(A_log[hv]) * sp);
+    beta[gi] = 1.0f / (1.0f + metal::exp(-bv));
+  }
+  if (!qk) { return; }
+  const float wv = (float)(((int)c < keyd ? qscale : kscale)[tid]);
+  for (int t = 0; t < n; ++t) {
+    const float s = simd_sum(cv[t] * cv[t]);
+    if (lane == 0) { partial[t][sid] = s; }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int t = 0; t < n; ++t) {
+    float p = lane < 4 ? partial[t][lane] : 0.0f;
+    p = simd_sum(p);
+    const float inv = rsqrt(p / 128.0f + eps);
+    out[o_base + (uint)t * o_stride] = (VPIPE_ELT)(cv[t] * inv * wv);
+  }
+}
+
+// qwen3_5_gdn_step_norm_gate_f16: threadgroup hv (32 x 32 threads) -- the
+// ndv4 step of v head hv for the T rows (thread (x, y) the dk lane x of
+// dv y * 4 ..), its outputs kept in threadgroup memory, then row t's 128
+// by simdgroups 4 t .. 4 t + 3: RMS (gnorm) and the sigmoid gate of z
+// (read where the in-projection left it: at Cd of each row's Nf).
+// Buffers 0-10 as the step's (y unused); T <= 8. grid {32, 32, Hv}, tg
+// {32, 32, 1}.
+kernel void qwen3_5_gdn_step_norm_gate_f16(
+    const device VPIPE_ELT* q [[buffer(0)]],
+    const device VPIPE_ELT* k [[buffer(1)]],
+    const device VPIPE_ELT* v [[buffer(2)]],
+    const device float* g [[buffer(3)]],
+    const device float* beta [[buffer(4)]],
+    const device float* state_in [[buffer(5)]],
+    device float* state_out [[buffer(7)]],
+    constant int& T [[buffer(8)]], constant int& Hk [[buffer(9)]],
+    constant int& Hv [[buffer(10)]],
+    const device VPIPE_ELT* gnorm [[buffer(11)]],   // [Dv]
+    const device VPIPE_ELT* zx    [[buffer(12)]],   // the in-proj rows
+    constant int& Nf [[buffer(13)]],
+    constant int& Cd [[buffer(14)]],
+    constant float& eps [[buffer(15)]],
+    device VPIPE_ELT* out [[buffer(16)]],           // [T, Hv * Dv]
+    uint3 tpig [[thread_position_in_grid]],
+    uint3 tpit [[thread_position_in_threadgroup]],
+    uint silid [[thread_index_in_simdgroup]],
+    uint sid [[simdgroup_index_in_threadgroup]])
+{
+  constexpr int NDV = 4;
+  threadgroup VPIPE_ELT ty[8][GDN_DV];
+  threadgroup float partial[8][4];
+  const uint Hku = (uint)(Hk < 0 ? -Hk : Hk), Hvu = (uint)Hv;
+  const uint hv_idx = tpig.z;
+  const uint hk_idx =
+      (Hk < 0) ? (hv_idx % Hku) : (hv_idx / (Hvu / Hku));
+  const uint Tu = (uint)T;
+  const uint tid = tpit.y * 32u + tpit.x;
+  // This thread's z and gate norm weight first (they wait on nothing).
+  const int row = (int)tid / 128, dv = (int)tid % 128;
+  const bool tail = row < T;
+  const float zv = tail ? (float)zx[(uint)row * (uint)Nf + (uint)Cd +
+                                    hv_idx * GDN_DV + (uint)dv]
+                        : 0.0f;
+  const float nwv = (float)gnorm[dv];
+
+  const device VPIPE_ELT* q_ = q + hk_idx * GDN_DK;
+  const device VPIPE_ELT* k_ = k + hk_idx * GDN_DK;
+  const device VPIPE_ELT* v_ = v + hv_idx * GDN_DV;
+  const uint dk_idx = tpit.x;
+  const uint dv_base = tpit.y * (uint)NDV;
+  float state[NDV][GDN_NPT];
+  for (int d = 0; d < NDV; ++d) {
+    const device float* is =
+        state_in + (hv_idx * GDN_DV + dv_base + d) * GDN_DK;
+    for (int i = 0; i < GDN_NPT; ++i) {
+      state[d][i] = is[GDN_NPT * dk_idx + i];
+    }
+  }
+  const device float* g_ = g;
+  const device float* beta_ = beta;
+  for (uint t = 0; t < Tu; ++t) {
+    const float g_t = g_[hv_idx];
+    const float beta_t = beta_[hv_idx];
+    float kreg[GDN_NPT], qreg[GDN_NPT];
+    for (int i = 0; i < GDN_NPT; ++i) {
+      kreg[i] = (float)k_[GDN_NPT * dk_idx + i];
+      qreg[i] = (float)q_[GDN_NPT * dk_idx + i];
+    }
+    for (int d = 0; d < NDV; ++d) {
+      float kv_mem = 0.0f;
+      for (int i = 0; i < GDN_NPT; ++i) {
+        state[d][i] = state[d][i] * g_t;
+        kv_mem += state[d][i] * kreg[i];
+      }
+      kv_mem = simd_sum(kv_mem);
+      const float delta = ((float)v_[dv_base + d] - kv_mem) * beta_t;
+      float o = 0.0f;
+      for (int i = 0; i < GDN_NPT; ++i) {
+        state[d][i] = state[d][i] + kreg[i] * delta;
+        o += state[d][i] * qreg[i];
+      }
+      o = simd_sum(o);
+      if (silid == 0) { ty[t][dv_base + d] = (VPIPE_ELT)o; }
+    }
+    q_ += Hku * GDN_DK; k_ += Hku * GDN_DK;
+    v_ += Hvu * GDN_DV;
+    g_ += Hvu; beta_ += Hvu;
+  }
+  for (int d = 0; d < NDV; ++d) {
+    device float* os = state_out + (hv_idx * GDN_DV + dv_base + d) * GDN_DK;
+    for (int i = 0; i < GDN_NPT; ++i) {
+      os[GDN_NPT * dk_idx + i] = state[d][i];
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float yv = tail ? (float)ty[row][dv] : 0.0f;
+  const float s = simd_sum(yv * yv);
+  if (tail && silid == 0) { partial[row][sid % 4] = s; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (!tail) { return; }
+  float p = silid < 4 ? partial[row][silid] : 0.0f;
+  p = simd_sum(p);
+  const float inv = rsqrt(p / (float)GDN_DV + eps);
+  const VPIPE_ELT nv = (VPIPE_ELT)(yv * inv * nwv);
+  out[(uint)row * Hvu * GDN_DV + hv_idx * GDN_DV + (uint)dv] =
+      (VPIPE_ELT)((float)nv * (1.0f / (1.0f + metal::exp(-zv))));
 }

@@ -3,6 +3,7 @@
 
 #include "generative-models/context-manager.h"
 #include "generative-models/model-loader.h"
+#include "generative-models/speculative-decode.h"
 #include "generative-models/token-muxer.h"
 #include "generative-models/tokenizer.h"
 
@@ -11,8 +12,14 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class MlxRuntime;
@@ -28,6 +35,9 @@ class LlamaModelExec;
 class MetalAudioEncoder;
 class MetalGemma4AudioEncoder;
 class MetalGemma4VisionEncoder;
+class MetalPixtralVisionEncoder;
+class MetalDeepseekV41Vision;
+class MetalLfm3VisionEncoder;
 class Gemma4UnifiedEmbedder;
 class MetalQwenVisionEncoder;
 class TokenMuxer;
@@ -54,11 +64,15 @@ enum class ComputeDtype { F16, BF16, F32 };
 // (the per-layer pass). Text input takes the fast path; the muxer
 // is wired for image-token mixing once a vision encoder lands.
 //
-// Thread safety: prefill / next_token / branch / make_context are
-// internally serialised on a single mutex. MLX is single-stream
-// per device, so this matches the underlying compute reality; the
-// future batch-decode path will relax the serialisation.
+// Thread safety: the forward calls (prefill / next_token / branch /
+// make_context and the decode loops) take no lock -- the metal backends
+// run their GPU work inline on the caller's thread -- and every load of
+// one spec shares ONE instance (GenerativeModelManager::load, a model
+// kept warm), so its users must not drive it at the same time. The
+// int8-prefill setters below are serialised among themselves, not
+// against a forward.
 class LoadedLanguageModel {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   ~LoadedLanguageModel();
 
@@ -88,6 +102,17 @@ public:
                       MlxRuntime*                runtime,
                       const SessionContextIntf*  session,
                       const std::string&         model_dir = {});
+  // The same with a separate MTP drafter's directory (LoadSpec::extra
+  // load_spec::kMtpDir).
+  LoadedLanguageModel(LoadedWeights              weights,
+                      std::unique_ptr<Tokenizer> tokenizer,
+                      ComputeDtype               compute_dtype,
+                      int                        page_tokens,
+                      std::uint32_t              max_pages,
+                      MlxRuntime*                runtime,
+                      const SessionContextIntf*  session,
+                      const std::string&         model_dir,
+                      const std::string&         mtp_dir);
 
   // Built successfully? On any internal failure (missing weight,
   // model-spec mismatch with the ContextManager, etc.) the
@@ -103,6 +128,19 @@ public:
   // Grows with the conversation, unlike the weights, so it is reported
   // separately -- see GenerativeModelManager::resident_kv_bytes().
   std::size_t kv_bytes() const;
+  // Bytes its runs hold beside the weights and the K/V above: the
+  // forward's scratch, grown to the largest piece a turn needed and kept,
+  // its rotary tables, the last logits. 0 where the exec cannot say
+  // (DeepSeek-V4.1 can). Host-only: NOT exported, as
+  // metal_deepseek_v41_vision.
+  __attribute__((visibility("hidden"))) std::size_t
+  run_state_bytes() const;
+  // Bytes it holds that its load did not allocate: filled after the
+  // constructor returns, on a thread of its own (Qwen3.8-Flash-Next's
+  // n-gram table under load_spec::kNgramResident), so a scope counting
+  // the load's allocations misses them. Host-only, as run_state_bytes.
+  __attribute__((visibility("hidden"))) std::size_t
+  filled_after_load_bytes() const;
 
   const ModelConfig& config()    const noexcept;
   const Tokenizer&   tokenizer() const noexcept;
@@ -148,6 +186,26 @@ public:
   // backend when a gemma4uv/gemma4ua mmproj was found. encode_image returns
   // host-f32 rows; spliced via the same owns_kv metal multimodal path.
   Gemma4UnifiedEmbedder* gemma4_unified_embedder() const noexcept;
+
+  // Metal-compute Pixtral tower + Mistral3 projector (Ministral-3).
+  // Non-null only on the metal backend for a Mistral3 checkpoint with a
+  // vision config. encode() returns native-f16 rows that INCLUDE the
+  // image's [IMG_BREAK] / [IMG_END] rows, so every [IMG] placeholder the
+  // chat template emits takes the next row; spliced with 1-D RoPE (this
+  // family has no mROPE: prefill_multimodal_metal ignores the grids).
+  MetalPixtralVisionEncoder* metal_pixtral_vision_encoder() const noexcept;
+  // DeepSeek-V4.1's ViT + aligner (an image's whole span of rows), or
+  // null for any other model or when its tower did not load. Host-only:
+  // NOT exported (the tower's type is not in the SDK, so no plugin can use
+  // it, and an exported method would be a new symbol a plugin built
+  // against this header fails to load without on an older ABI-8 host).
+  __attribute__((visibility("hidden"))) MetalDeepseekV41Vision*
+  metal_deepseek_v41_vision() const noexcept;
+  // LFM3-VL's vision tower + projector, or null for any other model or
+  // when it did not load: native-f16 rows, one an <|image|> placeholder,
+  // 1-D positions. Host-only (hidden), as metal_deepseek_v41_vision.
+  __attribute__((visibility("hidden"))) MetalLfm3VisionEncoder*
+  metal_lfm3_vision() const noexcept;
 
   // Host-float logits ([vocab]) of the last position predicted by the
   // metal backend's prefill/next_token. The MLX-free sampling source
@@ -254,6 +312,24 @@ public:
 
   // Mint a fresh root context.
   Context make_context();
+
+  // ---- a context SPILLED to disk and read back ------------------------
+  //
+  // What `ctx` holds -- its K/V, its recurrent state, where it stands --
+  // written to `path` with `meta` (the caller's own bytes: what the
+  // context covers), so a conversation outlives this model being
+  // unloaded: read back by the same checkpoint it is the context it was,
+  // and the next turn prefills only what is new. False (with *err) where
+  // the backend cannot (the metal Qwen family can) or the write fails;
+  // nothing is left at `path` then. Written whole, then renamed in.
+  bool save_context(const Context& ctx, const std::string& path,
+                    std::string_view meta, std::string* err = nullptr);
+  // A context read back from `path`. The file names the model that made
+  // it -- its architecture, its checkpoint and that checkpoint's files --
+  // and the layout of its K/V; another's is refused. Its meta into
+  // *meta. Invalid (with *err) when it cannot be.
+  Context load_context(const std::string& path, std::string* meta,
+                       std::string* err = nullptr);
 
   // Branch a parent context into an independent sibling. The
   // parent's partial tail page (if any) is frozen and shared by
@@ -444,13 +520,28 @@ public:
   std::span<const std::int32_t> base_suppressed_tokens() const noexcept;
 
   // Dynamic-int8 accelerated PREFILL GEMMs ("accelerated mode"): the big
-  // prompt-time matmuls run on the matrix units' int8 pipe (~2x the f16
-  // rate) with on-the-fly per-(row, 512-group) activation quantization.
-  // LOSSY (int8, ~1e-2 rel per GEMM -- prefill is NOT token-exact with
-  // this on) and strictly opt-in; decode is untouched. No-op on backends
-  // without the route (only the metal Qwen exec implements it today).
+  // prompt-time matmuls run on the matrix units' int8 pipe with the
+  // activations quantized on the fly, from 1024 rows, on matrix-core
+  // GPUs. LOSSY (int8, ~1e-2 rel per GEMM -- prefill is NOT token-exact
+  // with this on) and strictly opt-in; decode is untouched. No-op on
+  // backends without the route (the metal Qwen and LFM3 execs have it).
   // Env VPIPE_I8_GEMM=0|1 overrides. Set after load, before prefill.
+  //
+  // The flag is the MODEL's, and the model is shared (the note above): a
+  // stage states ITS preference with request_i8_prefill; this sets the
+  // flag outright, whoever else holds the model.
   void set_i8_prefill(bool on);
+  // A stage's preference in launch `epoch` (GenerativeModelManager::
+  // launch_epoch()). The first request of a launch sets the flag; later
+  // ones of the same launch only turn it on -- on if ANY stage of the
+  // launch asked, whatever order their initialize() ran in -- and a model
+  // kept warm comes to a launch that does not ask in 16 bits again. A
+  // request that leaves the flag as it was rebuilds nothing. Host-only.
+  __attribute__((visibility("hidden"))) void
+  request_i8_prefill(bool on, std::uint64_t epoch);
+  // Where the flag stands -- what was asked, whether or not the backend
+  // runs it (it needs matrix cores). Host-only (tests).
+  __attribute__((visibility("hidden"))) bool i8_prefill_requested() const;
 
   // Speculative decode via the MTP head: token-exact vs the serial decode, but
   // the drafter lets the verifier accept multiple tokens per forward.
@@ -460,9 +551,10 @@ public:
   // greedy (argmax) sampler reproduces serial greedy decode; a non-greedy
   // sampler reproduces serial sampling (speculative sampling -- the committed
   // tokens are exactly autoregressive samples from the main model; the drafter
-  // only changes acceptance rate). The verify does NOT apply repetition /
-  // presence penalties, so a caller that wants those must pass a penalty-free
-  // sampler (else fall back to the normal loop). `is_stop` ends the decode at
+  // only changes acceptance rate). Repetition / presence penalties apply as in
+  // pdecode_begin: `prompt` is the seen-set's start (pdecode_begin's
+  // `prompt`; first_token is added), so a penalised sampler stays token-exact
+  // with the pdecode loop given the same prompt. `is_stop` ends the decode at
   // the first accepted stop token WITHOUT keeping it (its speculative KV is
   // rolled back so the context ends cleanly). `on_tokens(span)` is invoked per
   // spec round with that round's newly accepted (non-stop) tokens, for
@@ -475,7 +567,49 @@ public:
       const SamplerParams&                                      params,
       const std::function<bool(std::int32_t)>&                  is_stop,
       const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+      int* produced, bool* hit_stop, std::span<const std::int32_t> prompt);
+  // The same with no prompt: the penalty seen-set starts empty.
+  bool mtp_generate(
+      Context& ctx, std::int32_t first_token, int max_tokens,
+      const SamplerParams&                                      params,
+      const std::function<bool(std::int32_t)>&                  is_stop,
+      const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
       int* produced = nullptr, bool* hit_stop = nullptr);
+
+  // ---- A prefill's pieces as they finish (prefill-progress.h) ----------
+  // `fn(done, total)` after each piece of every prefill from now on, on
+  // the forward's thread; empty: none. False where the backend reads a
+  // prompt in one forward or cannot say (a caller then times the prefill
+  // whole). `fn` may read its caller's frame: let it go (empty) on every
+  // way out of the prefill -- the model outlives the call. Host-only
+  // (hidden), as run_state_bytes: exported, it was a new symbol a plugin
+  // built against it could not load without on an older ABI-8 host.
+  __attribute__((visibility("hidden"))) bool
+  set_prefill_progress(std::function<void(int, int)> fn);
+
+  // ---- Speculative decode, any drafter (speculative-decode.h) ----------
+  // True iff the backend can decode speculatively with a drafter it
+  // carries: an attached DFlash / DFlash 2 drafter, or an MTP head.
+  bool spec_decode_available() const;
+  // spec_decode::kDrafter* of that drafter, "" when there is none.
+  std::string spec_drafter() const;
+  // Attach a separate drafter -- a DFlash / DFlash 2 checkpoint -- held at
+  // `bits` (0 as stored, 8 or 4). "" detaches. The model manager calls
+  // this when a LoadSpec names load_spec::kDraftDir; false (with *err)
+  // when the drafter cannot draft for this model, which is then unchanged.
+  bool attach_draft_model(const std::string& dir, int bits = 8,
+                          std::string* err = nullptr);
+  // mtp_generate's contract with whichever drafter is attached (DFlash
+  // first). `block` = tokens a round verifies, 0 = the drafter's choice;
+  // `*stats` gets the rounds / drafted / accepted counters.
+  bool spec_generate(
+      Context& ctx, std::int32_t first_token, int max_tokens,
+      const SamplerParams&                                      params,
+      const std::function<bool(std::int32_t)>&                  is_stop,
+      const std::function<bool(std::span<const std::int32_t>)>& on_tokens,
+      int* produced = nullptr, bool* hit_stop = nullptr,
+      std::span<const std::int32_t> prompt = {}, int block = 0,
+      SpecDecodeResult* stats = nullptr);
 
 
   // ---- Per-stage profile (for perf comparison vs mlx-lm) ------
@@ -533,5 +667,7 @@ build_mrope_position_ids(
     int*                                     out_rope_next_position);
 
 }
+
+VPIPE_API_END
 
 #endif

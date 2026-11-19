@@ -13,7 +13,9 @@
 // VPIPE_FLUX2_GOLDEN = the golden dir (for flux2_golden.*). VPIPE_FLUX2_E2E set
 // = run the end-to-end pipeline test. Unset => the relevant tier skips.
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
+#include "residency-reserve.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -21,10 +23,14 @@
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
 #include "common/job.h"
+#include "common/perf-flops.h"
 #include "common/session.h"
 #include "generative-models/context-manager.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/i8-gemm.h"
+#include "generative-models/generative-model-manager.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/model-quantizer.h"
@@ -49,6 +55,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -190,6 +197,69 @@ add_conditioner_(Pipeline* pl, Session& sess, Stage* src, const char* root)
   auto u = std::make_unique<DiffusionConditionerStage>(
       &sess, "cond", std::vector<InEdge>{{src, 0}}, std::move(c));
   return pl->insert_stage(std::move(u));
+}
+
+// The FLUX.2 text encoder's Config, exactly as diffusion-conditioner
+// builds it (encoder_config_flux2_): sized from config.json so the 8B
+// validates as well as the 4B, backbone-only because this encoder taps
+// hidden states and never decodes.
+//
+// Hoisted so the streaming-equality test runs against the SAME encoder
+// the pipeline loads. Two copies of a forty-field config drift, and a
+// drifted copy would compare streaming against a model no stage builds.
+MetalQwenModel::Config
+flux2_encoder_config_(const std::string& edir, bool* quantized)
+{
+  namespace fs = std::filesystem;
+  MetalQwenModel::Config c;
+  c.n_layers = 36; c.hidden = 2560; c.n_heads = 32; c.n_kv_heads = 8;
+  c.head_dim = 128; c.ffn_inner = 9728; c.vocab = 151936; c.rope_theta = 1.0e6f;
+  c.rms_eps = 1e-6f; c.rotary_dim = 128; c.full_attn_interval = 1;
+  c.tie_embeddings = true; c.use_bf16 = true; c.dense = true;
+  c.zero_centered_norm = false; c.attn_output_gate = false;
+  c.backbone_only = true; c.weight_prefix = "model."; c.max_seq = 1024;
+  c.page_tokens = 256;
+  bool declared_quant = false;   // config.json carries a quantization block
+  { std::ifstream in(fs::path(edir) / "config.json");
+    if (in) {
+      FlexData fd = FlexData::from_json(in);
+      if (fd.is_object()) {
+        auto obj = fd.as_object();               // bind view to a local
+        auto geti = [&](const char* k, int cur) -> int {
+          return obj.contains(k) ? (int)obj.at(k).as_int(cur) : cur;
+        };
+        auto getf = [&](const char* k, float cur) -> float {
+          return obj.contains(k) ? (float)obj.at(k).as_real(cur) : cur;
+        };
+        // Size from config.json so the 8B (9B pipeline) encoder validates too.
+        c.n_layers   = geti("num_hidden_layers", c.n_layers);
+        c.hidden     = geti("hidden_size", c.hidden);
+        c.n_heads    = geti("num_attention_heads", c.n_heads);
+        c.n_kv_heads = geti("num_key_value_heads", c.n_kv_heads);
+        c.head_dim   = geti("head_dim",
+                            c.n_heads > 0 ? c.hidden / c.n_heads : c.head_dim);
+        c.rotary_dim = c.head_dim;
+        c.ffn_inner  = geti("intermediate_size", c.ffn_inner);
+        c.vocab      = geti("vocab_size", c.vocab);
+        c.rope_theta = getf("rope_theta", c.rope_theta);
+        c.rms_eps    = getf("rms_norm_eps", c.rms_eps);
+        if (obj.contains("tie_word_embeddings")) {
+          c.tie_embeddings = obj.at("tie_word_embeddings").as_bool(true);
+        }
+        if (obj.contains("quantization")) {
+          FlexData q = obj.at("quantization");
+          if (q.is_object()) {
+            auto qo = q.as_object();             // bind view to a local
+            if (qo.contains("bits")) {
+              const int b = (int)qo.at("bits").as_int(0);
+              if (b == 4 || b == 8) { c.quant_bits = b; declared_quant = true; }
+            }
+          }
+        }
+      }
+    } }
+  if (quantized != nullptr) { *quantized = declared_quant; }
+  return c;
 }
 
 }  // namespace
@@ -549,6 +619,286 @@ TEST(flux2_smoke, vae_decode_auto_tiles_when_short)
   EXPECT_TRUE(tiled_ok);     // and that tiling rescued it
 }
 
+// The EXACT tiled decode (decode_exact_) against the whole one. Same
+// arithmetic but for the f32 summation order inside each GroupNorm's
+// statistics, so the bar is rounding -- the windowed decode above is held
+// to 20 dB. Three plans: a budget that lets planes be kept whole as later
+// sources, a tight one that keeps little and recomputes from the mid block
+// under a 128-pixel tile cap (many tiles, every pass deep), and one with
+// room for every stage whole, which must be BIT-IDENTICAL to decode(). Each
+// asserts the plan it meant to exercise ran: a budget that fits takes the
+// whole decode and compares it to itself.
+TEST(flux2_smoke, vae_decode_exact_tiles_match_whole)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  vpipe::Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  auto vae = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+  ASSERT_TRUE(vae != nullptr);
+  if (vae == nullptr) { return; }
+
+  const int gh = 48, gw = 40;                    // 768x640, not square
+  const int C = vae->config().dit_channels();
+  SharedBuffer z = mc->make_shared_buffer((std::size_t)C * gh * gw * 2);
+  ASSERT_TRUE(!z.empty());
+  std::mt19937 rng(8642);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto* d = static_cast<_Float16*>(z.contents());
+  for (std::size_t i = 0; i < (std::size_t)C * gh * gw; ++i) {
+    d[i] = (_Float16)nd(rng);
+  }
+  const std::size_t n = (std::size_t)3 * (gh * 16) * (gw * 16);
+  auto decode = [&](std::vector<float>* out) {
+    std::string err;
+    SharedBuffer rgb = vae->decode(z, gh, gw, &err);
+    if (rgb.empty() || rgb.byte_size() < n * 2) {
+      std::printf("[flux2_smoke] decode failed: %s\n", err.c_str());
+      return;
+    }
+    out->resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)p[i]; }
+  };
+  std::vector<float> whole;
+  decode(&whole);
+  ASSERT_TRUE(!whole.empty() && !vae->last_decode().exact);
+  if (whole.empty()) { return; }
+
+  struct Arm { const char* name; int budget_mb; int tile; };
+  const int need_mb = (int)(vae->decode_peak_bytes(gh, gw) >> 20);
+  const Arm arms[] = {
+    {"keeps planes", need_mb / 3, 0},
+    {"tight, 128-px tiles", need_mb / 4, 128},
+    {"keeps nothing, 64-px tiles", need_mb / 5, 64},
+    {"room for all", 1 << 16, 0},
+  };
+  ::setenv("VPIPE_VAE_EXACT", "1", 1);
+  for (const Arm& a : arms) {
+    ::setenv("VPIPE_VAE_BUDGET_MB", std::to_string(a.budget_mb).c_str(), 1);
+    if (a.tile > 0) {
+      ::setenv("VPIPE_VAE_EXACT_TILE", std::to_string(a.tile).c_str(), 1);
+    } else {
+      ::unsetenv("VPIPE_VAE_EXACT_TILE");
+    }
+    std::vector<float> got;
+    decode(&got);
+    const MetalFlux2Vae::DecodeReport rep = vae->last_decode();
+    ASSERT_TRUE(got.size() == whole.size());
+    if (got.size() != whole.size()) { continue; }
+    double se = 0.0, mx = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double e = (double)got[i] - whole[i];
+      se += e * e;
+      mx = std::max(mx, std::fabs(e));
+    }
+    const double r = rel_l2_(got.data(), whole.data(), n);
+    const double psnr = se > 0.0 ? 10.0 * std::log10(4.0 * n / se) : 99.0;
+    std::printf("[flux2_smoke] VAE exact tiled (%s, %d MB of %d): %d whole, "
+                "%d passes, %d tiles, %d kept, %.2fx work -- rel-L2 %.3g, "
+                "max %.4g, PSNR %.1f dB\n", a.name, a.budget_mb, need_mb,
+                rep.whole_stages, rep.passes, rep.tiles, rep.kept, rep.work,
+                r, mx, psnr);
+    EXPECT_TRUE(rep.exact);
+    if (a.budget_mb >= (1 << 16)) {
+      EXPECT_TRUE(rep.passes == 0);
+      EXPECT_TRUE(se == 0.0);              // every stage whole: identical
+    } else {
+      EXPECT_TRUE(rep.passes > 0 && rep.tiles > rep.passes);
+      EXPECT_TRUE(r < 1e-3);
+    }
+  }
+  ::unsetenv("VPIPE_VAE_EXACT");
+  ::unsetenv("VPIPE_VAE_EXACT_TILE");
+  ::unsetenv("VPIPE_VAE_BUDGET_MB");
+}
+
+// INT8 AGAINST F16, ON A REAL PICTURE (MetalFlux2Vae::set_accel): the 3x3
+// convs on the hardware int8 convolution, as the Qwen-Image codec runs
+// them. VPIPE_FLUX2_VAE_IMAGE names a picture as raw f32, channel-first
+// [3, H, H] in [-1, 1] (a side a multiple of 64 * patch);
+// VPIPE_FLUX2_TEST_MODEL_PATH the checkpoint (its vae/, or the VAE). The
+// picture is encoded and decoded in f16 -- the reference -- then decoded
+// at each tier: ENGAGED first (a GPU without the kernels runs f16 and
+// passes every numeric bar), then timed (best of two after a warm one)
+// and held to the reference by PSNR, and decoded again to the same
+// bytes. The int8 ENCODE is held by the picture its latent decodes to in
+// f16. And the exact tiled decode keeps its tiles f16 under int8: only
+// its head (the mid block, seen whole) takes the route. A real picture,
+// not noise: the activations' channel statistics are what the scales are
+// made of.
+TEST(flux2_smoke, vae_int8_against_f16)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const char* img_env = std::getenv("VPIPE_FLUX2_VAE_IMAGE");
+  if (root == nullptr || *root == '\0' || img_env == nullptr ||
+      *img_env == '\0') {
+    return;
+  }
+  vpipe::Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  if (!mc->supports_matrix_cores()) {
+    std::printf("[flux2_smoke] the int8 conv needs matrix cores (an M5); "
+                "skipped\n");
+    return;
+  }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  auto m = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{},
+                               /*with_encoder=*/true);
+  ASSERT_TRUE(m != nullptr && m->has_encoder());
+  if (m == nullptr || !m->has_encoder()) { return; }
+  const std::vector<float> img = read_f32_file_(img_env);
+  int H = 1;
+  while ((std::size_t)H * H * 3 < img.size()) { ++H; }
+  const int px = 8 * m->config().patch;
+  ASSERT_TRUE(!img.empty() && (std::size_t)H * H * 3 == img.size() &&
+              H % (8 * px) == 0);
+  if (img.empty() || (std::size_t)H * H * 3 != img.size() ||
+      H % (8 * px) != 0) {
+    return;
+  }
+  const int h16 = H / px;
+  SharedBuffer ib = mc->make_shared_buffer(img.size() * 2);
+  ASSERT_TRUE(!ib.empty());
+  if (ib.empty()) { return; }
+  {
+    auto* d = static_cast<_Float16*>(ib.contents());
+    for (std::size_t i = 0; i < img.size(); ++i) { d[i] = (_Float16)img[i]; }
+  }
+  const std::size_t n = (std::size_t)3 * H * H;
+  auto to_f32 = [&](const SharedBuffer& b) {
+    std::vector<float> v;
+    if (b.empty() || b.byte_size() < n * 2) { return v; }
+    v.resize(n);
+    const auto* p = static_cast<const _Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) { v[i] = (float)p[i]; }
+    return v;
+  };
+  // PSNR over [-1, 1] (peak-to-peak 2).
+  auto psnr = [&](const std::vector<float>& a, const std::vector<float>& b) {
+    double se = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const double e = (double)a[i] - (double)b[i];
+      se += e * e;
+    }
+    return se > 0.0 ? 10.0 * std::log10(4.0 * (double)n / se) : 99.0;
+  };
+  std::string err;
+  auto timed = [&](const std::function<SharedBuffer()>& run, double* ms) {
+    SharedBuffer out = run();                     // warm
+    if (out.empty()) { return out; }
+    double best = 0.0;
+    for (int i = 0; i < 2; ++i) {
+      const auto t0 = std::chrono::steady_clock::now();
+      out = run();
+      const double t = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (out.empty()) { return out; }
+      if (best == 0.0 || t < best) { best = t; }
+    }
+    *ms = best;
+    return out;
+  };
+
+  // The f16 reference.
+  double enc16 = 0.0, ms16 = 0.0;
+  SharedBuffer lat = timed([&] { return m->encode(ib, H, H); }, &enc16);
+  ASSERT_TRUE(!lat.empty());
+  if (lat.empty()) { return; }
+  const std::vector<float> ref =
+      to_f32(timed([&] { return m->decode(lat, h16, h16, &err); }, &ms16));
+  ASSERT_TRUE(!ref.empty() && m->i8_convs() == 0);
+  if (ref.empty()) { return; }
+  std::printf("[flux2_smoke] %dx%d f16: encode %.0f ms, decode %.0f ms, "
+              "%.2f dB against the picture\n", H, H, enc16, ms16,
+              psnr(ref, img));
+
+  const char* tiers[] = {"accurate", "fast", "token", "token_plain"};
+  int per_decode[4] = {0, 0, 0, 0};
+  for (int t = 0; t < 4; ++t) {
+    m->set_accel({/*i8_gemm=*/true, /*i8_tier=*/t});
+    const int c0 = m->i8_convs();
+    SharedBuffer once = m->decode(lat, h16, h16, &err);
+    per_decode[t] = m->i8_convs() - c0;
+    double ms8 = 0.0;
+    const std::vector<float> got = to_f32(
+        timed([&] { return m->decode(lat, h16, h16, &err); }, &ms8));
+    ASSERT_TRUE(!got.empty());
+    if (got.empty()) { continue; }
+    const std::vector<float> first = to_f32(once);
+    const bool same = first.size() == got.size() &&
+                      std::memcmp(first.data(), got.data(),
+                                  got.size() * sizeof(float)) == 0;
+    const double p = psnr(got, ref);
+    std::printf("[flux2_smoke]   int8 %-11s decode %.0f ms (%.2fx), %d "
+                "convs, %.2f dB against f16, repeated %s [%s]\n", tiers[t],
+                ms8, ms16 / ms8, per_decode[t], p,
+                same ? "IDENTICAL" : "DIFFERS", m->accel_note().c_str());
+    EXPECT_TRUE(per_decode[t] > 0);
+    EXPECT_TRUE(same);
+    // Lossy by design, but a picture: an int8 route gone wrong (a scale
+    // misplaced, a channel dropped) lands far under this.
+    EXPECT_TRUE(p > 30.0);
+  }
+  // Accurate takes the resnet convs; the others the residual stream's too.
+  EXPECT_TRUE(per_decode[1] > per_decode[0]);
+  EXPECT_TRUE(per_decode[2] == per_decode[1] &&
+              per_decode[3] == per_decode[1]);
+
+  // The int8 ENCODE, decoded in f16: what an edit's reference latent
+  // loses.
+  for (int t = 0; t < 2; ++t) {
+    m->set_accel({true, t});
+    const int c0 = m->i8_convs();
+    double enc8 = 0.0;
+    SharedBuffer lat8 = timed([&] { return m->encode(ib, H, H); }, &enc8);
+    const int convs = (m->i8_convs() - c0) / 3;
+    ASSERT_TRUE(!lat8.empty());
+    if (lat8.empty()) { continue; }
+    m->set_accel({});
+    const std::vector<float> got8 = to_f32(m->decode(lat8, h16, h16, &err));
+    ASSERT_TRUE(!got8.empty());
+    if (got8.empty()) { continue; }
+    const double pe = psnr(got8, ref);
+    std::printf("[flux2_smoke]   int8 %-11s encode %.0f ms against %.0f "
+                "(%.2fx), %d convs, decoded in f16 %.2f dB against f16\n",
+                tiers[t], enc8, enc16, enc16 / enc8, convs, pe);
+    EXPECT_TRUE(convs > 0);
+    EXPECT_TRUE(pe > 30.0);
+  }
+
+  // The exact tiled decode under int8: its tiles stay f16, so only the
+  // head's resnet convs (the mid block's, at the latent's size) go int8.
+  m->set_accel({true, 0});
+  ::setenv("VPIPE_VAE_EXACT", "1", 1);
+  ::setenv("VPIPE_VAE_BUDGET_MB",
+           std::to_string((int)(m->decode_peak_bytes(h16, h16) >> 20) / 3)
+               .c_str(), 1);
+  const int c0 = m->i8_convs();
+  const std::vector<float> ex = to_f32(m->decode(lat, h16, h16, &err));
+  const int head = m->i8_convs() - c0;
+  const MetalFlux2Vae::DecodeReport rep = m->last_decode();
+  ::unsetenv("VPIPE_VAE_EXACT");
+  ::unsetenv("VPIPE_VAE_BUDGET_MB");
+  ASSERT_TRUE(!ex.empty());
+  if (ex.empty()) { return; }
+  const double pex = psnr(ex, ref);
+  std::printf("[flux2_smoke]   int8 accurate exact tiled: %d passes, %d "
+              "tiles, %d int8 convs (the head's), %.2f dB against f16\n",
+              rep.passes, rep.tiles, head, pex);
+  EXPECT_TRUE(rep.exact && rep.passes > 0);
+  EXPECT_TRUE(head == 4);      // mid_res0 and mid_res1, two convs each
+  EXPECT_TRUE(pex > 30.0);
+  m->set_accel({});
+}
+
 // The two-pass group norm must be a pure speedup: same normalization, only
 // split so both passes saturate the GPU. It is not bit-identical (the
 // partials are summed in a different order), so this is a rel-L2 bound -- if
@@ -862,6 +1212,13 @@ TEST(flux2_smoke, vae_decode_bench)
   if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
   auto m = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
   ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  // VPIPE_VAE_BENCH_I8_TIER=<0..3>: the int8 route at that tier, so its
+  // scratch is held to the booking below too.
+  if (const char* e = std::getenv("VPIPE_VAE_BENCH_I8_TIER")) {
+    m->set_accel({true, std::atoi(e)});
+    std::printf("[flux2_smoke] %s\n", m->accel_note().c_str());
+  }
   const int C = m->config().dit_channels();
   // Latent grids to bench, as {h16, w16} (image pixels / 16). Default 512
   // and 1024 square. VPIPE_VAE_DEC_HW=1024x768 benches one real, NON-SQUARE
@@ -889,6 +1246,11 @@ TEST(flux2_smoke, vae_decode_bench)
     std::string err;
     m->decode(z, h16, w16, &err);                    // warm
     double best = 1e18;
+    // The measured peak beside the estimate: live SharedBuffer bytes above
+    // what was held before the timed decodes.
+    const std::size_t live0 =
+        metal_compute::shared_buffer_memory_stats().live_bytes;
+    metal_compute::shared_buffer_reset_peak();
     for (int i = 0; i < 3; ++i) {
       const auto t0 = std::chrono::steady_clock::now();
       SharedBuffer o = m->decode(z, h16, w16, &err);
@@ -896,10 +1258,77 @@ TEST(flux2_smoke, vae_decode_bench)
           std::chrono::steady_clock::now() - t0).count();
       if (!o.empty() && ms < best) { best = ms; }
     }
-    std::printf("[flux2_smoke] decode %dhx%dw: %.1f ms (peak est %llu MB)\n",
-                h16 * 16, w16 * 16, best,
+    const std::size_t pk =
+        metal_compute::shared_buffer_memory_stats().peak_bytes;
+    std::printf("[flux2_smoke] decode %dhx%dw: %.1f ms (peak %zu MB, est %llu "
+                "MB)\n", h16 * 16, w16 * 16, best,
+                pk > live0 ? (pk - live0) >> 20 : 0,
                 (unsigned long long)(m->decode_peak_bytes(h16, w16) >> 20));
+    // The preflight must not book less than a decode takes.
+    EXPECT_TRUE(m->decode_peak_bytes(h16, w16) >=
+                (pk > live0 ? pk - live0 : 0));
   }
+}
+
+// The row band the im2col fallback streams through is a memory knob, not a
+// numerical one: it splits a conv's GEMM along M, and rows are independent.
+// So the decode must not depend on it. Worth its own test because the band
+// is now CAPPED rather than sized from free headroom (decode_band_bytes_),
+// and because the hwconv A/B above needs matrix cores -- on a GPU without
+// the hardware conv, where every 3x3 gathers and the band therefore matters
+// most, nothing else watches this. VPIPE_FLUX2_TEST_MODEL_PATH gated.
+TEST(flux2_smoke, vae_decode_band_size_invariant)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  std::string vdir = std::string(root) + "/vae";
+  if (!fs::exists(fs::path(vdir) / "config.json")) { vdir = root; }
+  // Force every 3x3 onto the gathering path -- the hardware conv bands
+  // nothing, so the two arms would be identical by construction on it.
+  ::setenv("VPIPE_VAE_NO_HWCONV", "1", 1);
+  auto m = MetalFlux2Vae::load(vdir, mc, MetalFlux2Vae::Config{});
+  ::unsetenv("VPIPE_VAE_NO_HWCONV");
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  const int C = m->config().dit_channels();
+  const int h16 = 24, w16 = 24;                        // 384x384 at patch 2
+  const std::size_t hw = (std::size_t)h16 * w16;
+  SharedBuffer z = mc->make_shared_buffer((std::size_t)C * hw * 2);
+  std::uint32_t s = 0x7f4a7c15u;
+  auto* d = static_cast<_Float16*>(z.contents());
+  for (std::size_t i = 0; i < (std::size_t)C * hw; ++i) {
+    s = s * 1664525u + 1013904223u;
+    d[i] = (_Float16)(((float)(s >> 8) / 8388608.0f - 1.0f) * 3.0f);
+  }
+  std::vector<float> a, b;
+  auto run = [&](const char* rows, std::vector<float>* out) {
+    if (rows != nullptr) { ::setenv("VPIPE_FLUX2_VAE_BAND_ROWS", rows, 1); }
+    else                 { ::unsetenv("VPIPE_FLUX2_VAE_BAND_ROWS"); }
+    std::string err;
+    SharedBuffer rgb = m->decode(z, h16, w16, &err);
+    ::unsetenv("VPIPE_FLUX2_VAE_BAND_ROWS");
+    if (rgb.empty()) { return; }
+    const std::size_t n = rgb.byte_size() / 2;
+    out->resize(n);
+    const auto* p = static_cast<const _Float16*>(rgb.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)p[i]; }
+  };
+  run(nullptr, &a);                                    // the capped default
+  run("64", &b);                                       // many small bands
+  ASSERT_TRUE(!a.empty() && a.size() == b.size());
+  if (a.empty() || a.size() != b.size()) { return; }
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    if (a[i] != b[i]) { ++diff; }
+  }
+  const double r = rel_l2_(a.data(), b.data(), a.size());
+  std::printf("[flux2_smoke] band-size rel-L2 = %.6g (%zu/%zu elems differ)\n",
+              r, diff, a.size());
+  EXPECT_TRUE(std::isfinite(r) && r < 2e-3);
 }
 
 // NAX hardware conv A/B for the ENCODER (stride-2 downsample convs +
@@ -1089,6 +1518,817 @@ TEST(flux2_smoke, dit_forward_shape_finite)
               img_seq, c.out_channels);
 }
 
+// THE ANE TIERS AGAINST THE GPU, on a real checkpoint at 1024x1024.
+//
+// The double blocks' image feed-forward (and, with VPIPE_FLUX2_ANE_QKV, their
+// image q|k|v) and the single blocks' to_qkv_mlp_proj run half their rows on
+// the ANE. Each tier's output is fp16 there and bf16 on the GPU, and only
+// that difference may separate the two forwards -- so this is a PRECISION bar,
+// not an equality one, and a split with wrong rows or a wrong offset lands
+// nowhere near it. The two must also DIFFER: identical output means no row
+// ever reached the ANE.
+//
+// Env: VPIPE_FLUX2_TEST_MODEL_PATH (+ VPIPE_FLUX2_DIT_DIR), VPIPE_FLUX2_ANE_GRID
+// (64), VPIPE_FLUX2_ANE_QKV.
+TEST(flux2_smoke, forward_dit_ane_matches_gpu)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+                               ? std::string(ddir)
+                               : std::string(root) + "/transformer";
+  auto envi = [](const char* k, int d) {
+    const char* e = std::getenv(k); return (e && *e) ? std::atoi(e) : d; };
+  // 64 == 1024x1024, 4096 image rows: the tiers are chunked at 2048, so a
+  // smaller grid gives them less than a chunk and they switch themselves off.
+  const int grid = envi("VPIPE_FLUX2_ANE_GRID", 64);
+  const int TS = 64;
+  const int img_seq = grid * grid;
+
+  struct Arm {
+    std::vector<float> vel;
+    double ms = 0.0;
+    bool armed = false;
+    int int8 = 0;              // modules that ran rotated int8
+  };
+  auto run = [&](bool ane, bool int8 = false) {
+    Arm out;
+    MetalFlux2Transformer::Config cfg;
+    if (ane) {
+      cfg.session  = &sess;
+      cfg.ane_int8 = int8;
+      // _ROWS: the ANE's share (0 = measured balance); _LAYERS: cap the
+      // blocks, double then single -- the double count isolates them.
+      // Default: the tier's own share and chunk, which is what a graph gets.
+      cfg.ane_rows =
+          std::getenv("VPIPE_FLUX2_ANE_ROWS") != nullptr
+              ? (float)std::atof(std::getenv("VPIPE_FLUX2_ANE_ROWS"))
+              : 0.0f;
+      cfg.ane_layers = envi("VPIPE_FLUX2_ANE_LAYERS", 0);
+      cfg.ane_qkv  = std::getenv("VPIPE_FLUX2_ANE_QKV") != nullptr;
+    }
+    auto m = MetalFlux2Transformer::load(tdir, mc, cfg);
+    if (m == nullptr) { return out; }
+    const auto& c = m->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    SharedBuffer vel;
+    // The first forward pays the module compile and the controller's
+    // opening and is not timed; the best of the rest is (_ITERS forwards in
+    // all, default 2). Sub-5% questions need the best of several.
+    const int iters = std::max(2, envi("VPIPE_FLUX2_ANE_ITERS", 2));
+    for (int it = 0; it < iters; ++it) {
+      const auto t0 = std::chrono::steady_clock::now();
+      vel = m->forward_dit(ctx, TS, lat, img_seq, grid, grid, 0.5f);
+      const double ms = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - t0).count();
+      if (vel.empty()) { return out; }
+      if (it > 0 && (out.ms == 0.0 || ms < out.ms)) { out.ms = ms; }
+    }
+    out.armed = m->ane_armed();
+    out.int8 = m->ane_int8_modules();
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (vel.byte_size() < n * 2) { return out; }
+    // The DiT runs bf16: the top half of an f32.
+    const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
+    out.vel.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t bits = (std::uint32_t)vp[i] << 16;
+      std::memcpy(&out.vel[i], &bits, sizeof(float));
+    }
+    return out;
+  };
+
+  // _ANE_FIRST swaps the arms: the second arm runs on a warmer SoC, and a
+  // sub-10% whole-forward comparison is otherwise biased by the order.
+  const bool ane_first = std::getenv("VPIPE_FLUX2_ANE_FIRST") != nullptr;
+  Arm gpu, ane;
+  // _ANE_ONLY: the ANE arm alone, for comparing ANE settings by their stack
+  // timers at resolutions where every forward is long.
+  if (std::getenv("VPIPE_FLUX2_ANE_ONLY") != nullptr) {
+    ane = run(true);
+    std::printf("[flux2_smoke] ANE-only arm at %dx%d (armed %d): best warm "
+                "forward %.0f ms\n", grid * 16, grid * 16, ane.armed ? 1 : 0,
+                ane.ms);
+    EXPECT_TRUE(ane.armed && !ane.vel.empty());
+    return;
+  }
+  if (ane_first) {
+    ane = run(true);
+    gpu = run(false);
+  } else {
+    gpu = run(false);
+    ane = run(true);
+  }
+  ASSERT_TRUE(!gpu.vel.empty());
+  ASSERT_TRUE(ane.vel.size() == gpu.vel.size());
+  if (gpu.vel.empty() || ane.vel.size() != gpu.vel.size()) { return; }
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < gpu.vel.size(); ++i) {
+    const double d = (double)ane.vel[i] - (double)gpu.vel[i];
+    num += d * d;
+    den += (double)gpu.vel[i] * (double)gpu.vel[i];
+  }
+  const double r = den > 0.0 ? std::sqrt(num / den) : 0.0;
+  std::printf("[flux2_smoke] ANE-vs-GPU velocity rel-L2 %.3e at %dx%d (armed "
+              "%d); warm forward GPU %.0f ms, ANE %.0f ms (%.2fx)\n", r,
+              grid * 16, grid * 16, ane.armed ? 1 : 0, gpu.ms, ane.ms,
+              ane.ms > 0.0 ? gpu.ms / ane.ms : 0.0);
+  EXPECT_TRUE(ane.armed);
+  EXPECT_TRUE(r > 0.0);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+  if (!ane.armed) { return; }
+  if (ane_int8_env_free()) { EXPECT_TRUE(ane.int8 == 0); }
+
+  // ROTATED INT8 (ane_int8): every tier again in the GPU token tier's
+  // arithmetic -- the double feed-forward and the single projection (and
+  // q|k|v where asked) ENGAGED, then the same bar.
+  {
+    const Arm a8 = run(true, /*int8=*/true);
+    ASSERT_TRUE(a8.vel.size() == gpu.vel.size());
+    if (a8.vel.size() != gpu.vel.size()) { return; }
+    double n8 = 0.0, d8 = 0.0;
+    for (std::size_t i = 0; i < gpu.vel.size(); ++i) {
+      const double d = (double)a8.vel[i] - (double)gpu.vel[i];
+      n8 += d * d;
+      d8 += (double)gpu.vel[i] * (double)gpu.vel[i];
+    }
+    const double r8 = d8 > 0.0 ? std::sqrt(n8 / d8) : 0.0;
+    std::printf("[flux2_smoke] ... in rotated int8 (%d modules int8): "
+                "velocity rel-L2 %.3e\n", a8.int8, r8);
+    if (ane_int8_expected()) {
+      const bool qkv = std::getenv("VPIPE_FLUX2_ANE_QKV") != nullptr;
+      EXPECT_TRUE(a8.armed && a8.int8 == (qkv ? 3 : 2));
+      EXPECT_TRUE(std::isfinite(r8) && r8 < 0.10);
+    }
+  }
+
+  // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tiers read it when the
+  // first forward builds them), all three tiers at once -- the double
+  // blocks' q|k|v and feed-forward and the single blocks' projection --
+  // over ONE forward, the one the failure happens in. The FIRST split
+  // losing every ANE row leaves that forward the GPU's, which proves no
+  // later block split again. A PINNED share of 1024-row chunks losing only
+  // its SECOND chunk keeps the first chunk's ANE rows and recomputes the
+  // rest -- for the single blocks, their q/k/v AND the SwiGLU of the rows
+  // the ANE did write; the wrong range lands far from the GPU arm.
+  auto failing = [&](const char* spec, bool pinned, bool* latched) {
+    std::vector<float> v;
+    MetalFlux2Transformer::Config cfg;
+    cfg.session  = &sess;
+    cfg.ane_qkv  = true;
+    cfg.ane_rows = pinned ? 1.0f : 0.0f;
+    auto m = MetalFlux2Transformer::load(tdir, mc, cfg);
+    if (m == nullptr) { return v; }
+    const auto& c = m->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    std::mt19937 rng(7);                  // the same inputs as run()
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    setenv("VPIPE_ANE_FAIL", spec, 1);
+    if (pinned) { setenv("VPIPE_FLUX2_ANE_CHUNK", "1024", 1); }
+    SharedBuffer vel =
+        m->forward_dit(ctx, TS, lat, img_seq, grid, grid, 0.5f);
+    unsetenv("VPIPE_ANE_FAIL");
+    if (pinned) { unsetenv("VPIPE_FLUX2_ANE_CHUNK"); }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (vel.byte_size() < n * 2) { return v; }
+    const auto* vp = static_cast<const std::uint16_t*>(vel.contents());
+    v.resize(n);
+    for (std::size_t i = 0; i < n; ++i) {
+      const std::uint32_t bits = (std::uint32_t)vp[i] << 16;
+      std::memcpy(&v[i], &bits, sizeof(float));
+    }
+    *latched = m->ane_gpu_only();
+    return v;
+  };
+  auto rel_of = [&](const std::vector<float>& a, bool* finite) {
+    double nm2 = 0.0, dn2 = 0.0;
+    *finite = !a.empty();
+    for (std::size_t i = 0; i < a.size() && i < gpu.vel.size(); ++i) {
+      if (!std::isfinite(a[i])) { *finite = false; continue; }
+      const double d = (double)a[i] - (double)gpu.vel[i];
+      nm2 += d * d;
+      dn2 += (double)gpu.vel[i] * (double)gpu.vel[i];
+    }
+    return dn2 > 0.0 ? std::sqrt(nm2 / dn2) : 0.0;
+  };
+  bool l0 = false, l1 = false, fin0 = false, fin1 = false;
+  const std::vector<float> f0 = failing("0:0", false, &l0);
+  const std::vector<float> f1 = failing("0:1", true, &l1);
+  ASSERT_TRUE(f0.size() == gpu.vel.size() && f1.size() == gpu.vel.size());
+  if (f0.size() != gpu.vel.size() || f1.size() != gpu.vel.size()) { return; }
+  const double r_f0 = rel_of(f0, &fin0);
+  const double r_f1 = rel_of(f1, &fin1);
+  std::printf("[flux2_smoke] ANE rows lost -> GPU: rel-L2 %.3e (first "
+              "split, every row), %.3e (second 1024-row chunk of a pinned "
+              "share) against GPU-only\n", r_f0, r_f1);
+  EXPECT_TRUE(l0);                 // engaged: the tiers fell back
+  EXPECT_TRUE(l1);
+  EXPECT_TRUE(fin0 && fin1);
+  EXPECT_TRUE(r_f0 < 1e-6);        // every row the GPU's
+  EXPECT_TRUE(r_f0 < 0.01 * r);
+  EXPECT_TRUE(r_f1 < 0.10);        // the right rows were recomputed
+  EXPECT_TRUE(r_f1 > r_f0);        // and the ANE's first chunk kept
+}
+
+// BLOCK STREAMING MUST NOT CHANGE A SINGLE BIT.
+//
+// The streamed path reads every block off disk per forward into two
+// reusable slots (shared/block-slots.h) instead of allocating one per
+// block, and both of this model's stacks rebuild something after the
+// read: the double blocks riffle ff.linear_in / ff_context.linear_in
+// into the fused-SwiGLU order, and the single blocks slice
+// to_qkv_mlp_proj into qkv + an interleaved gate|up. Any of that done
+// even slightly differently from the load-time route is SILENT -- right
+// shapes, plausible numbers, a slightly different picture -- so the bar
+// is byte equality with the preloaded forward, not closeness.
+//
+// It reads the whole checkpoint twice, which is the price of the only
+// check that can catch a wrong permutation.
+TEST(flux2_smoke, streamed_matches_preloaded)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+
+  const int TS = 16, gh = 4, gw = 4, img_seq = gh * gw;
+
+  std::vector<float> pre, str, grown;
+  double fwd_s = 0.0;
+  int nd_blocks = 0, ns_blocks = 0, kept = 0;
+  // `grow` runs the streamed model with residency ON and takes the
+  // SECOND forward, where some blocks come out of the resident set and
+  // the rest are still refilled. That is the arm that exercises
+  // promotion -- a block copied out of a slot -- and a mixed pass; with
+  // growth off nothing is ever promoted and clone(copy=true) is dead
+  // code.
+  auto run = [&](bool stream, bool grow, std::vector<float>& out) -> bool {
+    auto dit = MetalFlux2Transformer::load(
+        tdir, mc, MetalFlux2Transformer::Config{}, stream);
+    if (dit == nullptr) { return false; }
+    // Growth OFF by default: a promoted block would be served out of
+    // _double / _single on the later forwards, which is a different
+    // question and would hide the refill this test exists to check.
+    dit->set_residency_reserve(grow ? test_residency_reserve(2ull << 30) : 0);
+    if (grow) { dit->set_residency_schedule(4); }
+    const auto& c = dit->config();
+    nd_blocks = c.n_double;
+    ns_blocks = c.n_single;
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return false; }
+    std::mt19937 rng(20260823);
+    std::normal_distribution<float> ndist(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)ndist(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)ndist(rng);
+    }
+    SharedBuffer v;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    }
+    fwd_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    kept = dit->resident_block_count();
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return false; }
+    const auto* p = static_cast<const _Float16*>(v.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return true;
+  };
+
+  ASSERT_TRUE(run(false, false, pre));
+  const double pre_s = fwd_s;
+  ASSERT_TRUE(run(true, false, str));
+  std::printf("[flux2_smoke] %d+%d blocks -- forward: preloaded %.1f s, "
+              "streamed %.1f s (slots %s)\n", nd_blocks, ns_blocks, pre_s,
+              fwd_s,
+              std::getenv("VPIPE_FLUX2_NO_SLOTS") != nullptr ? "OFF" : "on");
+
+  ASSERT_TRUE(pre.size() == str.size() && !pre.empty());
+  std::size_t diff = 0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < pre.size(); ++i) {
+    if (pre[i] != str[i]) {
+      ++diff;
+      worst = std::max(worst, (double)std::fabs(pre[i] - str[i]));
+    }
+  }
+  std::printf("[flux2_smoke] streamed vs preloaded: %zu of %zu differ "
+              "(worst %.3e)\n", diff, pre.size(), worst);
+  EXPECT_TRUE(diff == 0);
+
+  ASSERT_TRUE(run(true, true, grown));
+  ASSERT_TRUE(grown.size() == pre.size());
+  std::size_t gdiff = 0;
+  for (std::size_t i = 0; i < pre.size(); ++i) {
+    if (pre[i] != grown[i]) { ++gdiff; }
+  }
+  std::printf("[flux2_smoke] resident-grown (%d of %d blocks kept) vs "
+              "preloaded: %zu of %zu differ\n", kept,
+              nd_blocks + ns_blocks, gdiff, pre.size());
+  EXPECT_TRUE(gdiff == 0);
+}
+
+// A MIXED PACK (VPIPE_FLUX2_MIXED_DIT = the transformer/ of a
+// model-quantize bits 4 + mixed run): whole blocks -- double or single --
+// at w8, the rest at w4, so a slot built for one width is asked to hold
+// the other, including the riffled linear_in and the single block's
+// split qkv / mlp halves (BlockSlots::Ops::same_layout). The pack must
+// really mix widths WITHIN a stack, and its four holds -- preloaded,
+// streamed, no slots, promoted -- must be BYTE-IDENTICAL with i8 off,
+// and on a matrix-core box under the signed layout and (when block 0,
+// which gates the fast tier, is w8) the fast and token tiers. Before
+// the slots rebuilt such a block, preloaded and no-slots agreed and the
+// two slot holds did not.
+TEST(flux2_smoke, a_mixed_pack_holds_agree)
+{
+  const char* ddir = std::getenv("VPIPE_FLUX2_MIXED_DIT");
+  if (ddir == nullptr || *ddir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  int d8 = 0, d4 = 0, s8 = 0, s4 = 0;
+  {
+    auto ws = vpipe::genai::WeightSet::open(ddir, nullptr);
+    ASSERT_TRUE(ws != nullptr);
+    if (ws == nullptr) { return; }
+    for (int L = 0; L < 64; ++L) {
+      const int bd = vpipe::genai::stored_affine_bits(
+          *ws, "transformer_blocks." + std::to_string(L) + ".attn.to_q", 64);
+      const int bs = vpipe::genai::stored_affine_bits(
+          *ws, "single_transformer_blocks." + std::to_string(L) +
+                   ".attn.to_qkv_mlp_proj", 64);
+      d8 += bd == 8; d4 += bd == 4;
+      s8 += bs == 8; s4 += bs == 4;
+    }
+  }
+  std::printf("[flux2_smoke] mixed pack: double %d w8 / %d w4, single %d "
+              "w8 / %d w4\n", d8, d4, s8, s4);
+  // Each stack has its own slot pair, so a stack crosses widths only if
+  // it holds both. The ranking decides which: MEASURED on klein-9B,
+  // mixed_frac 0.25 put all 8 double blocks at w8 and every single at w4
+  // -- no slot ever crossed -- so this wants a pack where at least one
+  // stack is mixed (0.125 mixes the doubles, 0.5 the singles).
+  const bool dmix = d8 > 0 && d4 > 0, smix = s8 > 0 && s4 > 0;
+  ASSERT_TRUE(dmix || smix);
+  if (!dmix && !smix) { return; }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int TS = 64, gh = 32, gw = 40, img_seq = gh * gw;
+  bool engaged = true;
+  bool fast_on = false;
+  int f8 = 0, f4 = 0;
+  int promoted = 0, relaid = 0, held_w4 = 0;
+  int stack = 0;
+  std::size_t grown_bytes = 0;
+  auto run = [&](int tier, bool stream, bool slots, bool grow,
+                 bool hold = false) {
+    std::vector<float> out;
+    std::unique_ptr<Env> ns;
+    if (!slots) { ns = std::make_unique<Env>("VPIPE_FLUX2_NO_SLOTS", "1"); }
+    MetalFlux2Transformer::Config cfg;
+    cfg.i8_gemm = tier >= 0;
+    cfg.i8_tier = tier < 0 ? 0 : tier;
+    cfg.i8_hold_w4 = hold;
+    auto dit = MetalFlux2Transformer::load(ddir, mc, cfg, stream);
+    if (dit == nullptr) { return out; }
+    if (tier == 0 && !dit->signed_layout()) { engaged = false; }
+    if (tier > 0) {
+      fast_on = dit->fast_tier();
+      if (!stream) {
+        f8 = dit->fast_weights(8);
+        f4 = dit->fast_weights(4);
+      }
+    }
+    dit->set_residency_reserve(grow ? test_residency_reserve(16ull << 30) : 0);
+    if (grow) { dit->set_residency_schedule(4); }
+    const auto& c = dit->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return out; }
+    std::mt19937 rng(20261018);
+    std::normal_distribution<float> ndist(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)ndist(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)ndist(rng);
+    }
+    SharedBuffer v;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    }
+    if (grow) {
+      promoted = dit->resident_block_count();
+      stack = dit->config().n_double + dit->config().n_single;
+      grown_bytes = dit->resident_block_bytes();
+      held_w4 = dit->held_w4_layouts();
+    }
+    if (stream && slots && !grow) { relaid = dit->slot_relayouts(); }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return out; }
+    const auto* p = static_cast<const _Float16*>(v.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+  std::vector<int> tiers = {-1};
+  if (mc->supports_matrix_cores()) { tiers.insert(tiers.end(), {0, 1, 2}); }
+  const char* tname[3] = {"accurate (signed)", "fast", "token"};
+  for (int tier : tiers) {
+    engaged = true;
+    const std::vector<float> pre = run(tier, false, true, false);
+    ASSERT_TRUE(!pre.empty());
+    if (pre.empty()) { return; }
+    if (tier > 0) {
+      // BOTH WIDTHS take the tier: a w8 block's codes converted once,
+      // a w4 one's into the scratch before each GEMM. Uniform w8 packs:
+      // fast_tier_matches_accurate.
+      std::printf("[flux2_smoke] mixed pack, %s: %d w8 and %d w4 "
+                  "projections in its layout\n", tname[tier], f8, f4);
+      EXPECT_TRUE(fast_on && f8 > 0 && f4 > 0);
+      if (!fast_on) { continue; }
+    }
+    const std::vector<float> str = run(tier, true, true, false);
+    const std::vector<float> flat = run(tier, true, false, false);
+    const std::vector<float> grown = run(tier, true, true, true);
+    const std::size_t grown_pc = grown_bytes;
+    const int held_pc = held_w4;
+    // A HELD layout reached by PROMOTION: residency converts each w4
+    // projection of a block it keeps (keep_double_ / keep_single_),
+    // which then books more than the pack -- and must equal the held
+    // preload, which equals per call.
+    const auto grown_held =
+        tier > 0 ? run(tier, true, true, true, true) : grown;
+    const std::size_t grown_h = grown_bytes;
+    const int grown_n = promoted;
+    const int held_h = held_w4;
+    // ...and with NO SLOTS, where promote_into MOVES each per-block read
+    // into the resident set: the keep pass (keep_double_ / keep_single_)
+    // must leave it holding exactly what the slots' clone does.
+    const auto flat_held =
+        tier > 0 ? run(tier, true, false, true, true) : grown;
+    const std::size_t flat_h = tier > 0 ? grown_bytes : grown_h;
+    const int flat_n = tier > 0 ? promoted : grown_n;
+    // The bytes compare only where BOTH kept the whole streamed stack:
+    // a slotted run short of it still holds its slot pair, and a box
+    // with little room (a 16 GB M5) keeps what its budget allows.
+    const bool whole = grown_n == stack && flat_n == stack;
+    const int flat_w4 = tier > 0 ? held_w4 : held_h;
+    // The engine's other answer for a w4 pack: its int8 layout
+    // HELD (Config::i8_hold_w4) where it is converted per GEMM
+    // above -- the same values, so the same bytes.
+    const auto held =
+        tier > 0 ? run(tier, false, true, false, true) : pre;
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    std::printf("[flux2_smoke] mixed pack, %s: streamed %s, no slots %s, "
+                "promoted (%d blocks) %s%s\n",
+                tier < 0 ? "no i8" : tname[tier],
+                same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT", promoted,
+                same(grown) ? "IDENTICAL" : "DIFFERENT",
+                engaged ? "" : " -- NOT ENGAGED");
+    EXPECT_TRUE(engaged);
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(promoted > 0 && same(grown));
+    if (tier > 0) {
+      std::printf("[flux2_smoke] ... w4 layout held: %s; held by promotion "
+                  "%s (%d w4 projections held, %zu MB booked, against %d / "
+                  "%zu per call); no slots %s (%d held, %zu MB)\n",
+                  same(held) ? "IDENTICAL" : "DIFFERENT",
+                  same(grown_held) ? "IDENTICAL" : "DIFFERENT", held_h,
+                  grown_h >> 20, held_pc, grown_pc >> 20,
+                  same(flat_held) ? "IDENTICAL" : "DIFFERENT", flat_w4,
+                  flat_h >> 20);
+      EXPECT_TRUE(same(grown_held));
+      EXPECT_TRUE(held_h > 0 && held_pc == 0 && grown_h > grown_pc);
+      // The moved blocks hold, and book, what the cloned ones do.
+      EXPECT_TRUE(same(flat_held) &&
+                  (!whole || (flat_w4 == held_h && flat_h == grown_h)));
+    }
+    EXPECT_TRUE(same(held));
+    // The slots crossed widths and REBUILT. A slot that refused such a
+    // block instead turns itself off, and its holds still agree.
+    std::printf("[flux2_smoke] ... %d streamed blocks built into their "
+                "slot\n", relaid);
+    EXPECT_TRUE(relaid > 0);
+  }
+}
+
+// THE SIGNED INT8 LAYOUT on a real quantized pack (VPIPE_FLUX2_DIT_DIR at a
+// model-quantize'd w4/w8 DiT; i8_gemm on; M5 only). The layout is converted
+// in three places -- in the entries a preloaded block keeps, in a streamed
+// read, and in a refilled slot -- and promotion copies it, so every arm
+// must be BYTE-IDENTICAL to the preloaded one: preloaded, streamed through
+// the slots, streamed without them, and the second forward of a streamed
+// run that has promoted blocks. Against the dense forward (i8 off) it is
+// held within a gross-error bar of the unsigned native route
+// (VPIPE_I8_SIGNED=0). MEASURED on the FLUX.2-klein-4B w8 pack, signed
+// 3.43e-2 and native 3.64e-2: the native route's zero point is b ~ -128
+// s, and its zero-point product rounds u to bf16 against a term that
+// cancels most of the main one, where b' is near the group's middle. The
+// geometry reaches every route a
+// signed weight takes: the int8 GEMM (1280 image rows), the signed
+// dequant into matmul2d (the double blocks' 64-row text stream, under the
+// int8 floor), and the steel fallback through the signed dequant (an
+// 8-row text stream in the second geometry). VPIPE_I8_SIGNED_MIN_M=16
+// sends the 64-row stream through the int8 GEMM too.
+TEST(flux2_smoke, signed_layout_matches_native)
+{
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  if (ddir == nullptr || *ddir == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const std::string tdir = ddir;
+  struct Env {
+    const char* k;
+    explicit Env(const char* key, const char* v) : k(key) {
+      ::setenv(key, v, 1);
+    }
+    ~Env() { ::unsetenv(k); }
+  };
+  // The split tuner acts between forwards and would make the promoted
+  // arm's second forward a different reassociation: splits off.
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  for (int TS : {64, 8}) {
+    const int gh = 32, gw = 40, img_seq = gh * gw;
+    bool engaged = true;
+    auto run = [&](bool sgn, bool stream, bool grow, bool slots,
+                   std::vector<float>& out, bool i8 = true) -> bool {
+      std::unique_ptr<Env> e1, e2;
+      if (!sgn) { e1 = std::make_unique<Env>("VPIPE_I8_SIGNED", "0"); }
+      if (!slots) { e2 = std::make_unique<Env>("VPIPE_FLUX2_NO_SLOTS", "1"); }
+      MetalFlux2Transformer::Config cfg{};
+      cfg.i8_gemm = i8;
+      auto dit = MetalFlux2Transformer::load(tdir, mc, cfg, stream);
+      if (dit == nullptr) { return false; }
+      if (dit->signed_layout() != (sgn && i8)) { engaged = false; }
+      dit->set_residency_reserve(grow ? test_residency_reserve(2ull << 30) : 0);
+      if (grow) { dit->set_residency_schedule(4); }
+      const auto& c = dit->config();
+      SharedBuffer ctx =
+          mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+      SharedBuffer lat =
+          mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+      if (ctx.empty() || lat.empty()) { return false; }
+      std::mt19937 rng(20261016);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      auto* cp = static_cast<_Float16*>(ctx.contents());
+      for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+        cp[i] = (_Float16)nd(rng);
+      }
+      auto* lp = static_cast<_Float16*>(lat.contents());
+      for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels;
+           ++i) {
+        lp[i] = (_Float16)nd(rng);
+      }
+      SharedBuffer v;
+      for (int it = 0; it < (grow ? 2 : 1); ++it) {
+        v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+      }
+      if (grow && dit->resident_block_count() == 0) { engaged = false; }
+      const std::size_t n = (std::size_t)img_seq * c.out_channels;
+      if (v.empty() || v.byte_size() < n * 2) { return false; }
+      const auto* p = static_cast<const _Float16*>(v.contents());
+      out.resize(n);
+      for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+      return true;
+    };
+    std::vector<float> dense, nat, pre, str, flat, grown;
+    ASSERT_TRUE(run(false, false, false, true, dense, /*i8=*/false));
+    ASSERT_TRUE(run(false, false, false, true, nat));
+    ASSERT_TRUE(run(true, false, false, true, pre));
+    ASSERT_TRUE(run(true, true, false, true, str));
+    ASSERT_TRUE(run(true, true, false, false, flat));
+    ASSERT_TRUE(run(true, true, true, true, grown));
+    EXPECT_TRUE(engaged);
+    if (nat.empty() || pre.size() != nat.size()) { continue; }
+    auto same = [&](const std::vector<float>& a) {
+      return a.size() == pre.size() &&
+             std::memcmp(a.data(), pre.data(), a.size() * 4) == 0;
+    };
+    const double r = rel_l2_(pre.data(), nat.data(), pre.size());
+    const double rs = rel_l2_(pre.data(), dense.data(), pre.size());
+    const double rn = rel_l2_(nat.data(), dense.data(), pre.size());
+    std::printf("[flux2_smoke] signed layout, txt %d: vs native rel-L2 "
+                "%.3e; vs the dense (i8 off) forward: signed %.3e, native "
+                "%.3e; streamed %s, no slots %s, promoted %s\n", TS, r, rs,
+                rn, same(str) ? "IDENTICAL" : "DIFFERENT",
+                same(flat) ? "IDENTICAL" : "DIFFERENT",
+                same(grown) ? "IDENTICAL" : "DIFFERENT");
+    EXPECT_TRUE(same(str));
+    EXPECT_TRUE(same(flat));
+    EXPECT_TRUE(same(grown));
+    // At least as close to the dense forward as the unsigned route.
+    // A GROSS-ERROR guard, not a ranking: on random inputs this forward
+    // is chaotic -- QI21's dense forward moved 4.8e-2 for a per-weight
+    // change of 5e-5 (gemm_i8.signed_dequant_on_a_real_pack: both
+    // dequants 7.3e-3 from the bf16 weights, equal to four digits) -- so
+    // two equally accurate routes land a few percent apart either way.
+    // gemm_i8.signed_layout_matches_oracle is the accuracy statement; a
+    // misread layout is O(1) here.
+    EXPECT_TRUE(rs <= 1.25 * rn);
+  }
+}
+
+// THE FAST AND TOKEN TIERS (i8_gemm_tier fast / token / token_plain) on
+// the image-stream projections, as qwen_image_21_dit.fast_tier_matches_
+// accurate: a w8 g64 pack (VPIPE_FLUX2_DIT_DIR) converted in the entries
+// a preloaded block keeps, in a streamed read, in a refilled slot and
+// copied by promotion -- every arm BYTE-IDENTICAL to the preloaded one --
+// and a bf16 checkpoint (VPIPE_FLUX2_TEST_MODEL_PATH's transformer/)
+// quantized once at load, or after each refill streamed (its four holds
+// byte-identical the same way). Each arm must ENGAGE (the tier at the
+// group it names) before anything is compared, and sit within a
+// gross-error bar of the accurate tier in distance from the dense (i8
+// off) forward. 1280 image rows, above the int8 floor of 1024; a 64-row
+// text stream, whose double-block projections stay on the accurate tier.
+// M5 only.
+TEST(flux2_smoke, fast_tier_matches_accurate)
+{
+  const char* qd = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const std::string pack = qd != nullptr ? qd : "";
+  const std::string bf16 =
+      root != nullptr && *root != '\0' ? std::string(root) + "/transformer"
+                                        : std::string();
+  if (pack.empty() && bf16.empty()) { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  struct Env {
+    const char* k;
+    Env(const char* key, const char* v) : k(key) { ::setenv(key, v, 1); }
+    ~Env() { ::unsetenv(k); }
+  };
+  Env nosplit("VPIPE_I8_SPLITK_MAX_S", "0");
+  const int gh = 32, gw = 40, img_seq = gh * gw, TS = 64;
+  bool engaged = true;
+  auto run = [&](const std::string& dir, bool i8, int tier, bool stream,
+                 bool grow, bool slots) {
+    std::vector<float> out;
+    std::unique_ptr<Env> e2;
+    if (!slots) { e2 = std::make_unique<Env>("VPIPE_FLUX2_NO_SLOTS", "1"); }
+    MetalFlux2Transformer::Config cfg{};
+    cfg.i8_gemm = i8;
+    cfg.i8_tier = tier;
+    auto dit = MetalFlux2Transformer::load(dir, mc, cfg, stream);
+    if (dit == nullptr) { return out; }
+    const int fg = dit->fast_group();
+    if (dit->fast_tier() != (i8 && tier != 0) ||
+        (i8 && tier >= 2 && fg != I8GemmContext::kTokenGroup) ||
+        (i8 && tier == 1 && (fg <= 0 || fg == I8GemmContext::kTokenGroup))) {
+      engaged = false;
+    }
+    dit->set_residency_reserve(grow ? test_residency_reserve(2ull << 30) : 0);
+    if (grow) { dit->set_residency_schedule(4); }
+    const auto& c = dit->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat =
+        mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return out; }
+    std::mt19937 rng(20261018);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    SharedBuffer v;
+    for (int it = 0; it < (grow ? 2 : 1); ++it) {
+      v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    }
+    if (grow && dit->resident_block_count() == 0) { engaged = false; }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return out; }
+    const auto* p = static_cast<const _Float16*>(v.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+  auto same = [](const std::vector<float>& a, const std::vector<float>& b) {
+    return a.size() == b.size() && !a.empty() &&
+           std::memcmp(a.data(), b.data(), a.size() * 4) == 0;
+  };
+  // A GROSS-ERROR guard, not a ranking (see signed_layout_matches_native:
+  // random-input forwards are chaotic): the fast tier's GEMMs are
+  // 1.3-1.45x the accurate tier's error on outlier-free operands, the
+  // plain token tier's ~1.7x on real weights and the rotated one's about
+  // the fast tier's, so a misread layout is what this catches.
+  const double bar[4] = {0.0, 2.5, 3.0, 4.0};
+  const char* tname[4] = {"accurate", "fast", "token", "token_plain"};
+  for (const std::string& dir : {pack, bf16}) {
+    if (dir.empty()) { continue; }
+    const bool is_pack = dir == pack;
+    const auto dense = run(dir, false, 0, false, false, true);
+    const auto acc = run(dir, true, 0, false, false, true);
+    ASSERT_TRUE(!dense.empty() && acc.size() == dense.size());
+    if (dense.empty() || acc.size() != dense.size()) { continue; }
+    // The bars were set against the accurate tier with its groups
+    // unrotated; the rotation (on by default) lowers that yardstick where
+    // a channel stands out, so the bars hold against the larger of the
+    // two, and the rotated forward is held to a gross bar of the plain.
+    const double ra1 = rel_l2_(acc.data(), dense.data(), acc.size());
+    double ra0 = ra1;
+    {
+      Env plain("VPIPE_I8_ACC_ROT", "0");
+      const auto acc0 = run(dir, true, 0, false, false, true);
+      if (acc0.size() == dense.size()) {
+        ra0 = rel_l2_(acc0.data(), dense.data(), acc0.size());
+      }
+    }
+    std::printf("[flux2_smoke] %s, accurate tier vs the dense forward: "
+                "%.3e rotated, %.3e plain\n", is_pack ? "w8 pack" : "bf16",
+                ra1, ra0);
+    EXPECT_TRUE(ra1 <= 1.25 * ra0);
+    const double ra = std::max(ra1, ra0);
+    for (int tier : {1, 2, 3}) {
+      engaged = true;
+      const auto pre = run(dir, true, tier, false, false, true);
+      // Every hold, the bf16 checkpoint's too: a streamed bf16 block
+      // quantizes its refilled source into the layout (QWeight::ds) and
+      // a promotion keeps the layout alone, so each runs the tier the
+      // preload runs.
+      const auto str = run(dir, true, tier, true, false, true);
+      const auto flat = run(dir, true, tier, true, false, false);
+      const auto grown = run(dir, true, tier, true, true, true);
+      EXPECT_TRUE(engaged);
+      ASSERT_TRUE(pre.size() == dense.size());
+      if (pre.size() != dense.size()) { continue; }
+      const double rf = rel_l2_(pre.data(), dense.data(), pre.size());
+      std::printf("[flux2_smoke] %s tier, %s, %d+%d rows: vs the dense "
+                  "forward %.3e, accurate %.3e; streamed %s, no slots %s, "
+                  "promoted %s\n", tname[tier],
+                  is_pack ? "w8 pack" : "bf16", img_seq, TS, rf, ra,
+                  same(str, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(flat, pre) ? "IDENTICAL" : "DIFFERENT",
+                  same(grown, pre) ? "IDENTICAL" : "DIFFERENT");
+      EXPECT_TRUE(same(str, pre));
+      EXPECT_TRUE(same(flat, pre));
+      EXPECT_TRUE(same(grown, pre));
+      EXPECT_TRUE(rf <= bar[tier] * ra);
+    }
+  }
+}
+
 // Reference-image conditioning: forward_dit with reference latents (a) still
 // emits ONLY the generated-token velocity [img_seq, out_channels] (refs dropped
 // from the output), (b) stays finite with one and two references, and (c)
@@ -1188,7 +2428,9 @@ struct KvFixture {
   int TS = 8, gh = 4, gw = 4, img_seq = 16;
   std::size_t n = 0;
 
-  bool build(bool klein_kv) {
+  // `sol` defaults to the shipped Config (tier off), so every caller that
+  // predates Sol is unchanged and a klein_kv test still measures klein_kv.
+  bool build(bool klein_kv, const sol::Config& sol_cfg = sol::Config{}) {
     const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
     if (root == nullptr || *root == '\0') { return false; }
     // VPIPE_FLUX2_KV_BENCH=<grid> runs the REAL generation geometry (32 -> a
@@ -1203,6 +2445,7 @@ struct KvFixture {
     if (mc == nullptr) { return false; }
     MetalFlux2Transformer::Config cfg;
     cfg.klein_kv = klein_kv;
+    cfg.sol = sol_cfg;
     dit = MetalFlux2Transformer::load(std::string(root) + "/transformer", mc,
                                       cfg);
     if (dit == nullptr) { return false; }
@@ -1337,6 +2580,100 @@ TEST(flux2_kv, cached_matches_uncached)
               r0, r1, kv.ref_seq);
   EXPECT_TRUE(r0 < 1e-6);          // same arithmetic
   EXPECT_TRUE(r1 < 5e-3);          // cache stands in for recomputation
+}
+
+// SOL-ATTN ON FLUX.2, and the three things that have to be true of it.
+//
+// 1. A tier that routes NOTHING must be byte-identical to the tier being
+//    off -- same kernel, same rounding for every block it skips.
+// 2. WITH REFERENCES AND klein_kv OFF it must actually route. That is
+//    the path that matters here: the references sit IN the joint
+//    sequence, so the keys are still the queries and Sol applies.
+// 3. WITH klein_kv ON it must decline. A cached step attends the live
+//    queries over sequence-plus-spliced-reference keys and a fill step
+//    runs a second query group over reference keys alone -- the keys are
+//    then not the queries, and a centroid would summarise the wrong
+//    sequence. forward_dit gates on the GEOMETRY, so this must come back
+//    byte-identical to klein_kv without Sol.
+//
+// GEOMETRY IS THE TRAP. The fixture's default 4x4 grid is a 24-token
+// joint sequence -- one routing block -- and Sol declines below 16, so
+// every arm would be trivially identical and arm 2 would assert on a
+// path that never engaged. VPIPE_FLUX2_KV_BENCH=32 raises it to 512
+// text + 1024 image tokens = 24 routing blocks. Without it this test
+// says so and skips rather than passing vacuously.
+TEST(flux2_kv, sol_routes_the_joint_attention_and_declines_klein_kv)
+{
+  const char* g = std::getenv("VPIPE_FLUX2_KV_BENCH");
+  if (g == nullptr || std::atoi(g) < 32) {
+    std::printf("[flux2_kv] sol: needs VPIPE_FLUX2_KV_BENCH>=32 for a "
+                "sequence Sol will route (>=16 key blocks); skipped\n");
+    return;
+  }
+  sol::Config on;
+  on.enabled = true;
+  // A routing point, NOT the stage default -- generate-image now
+  // ships 0, which keeps more blocks and would weaken the
+  // routed-differs-from-dense signal this test turns on.
+  on.tau = 0.7f;
+  on.key_block = 64;
+  on.local_radius = 1;
+  on.dense_layers = 1;
+  sol::Config all_dense = on;
+  // PAST ANY BLOCK COUNT, which is what "routes nothing" means here.
+  // Deliberately not `n_double + n_single` read from a default Config: a
+  // checkpoint's own dims come from read_dims at load, so a figure taken
+  // before the load could be smaller than the stack this test actually
+  // runs and would leave the tail routed while claiming it was dense.
+  all_dense.dense_layers = 1 << 16;
+
+  auto refs_of = [](KvFixture& f, unsigned seed) {
+    f.rng.seed(seed);
+    std::vector<MetalFlux2Transformer::RefImage> r;
+    r.push_back(f.make_ref(2, 3));
+    return r;
+  };
+  auto run = [&](KvFixture& f) {
+    const auto refs = refs_of(f, 99);
+    return f.dit->forward_dit(f.ctx, f.TS, f.lat, f.img_seq, f.gh, f.gw,
+                              0.5f, -1.0f, refs);
+  };
+
+  // --- klein_kv OFF: the reference-editing path Sol is for -------------
+  KvFixture off, dense, routed;
+  if (!off.build(/*klein_kv=*/false)) { return; }
+  if (!dense.build(/*klein_kv=*/false, all_dense)) { return; }
+  if (!routed.build(/*klein_kv=*/false, on)) { return; }
+  SharedBuffer v_off = run(off), v_dense = run(dense), v_routed = run(routed);
+  ASSERT_TRUE(!v_off.empty() && !v_dense.empty() && !v_routed.empty());
+  const std::vector<float> a = off.vec(v_off), b = dense.vec(v_dense),
+                           c = routed.vec(v_routed);
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < a.size(); ++i) { if (a[i] != b[i]) { ++diff; } }
+  std::printf("[flux2_kv] sol all-dense vs off: %zu of %zu differ\n", diff,
+              a.size());
+  EXPECT_TRUE(diff == 0);
+  const double r = rel_l2_(c.data(), a.data(), off.n);
+  std::printf("[flux2_kv] sol routed vs dense rel-L2 %.4f (refs, klein_kv "
+              "off, seq %d)\n", r, off.TS + off.img_seq);
+  EXPECT_TRUE(std::isfinite(r));
+  EXPECT_TRUE(r > 1e-5);    // it approximated something
+  EXPECT_TRUE(r < 0.5);     // and it is still this attention
+
+  // --- klein_kv ON: the geometry Sol must refuse ----------------------
+  KvFixture kv_off, kv_sol;
+  if (!kv_off.build(/*klein_kv=*/true)) { return; }
+  if (!kv_sol.build(/*klein_kv=*/true, on)) { return; }
+  SharedBuffer k0 = run(kv_off), k1 = run(kv_sol);
+  ASSERT_TRUE(!k0.empty() && !k1.empty());
+  const std::vector<float> ka = kv_off.vec(k0), kb = kv_sol.vec(k1);
+  std::size_t kdiff = 0;
+  for (std::size_t i = 0; i < ka.size(); ++i) {
+    if (ka[i] != kb[i]) { ++kdiff; }
+  }
+  std::printf("[flux2_kv] sol under klein_kv vs dense: %zu of %zu differ "
+              "(want 0 -- the gate declined)\n", kdiff, ka.size());
+  EXPECT_TRUE(kdiff == 0);
 }
 
 // A changed geometry must REBUILD the cache rather than splice a band of the
@@ -1945,53 +3282,8 @@ TEST(flux2_golden, text_encoder_loads_runs)
   const std::string edir = (eov != nullptr && *eov != '\0')
       ? std::string(eov) : std::string(root) + "/text_encoder";
 
-  MetalQwenModel::Config c;
-  c.n_layers = 36; c.hidden = 2560; c.n_heads = 32; c.n_kv_heads = 8;
-  c.head_dim = 128; c.ffn_inner = 9728; c.vocab = 151936; c.rope_theta = 1.0e6f;
-  c.rms_eps = 1e-6f; c.rotary_dim = 128; c.full_attn_interval = 1;
-  c.tie_embeddings = true; c.use_bf16 = true; c.dense = true;
-  c.zero_centered_norm = false; c.attn_output_gate = false;
-  c.backbone_only = true; c.weight_prefix = "model."; c.max_seq = 1024;
-  c.page_tokens = 256;
-  bool declared_quant = false;   // config.json carries a quantization block
-  { std::ifstream in(fs::path(edir) / "config.json");
-    if (in) {
-      FlexData fd = FlexData::from_json(in);
-      if (fd.is_object()) {
-        auto obj = fd.as_object();               // bind view to a local
-        auto geti = [&](const char* k, int cur) -> int {
-          return obj.contains(k) ? (int)obj.at(k).as_int(cur) : cur;
-        };
-        auto getf = [&](const char* k, float cur) -> float {
-          return obj.contains(k) ? (float)obj.at(k).as_real(cur) : cur;
-        };
-        // Size from config.json so the 8B (9B pipeline) encoder validates too.
-        c.n_layers   = geti("num_hidden_layers", c.n_layers);
-        c.hidden     = geti("hidden_size", c.hidden);
-        c.n_heads    = geti("num_attention_heads", c.n_heads);
-        c.n_kv_heads = geti("num_key_value_heads", c.n_kv_heads);
-        c.head_dim   = geti("head_dim",
-                            c.n_heads > 0 ? c.hidden / c.n_heads : c.head_dim);
-        c.rotary_dim = c.head_dim;
-        c.ffn_inner  = geti("intermediate_size", c.ffn_inner);
-        c.vocab      = geti("vocab_size", c.vocab);
-        c.rope_theta = getf("rope_theta", c.rope_theta);
-        c.rms_eps    = getf("rms_norm_eps", c.rms_eps);
-        if (obj.contains("tie_word_embeddings")) {
-          c.tie_embeddings = obj.at("tie_word_embeddings").as_bool(true);
-        }
-        if (obj.contains("quantization")) {
-          FlexData q = obj.at("quantization");
-          if (q.is_object()) {
-            auto qo = q.as_object();             // bind view to a local
-            if (qo.contains("bits")) {
-              const int b = (int)qo.at("bits").as_int(0);
-              if (b == 4 || b == 8) { c.quant_bits = b; declared_quant = true; }
-            }
-          }
-        }
-      }
-    } }
+  bool declared_quant = false;
+  const MetalQwenModel::Config c = flux2_encoder_config_(edir, &declared_quant);
 
   auto enc = MetalQwenModel::load(edir, mc, c);
   ASSERT_TRUE(enc != nullptr);
@@ -2264,6 +3556,103 @@ TEST(flux2_bench, forward_dit)
 // Quantize <root>/transformer -> <root>-dit-w<bits>g64 (plain affine, the DiT
 // Linear leaf set), reusing the dir if present. Opt-in: VPIPE_FLUX2_QUANTIZE =
 // 8 | 4. Produces the dirs the bench / golden feed via VPIPE_FLUX2_DIT_DIR.
+// THE SIGNED INT8 LAYOUT'S WORTH, in the forward itself: one bf16 DiT and
+// one quantized pack (VPIPE_FLUX2_DIT_DIR), i8_gemm on, preloaded, at a
+// 1024^2 geometry (4096 image rows + 512 text). Arms: bf16, the pack in
+// the signed layout, the pack on the unsigned native route
+// (VPIPE_I8_SIGNED=0). Each arm loads, warms (two forwards: the second
+// is the first the split tuner has answered), then times VPIPE_FLUX2_
+// SIGNED_BENCH_ITERS forwards and keeps the median; the arms rotate
+// through VPIPE_FLUX2_SIGNED_BENCH_ROUNDS rounds, the order reversed
+// every other one, so a box that throttles mid-run costs every arm alike.
+// VPIPE_FLUX2_SIGNED_BENCH=1 runs it.
+TEST(flux2_bench, signed_layout_forward)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  if (root == nullptr || *root == '\0' || ddir == nullptr || *ddir == '\0' ||
+      std::getenv("VPIPE_FLUX2_SIGNED_BENCH") == nullptr) {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  auto env_int = [](const char* k, int d) {
+    const char* e = std::getenv(k);
+    return e != nullptr ? std::max(1, std::atoi(e)) : d;
+  };
+  const int iters = env_int("VPIPE_FLUX2_SIGNED_BENCH_ITERS", 5);
+  const int rounds = env_int("VPIPE_FLUX2_SIGNED_BENCH_ROUNDS", 3);
+  const int HW = env_int("VPIPE_FLUX2_BENCH_HW", 1024);
+  const int gh = HW / 16, gw = HW / 16, img_seq = gh * gw, TS = 512;
+  struct Arm { const char* name; std::string dir; bool sgn; };
+  const Arm arms[] = {
+      {"bf16", std::string(root) + "/transformer", true},
+      {"w8 signed", ddir, true},
+      {"w8 native", ddir, false},
+  };
+  std::vector<std::vector<double>> med(3);
+  for (int r = 0; r < rounds; ++r) {
+    for (int k = 0; k < 3; ++k) {
+      const int a = (r % 2 == 0) ? k : 2 - k;
+      if (!arms[a].sgn) { ::setenv("VPIPE_I8_SIGNED", "0", 1); }
+      MetalFlux2Transformer::Config cfg{};
+      cfg.i8_gemm = true;
+      auto dit = MetalFlux2Transformer::load(arms[a].dir, mc, cfg,
+                                             /*stream_blocks=*/false);
+      ::unsetenv("VPIPE_I8_SIGNED");
+      ASSERT_TRUE(dit != nullptr);
+      if (dit == nullptr) { return; }
+      const auto& c = dit->config();
+      std::mt19937 rng(0);
+      std::normal_distribution<float> nd(0.0f, 1.0f);
+      SharedBuffer ctx =
+          mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+      SharedBuffer lat =
+          mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+      { auto* p = static_cast<_Float16*>(ctx.contents());
+        for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+          p[i] = (_Float16)nd(rng);
+        } }
+      { auto* p = static_cast<_Float16*>(lat.contents());
+        for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels;
+             ++i) {
+          p[i] = (_Float16)nd(rng);
+        } }
+      for (int w = 0; w < 2; ++w) {
+        ASSERT_TRUE(
+            !dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f).empty());
+      }
+      std::vector<double> t;
+      for (int i = 0; i < iters; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        SharedBuffer v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw,
+                                          0.5f);
+        t.push_back(std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - t0).count());
+        ASSERT_TRUE(!v.empty());
+      }
+      std::sort(t.begin(), t.end());
+      med[(std::size_t)a].push_back(t[t.size() / 2]);
+      std::printf("[flux2_bench] round %d %-10s %7.1f ms/forward (median of "
+                  "%d; signed layout %s)\n", r, arms[a].name,
+                  t[t.size() / 2], iters, dit->signed_layout() ? "on" : "off");
+    }
+  }
+  std::printf("[flux2_bench] %dx%d, %d+%d rows, medians over %d rounds:\n",
+              HW, HW, img_seq, TS, rounds);
+  std::vector<double> m(3);
+  for (int a = 0; a < 3; ++a) {
+    std::vector<double> v = med[(std::size_t)a];
+    std::sort(v.begin(), v.end());
+    m[(std::size_t)a] = v[v.size() / 2];
+  }
+  for (int a = 0; a < 3; ++a) {
+    std::printf("[flux2_bench]   %-10s %7.1f ms  %.3fx bf16\n", arms[a].name,
+                m[(std::size_t)a], m[0] / m[(std::size_t)a]);
+  }
+}
+
 TEST(flux2_quant, make)
 {
   const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
@@ -2522,3 +3911,757 @@ TEST(flux2_smoke, vae_conv_phase_bench)
               gflop, gb_col, gb_col / (t_im / 1e3),
               gflop / 1e3 / (t_gm / 1e3));
 }
+
+
+// ---- streamed residency, wired ------------------------------------------
+//
+// The end of the policy every DiT shares: a streamed block that is KEPT
+// gets mlock'd through the manager's pool, and admission is gated on the
+// pool having room for it. What this pins is the pair of properties that
+// bound memory rather than the ones that make it fast.
+//
+//   1. THE RESULT DOES NOT MOVE. Keeping a block and streaming it must
+//      produce the same velocity to the bit -- a resident block is the
+//      same bytes read once instead of every step, so anything else is a
+//      bug in the promotion (a buffer aliased where it should be copied,
+//      a fused weight kept unfused).
+//   2. NOTHING GROWS WITHOUT A CEILING. Wired memory is the one
+//      allocation the kernel cannot take back, so the resident set must
+//      stop at the pool's limit and the process must never pass it --
+//      the failure mode is a panicked box, not a slow one.
+//
+// Run against a small pool on purpose: with the box's real pool a 9B DiT
+// fits entirely and the gate never fires, which is the case that proves
+// nothing.
+// LAYER STREAMING MUST NOT CHANGE A SINGLE BIT, for the text encoder as
+// much as for the DiT.
+//
+// declare_resources() claims this encoder with a floor -- what it holds
+// if it streams -- and the resource phase may admit a graph on the
+// strength of that. The claim is only honest if the encoder really can
+// stream, and the trade is only acceptable if the answer does not move.
+// Because a streamed layer is built by the SAME build_layer_ a resident
+// load runs, the bar is BIT-IDENTICAL rather than close; anything else
+// means the two paths read the checkpoint differently.
+//
+// Runs the {9,18,27} MULTI-LAYER tap FLUX.2 actually conditions on,
+// which the single-tap encoders elsewhere do not cover: what streaming
+// can break is the build/free/commit protocol around a tap, and a tap
+// at layer 9 that is later freed is a different case from the last one.
+// The two loads are SEQUENTIAL -- the first is destroyed before the
+// second is built -- so this never holds two copies.
+TEST(flux2_smoke, encoder_layer_streaming_matches_resident)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const char* eov = std::getenv("VPIPE_FLUX2_ENC_DIR");
+  const std::string edir = (eov != nullptr && *eov != '\0')
+      ? std::string(eov) : (fs::path(root) / "text_encoder").string();
+  if (!fs::exists(fs::path(edir) / "config.json")) { return; }
+
+  const MetalQwenModel::Config base = flux2_encoder_config_(edir, nullptr);
+  auto wts = MetalLlamaWeights::open_model(edir);
+  ASSERT_TRUE(wts.has_value());
+  SharedBuffer embed = wts->load("model.embed_tokens.weight", mc);
+  ASSERT_TRUE(!embed.empty());
+
+  const int EH = base.hidden, n = 8;
+  const std::vector<int> taps_l = {8, 17, 26};
+  auto make_x = [&]() {
+    SharedBuffer x = mc->make_shared_buffer((std::size_t)n * EH * 2);
+    const auto* tbl = static_cast<const std::uint8_t*>(embed.contents());
+    auto* xb = static_cast<std::uint8_t*>(x.contents());
+    for (int i = 0; i < n; ++i) {
+      std::memcpy(xb + (std::size_t)i * EH * 2,
+                  tbl + (std::size_t)(i + 100) * EH * 2, (std::size_t)EH * 2);
+    }
+    return x;
+  };
+  auto run = [&](bool stream, std::vector<std::uint16_t>& out) -> bool {
+    MetalQwenModel::Config c = base;
+    c.stream_layers = stream;
+    c.pin_frac      = 0.0;   // pure streaming: every layer takes the path
+    auto enc = MetalQwenModel::load(edir, mc, c);
+    if (enc == nullptr) { return false; }
+    // Without this the streamed arm can pass vacuously: load() DOWNGRADES
+    // streaming to resident for anything with an output head, and a silent
+    // downgrade would compare a model against itself.
+    if (enc->streaming_layers() != stream) { return false; }
+    genai::ContextManager* cm = enc->context_manager();
+    const genai::ContextId cid = cm->acquire_root();
+    SharedBuffer t = enc->forward_embeddings_taps(cid, make_x(), n, taps_l);
+    cm->release(cid);
+    if (t.empty()) { return false; }
+    const auto* p = static_cast<const std::uint16_t*>(t.contents());
+    out.assign(p, p + t.byte_size() / 2);
+    return true;
+  };
+
+  std::vector<std::uint16_t> want, got;
+  ASSERT_TRUE(run(false, want));
+  ASSERT_TRUE(run(true, got));
+  ASSERT_TRUE(want.size() == got.size() && !want.empty());
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < want.size(); ++i) {
+    if (want[i] != got[i]) { ++diff; }
+  }
+  std::printf("[flux2_smoke] encoder {9,18,27} taps, streamed vs resident: "
+              "%zu of %zu words differ\n", diff, want.size());
+  EXPECT_TRUE(diff == 0);
+}
+
+TEST(flux2_smoke, kept_blocks_are_wired_and_bounded_by_the_pool)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto* mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+
+  const int TS = 64, gh = 8, gw = 8, img_seq = gh * gw;
+
+  // Small enough that the gate binds well before the stack is resident,
+  // and small enough to sit under RLIMIT_MEMLOCK on any box.
+  const std::size_t kPool = 512ull << 20;
+  mgr->set_wired_pool_bytes(kPool);
+  const std::size_t limit = mgr->wired_pool_limit();
+
+  auto dit = MetalFlux2Transformer::load(
+      tdir, mc, MetalFlux2Transformer::Config{}, /*stream_blocks=*/true);
+  if (dit == nullptr) { mgr->set_wired_pool_pct(0); return; }
+  // A zero reserve is an ANSWER, not a default: this test frees the DiT
+  // itself, so there is no peer to hold room clear for. Without one,
+  // BlockResidency keeps growth off entirely.
+  dit->set_residency_reserve(0);
+  dit->set_residency_schedule(4);
+
+  const auto& c = dit->config();
+  SharedBuffer ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+  SharedBuffer lat =
+      mc->make_shared_buffer((std::size_t)img_seq * c.in_channels * 2);
+  ASSERT_TRUE(!ctx.empty() && !lat.empty());
+  std::mt19937 rng(9182);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  auto* cp = static_cast<_Float16*>(ctx.contents());
+  for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+    cp[i] = (_Float16)nd(rng);
+  }
+  auto* lp = static_cast<_Float16*>(lat.contents());
+  for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+    lp[i] = (_Float16)nd(rng);
+  }
+
+  auto forward = [&]() {
+    std::vector<std::uint16_t> out;
+    SharedBuffer v = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    if (v.empty() || v.byte_size() < n * 2) { return out; }
+    out.assign(static_cast<const std::uint16_t*>(v.contents()),
+               static_cast<const std::uint16_t*>(v.contents()) + n);
+    return out;
+  };
+
+  // Forward 1 streams every block and keeps what the pool allows;
+  // forwards 2-3 run against a partly resident stack.
+  const std::vector<std::uint16_t> a = forward();
+  ASSERT_TRUE(!a.empty());
+  const int kept1 = dit->resident_block_count();
+  EXPECT_TRUE(mgr->wired_pool_used() <= limit);
+
+  for (int i = 0; i < 2; ++i) {
+    const std::vector<std::uint16_t> b = forward();
+    ASSERT_TRUE(b.size() == a.size());
+    // BIT-identical, not close: same weights, same inputs, same kernels.
+    EXPECT_TRUE(std::memcmp(a.data(), b.data(), a.size() * 2) == 0);
+    EXPECT_TRUE(mgr->wired_pool_used() <= limit);
+  }
+  const int kept3 = dit->resident_block_count();
+  std::printf("[flux2_smoke] wired residency: %d -> %d blocks kept, "
+              "pool %zu of %zu MB\n", kept1, kept3,
+              (std::size_t)(mgr->wired_pool_used() >> 20),
+              (std::size_t)(limit >> 20));
+  // The set may stop at zero on a box already under pressure -- that is
+  // the policy working, not a failure. What must hold is that it never
+  // outran the ceiling and that it did not shrink the answer.
+  EXPECT_TRUE(dit->resident_block_bytes() <= limit);
+
+  // And the pool comes BACK when the model goes. A DiT freed for the
+  // vae-decode and reloaded per prompt would otherwise leak its whole
+  // share of the budget every prompt until nothing could wire at all.
+  dit.reset();
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+  mgr->set_wired_pool_pct(0);
+}
+
+// ---- runtime LoRA ---------------------------------------------------
+
+// The module names a runtime adapter has to use, checked against a REAL
+// checkpoint's tensor names.
+//
+// This is the test the feature needs most, and it needs no GPU and no
+// model load. A LoRA binds by NAME: a name that matches nothing is not
+// an error anywhere -- Adapter::bind treats an absent module as the
+// ordinary case, because an adapter is free to touch some projections
+// and not others -- so a typo produces an adapter that loads, reports,
+// and changes nothing. Against the checkpoint the typo is immediate.
+//
+// N is checked too (a wrong output dim would be counted a SHAPE SKIP,
+// which is at least loud, but the message would blame the adapter for
+// the model's error). K is checked only where the base tensor is dense:
+// a quantized `.weight` holds packed codes, so its second dimension is
+// K/8, not K.
+TEST(flux2_smoke, lora_module_names_match_the_checkpoint)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  namespace fs = std::filesystem;
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+  auto wopt = MetalLlamaWeights::open_model(tdir);
+  ASSERT_TRUE(wopt.has_value());
+  if (!wopt.has_value()) { return; }
+  const MetalLlamaWeights& w = *wopt;
+
+  // Size the Config from the checkpoint itself rather than from
+  // config.json: these are the same derivations load() makes in
+  // streaming mode, and taking them from the tensors keeps the test
+  // from agreeing with a config that disagrees with the weights.
+  MetalFlux2Transformer::Config cfg;
+  auto rows = [&](const char* nm) -> int {
+    const auto* ti = w.info(nm);
+    return (ti != nullptr && !ti->shape.empty()) ? (int)ti->shape[0] : 0;
+  };
+  cfg.hidden = rows("transformer_blocks.0.attn.to_q.weight");
+  ASSERT_TRUE(cfg.hidden > 0);
+  if (cfg.hidden <= 0) { return; }
+  cfg.double_ff_hidden = rows("transformer_blocks.0.ff.linear_in.weight");
+  const int pw = rows("single_transformer_blocks.0.attn.to_qkv_mlp_proj"
+                      ".weight");
+  ASSERT_TRUE(cfg.double_ff_hidden > 0 && pw > 3 * cfg.hidden);
+  if (cfg.double_ff_hidden <= 0 || pw <= 3 * cfg.hidden) { return; }
+  cfg.single_mlp_in = (pw - 3 * cfg.hidden) / 2;
+  cfg.n_double = 0;
+  cfg.n_single = 0;
+  while (w.info("transformer_blocks." + std::to_string(cfg.n_double) +
+                ".attn.to_q.weight") != nullptr) {
+    ++cfg.n_double;
+  }
+  while (w.info("single_transformer_blocks." + std::to_string(cfg.n_single) +
+                ".attn.to_out.weight") != nullptr) {
+    ++cfg.n_single;
+  }
+  EXPECT_TRUE(cfg.n_double > 0 && cfg.n_single > 0);
+
+  const auto mods = MetalFlux2Transformer::lora_module_list(cfg);
+  EXPECT_TRUE(mods.size() ==
+              (std::size_t)(cfg.n_double * 12 + cfg.n_single * 2));
+  int missing = 0, bad_n = 0, bad_k = 0, k_checked = 0;
+  for (const auto& m : mods) {
+    const auto* ti = w.info(m.name + ".weight");
+    if (ti == nullptr || ti->shape.size() != 2) {
+      if (missing < 4) {
+        std::printf("[flux2_smoke] LoRA module '%s' names no base tensor\n",
+                    m.name.c_str());
+      }
+      ++missing;
+      continue;
+    }
+    if ((int)ti->shape[0] != m.n) { ++bad_n; }
+    if (w.info(m.name + ".scales") == nullptr) {
+      ++k_checked;
+      if ((int)ti->shape[1] != m.k) { ++bad_k; }
+    }
+  }
+  EXPECT_TRUE(missing == 0);
+  EXPECT_TRUE(bad_n == 0);
+  EXPECT_TRUE(bad_k == 0);
+  std::printf("[flux2_smoke] %zu LoRA modules (%d double + %d single blocks) "
+              "all name a base tensor; N checked on all, K on %d dense\n",
+              mods.size(), cfg.n_double, cfg.n_single, k_checked);
+}
+
+// Which projections the fused paths swallow. Getting this wrong does
+// NOT fail -- it produces a run where the adapter's two biggest
+// projections quietly do not apply -- so it is asserted rather than
+// left to a forward that has no reference to disagree with.
+// TWO adapters ride together, and their strengths are independent.
+//
+// The shared machinery (lora::Stack, Applier::apply over one) is
+// exercised end to end by minimax_h3_lora.two_adapters_add_and_are_
+// dialled_apart; what is FLUX.2's own is the per-slot binding into
+// DoubleLora/SingleLora and the lora_at_ wiring at fourteen projections.
+// A member-pointer that names the wrong factor still COMPILES, so this
+// runs the real DiT.
+//
+// The adapters are synthesised from lora_module_list(), which is the
+// same table bind_lora_ walks -- so every module the model can adapt is
+// adapted, the fused ones included (which turns the SwiGLU weave off,
+// deliberately: that is the path a real adapter takes too).
+//
+// Env: VPIPE_FLUX2_TEST_MODEL_PATH (+ optional VPIPE_FLUX2_DIT_DIR).
+TEST(flux2_smoke, two_adapters_add_and_are_dialled_apart)
+{
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+
+  // One block of each stack: the adapter question is per projection, and
+  // twenty-five blocks would only be twenty-five times the load.
+  MetalFlux2Transformer::Config cfg;
+  cfg.n_double = 1;
+  cfg.n_single = 1;
+  // The DIMS have to come from the model, not from Config's defaults:
+  // load() derives double_ff_hidden and single_mlp_in from the
+  // checkpoint, and factors built against the defaults are the wrong
+  // SHAPE -- which the binder counts as a skip, so the adapter loads,
+  // reports nothing and does nothing.
+  {
+    auto probe = MetalFlux2Transformer::load(tdir, mc, cfg, false, {});
+    ASSERT_TRUE(probe != nullptr);
+    if (probe == nullptr) { return; }
+    cfg = probe->config();
+    cfg.n_double = 1;
+    cfg.n_single = 1;
+  }
+
+  // A synthetic adapter over EVERY module this shape can carry.
+  auto write_adapter = [&](const fs::path& p, int rank, float amp,
+                           float phase) -> bool {
+    struct T { std::string name; int n, k; };
+    std::vector<T> ts;
+    for (const auto& m : MetalFlux2Transformer::lora_module_list(cfg)) {
+      if (m.n <= 0 || m.k <= 0) { continue; }
+      ts.push_back({m.name + ".lora_A.weight", rank, m.k});
+      ts.push_back({m.name + ".lora_B.weight", m.n, rank});
+    }
+    if (ts.empty()) { return false; }
+    std::string hdr = "{";
+    std::uint64_t off = 0;
+    for (std::size_t i = 0; i < ts.size(); ++i) {
+      const std::uint64_t bytes = (std::uint64_t)ts[i].n * ts[i].k * 2;
+      hdr += (i ? "," : "");
+      hdr += "\"" + ts[i].name + "\":{\"dtype\":\"BF16\",\"shape\":[" +
+             std::to_string(ts[i].n) + "," + std::to_string(ts[i].k) +
+             "],\"data_offsets\":[" + std::to_string(off) + "," +
+             std::to_string(off + bytes) + "]}";
+      off += bytes;
+    }
+    hdr += "}";
+    while (hdr.size() % 8 != 0) { hdr += " "; }
+    std::ofstream f(p, std::ios::binary);
+    if (!f) { return false; }
+    const std::uint64_t hl = hdr.size();
+    f.write(reinterpret_cast<const char*>(&hl), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    std::vector<std::uint16_t> buf;
+    for (const T& t : ts) {
+      const std::size_t n = (std::size_t)t.n * t.k;
+      buf.resize(n);
+      for (std::size_t i = 0; i < n; ++i) {
+        const float v = amp * std::sin((float)i * 0.017f + phase);
+        std::uint32_t bits;
+        std::memcpy(&bits, &v, 4);
+        buf[i] = (std::uint16_t)(bits >> 16);   // bf16: truncate
+      }
+      f.write(reinterpret_cast<const char*>(buf.data()),
+              (std::streamsize)n * 2);
+    }
+    return (bool)f;
+  };
+
+  // The SAME sum in ONE slot: A = [A1; A2] stacked on the rank axis and
+  // B = [B1 | B2] beside it, which is exactly
+  // W x + B1 (A1 x) + B2 (A2 x) as a single rank-2r adapter. It is the
+  // ground truth the two-slot arms are measured against -- the only
+  // thing that differs is how many times y is accumulated onto.
+  auto write_merged = [&](const fs::path& p, int rank, float amp,
+                          float ph1, float ph2) -> bool {
+    struct T { std::string name; int n, k; bool is_b; };
+    std::vector<T> ts;
+    for (const auto& m : MetalFlux2Transformer::lora_module_list(cfg)) {
+      if (m.n <= 0 || m.k <= 0) { continue; }
+      ts.push_back({m.name + ".lora_A.weight", 2 * rank, m.k, false});
+      ts.push_back({m.name + ".lora_B.weight", m.n, 2 * rank, true});
+    }
+    if (ts.empty()) { return false; }
+    std::string hdr = "{";
+    std::uint64_t off = 0;
+    for (std::size_t i = 0; i < ts.size(); ++i) {
+      const std::uint64_t bytes = (std::uint64_t)ts[i].n * ts[i].k * 2;
+      hdr += (i ? "," : "");
+      hdr += "\"" + ts[i].name + "\":{\"dtype\":\"BF16\",\"shape\":[" +
+             std::to_string(ts[i].n) + "," + std::to_string(ts[i].k) +
+             "],\"data_offsets\":[" + std::to_string(off) + "," +
+             std::to_string(off + bytes) + "]}";
+      off += bytes;
+    }
+    hdr += "}";
+    while (hdr.size() % 8 != 0) { hdr += " "; }
+    std::ofstream f(p, std::ios::binary);
+    if (!f) { return false; }
+    const std::uint64_t hl = hdr.size();
+    f.write(reinterpret_cast<const char*>(&hl), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    auto bf16 = [&](float v) {
+      std::uint32_t bits;
+      std::memcpy(&bits, &v, 4);
+      return (std::uint16_t)(bits >> 16);
+    };
+    std::vector<std::uint16_t> buf;
+    for (const T& t : ts) {
+      buf.assign((std::size_t)t.n * t.k, 0);
+      if (!t.is_b) {
+        // [2r, k]: the two A blocks stacked, so a flat copy of each.
+        const std::size_t half = (std::size_t)rank * t.k;
+        for (std::size_t i = 0; i < half; ++i) {
+          buf[i]        = bf16(amp * std::sin((float)i * 0.017f + ph1));
+          buf[half + i] = bf16(amp * std::sin((float)i * 0.017f + ph2));
+        }
+      } else {
+        // [n, 2r]: the two B blocks SIDE BY SIDE, so the rows interleave.
+        for (int row = 0; row < t.n; ++row) {
+          for (int j = 0; j < rank; ++j) {
+            const std::size_t src = (std::size_t)row * rank + j;
+            buf[(std::size_t)row * 2 * rank + j] =
+                bf16(amp * std::sin((float)src * 0.017f + ph1));
+            buf[(std::size_t)row * 2 * rank + rank + j] =
+                bf16(amp * std::sin((float)src * 0.017f + ph2));
+          }
+        }
+      }
+      f.write(reinterpret_cast<const char*>(buf.data()),
+              (std::streamsize)buf.size() * 2);
+    }
+    return (bool)f;
+  };
+
+  std::error_code ec;
+  const fs::path dir = fs::temp_directory_path() / "vpipe-ut-flux2-2lora";
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir, ec);
+  const fs::path pa = dir / "a.safetensors";
+  const fs::path pb = dir / "b.safetensors";
+  ASSERT_TRUE(write_adapter(pa, 8, 0.04f, 0.0f));
+  ASSERT_TRUE(write_adapter(pb, 8, 0.04f, 1.7f));
+  const fs::path pm = dir / "merged.safetensors";
+  ASSERT_TRUE(write_merged(pm, 8, 0.04f, 0.0f, 1.7f));
+
+  using Spec  = MetalFlux2Transformer::LoraSpec;
+  using Specs = std::vector<Spec>;
+  const Spec A{pa.string(), 1.0f};
+  const Spec B{pb.string(), 1.0f};
+
+  const int TS = 8, gh = 4, gw = 4, img_seq = gh * gw;
+  int slots = 0, mods0 = 0, mods1 = 0;
+  auto arm = [&](const Specs& specs, const std::vector<float>& turn,
+                 std::vector<float>* out) {
+    auto dit = MetalFlux2Transformer::load(tdir, mc, cfg, false, specs);
+    if (dit == nullptr) { return false; }
+    for (std::size_t i = 0; i < turn.size(); ++i) {
+      dit->set_lora_scale((int)i, turn[i]);
+    }
+    slots = dit->lora_slots();
+    mods0 = dit->lora_modules(0);
+    mods1 = dit->lora_modules(1);
+    const auto& c = dit->config();
+    SharedBuffer ctx =
+        mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+    SharedBuffer lat = mc->make_shared_buffer((std::size_t)img_seq *
+                                              c.in_channels * 2);
+    if (ctx.empty() || lat.empty()) { return false; }
+    std::mt19937 rng(7);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)img_seq * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+    SharedBuffer vel = dit->forward_dit(ctx, TS, lat, img_seq, gh, gw, 0.5f);
+    if (vel.empty()) { return false; }
+    const std::size_t n = (std::size_t)img_seq * c.out_channels;
+    out->resize(n);
+    const auto* vp = static_cast<const _Float16*>(vel.contents());
+    for (std::size_t i = 0; i < n; ++i) { (*out)[i] = (float)vp[i]; }
+    return true;
+  };
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double num = 0.0, den = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      const double d = (double)a[i] - (double)b[i];
+      num += d * d;
+      den += (double)b[i] * (double)b[i];
+    }
+    return den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+  };
+
+  std::vector<float> v_off, v_a, v_ab, v_ba, v_dial;
+  ASSERT_TRUE(arm({}, {}, &v_off));
+  EXPECT_TRUE(slots == 0);
+  ASSERT_TRUE(arm({A}, {}, &v_a));
+  const int a_mods = mods0;
+  EXPECT_TRUE(slots == 1 && a_mods > 0 && mods1 == 0);
+  ASSERT_TRUE(arm({A, B}, {}, &v_ab));
+  EXPECT_TRUE(slots == 2 && mods0 == a_mods && mods1 == a_mods);
+  // Held, because the arms below reuse `mods0`/`mods1` and the last one
+  // is a single slot.
+  const int two_mods0 = mods0, two_mods1 = mods1;
+  // ORDER DOES NOT MATTER, and that is the arm that says the slots have
+  // their own scratch. Addition commutes -- but if both slots wrote
+  // their [rows, rank] intermediate to the same place, the LAST one's
+  // would be what both B factors multiply, and the two orders would
+  // compute two different (wrong) things.
+  ASSERT_TRUE(arm({B, A}, {}, &v_ba));
+  // Loaded at full in BOTH and the second turned to zero afterwards: the
+  // first must still be exactly where one adapter alone puts it. No
+  // kernels are encoded for a slot at zero, so this is the same run.
+  ASSERT_TRUE(arm({A, B}, {1.0f, 0.0f}, &v_dial));
+
+  // The same three arms at a tenth of the strength, to tell a ROUNDING
+  // apart from an error that scales with the adapters.
+  const Spec A1{pa.string(), 0.1f}, B1{pb.string(), 0.1f};
+  std::vector<float> w_a, w_ab, w_ba;
+  ASSERT_TRUE(arm({A1}, {}, &w_a));
+  ASSERT_TRUE(arm({A1, B1}, {}, &w_ab));
+  ASSERT_TRUE(arm({B1, A1}, {}, &w_ba));
+  // The SAME adapter, once in slot 0 and once in slot 1 with the other
+  // slot inert. Both must equal {A} alone BIT FOR BIT: a slot at zero
+  // encodes nothing, so the only thing that changed is which scratch
+  // REGION the live adapter writes its intermediate into.
+  std::vector<float> v_a_b0, v_b0_a, v_m;
+  const Spec Bz{pb.string(), 0.0f};
+  ASSERT_TRUE(arm({A, Bz}, {}, &v_a_b0));
+  ASSERT_TRUE(arm({Bz, A}, {}, &v_b0_a));
+  // The ground truth: both adapters as ONE rank-16 slot.
+  ASSERT_TRUE(arm({Spec{pm.string(), 1.0f}}, {}, &v_m));
+
+  const double d_a    = rel(v_a, v_off);
+  const double d_b    = rel(v_ab, v_a);
+  const double swap   = rel(v_ab, v_ba);
+  const double solo   = rel(v_dial, v_a);
+  const double reg0   = rel(v_a_b0, v_a);
+  const double reg1   = rel(v_b0_a, v_a);
+  const double m_ab   = rel(v_ab, v_m);
+  const double m_ba   = rel(v_ba, v_m);
+  const double m_one  = rel(v_a, v_m);
+  std::printf("[flux2_smoke] two slots: %d+%d modules | first moves %.3e, "
+              "second adds %.3e | vs the merged rank-16 adapter: {A,B} "
+              "%.3e, {B,A} %.3e, ONE adapter %.3e | swap %.3e | dialled to "
+              "0 %.3e | either scratch region %.3e / %.3e\n",
+              two_mods0, two_mods1, d_a, d_b, m_ab, m_ba, m_one, swap,
+              solo, reg0, reg1);
+  fs::remove_all(dir, ec);
+  // Both adapters reach the output, or every bar below compares a run
+  // with itself.
+  EXPECT_TRUE(d_a > 1e-3 && d_b > 1e-3);
+  // THE SUM, NOT ONE OF THE PARTS. Stacking the two on the rank axis is
+  // the same arithmetic through one GEMM pair, so it is the answer both
+  // orders have to land on -- and they land 5x nearer it than a single
+  // adapter does. The residual is the price of accumulating onto y
+  // TWICE in bf16 instead of once, and MEASURED it does not scale with
+  // the adapters (3.9e-2 at full strength, 5.4e-2 at a tenth of it,
+  // while the adapters' own effect moves 3.0e-1 -> 5.0e-2): a fixed
+  // rounding, spread over 14 modules in each of two blocks and
+  // amplified by what follows them. Two DIFFERENT adapters, which is
+  // the case this exists for, have nothing to be compared against.
+  EXPECT_TRUE(m_ab < 0.25 * m_one);
+  EXPECT_TRUE(m_ba < 0.25 * m_one);
+  // Order-independence follows, and is worth its own bar: naming the two
+  // adapters either way round is the same request.
+  EXPECT_TRUE(swap < 0.25 * m_one);
+  // The exact ones. A slot at zero encodes no kernels, and a live
+  // adapter does not care which region it was given.
+  //
+  // NOTE what the region bar does NOT pin. Applier::apply runs each
+  // slot's pair back to back -- t, then y += t B^T -- so slot 1's first
+  // GEMM writes the scratch only after slot 0's second has read it, and
+  // sharing one region would be CORRECT here, merely serialised. (H3 is
+  // the opposite: its gemm_ issues every t first, so that its base tile
+  // can fold one of them, and overlapping regions there corrupt. The
+  // mutation is caught by minimax_h3_lora, not here.) Disjoint regions
+  // are a scheduling choice on this path; this bar says the offsets are
+  // arithmetically sound, not that they are load-bearing.
+  EXPECT_TRUE(reg0 == 0.0 && reg1 == 0.0);
+  EXPECT_TRUE(solo == 0.0);
+}
+
+TEST(flux2_smoke, lora_forbids_fusion_names_the_fused_projections)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path dir = fs::temp_directory_path() / "vpipe-ut-flux2-lora";
+  fs::create_directories(dir, ec);
+
+  // A minimal F32 safetensors holding only the names -- file_touches
+  // reads the header, so the tensors need no useful content.
+  auto write = [&](const fs::path& p,
+                   const std::vector<std::string>& names) -> bool {
+    std::string hdr = "{";
+    std::size_t off = 0;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      if (i) { hdr += ","; }
+      hdr += "\"" + names[i] + "\":{\"dtype\":\"F32\",\"shape\":[1,1],"
+             "\"data_offsets\":[" + std::to_string(off) + "," +
+             std::to_string(off + 4) + "]}";
+      off += 4;
+    }
+    hdr += "}";
+    while (hdr.size() % 8 != 0) { hdr += " "; }
+    std::ofstream f(p, std::ios::binary);
+    if (!f) { return false; }
+    const std::uint64_t hl = hdr.size();
+    f.write(reinterpret_cast<const char*>(&hl), 8);
+    f.write(hdr.data(), (std::streamsize)hdr.size());
+    const float z = 0.0f;
+    for (std::size_t i = 0; i < names.size(); ++i) {
+      f.write(reinterpret_cast<const char*>(&z), 4);
+    }
+    return (bool)f;
+  };
+
+  const std::string b = "transformer_blocks.0.";
+  const std::string s = "single_transformer_blocks.0.";
+  struct Case { const char* tag; std::vector<std::string> names; bool forbid; };
+  const Case cases[] = {
+    // The three fused projections, each on its own.
+    {"ff.linear_in", {b + "ff.linear_in.lora_A.weight",
+                      b + "ff.linear_in.lora_B.weight"}, true},
+    {"ff_context.linear_in", {b + "ff_context.linear_in.lora_A.weight",
+                              b + "ff_context.linear_in.lora_B.weight"}, true},
+    {"to_qkv_mlp_proj", {s + "attn.to_qkv_mlp_proj.lora_A.weight",
+                         s + "attn.to_qkv_mlp_proj.lora_B.weight"}, true},
+    // Everything the fused paths leave alone. `linear_out` is the trap:
+    // it shares a prefix with `linear_in` and is NOT fused, so a match
+    // on "ff.linear" would turn the weave off for no reason.
+    {"attn only", {b + "attn.to_q.lora_A.weight",
+                   b + "attn.to_q.lora_B.weight",
+                   b + "attn.to_out.0.lora_A.weight",
+                   b + "attn.to_out.0.lora_B.weight"}, false},
+    {"ff.linear_out", {b + "ff.linear_out.lora_A.weight",
+                       b + "ff.linear_out.lora_B.weight",
+                       b + "ff_context.linear_out.lora_A.weight",
+                       b + "ff_context.linear_out.lora_B.weight",
+                       s + "attn.to_out.lora_A.weight",
+                       s + "attn.to_out.lora_B.weight"}, false},
+  };
+  for (const Case& c : cases) {
+    const fs::path p = dir / "case.safetensors";
+    ASSERT_TRUE(write(p, c.names));
+    const bool got = MetalFlux2Transformer::lora_forbids_fusion(p.string());
+    if (got != c.forbid) {
+      std::printf("[flux2_smoke] '%s': forbids_fusion %d, expected %d\n",
+                  c.tag, (int)got, (int)c.forbid);
+    }
+    EXPECT_TRUE(got == c.forbid);
+    fs::remove(p, ec);
+  }
+  // A file that is not there answers NO: the real error belongs to the
+  // bind that follows, and refusing the weave over an unreadable file
+  // would be a slowdown chosen for a reason that never materialized.
+  EXPECT_FALSE(MetalFlux2Transformer::lora_forbids_fusion(
+      (dir / "nope.safetensors").string()));
+}
+
+// ---- perf-flops ----------------------------------------------------
+//
+// The forward's arithmetic, as the FLOP/s meter is credited with it
+// (common/perf-flops.h, shared/dit-flops.h): EXACT against a count
+// derived here from the structure -- the embedders and the three
+// modulation projections, each double block's image and text halves
+// around one joint attention, each single block's fused projection,
+// attention and output, and the final layer -- and credited whole once
+// the buffers retire. The stack is the checkpoint's (it is read from
+// config.json), streamed, at a small geometry. Env:
+// VPIPE_FLUX2_TEST_MODEL_PATH (+ VPIPE_FLUX2_DIT_DIR).
+TEST(flux2_smoke, forward_credits_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* root = std::getenv("VPIPE_FLUX2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const char* ddir = std::getenv("VPIPE_FLUX2_DIT_DIR");
+  const std::string tdir = (ddir != nullptr && *ddir != '\0')
+      ? std::string(ddir) : std::string(root) + "/transformer";
+  auto dit = MetalFlux2Transformer::load(
+      tdir, mc, MetalFlux2Transformer::Config{}, /*stream=*/true);
+  ASSERT_TRUE(dit != nullptr);
+  if (dit == nullptr) { return; }
+  dit->set_residency_reserve(0);
+  const auto& c = dit->config();
+
+  const int TS = 24, gh = 8, gw = 8, IS = gh * gw, seq = TS + IS;
+  SharedBuffer ctx = mc->make_shared_buffer((std::size_t)TS * c.joint_dim * 2);
+  SharedBuffer lat =
+      mc->make_shared_buffer((std::size_t)IS * c.in_channels * 2);
+  ASSERT_TRUE(!ctx.empty() && !lat.empty());
+  if (ctx.empty() || lat.empty()) { return; }
+  {
+    std::mt19937 rng(20261010);
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    auto* cp = static_cast<_Float16*>(ctx.contents());
+    for (std::size_t i = 0; i < (std::size_t)TS * c.joint_dim; ++i) {
+      cp[i] = (_Float16)nd(rng);
+    }
+    auto* lp = static_cast<_Float16*>(lat.contents());
+    for (std::size_t i = 0; i < (std::size_t)IS * c.in_channels; ++i) {
+      lp[i] = (_Float16)nd(rng);
+    }
+  }
+
+  // The count, from the structure. Every projection here is linear in
+  // its rows, so a double block's image and text halves sum to one
+  // projection over the joint rows.
+  const long long H = c.hidden, DFF = c.double_ff_hidden;
+  const long long INNER = DFF / 2, SMLP = c.single_mlp_in;
+  const long long OC = c.out_channels > 0 ? c.out_channels : c.in_channels;
+  const std::uint64_t attn =
+      attention_flops(c.n_heads, (long long)seq * seq, c.head_dim);
+  const std::uint64_t dbl = 4 * gemm_flops(seq, H, H) +
+                            gemm_flops(seq, DFF, H) +
+                            gemm_flops(seq, H, INNER) + attn;
+  const std::uint64_t sgl = gemm_flops(seq, 3 * H + 2 * SMLP, H) +
+                            gemm_flops(seq, H, H + SMLP) + attn;
+  const std::uint64_t want =
+      gemm_flops(1, H, c.timestep_dim) + gemm_flops(1, H, H) +
+      2 * gemm_flops(1, 6 * H, H) + gemm_flops(1, 3 * H, H) +
+      gemm_flops(IS, H, c.in_channels) + gemm_flops(TS, H, c.joint_dim) +
+      (std::uint64_t)c.n_double * dbl + (std::uint64_t)c.n_single * sgl +
+      gemm_flops(1, 2 * H, H) + gemm_flops(IS, OC, H);
+
+  const pf::Totals g0 = pf::totals(pf::kGpu);
+  const SharedBuffer vel = dit->forward_dit(ctx, TS, lat, IS, gh, gw, 0.5f);
+  ASSERT_TRUE(!vel.empty());
+  const std::uint64_t flushed = dit->gpu_flops().flushed();
+  // The last buffer's handler may run after the wait that saw it.
+  for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                 flushed; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  const std::uint64_t gpu = pf::totals(pf::kGpu).flops - g0.flops;
+  std::printf("[flux2_smoke] flops: %d+%d blocks over %d rows: counted "
+              "%.5f TFLOP, derived %.5f, credited %.5f\n", c.n_double,
+              c.n_single, seq, flushed / 1e12, want / 1e12, gpu / 1e12);
+  EXPECT_TRUE(flushed == want);
+  EXPECT_TRUE(gpu == flushed);
+}
+

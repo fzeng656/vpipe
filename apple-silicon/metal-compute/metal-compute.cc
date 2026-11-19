@@ -1,4 +1,6 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/wire-on-alloc.h"
+#include "common/memory-owner.h"
 
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -27,6 +29,7 @@
 #include <deque>
 #include <fstream>
 #include <iterator>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -212,6 +215,8 @@ struct MetalCompute::Impl {
   MTL::Heap*           small_heap            = nullptr;
   std::size_t          alloc_buffers_heap    = 0;
   std::size_t          alloc_buffers_device  = 0;
+  // MTLDevice.maxBufferLength, cached on first query under alloc_mu.
+  mutable std::size_t  max_buffer_len        = 0;
 
   // PSO binary archive (Metal 3+). Allocated by
   // set_binary_archive_path; nullptr means "archive disabled".
@@ -707,6 +712,17 @@ MetalCompute::residency_stats() const noexcept
   return out;
 }
 
+MetalCompute::CacheStats
+MetalCompute::cache_stats() const noexcept
+{
+  CacheStats out;
+  if (!_impl->valid) { return out; }
+  std::lock_guard<std::mutex> lk(_impl->cache_mu);
+  out.libraries = _impl->lib_cache.size();
+  out.pipelines = _impl->pso_cache.size();
+  return out;
+}
+
 MetalCompute::MemoryBudget
 MetalCompute::memory_budget() const noexcept
 {
@@ -780,6 +796,9 @@ MetalCompute::memory_budget() const noexcept
                     reinterpret_cast<task_info_t>(&ti), &c) == KERN_SUCCESS) {
       out.self_compressed = (std::size_t)ti.compressed;
       out.self_footprint  = (std::size_t)ti.phys_footprint;
+      if (c > TASK_VM_INFO_REV2_COUNT && ti.ledger_tag_graphics_footprint > 0) {
+        out.self_graphics = (std::size_t)ti.ledger_tag_graphics_footprint;
+      }
     }
   }
   {
@@ -819,6 +838,109 @@ MetalCompute::pso_archive_stats() const noexcept
   return out;
 }
 
+// ---- WireOnAlloc (wire-on-alloc.h) ----------------------------------------
+
+namespace {
+thread_local int         t_wire_depth = 0;
+thread_local std::size_t t_wired      = 0;
+// The buffers this thread's open scopes wired and have not freed, by
+// contents pointer, and their total. Kept only while a scope is open: a
+// buffer freed after the outermost one closes was the load's to keep.
+thread_local std::unordered_map<const void*, std::size_t> t_live;
+thread_local std::size_t t_live_bytes = 0;
+// The live total past which nothing more is wired (the rooms of the open
+// scopes, the smallest), and what that left unwired.
+constexpr std::size_t    kNoRoomEnd  = std::numeric_limits<std::size_t>::max();
+thread_local std::size_t t_room_end  = kNoRoomEnd;
+thread_local std::size_t t_held_back = 0;
+}  // namespace
+
+WireOnAlloc::WireOnAlloc(std::size_t room) noexcept
+    : _start(t_wired), _start_live(t_live_bytes), _start_held(t_held_back),
+      _outer_end(t_room_end)
+{
+  ++t_wire_depth;
+  const std::size_t end = room > kNoRoomEnd - t_live_bytes
+                              ? kNoRoomEnd
+                              : t_live_bytes + room;
+  if (end < t_room_end) { t_room_end = end; }
+}
+
+WireOnAlloc::~WireOnAlloc()
+{
+  t_room_end = _outer_end;
+  if (--t_wire_depth == 0) {
+    t_live.clear();
+    t_live_bytes = 0;
+  }
+}
+
+bool
+WireOnAlloc::active() noexcept
+{
+  return t_wire_depth > 0;
+}
+
+bool
+WireOnAlloc::may_wire(std::size_t bytes) noexcept
+{
+  if (t_wire_depth == 0) { return false; }
+  if (bytes <= t_room_end && t_live_bytes <= t_room_end - bytes) {
+    return true;
+  }
+  t_held_back += bytes;
+  return false;
+}
+
+std::size_t
+WireOnAlloc::live_now() noexcept
+{
+  return t_wire_depth > 0 ? t_live_bytes : 0;
+}
+
+void
+WireOnAlloc::note_wired(const void* contents, std::size_t bytes) noexcept
+{
+  t_wired += bytes;
+  try {
+    t_live[contents] = bytes;
+    t_live_bytes += bytes;
+  } catch (...) {
+    // Untracked, so neither live nor ever subtracted: an under-charge of
+    // one buffer, never a count that goes negative.
+  }
+}
+
+void
+WireOnAlloc::note_unwired(const void* contents) noexcept
+{
+  if (t_wire_depth == 0) { return; }
+  const auto it = t_live.find(contents);
+  if (it == t_live.end()) { return; }
+  t_live_bytes -= it->second;
+  t_live.erase(it);
+}
+
+std::size_t
+WireOnAlloc::wired_bytes() const noexcept
+{
+  return t_wired - _start;
+}
+
+std::size_t
+WireOnAlloc::live_bytes() const noexcept
+{
+  // Clamped: an outer scope's buffer freed inside this one leaves the
+  // total below where this scope started.
+  return t_live_bytes > _start_live ? t_live_bytes - _start_live : 0;
+}
+
+std::size_t
+WireOnAlloc::held_back_bytes() const noexcept
+{
+  return t_held_back - _start_held;
+}
+
 SharedBuffer
 MetalCompute::make_shared_buffer(std::size_t byte_size,
                                  std::size_t alignment,
@@ -837,6 +959,7 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   }
 
   MTL::Buffer* buf = nullptr;
+  bool from_heap = false;
 
   // Heap fast path: small Tracked allocations sub-allocate from
   // the pre-created automatic heap. Untracked bypasses (heap's
@@ -852,6 +975,7 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
         static_cast<NS::UInteger>(byte_size), opts);
     if (buf != nullptr) {
       ++_impl->alloc_buffers_heap;
+      from_heap = true;
     }
   }
   if (buf == nullptr) {
@@ -888,8 +1012,47 @@ MetalCompute::make_shared_buffer(std::size_t byte_size,
   // MTL::Buffer by refcount and are deliberately not counted again).
   out._accounted = true;
   account_alloc_(byte_size);
+  // And WHOSE: the owner and use in force on this thread
+  // (common/memory-owner.h), counted out when the handle goes.
+  const std::uint32_t slot = memory_slot_now();
+  out._owner_slot = slot;
+  memory_slot_add(slot, byte_size);
+  // Inside a WireOnAlloc scope: wired before anything is written, so the
+  // compressor never takes it (wire-on-alloc.h). Not a heap slice: its
+  // pages are the heap's, shared with whatever else lives there.
+  // Within the scope's room (the wired pool's): past it, left unwired.
+  if (WireOnAlloc::active() && !from_heap &&
+      byte_size >= WireOnAlloc::kMinBytes &&
+      WireOnAlloc::may_wire(byte_size) && out.set_wired(true)) {
+    WireOnAlloc::note_wired(out.contents(), byte_size);
+  }
   pool->release();
   return out;
+}
+
+std::size_t
+MetalCompute::max_buffer_length() const noexcept
+{
+  if (!_impl->valid || _impl->device == nullptr) { return 0; }
+  std::lock_guard<std::mutex> g(_impl->alloc_mu);
+  if (_impl->max_buffer_len == 0) {
+    _impl->max_buffer_len =
+        static_cast<std::size_t>(_impl->device->maxBufferLength());
+    // SIMULATE A SMALLER DEVICE, the way VPIPE_RAM_LIMIT_MB simulates a
+    // smaller box. The limit scales with installed RAM, so the code that
+    // handles a shard larger than it is only reachable on the machines
+    // that have least of it -- which is the wrong place to discover it
+    // does not work. Lowering the number here makes the path testable
+    // anywhere; it can only ever lower it.
+    if (const char* e = std::getenv("VPIPE_MAX_BUFFER_MB")) {
+      const long long mb = std::atoll(e);
+      if (mb > 0) {
+        const std::size_t want = static_cast<std::size_t>(mb) << 20;
+        if (want < _impl->max_buffer_len) { _impl->max_buffer_len = want; }
+      }
+    }
+  }
+  return _impl->max_buffer_len;
 }
 
 SharedBuffer
@@ -915,9 +1078,24 @@ MetalCompute::make_no_copy_buffer(void* ptr, std::size_t byte_size) const
       ptr, static_cast<NS::UInteger>(mapped_len),
       MTL::ResourceStorageModeShared, nullptr);
   if (buf == nullptr) {
-    session()->warn(fmt(
-        "MetalCompute::make_no_copy_buffer: newBufferWithBytesNoCopy failed "
-        "(byte_size={})", byte_size));
+    // NAME THE LIMIT, not the call. `newBufferWithBytesNoCopy failed`
+    // told a reader which API said no and nothing about why, and the
+    // why is almost always one number: a device will not create a
+    // buffer longer than maxBufferLength, which is a fraction of
+    // installed RAM and so is smallest on the boxes that map the most.
+    // A caller that checked max_buffer_length() first never gets here.
+    const std::size_t cap = max_buffer_length();
+    if (cap != 0 && mapped_len > cap) {
+      session()->warn(fmt(
+          "MetalCompute::make_no_copy_buffer: {} MB is over this device's "
+          "{} MB maxBufferLength, so it cannot be wrapped without a copy",
+          byte_size >> 20, cap >> 20));
+    } else {
+      session()->warn(fmt(
+          "MetalCompute::make_no_copy_buffer: the device refused a {} MB "
+          "no-copy wrap (maxBufferLength is {} MB, so this is not a size "
+          "limit)", byte_size >> 20, cap >> 20));
+    }
     pool->release();
     return SharedBuffer{};
   }
@@ -1036,6 +1214,27 @@ MetalCompute::register_metal_library(std::string_view     name,
                                      const unsigned char* bytes,
                                      std::size_t          n) const
 {
+  // A PLUGIN BUILT IN RUNTIME-COMPILE MODE HAS NO BYTES TO GIVE, and
+  // that is a success rather than an omission: its object registered the
+  // MSL SOURCE from a static initializer as it loaded, and
+  // load_library() will compile it on first use. The plugin's call site
+  // is identical in both modes -- which is the point, since a plugin
+  // should not have to know which toolchain its build machine had -- so
+  // an empty pair here means "already provided, by the other route" and
+  // must not warn.
+  if (n == 0 && bytes != nullptr) {
+    const char*  src  = nullptr;
+    std::size_t  len  = 0;
+    int          lang = 0;
+    if (_embedded::find_embedded_metal_source(name, &src, &len, &lang)) {
+      if (session() != nullptr) {
+        session()->log_normal(fmt(
+            "MetalCompute: runtime metal library '{}' is embedded as SOURCE "
+            "({} bytes of MSL, compiled at first use)", name, len));
+      }
+      return true;
+    }
+  }
   if (_embedded::register_runtime_metallib(name, bytes, n)) {
     if (session() != nullptr) {
       session()->log_normal(fmt(

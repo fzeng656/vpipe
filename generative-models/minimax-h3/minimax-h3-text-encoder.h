@@ -83,6 +83,31 @@ class MiniMaxH3TextEncoder {
     // back to these, and a mismatch shows up as a shape failure at load
     // rather than as wrong pixels.
     MetalQwenVisionEncoder::Config vision;
+
+    // Where the WEIGHTS are, when not beside the config: a directory or a
+    // single file (a Draw Things .ckpt, presented under the release's
+    // names). Empty reads them from the encoder directory, as ever; the
+    // config and the tokenizer always come from there.
+    std::string weights;
+
+    // P-H3-Image's conditioning (generative-models/minimax-h3/
+    // p-h3-image.h): SEVERAL taps mapped to `text_dim` by a CONNECTOR.
+    // `taps` are HF `output_hidden_states` indices in the order their
+    // rows are concatenated -- i the output of layer i, `total_layers`
+    // the FINAL NORMED state (the model's own norm applied), never 0 --
+    // and `tap` is their deepest, the layers that run. `connector` is
+    // the PH3ImageTextConnector directory (`text_connector/`) beside the
+    // encoder, read by config_from_json. Both empty: MiniMax-H3's one
+    // raw `tap`, no connector.
+    std::vector<int> taps;
+    std::string connector;
+
+    // MiniMax-H3-Image's presentation (minimax-h3-image.h): a picture is
+    // labelled "Picture i: " -- no angle brackets, where H3 writes
+    // "<Picture i>: " -- and the prompt, and each label, keeps at most
+    // `max_tokens` tokens. Defaults: H3's, nothing truncated.
+    bool bare_picture_labels = false;
+    int  max_tokens          = 0;
   };
 
   // `path` may be the `text_encoder` directory, the partition root, or
@@ -121,11 +146,36 @@ class MiniMaxH3TextEncoder {
 
   ~MiniMaxH3TextEncoder();
 
-  // Whether the backbone streams its layers through the prefill instead
-  // of holding them (Config::lm.stream_layers -- the 16 GB path), and
-  // how many leading layers stayed pinned. For the stage's log line.
+  // Whether the backbone streams its layers instead of holding them
+  // (Config::lm.stream_decode, or stream_layers where that path cannot
+  // serve the checkpoint), and how many leading layers a prefill-streamed
+  // one pinned. For the stage's log line.
   bool streaming() const { return _lm && _lm->streaming_layers(); }
   int  pinned_layers() const { return _lm ? _lm->pinned_layers() : 0; }
+  // The backbone's measured residency, where it streams through the
+  // raw-source slots (MetalQwenModel::streams_decode): growth is off
+  // until a reserve is set, and 0 is an answer.
+  bool streams_resident_set() const { return _lm && _lm->streams_decode(); }
+  void set_residency_reserve(std::size_t bytes)
+  {
+    if (_lm) { _lm->set_residency_reserve(bytes); }
+  }
+  void set_residency_schedule(int forwards)
+  {
+    if (_lm) { _lm->set_residency_schedule(forwards); }
+  }
+  int resident_layer_count() const
+  {
+    return _lm ? _lm->resident_layer_count() : 0;
+  }
+  std::uint64_t resident_bytes() const
+  {
+    return _lm ? _lm->resident_bytes() : 0;
+  }
+  std::size_t release_idle_slots()
+  {
+    return _lm ? _lm->release_idle_slots() : 0;
+  }
 
   // Tokenize VERBATIM -- no chat template, no special tokens.
   std::vector<std::int32_t> tokenize(std::string_view prompt) const;
@@ -193,6 +243,10 @@ class MiniMaxH3TextEncoder {
   // verbatim. No chat template and no special tokens, exactly as the
   // text-only path.
   //
+  // An EMPTY `refs` is the prompt-only form: the presentation is the
+  // prompt alone, and it is run through encode()'s own path, so it
+  // returns the same bytes encode(prompt) does.
+  //
   // `token_tags`, when non-null, receives MiniMax-H3's own per-row
   // modality tag: text rows are tagged 1 and a VISION BLOCK's rows are
   // tagged 0 (video). That is not the same thing as the Qwen-internal
@@ -238,8 +292,28 @@ class MiniMaxH3TextEncoder {
 
   const Config& config() const { return _cfg; }
 
+  // Whether this encoder conditions through a connector (P-H3-Image).
+  bool has_connector() const { return !_cfg.connector.empty(); }
+
+  // The connector over taps a caller already has -- [taps.size()][n]
+  // [hidden] bf16, the taps forward's layout, the last of them RAW when
+  // it is the normed state (it is normed here) -- into [n, text_dim]
+  // bf16. Public so a test can pin it on the reference's own hidden
+  // states. Empty on failure, with `err`.
+  metal_compute::SharedBuffer
+  connect(const metal_compute::SharedBuffer& taps, int n,
+          std::string* err = nullptr) const;
+
  private:
   MiniMaxH3TextEncoder() = default;
+
+  // The taps forward's layer list (0-indexed, after layer k) for
+  // `_cfg.tap` / `_cfg.taps`.
+  std::vector<int> tap_layers_() const;
+  // The forward's taps, as the DiT reads them: H3's one tap as it is,
+  // P-H3-Image's through the connector.
+  metal_compute::SharedBuffer
+  finish_(metal_compute::SharedBuffer h, int n, std::string* err) const;
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -247,6 +321,13 @@ class MiniMaxH3TextEncoder {
   std::unique_ptr<MetalQwenModel> _lm;
   std::unique_ptr<Tokenizer> _tok;
   metal_compute::SharedBuffer _embed;
+  // P-H3-Image's connector (all f32, as stored) and the encoder's final
+  // norm, which the normed tap needs. `_conn_ws` is the connector's
+  // checkpoint, held for the buffers' lifetime.
+  std::shared_ptr<WeightSet> _conn_ws;
+  metal_compute::SharedBuffer _in_mean, _in_std, _proj, _out_mean, _out_std,
+      _sink;
+  std::vector<float> _final_norm;
 };
 
 }  // namespace genai

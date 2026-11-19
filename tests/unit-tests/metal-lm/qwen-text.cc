@@ -3,6 +3,17 @@
 // GGUF byte-level tokenizer round trip.
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
+#include "common/flex-bag.h"
+#include "generative-models/lm-run-memory.h"
+#include "pipeline/resource-plan.h"
+#include "stages/model-memory.h"
+
+#include <atomic>
+#include <filesystem>
+#include <thread>
+
+#include <sys/sysctl.h>
+#include <unistd.h>
 
 // Matrix-core (M5+) prefill GEMM must be greedy token-exact with the steel
 // quantized GEMM. Loads the SAME Qwen3.5 checkpoint twice -- once with the
@@ -540,6 +551,156 @@ TEST(metal_lm_smoke, qwen35_moe_text_chat) {
   EXPECT_TRUE(mism == 0);
 }
 
+// The three MoE prefill tiers compute one function: a ~350-token turn of
+// real text (past the steel tier's density line of ~4 routed rows an
+// expert, short of the old 1024-row one) prefilled with each forced --
+// per-pair gather, the grouped GEMV, the steel grouped GEMM. The grouped
+// GEMV reads the same weights in the same order as the pair gather, so it
+// is BIT-IDENTICAL to it. The steel tile stages its dequantized weights
+// in f16 and accumulates in another order, so it lands at the model's own
+// rounding floor -- MEASURED 0.057 on the last row's logits, against
+// 0.065 between the pair gather in f16 and in bf16 -- and is held to that
+// floor, measured here, with the same pick everywhere. Those three run on
+// the steel kernels (VPIPE_QWEN_MOE_NAX=0); a fourth runs the steel tier
+// as a GPU with matrix cores does (the routed experts' NAX twins, the
+// shared expert on matmul2d): ENGAGED there and held to the same floor,
+// bit-identical to the steel arm everywhere else. On a box that cannot
+// hold the experts they live in the expert cache (bit-identical to
+// resident). VPIPE_QWEN35_MOE_TEST_MODEL_PATH (Qwen3.6-35B-A3B-4bit).
+TEST(metal_lm_smoke, qwen35_moe_prefill_tiers_agree) {
+  const char* path = std::getenv("VPIPE_QWEN35_MOE_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  genai::ModelLoader loader(&sess);
+  auto cfg = loader.load_config(path);
+  ASSERT_TRUE(cfg.has_value());
+  if (!cfg.has_value()) { return; }
+  auto tok = genai::Tokenizer::from_huggingface_json(
+      std::string(path) + "/tokenizer.json", &sess);
+  ASSERT_TRUE(tok != nullptr);
+  if (!tok) { return; }
+  auto tpl = genai::make_chat_template(*cfg, *tok);
+  ASSERT_TRUE(tpl != nullptr);
+  if (!tpl) { return; }
+  std::string text =
+      "Summarize the following notes on memory planning in two sentences. ";
+  const char* para =
+      "A graph routinely asks one machine to hold several large models at "
+      "once: a diffusion transformer, its text encoder, a VAE, sometimes a "
+      "language model beside them. Weights are what a model holds; scratch "
+      "is what it allocates to run, and for a decode the second can dwarf "
+      "the first. Every stage declares what it will hold before anything "
+      "loads, so the plan is the same whichever stage loads first. ";
+  for (int i = 0; i < 4; ++i) { text += para; }
+  std::vector<std::int32_t> ids;
+  tpl->render_user_turn(text, /*is_first_turn=*/true, &ids);
+  const int n = (int)ids.size();
+  auto mcfg = genai::MetalQwenModel::config_from(*cfg);
+  mcfg.page_tokens = 512;
+  mcfg.max_pages = 8;
+  ASSERT_TRUE(mcfg.is_moe());
+  ASSERT_TRUE(n >= 256 && n < 1024 && (long long)n * mcfg.top_k >=
+                                          4LL * mcfg.n_experts);
+  // A box under 48 GB keeps the experts in a 4 GB cache (a 16 GB M5).
+  std::uint64_t ram = 0;
+  std::size_t ram_len = sizeof(ram);
+  sysctlbyname("hw.memsize", &ram, &ram_len, nullptr, 0);
+  if (ram != 0 && ram < (48ull << 30)) {
+    mcfg.expert_cache_bytes = (std::size_t)4 << 30;
+  }
+  struct Arm {
+    const char* name;
+    const char* grouped;
+    const char* steel;
+    const char* nax;
+    bool        bf16;
+  };
+  // The f16 arms share one load; the bf16 pair gather, the floor, loads
+  // after it is released.
+  const Arm arms[] = {{"pair", "0", "0", "0", false},
+                      {"gemv", "1", "0", "0", false},
+                      {"steel", "1", "1", "0", false},
+                      {"nax", "1", "1", "1", false},
+                      {"pair bf16", "0", "0", "0", true}};
+  std::vector<std::vector<float>> out;
+  std::unique_ptr<genai::MetalQwenModel> model;
+  bool model_bf16 = false, matrix_cores = false;
+  std::uint64_t nax_gemms = 0, shared_mma = 0;
+  for (const Arm& a : arms) {
+    if (!model || model_bf16 != a.bf16) {
+      model.reset();
+      mc->memory_budget_settled();
+      mcfg.use_bf16 = a.bf16;
+      model = genai::MetalQwenModel::load(path, mc, mcfg);
+      model_bf16 = a.bf16;
+    }
+    ASSERT_TRUE(model != nullptr);
+    if (!model) { return; }
+    ::setenv("VPIPE_QWEN_MOE_GROUPED", a.grouped, 1);
+    ::setenv("VPIPE_QWEN_MOE_STEEL", a.steel, 1);
+    ::setenv("VPIPE_QWEN_MOE_NAX", a.nax, 1);
+    const std::uint64_t g0 = model->moe_nax_gemms();
+    const std::uint64_t s0 = model->moe_shared_mma_gemms();
+    const auto cid = model->context_manager()->acquire_root();
+    out.push_back(model->prefill(cid, ids));
+    model->context_manager()->release(cid);
+    if (std::string(a.name) == "nax") {
+      matrix_cores = model->uses_matrix_cores();
+      nax_gemms = model->moe_nax_gemms() - g0;
+      shared_mma = model->moe_shared_mma_gemms() - s0;
+    } else {
+      EXPECT_TRUE(model->moe_nax_gemms() == g0 &&
+                  model->moe_shared_mma_gemms() == s0);
+    }
+  }
+  ::unsetenv("VPIPE_QWEN_MOE_GROUPED");
+  ::unsetenv("VPIPE_QWEN_MOE_STEEL");
+  ::unsetenv("VPIPE_QWEN_MOE_NAX");
+  auto rel = [](const std::vector<float>& a, const std::vector<float>& b) {
+    double d = 0.0, r = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      d += ((double)a[i] - b[i]) * ((double)a[i] - b[i]);
+      r += (double)a[i] * a[i];
+    }
+    return r > 0.0 ? std::sqrt(d / r) : 0.0;
+  };
+  auto argmax = [](const std::vector<float>& v) {
+    return (int)(std::max_element(v.begin(), v.end()) - v.begin());
+  };
+  for (const auto& o : out) {
+    ASSERT_TRUE(!o.empty() && o.size() == out[0].size());
+    if (o.empty() || o.size() != out[0].size()) { return; }
+  }
+  const double gp = rel(out[0], out[1]), sp = rel(out[0], out[2]);
+  const double np_ = rel(out[0], out[3]), ns = rel(out[2], out[3]);
+  const double floor = rel(out[0], out[4]);
+  std::printf("[qwen35_moe] %d-token prefill%s, last row from the per-pair "
+              "gather: grouped GEMV %.5f, steel %.5f, %s %.5f (from steel "
+              "%.5f; %llu NAX expert GEMMs, %llu shared on matmul2d); f16 vs "
+              "bf16 %.5f; picks %d %d %d %d %d\n", n,
+              mcfg.expert_cache_bytes ? " (experts cached)" : "", gp, sp,
+              matrix_cores ? "matrix cores" : "steel again", np_, ns,
+              (unsigned long long)nax_gemms, (unsigned long long)shared_mma,
+              floor, argmax(out[0]), argmax(out[1]), argmax(out[2]),
+              argmax(out[3]), argmax(out[4]));
+  EXPECT_TRUE(gp == 0.0);
+  EXPECT_TRUE(sp > 0.0);   // the steel tier engaged
+  EXPECT_TRUE(floor > 0.0 && sp < 1.25 * floor);
+  if (matrix_cores) {
+    // Every layer's two expert GEMMs and two shared ones, at least.
+    EXPECT_TRUE(nax_gemms >= 2ull * mcfg.n_layers);
+    EXPECT_TRUE(shared_mma >= 2ull * mcfg.n_layers);
+    EXPECT_TRUE(np_ > 0.0 && np_ < 1.25 * floor);
+  } else {
+    EXPECT_TRUE(ns == 0.0 && nax_gemms == 0 && shared_mma == 0);
+  }
+  for (int i = 1; i < 5; ++i) {
+    EXPECT_TRUE(argmax(out[0]) == argmax(out[i]));
+  }
+}
+
 // GGUF tokenizer scheme regression. Tokenizer::from_gguf must pick byte-level
 // (gpt2) vs metaspace (llama) from tokenizer.ggml.model. A Qwen3.5 GGUF is
 // "gpt2" byte-level -- the bug forced every GGUF to metaspace, so the raw
@@ -580,4 +741,716 @@ TEST(metal_lm_smoke, qwen_gguf_tokenizer_byte_level_round_trip) {
       EXPECT_TRUE(hf->decode(hf->encode(text)) == text);
     }
   }
+}
+
+// A language model KEPT WARM (GenerativeModelManager::keep_warm, text-chat's
+// `keep_loaded`): once its last user lets it go, the next load of the same
+// spec is handed the SAME model -- no read, no warmup; a launch declaring
+// other weights releases it before that launch loads; and its time runs
+// out on its own. Gated on VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, language_model_kept_warm) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const genai::LoadedLanguageModel* first = lm.get();
+  mgr->keep_warm(lm, path, 60.0);
+  lm.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->cached_count() == 1);   // its last user is gone
+  const auto t0 = std::chrono::steady_clock::now();
+  auto again = mgr->load(spec);
+  const double ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - t0).count();
+  EXPECT_TRUE(again.get() == first);
+  EXPECT_TRUE(ms < 50.0);
+  again.reset();
+
+  // A launch that holds other weights: released before it loads.
+  mgr->clear_declarations();
+  mgr->declare_weights(path, 1 << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 0);   // it holds this one
+  mgr->clear_declarations();
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 0);   // it holds nothing
+  mgr->declare_weights("/nonexistent/another-model", 1 << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 1);
+  mgr->clear_declarations();
+  EXPECT_TRUE(mgr->warm_count() == 0);
+  EXPECT_TRUE(mgr->cached_count() == 0);             // unloaded
+
+  // Its time runs out on its own.
+  auto third = mgr->load(spec);
+  ASSERT_TRUE(third != nullptr);
+  mgr->keep_warm(third, path, 0.3);
+  third.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  for (int i = 0; i < 50 && mgr->warm_count() > 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  EXPECT_TRUE(mgr->warm_count() == 0);
+  EXPECT_TRUE(mgr->cached_count() == 0);
+}
+
+// A language model kept warm and asked for again under OTHER SETTINGS (its
+// K/V pages here: a host that changed how it loads it): the warm one goes
+// before the load, not kept beside the new one -- two copies of one
+// model's weights resident until the old hold ran out. One still in use
+// stays, its parked conversation with it. Gated on
+// VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_warm_model_under_other_settings_is_let_go) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  mgr->keep_warm(lm, path, 60.0);
+  lm.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+
+  // The same settings: handed the warm one, which stays.
+  auto same = mgr->load(spec);
+  ASSERT_TRUE(same != nullptr);
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->cached_count() == 1);
+  same.reset();
+
+  // Other pages: the warm one let go first -- one copy, the new one.
+  genai::LoadSpec more = spec;
+  more.max_pages = 16;
+  auto other = mgr->load(more);
+  ASSERT_TRUE(other != nullptr && other->valid());
+  EXPECT_TRUE(mgr->warm_count() == 0);
+  EXPECT_TRUE(mgr->cached_count() == 1);
+
+  // Kept warm in its turn: the one hold.
+  mgr->keep_warm(other, path, 60.0);
+  other.reset();
+  EXPECT_TRUE(mgr->warm_count() == 1);
+
+  // IN USE when a load under other settings comes (a peer stage on the
+  // folder): letting it go would free nothing, so its hold stays, and the
+  // conversation parked on it with no file to go to.
+  auto in_use = mgr->load(more);
+  ASSERT_TRUE(in_use != nullptr);
+  mgr->park_context("conv-a", in_use, in_use->make_context(), "held", "");
+  auto peer = mgr->load(spec);
+  ASSERT_TRUE(peer != nullptr && peer->valid());
+  EXPECT_TRUE(peer != in_use);
+  EXPECT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->cached_count() == 2);
+  genai::LoadedLanguageModel::Context taken;
+  std::string meta;
+  EXPECT_TRUE(mgr->take_context("conv-a", in_use, &taken, &meta));
+  EXPECT_TRUE(meta == "held");
+}
+
+// A language model WIRED AS IT LOADS (load_spec::kWireWeights, text-chat's
+// `wire_weights`): its buffers mlock'd as they are allocated, so the
+// compressor cannot take the weights mid-read; what the load left wired is
+// charged to the wired pool while the model lives and given back once it is
+// gone. Gated on VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, language_model_wired_as_it_loads) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+  bag::set_flag(spec.extra, genai::load_spec::kWireWeights, true);
+  const std::size_t pool0 = mgr->wired_pool_used();
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  const std::size_t charged = mgr->wired_pool_used() - pool0;
+  // Most of the checkpoint (the 9B OptiQ: ~7 GB on disk).
+  EXPECT_TRUE(charged > (std::size_t)4 << 30);
+  // It decodes as ever.
+  {
+    auto ctx = lm->make_context();
+    ASSERT_TRUE(ctx.valid());
+    const std::int32_t ids[4] = {9707, 11, 1879, 0};
+    EXPECT_TRUE(lm->prefill(ctx, std::span<const std::int32_t>(ids, 4)) >= 0);
+  }
+  lm.reset();
+  // Gone: the next planning pass (or load) gives its bytes back.
+  mgr->release_warm_unclaimed();
+  mgr->clear_declarations();
+  mgr->declare_weights("/nonexistent/another-model", 1 << 20);
+  mgr->release_warm_unclaimed();
+  mgr->clear_declarations();
+  EXPECT_TRUE(mgr->wired_pool_used() == pool0);
+}
+
+// A language model KEPT WARM is REPORTED (warm_report,
+// SessionIntf::memory_report): `kind` "language-model", its canonical
+// directory, the bytes its load left wired, its K/V and the time it has
+// left. And a report polled while the hold expires -- it reads K/V from a
+// copy of the model, so it can be the one that lets it go -- leaves the
+// pool where it was without a planning pass. (The test cannot force that
+// interleaving; it checks the pool settles whichever thread frees the
+// model.) Gated on VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_warm_language_model_is_reported) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "bf16";
+  spec.page_tokens = 512;
+  spec.max_pages = 8;
+  bag::set_flag(spec.extra, genai::load_spec::kWireWeights, true);
+  const std::size_t pool0 = mgr->wired_pool_used();
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  const std::size_t charged = mgr->wired_pool_used() - pool0;
+  EXPECT_TRUE(charged > (std::size_t)4 << 30);
+  {
+    auto ctx = lm->make_context();
+    ASSERT_TRUE(ctx.valid());
+    const std::int32_t ids[4] = {9707, 11, 1879, 0};
+    EXPECT_TRUE(lm->prefill(ctx, std::span<const std::int32_t>(ids, 4)) >= 0);
+  }
+  const std::size_t kv = lm->kv_bytes();
+  EXPECT_TRUE(kv > 0);
+
+  mgr->keep_warm(lm, path, 60.0);
+  auto r = mgr->warm_report();
+  ASSERT_TRUE(r.size() == 1);
+  if (r.size() != 1) { return; }
+  EXPECT_TRUE(r[0].kind == "language-model");
+  EXPECT_TRUE(r[0].dir == std::filesystem::canonical(path).string());
+  EXPECT_TRUE(r[0].bytes == charged);
+  EXPECT_TRUE(r[0].kv_bytes == kv);
+  EXPECT_TRUE(r[0].seconds > 50.0 && r[0].seconds <= 60.0);
+  std::printf("[warm_report] %s: %zu MB wired, %zu KB of K/V, %.1f s\n",
+              r[0].dir.c_str(), r[0].bytes >> 20, r[0].kv_bytes >> 10,
+              r[0].seconds);
+  const vpipe::SessionIntf& host = sess;
+  const std::string json = host.memory_report().to_json();
+  EXPECT_TRUE(json.find("\"language-model\"") != std::string::npos);
+
+  // A short hold (renewing only lengthens one, so it is dropped first),
+  // the last user gone, a report polling as it expires.
+  mgr->keep_warm(lm, path, 0);
+  mgr->keep_warm(lm, path, 0.5);
+  lm.reset();
+  std::atomic<bool> stop{false};
+  std::atomic<int> polls{0};
+  std::thread poller([&] {
+    while (!stop.load()) {
+      (void)mgr->warm_report();
+      polls.fetch_add(1);
+    }
+  });
+  bool settled = false;
+  for (int i = 0; i < 100 && !settled; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    settled = mgr->warm_count() == 0 && mgr->wired_pool_used() == pool0;
+  }
+  stop.store(true);
+  poller.join();
+  std::printf("[warm_report] %d reports while the hold expired\n",
+              polls.load());
+  EXPECT_TRUE(polls.load() > 0);
+  EXPECT_TRUE(settled);
+  EXPECT_TRUE(mgr->cached_count() == 0);
+}
+
+// A CONTEXT SAVED to disk and read back decodes as the one it was saved
+// from, token for token (greedy, the same kernels either way); and a
+// conversation PARKED with a warm model is taken back by its key, or
+// saved to its file when the hold goes. Gated on
+// VPIPE_QWEN35_TEST_MODEL_PATH (Qwen3.5: paged K/V and GDN state both).
+TEST(metal_lm_smoke, a_context_saved_reads_back_token_exact) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 16;
+  spec.max_pages = 256;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  const auto prompt = lm->tokenizer().encode(
+      "Once upon a time, in a village between two rivers, there lived an "
+      "old clockmaker who kept every clock in the village a minute fast, "
+      "so that nobody would ever be late. One morning");
+  ASSERT_TRUE(prompt.size() > 32);   // more than two pages
+  auto decode = [&](genai::LoadedLanguageModel::Context& c,
+                    std::int32_t t) {
+    std::vector<std::int32_t> out{t};
+    for (int i = 0; i < 12; ++i) {
+      t = lm->next_token_greedy(c, t);
+      out.push_back(t);
+    }
+    return out;
+  };
+  // As decoded straight on.
+  std::vector<std::int32_t> want;
+  {
+    auto c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    ASSERT_TRUE(t >= 0);
+    want = decode(c, t);
+  }
+  // Saved after the prefill, read back, decoded.
+  const auto dir = std::filesystem::temp_directory_path()
+      / ("vpipe-ctx-" + std::to_string(std::chrono::steady_clock::now()
+                                             .time_since_epoch().count()));
+  std::filesystem::create_directories(dir);
+  const std::string file = (dir / "a.vctx").string();
+  {
+    auto c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    ASSERT_TRUE(t >= 0);
+    std::string err;
+    ASSERT_TRUE(lm->save_context(c, file, "meta-bytes", &err));
+    if (!err.empty()) { std::printf("save: %s\n", err.c_str()); }
+  }
+  {
+    std::string meta, err;
+    auto back = lm->load_context(file, &meta, &err);
+    if (!back.valid()) { std::printf("load: %s\n", err.c_str()); }
+    ASSERT_TRUE(back.valid());
+    if (!back.valid()) { return; }
+    EXPECT_TRUE(meta == "meta-bytes");
+    EXPECT_TRUE(back.seq_len() == (int)prompt.size());
+    EXPECT_TRUE(back.last_predicted_id() == want[0]);
+    const auto got = decode(back, want[0]);
+    EXPECT_TRUE(got == want);
+  }
+  // A file cut short is refused, and makes nothing.
+  {
+    std::filesystem::resize_file(file, std::filesystem::file_size(file) / 2);
+    std::string meta, err;
+    auto back = lm->load_context(file, &meta, &err);
+    EXPECT_TRUE(!back.valid());
+    EXPECT_TRUE(!err.empty());
+  }
+
+  // Parked with the model kept warm: taken back by its key, as it was.
+  mgr->keep_warm(lm, path, 60.0);
+  {
+    auto c = lm->make_context();
+    ASSERT_TRUE(lm->prefill(c, prompt) == want[0]);
+    const std::string spill = (dir / "kept.vctx").string();
+    mgr->park_context("conv-a", lm, std::move(c), "held", spill);
+    genai::LoadedLanguageModel::Context none;
+    std::string meta;
+    EXPECT_TRUE(!mgr->take_context("conv-b", lm, &none, &meta));
+    genai::LoadedLanguageModel::Context taken;
+    ASSERT_TRUE(mgr->take_context("conv-a", lm, &taken, &meta));
+    EXPECT_TRUE(meta == "held");
+    EXPECT_TRUE(decode(taken, want[0]) == want);
+    // Parked again; the hold ends: saved to its file first.
+    auto c2 = lm->make_context();
+    ASSERT_TRUE(lm->prefill(c2, prompt) == want[0]);
+    mgr->park_context("conv-a", lm, std::move(c2), "held", spill);
+    EXPECT_TRUE(!std::filesystem::exists(spill));
+    mgr->keep_warm(lm, path, 0);
+    EXPECT_TRUE(std::filesystem::exists(spill));
+    std::string m2, err;
+    auto back = lm->load_context(spill, &m2, &err);
+    ASSERT_TRUE(back.valid());
+    if (back.valid()) { EXPECT_TRUE(decode(back, want[0]) == want); }
+    // Dropped: nothing to take.
+    mgr->keep_warm(lm, path, 60.0);
+    auto c3 = lm->make_context();
+    mgr->park_context("conv-c", lm, std::move(c3), "", "");
+    EXPECT_TRUE(mgr->drop_context("conv-c"));
+    EXPECT_TRUE(!mgr->drop_context("conv-c"));
+    mgr->keep_warm(lm, path, 0);
+  }
+  std::error_code ec;
+  std::filesystem::remove_all(dir, ec);
+}
+
+// The model manager saves and releases PARKED contexts on threads of its
+// own -- the warm hold's reaper, a launch's planner, a host ending a
+// conversation -- while another context of the same model decodes.
+// Here a second thread saves and releases contexts, and drops parked
+// ones, for the whole of a decode that also makes and frees contexts
+// of its own: the decode's greedy tokens are those it makes alone, and
+// every context saved reads back. Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, contexts_go_on_another_thread_while_it_decodes) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 16;
+  spec.max_pages = 1024;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  using Ctx = genai::LoadedLanguageModel::Context;
+  const auto prompt = lm->tokenizer().encode(
+      "The lighthouse keeper wrote one line in the log every night, and "
+      "on the last night of the year he wrote");
+  const auto line = lm->tokenizer().encode("A short line, held.");
+  constexpr int kTokens = 40;
+  auto decode = [&](Ctx& c, std::int32_t t, const std::function<void()>&
+                                                 between) {
+    std::vector<std::int32_t> out{t};
+    for (int i = 1; i < kTokens; ++i) {
+      t = lm->next_token_greedy(c, t);
+      out.push_back(t);
+      between();
+    }
+    return out;
+  };
+  std::vector<std::int32_t> want;
+  {
+    Ctx c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    ASSERT_TRUE(t >= 0);
+    want = decode(c, t, [] {});
+  }
+
+  // Theirs: contexts the other thread saves (every second one) and
+  // releases; and contexts parked with the warm model under keys, which
+  // it drops, then lets the hold go (saving those with a file).
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path()
+      / ("vpipe-ctx-mt-" + std::to_string(::getpid()));
+  fs::create_directories(dir);
+  constexpr int kTheirs = 48, kParked = 16;
+  std::vector<Ctx> theirs;
+  for (int i = 0; i < kTheirs; ++i) {
+    theirs.push_back(lm->make_context());
+    ASSERT_TRUE(lm->prefill(theirs.back(), line) >= 0);
+  }
+  mgr->keep_warm(lm, path, 600.0);
+  auto file = [&](const char* tag, int i) {
+    return (dir / (std::string(tag) + std::to_string(i) + ".vctx"))
+        .string();
+  };
+  for (int i = 0; i < kParked; ++i) {
+    Ctx c = lm->make_context();
+    ASSERT_TRUE(lm->prefill(c, line) >= 0);
+    mgr->park_context("k" + std::to_string(i), lm, std::move(c), "m",
+                      i % 2 ? file("p", i) : std::string());
+  }
+
+  std::atomic<bool> go{false}, done{false};
+  std::atomic<int>  saved{0};
+  std::thread other([&] {
+    while (!go.load()) { std::this_thread::yield(); }
+    for (int i = 0; i < kTheirs; ++i) {
+      if (i % 2 && lm->save_context(theirs[(size_t)i], file("t", i), "")) {
+        ++saved;
+      }
+      theirs[(size_t)i] = Ctx{};
+      if (i % 4 == 0 && i / 4 < kParked / 2) {
+        (void)mgr->drop_context("k" + std::to_string(2 * (i / 4)));
+      }
+      if (!done.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    mgr->keep_warm(lm, path, 0);   // the hold ends: the rest saved
+  });
+  std::vector<std::int32_t> got;
+  {
+    Ctx c = lm->make_context();
+    const std::int32_t t = lm->prefill(c, prompt);
+    go.store(true);
+    // A context of its own made and freed at every token: the map grows
+    // under the other thread's erases.
+    got = decode(c, t, [&] {
+      Ctx extra = lm->make_context();
+      (void)lm->prefill(extra, line);
+    });
+    done.store(true);
+  }
+  other.join();
+  EXPECT_TRUE(got == want);
+  EXPECT_TRUE(saved.load() == kTheirs / 2);
+  int read_back = 0;
+  for (int i = 1; i < kTheirs; i += 2) {
+    std::string meta, err;
+    Ctx back = lm->load_context(file("t", i), &meta, &err);
+    if (back.valid() && back.seq_len() == (int)line.size()) { ++read_back; }
+  }
+  for (int i = 1; i < kParked; i += 2) {
+    std::string meta, err;
+    Ctx back = lm->load_context(file("p", i), &meta, &err);
+    if (back.valid() && back.seq_len() == (int)line.size()
+        && meta == "m") {
+      ++read_back;
+    }
+  }
+  std::printf("[contexts on another thread] decode %s; %d of %d saved "
+              "contexts read back\n", got == want ? "exact" : "DIFFERS",
+              read_back, kTheirs / 2 + kParked / 2);
+  EXPECT_TRUE(read_back == kTheirs / 2 + kParked / 2);
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// A model kept warm that a launch does not claim STAYS when the launch
+// fits beside it and GOES when it does not -- decided by the weights
+// planner as a launch's claims reach it. A launch claiming the model
+// keeps it whatever the box. Its runs are weighed at the arena the plan
+// booked for them when it was let go: this exec cannot say what they
+// hold (warm_run_bytes). Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_warm_model_stays_beside_a_launch_that_fits) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  // the run arena a stage's plan books for it, declared as it is let go
+  const std::size_t booked = (std::size_t)64 << 20;
+  mgr->declare_scratch(genai::lm_run_label(path), booked, std::string());
+  EXPECT_TRUE(lm->run_state_bytes() == 0);
+  mgr->keep_warm(lm, path, 600.0);
+  lm.reset();
+  ASSERT_TRUE(mgr->warm_count() == 1);
+  EXPECT_TRUE(mgr->warm_run_bytes(path) == booked);
+  mgr->clear_declarations();
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path other = fs::temp_directory_path()
+      / ("vpipe-warm-fit-" + std::to_string(::getpid()));
+  fs::create_directories(other);
+  {
+    std::ofstream f(other / "model.safetensors", std::ios::binary);
+    const std::string blob(1 << 20, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  auto launch = [&](const char* ram_mb, const std::string& dir) {
+    ::setenv("VPIPE_RAM_LIMIT_MB", ram_mb, 1);
+    pl->begin_plan(&sess);
+    pl->claim(&sess, dir, "", "", 0);
+    pl->end_plan(&sess);
+    ::unsetenv("VPIPE_RAM_LIMIT_MB");
+    return mgr->warm_count();
+  };
+  // A box with room for both: kept.
+  EXPECT_TRUE(launch("1048576", other.string()) == 1);
+  // The launch claims the warm model itself: kept, however small the box.
+  EXPECT_TRUE(launch("1024", path) == 1);
+  // A box without room for the model beside the launch: released.
+  EXPECT_TRUE(launch("1024", other.string()) == 0);
+  mgr->clear_declarations();
+  std::error_code ec;
+  fs::remove_all(other, ec);
+}
+
+// The int8 prefill's flag follows the LAUNCH, not the last stage. Every
+// load of one spec shares one model -- a launch's stages naming one
+// checkpoint, and a later launch handed a model kept warm -- so a stage
+// states its preference with request_i8_prefill, tagged with the
+// manager's launch epoch (bumped where every launch's plan begins): in
+// a launch the model runs int8 if ANY stage asked, whatever order their
+// initialize() ran in, and a new launch starts afresh -- a warm model
+// handed to a stage that does not ask is in 16 bits again. Requests from
+// stages initializing together are serialised. The flag as asked, not as
+// run (that needs matrix cores), so this holds on any GPU.
+// Env VPIPE_QWEN35_TEST_MODEL_PATH and / or VPIPE_LFM3_TEST_MODEL_PATH
+// (the two execs with the int8 route).
+TEST(metal_lm_smoke, i8_prefill_follows_the_launch_not_the_last_stage) {
+  const char* envs[] = {"VPIPE_QWEN35_TEST_MODEL_PATH",
+                        "VPIPE_LFM3_TEST_MODEL_PATH"};
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  for (const char* e : envs) {
+    const char* path = std::getenv(e);
+    if (!path || !*path) { continue; }
+    ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+    Session sess;
+    auto* mgr = sess.generative_model_manager();
+    ASSERT_TRUE(mgr != nullptr);
+    if (mgr == nullptr) { return; }
+    genai::LoadSpec spec;
+    spec.hf_dir = path;
+    spec.page_tokens = 256;
+    spec.max_pages = 8;
+    auto lm = mgr->load(spec);
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    ASSERT_TRUE(lm != nullptr && lm->valid());
+    if (!lm || !lm->valid()) { continue; }
+    // A launch as the runtime opens one: its plan (claiming the model,
+    // so a warm one is kept), then the stages' initialize().
+    auto launch = [&]() {
+      pl->begin_plan(&sess);
+      pl->claim(&sess, path, "", "", 0);
+      pl->end_plan(&sess);
+      return mgr->launch_epoch();
+    };
+    auto asked = [&]() { return lm->i8_prefill_requested(); };
+    // Launch 1: a stage asks, a second sharing the model does not.
+    const std::uint64_t e1 = launch();
+    lm->request_i8_prefill(true, e1);
+    const bool one = asked();
+    lm->request_i8_prefill(false, e1);
+    const bool both = asked();
+    // Kept warm and handed to the next load: the flag rides along...
+    genai::LoadedLanguageModel* const raw = lm.get();
+    mgr->keep_warm(lm, path, 600.0);
+    lm.reset();
+    lm = mgr->load(spec);
+    ASSERT_TRUE(lm.get() == raw);
+    if (lm.get() != raw) { return; }
+    const bool carried = asked();
+    // ...and launch 2's stage, which does not ask, puts it back.
+    const std::uint64_t e2 = launch();
+    lm->request_i8_prefill(false, e2);
+    const bool handed = asked();
+    // Launch 3: the same two stages in the other order.
+    const std::uint64_t e3 = launch();
+    lm->request_i8_prefill(false, e3);
+    lm->request_i8_prefill(true, e3);
+    const bool reversed = asked();
+    // Launch 4: eight stages initializing together, one asking; launch
+    // 5: none asking.
+    auto together = [&](std::uint64_t ep, int asker) {
+      std::vector<std::thread> ts;
+      for (int i = 0; i < 8; ++i) {
+        ts.emplace_back([&, i] { lm->request_i8_prefill(i == asker, ep); });
+      }
+      for (auto& t : ts) { t.join(); }
+      return asked();
+    };
+    const bool four = together(launch(), 5);
+    const bool five = together(launch(), -1);
+    // set_i8_prefill sets it outright; the next launch starts afresh.
+    lm->set_i8_prefill(true);
+    const bool outright = asked();
+    lm->request_i8_prefill(false, launch());
+    const bool after = asked();
+    std::printf("[i8-flag] %s: launch 1 asked %d, + a stage not asking %d; "
+                "handed over warm %d, launch 2 not asking %d; launch 3 in "
+                "the other order %d; 8 together, one asking %d, none %d; "
+                "outright %d, then a launch not asking %d (epochs %llu.."
+                "%llu)\n", path, one, both, carried, handed, reversed, four,
+                five, outright, after, (unsigned long long)e1,
+                (unsigned long long)mgr->launch_epoch());
+    EXPECT_TRUE(e2 > e1 && e3 > e2);
+    EXPECT_TRUE(one && both);
+    EXPECT_TRUE(carried);
+    EXPECT_TRUE(!handed);
+    EXPECT_TRUE(reversed);
+    EXPECT_TRUE(four && !five);
+    EXPECT_TRUE(outright && !after);
+    mgr->keep_warm(lm, path, 0.0);
+    mgr->clear_declarations();
+  }
+}
+
+// A long prefill onto a BRANCHED context answers as the same tokens fed to
+// an unbranched one. branch() freezes the parent's partial tail page, so
+// the child's next page starts mid-sequence; the steel prefill attention
+// (chunks from 2048 rows) took a key's page to be position / page_tokens
+// and read the wrong keys -- 1 of 12 greedy tokens matched. A 1500-token
+// chunk (the flash member, which always walked the table) is the control.
+// Gated on VPIPE_QWEN35_TEST_MODEL_PATH.
+TEST(metal_lm_smoke, a_long_prefill_onto_a_branch_matches_unbranched) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  if (mgr == nullptr) { return; }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 512;
+  spec.max_pages = 64;
+  auto lm = mgr->load(spec);
+  ASSERT_TRUE(lm && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  std::string text;
+  for (int i = 0; i < 400; ++i) {
+    text += "Entry " + std::to_string(i) + ": the courier left station " +
+            std::to_string((i * 37) % 101) + " carrying parcel " +
+            std::to_string((i * 53) % 997) + ". ";
+  }
+  const auto all = lm->tokenizer().encode(text);
+  ASSERT_TRUE(all.size() > 2400);
+  if (all.size() <= 2400) { return; }
+  // 100 tokens leave the parent's only page partial when it branches.
+  const std::span<const std::int32_t> head(all.data(), 100);
+  auto greedy = [&](genai::LoadedLanguageModel::Context& c,
+                    std::span<const std::int32_t> tail) {
+    std::vector<std::int32_t> out;
+    std::int32_t t = lm->prefill(c, tail);
+    for (int i = 0; i < 12 && t >= 0; ++i) {
+      out.push_back(t);
+      t = lm->next_token(c);
+    }
+    return out;
+  };
+  for (const int n : {1500, 2200}) {
+    const std::span<const std::int32_t> tail(all.data() + 100, (size_t)n);
+    auto plain = lm->make_context();
+    ASSERT_TRUE(lm->prefill(plain, head) >= 0);
+    const auto want = greedy(plain, tail);
+    auto parent = lm->make_context();
+    ASSERT_TRUE(lm->prefill(parent, head) >= 0);
+    auto child = lm->branch(parent);
+    ASSERT_TRUE(child.valid());
+    const auto got = greedy(child, tail);
+    int same = 0;
+    for (size_t i = 0; i < want.size() && i < got.size(); ++i) {
+      same += want[i] == got[i] ? 1 : 0;
+    }
+    std::printf("[branch prefill] %d-token chunk onto a branch: %d of %zu "
+                "greedy tokens as unbranched\n", n, same, want.size());
+    EXPECT_TRUE(want.size() == 12 && got == want);
+  }
+  ::unsetenv("VPIPE_LLM_BACKEND");
 }

@@ -41,11 +41,16 @@
 // time; a continuous capture graph has everything live at once and every
 // stage says so.
 
+#include "common/flex-data.h"
 #include "pipeline/clock-domain.h"
 
 #include <cstddef>
 #include <string>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -89,6 +94,9 @@ struct StageHolding {
   // still wanted.
   bool reclaimable = false;
 
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
+
   // What this holding costs on a box with no room to spare.
   std::size_t floor_bytes() const
   {
@@ -96,6 +104,38 @@ struct StageHolding {
     return floor > 0 ? floor : preload;
   }
 };
+
+// Correct a holding to what its model reports holding once LOADED.
+//
+// A block-streaming model builds its slot pair on its first forward, not
+// in load(), so a figure read straight after load is its trunk plus
+// whatever it pinned -- two blocks per stack under the floor the stage
+// declared for it. Written over both columns as said, that replaced a
+// floor that had been planned correctly, and under-counting is the
+// direction that admits a graph the box cannot hold.
+//
+// So the floor is the LARGER of the declared floor and what the model
+// held at load, and it stays there; the preload is what the model holds
+// NOW, never less than that floor. Pass `load_floor` = 0 for the
+// load-time correction, and the value it returned for every later one --
+// after a generation, when the slots exist and a resident set may have
+// grown or shed. Growth moves only the preload: a residency policy sheds
+// it again under pressure, so it is not part of the least the model can
+// be held at.
+//
+// With no declared floor there is no smaller form, and the load-time
+// figure is the floor -- which is what a model that does not stream
+// holds. Returns the floor.
+inline std::size_t
+correct_loaded_holding(StageHolding& h, std::size_t held,
+                       std::size_t load_floor = 0)
+{
+  std::size_t f = load_floor > 0 ? load_floor : held;
+  if (h.floor > f) { f = h.floor; }
+  h.floor   = f;
+  h.preload = held > f ? held : f;
+  return f;
+}
 
 // What one stage costs the box, in its own terms.
 //
@@ -123,6 +163,9 @@ struct StageMemory {
   // Shorter than the stage's oport count is fine; the rest are zero.
   std::vector<std::size_t> outputs;
 
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
+
   // The common case: one checkpoint, named.
   void hold(std::string source, std::size_t preload, std::size_t floor = 0,
             bool releases = false, bool reclaimable = false)
@@ -143,6 +186,9 @@ struct MemoryPlanStep {
   std::string stage_id;
   std::size_t at_floor   = 0;   // everything streamable at its floor
   std::size_t at_preload = 0;   // everything resident
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 struct MemoryPlan {
@@ -159,6 +205,9 @@ struct MemoryPlan {
   // then computed in declaration order, which is still an upper bound on
   // nothing in particular -- callers should report rather than refuse.
   bool ordered = true;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Where a stage's revision goes once the run has started.
@@ -194,5 +243,7 @@ MemoryPlan compute_memory_plan(const std::vector<Stage*>&       stages,
                                const std::vector<StageMemory>&  mem);
 
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

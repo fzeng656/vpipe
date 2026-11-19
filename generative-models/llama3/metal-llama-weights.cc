@@ -1,17 +1,28 @@
 #include "generative-models/llama3/metal-llama-weights.h"
 
+#include "generative-models/krea2/krea2-native-checkpoint.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
+#include "generative-models/shared/fp8-layout.h"
+
+#include "generative-models/shared/drawthings-store.h"
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
+#include "generative-models/shared/torch-zip.h"
 #include "generative-models/model-loader.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <dispatch/dispatch.h>
 #include <fcntl.h>
+#include <mutex>
 
 #include <vector>
 #include <filesystem>
@@ -33,7 +44,72 @@ struct GgufBacking {
   std::optional<GgufFile>                           gguf;
   std::unique_ptr<GgufConverterBase>                conv;
   std::unordered_map<std::string, ConvertedTensorSpec> specs;
+  // A Draw Things `.ckpt` (shared/drawthings-store.h) rides here too,
+  // because this is the one place the class keeps format state without
+  // its layout -- an exported one -- changing. Its index, the recipe of
+  // every tensor it CONVERTS (shard == -3: a codec other than raw, a
+  // concatenation, a folded norm), and the file mapping they decode
+  // from, which the shard owns.
+  // A converted tensor's TensorInfo::offset is its recipe's index here,
+  // not a name lookup, so a rename of the table (translate_names_)
+  // cannot orphan it.
+  struct DrawThings {
+    enum class View { kDense, kCodes, kScales };
+    struct Recipe {
+      int mapped = -1;
+      View view = View::kDense;
+    };
+    std::vector<drawthings::Tensor> tensors;
+    std::vector<drawthings::Mapped> mapped;
+    std::vector<Recipe> recipes;
+    const std::uint8_t* file = nullptr;
+    std::size_t size = 0;
+  };
+  std::unique_ptr<DrawThings> dt;
 };
+
+namespace {
+
+// A converted Draw Things tensor into `dst`: the recipe its info's
+// offset names -- the rows gathered and decoded, in the dtype the info
+// says (the store's element type), or an i8x weight's gathered codes or
+// row scales.
+bool
+dt_convert_(const GgufBacking::DrawThings& dt,
+            const MetalLlamaWeights::TensorInfo& ti, void* dst)
+{
+  using View = GgufBacking::DrawThings::View;
+  if (ti.offset >= dt.recipes.size()) { return false; }
+  const auto& rc = dt.recipes[(std::size_t)ti.offset];
+  const drawthings::Mapped& m = dt.mapped[(std::size_t)rc.mapped];
+  if (rc.view == View::kCodes) {
+    return drawthings::gather_i8x(m, dt.tensors, dt.file, dt.size,
+                                  static_cast<std::int8_t*>(dst), nullptr,
+                                  nullptr);
+  }
+  if (rc.view == View::kScales) {
+    return drawthings::gather_i8x(m, dt.tensors, dt.file, dt.size, nullptr,
+                                  static_cast<std::uint8_t*>(dst), nullptr);
+  }
+  std::size_t n = 1;
+  for (std::int64_t d : m.shape) { n *= (std::size_t)d; }
+  const bool f32 = ti.dtype == "F32";
+  if (n * (f32 ? 4 : 2) > ti.nbytes) { return false; }
+  if (f32) {
+    return drawthings::gather_f32(m, dt.tensors, dt.file, dt.size,
+                                  static_cast<float*>(dst), nullptr);
+  }
+  std::vector<float> v(n);
+  if (!drawthings::gather_f32(m, dt.tensors, dt.file, dt.size, v.data(),
+                              nullptr)) {
+    return false;
+  }
+  auto* h = static_cast<__fp16*>(dst);
+  for (std::size_t i = 0; i < n; ++i) { h[i] = (__fp16)v[i]; }
+  return true;
+}
+
+}  // namespace
 
 bool
 MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
@@ -48,6 +124,160 @@ MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
     return false;
   }
   const std::size_t file_size = static_cast<std::size_t>(st.st_size);
+
+  // A torch.save() checkpoint. Its tensors lie in the file as contiguous
+  // bytes exactly as a safetensors file's do; only the table of contents
+  // differs (a pickle instead of a JSON header). So it is mapped the same
+  // way, with a data section that starts at byte 0 and offsets taken from
+  // the archive -- and every read path below serves it unchanged. See
+  // shared/torch-zip.h for what the reader accepts and refuses.
+  if (torch_zip::looks_like_zip(fd)) {
+    std::vector<torch_zip::Tensor> tz;
+    std::string terr;
+    if (!torch_zip::read_index(fd, file_size, &tz, &terr)) {
+      ::close(fd);
+      return false;
+    }
+    void* tbase = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (tbase == MAP_FAILED) {
+      ::close(fd);
+      return false;
+    }
+    const int tidx = static_cast<int>(_shards.size());
+    Shard sh;
+    sh.fd = fd;
+    sh.fd_stream = ::open(safetensors_path.c_str(), O_RDONLY);
+#ifdef F_NOCACHE
+    if (sh.fd_stream >= 0) { (void)::fcntl(sh.fd_stream, F_NOCACHE, 1); }
+#endif
+    sh.base = tbase;
+    sh.map_size = file_size;
+    sh.data_start = 0;
+    _shards.push_back(sh);
+    for (torch_zip::Tensor& t : tz) {
+      TensorInfo ti;
+      ti.dtype = std::move(t.dtype);
+      ti.shape = std::move(t.shape);
+      ti.offset = t.offset;
+      ti.nbytes = t.nbytes;
+      ti.shard = tidx;
+      _tensors.emplace(std::move(t.name), std::move(ti));
+    }
+    return true;
+  }
+
+  // A DRAW THINGS checkpoint: an SQLite table of contents with the bytes
+  // after it (shared/drawthings-store.h). Mapped whole, like the torch
+  // archive above, and presented under the diffusers names its model's
+  // loader reads. Raw tensors are served where they lie; an i8x weight
+  // is served THREE ways -- its codes (`<stem>.i8x`, I8 [N, K]) and row
+  // scales (`<stem>.i8x_scales`) where they lie, for a loader that runs
+  // them natively, and `<stem>.weight` dequantized on the way out for
+  // one that does not; everything else is converted on the way out.
+  if (drawthings::looks_like(fd)) {
+    std::vector<drawthings::Tensor> ts;
+    std::vector<drawthings::Mapped> ms;
+    std::string family, derr;
+    if (!drawthings::read_index(safetensors_path, file_size, &ts, &derr) ||
+        !drawthings::map_to_diffusers(ts, &ms, &family, &derr)) {
+      std::fprintf(stderr, "MetalLlamaWeights: %s: %s\n",
+                   safetensors_path.c_str(), derr.c_str());
+      ::close(fd);
+      return false;
+    }
+    void* dbase = ::mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (dbase == MAP_FAILED) {
+      ::close(fd);
+      return false;
+    }
+    const int didx = static_cast<int>(_shards.size());
+    Shard sh;
+    sh.fd = fd;
+    sh.fd_stream = ::open(safetensors_path.c_str(), O_RDONLY);
+#ifdef F_NOCACHE
+    if (sh.fd_stream >= 0) { (void)::fcntl(sh.fd_stream, F_NOCACHE, 1); }
+#endif
+    sh.base = dbase;
+    sh.map_size = file_size;
+    sh.data_start = 0;
+    _shards.push_back(sh);
+    auto dt = std::make_unique<GgufBacking::DrawThings>();
+    dt->file = static_cast<const std::uint8_t*>(dbase);
+    dt->size = file_size;
+    using View = GgufBacking::DrawThings::View;
+    auto converted = [&](const std::string& nm, int mi, View view,
+                         const char* dtype, std::vector<std::int64_t> shape,
+                         std::uint64_t nbytes) {
+      TensorInfo ti;
+      ti.dtype = dtype;
+      ti.shape = std::move(shape);
+      ti.offset = dt->recipes.size();     // the recipe, see DrawThings
+      ti.nbytes = nbytes;
+      ti.shard = -3;                      // Draw Things, converted
+      dt->recipes.push_back({mi, view});
+      _tensors.emplace(nm, std::move(ti));
+    };
+    dt->mapped = std::move(ms);
+    for (std::size_t mi = 0; mi < dt->mapped.size(); ++mi) {
+      const drawthings::Mapped& m = dt->mapped[mi];
+      const drawthings::Tensor& t0 = ts[(std::size_t)m.parts[0].index];
+      const std::string full = m.name + "." + m.leaf;
+      const int elt = m.f32 ? 4 : t0.elt;
+      const char* dtype = elt == 4 ? "F32" : "F16";
+      // ONE stored tensor as it lies: no gather, no slice, no fold, no
+      // widening.
+      const bool one = m.parts.size() == 1 && !m.parts[0].rope &&
+                       m.parts[0].row0 == 0 && m.parts[0].nrows < 0 &&
+                       m.fn == drawthings::Mapped::Fn::kNone &&
+                       elt == t0.elt;
+      if (one && t0.codec == drawthings::kCodecRaw && t0.external) {
+        TensorInfo ti;
+        ti.dtype = dtype;
+        ti.shape = m.shape;
+        ti.offset = t0.offset;
+        ti.nbytes = (std::uint64_t)t0.count() * (std::uint64_t)t0.elt;
+        ti.shard = didx;
+        _tensors.emplace(full, std::move(ti));
+        continue;
+      }
+      if (m.leaf == "weight" && drawthings::i8x_whole(m, ts)) {
+        std::int64_t K = 1;
+        for (std::size_t d = 1; d < m.shape.size(); ++d) { K *= m.shape[d]; }
+        const std::int64_t N = m.shape[0];
+        if (one) {
+          TensorInfo c;
+          c.dtype = "I8";
+          c.shape = {N, K};
+          c.offset = t0.offset;
+          c.nbytes = (std::uint64_t)t0.count();
+          c.shard = didx;
+          _tensors.emplace(m.name + ".i8x", std::move(c));
+          TensorInfo s;
+          s.dtype = dtype;
+          s.shape = {N};
+          s.offset = t0.offset + drawthings::i8x_scale_offset(t0);
+          s.nbytes = (std::uint64_t)N * (std::uint64_t)t0.elt;
+          s.shard = didx;
+          _tensors.emplace(m.name + ".i8x_scales", std::move(s));
+        } else {
+          // Gathered from several, or reordered: still whole rows, each
+          // with its own scale, so still an i8x weight -- served by copy.
+          converted(m.name + ".i8x", (int)mi, View::kCodes, "I8", {N, K},
+                    (std::uint64_t)N * (std::uint64_t)K);
+          converted(m.name + ".i8x_scales", (int)mi, View::kScales, dtype,
+                    {N}, (std::uint64_t)N * (std::uint64_t)t0.elt);
+        }
+      }
+      std::int64_t n = 1;
+      for (std::int64_t d : m.shape) { n *= d; }
+      converted(full, (int)mi, View::kDense, dtype, m.shape,
+                (std::uint64_t)n * (std::uint64_t)elt);
+    }
+    dt->tensors = std::move(ts);
+    if (!_gguf) { _gguf = std::make_unique<GgufBacking>(); }
+    _gguf->dt = std::move(dt);
+    return true;
+  }
 
   // safetensors: u64 LE header length, then that many JSON bytes,
   // then the tensor data blob (data_offsets are relative to it).
@@ -103,6 +333,18 @@ MetalLlamaWeights::map_shard_(const std::string& safetensors_path)
   for (auto entry : j.as_object()) {
     const std::string_view key = entry.first;
     if (key == "__metadata__") {
+      // A file-level annotation, kept for the FIRST shard that carries
+      // one: safetensors permits only string values, and a sharded
+      // model repeats the same object per shard.
+      if (_metadata.empty() && entry.second.is_object()) {
+        FlexData md = entry.second;              // own it before viewing
+        for (auto kv : md.as_object()) {
+          if (kv.second.is_string()) {
+            _metadata.emplace(std::string(kv.first),
+                              std::string(kv.second.as_string("")));
+          }
+        }
+      }
       continue;
     }
     const FlexData& e = entry.second;
@@ -149,6 +391,41 @@ MetalLlamaWeights::open(const std::string& safetensors_path)
   return w;
 }
 
+namespace {
+
+// Every name translation a checkpoint can need, applied here, once, so
+// every reader of it sees the one namespace its loader reads. Each is a
+// no-op on a checkpoint that is not its layout, and each renames a
+// checkpoint WHOLE or not at all.
+//
+//   krea2::translate_native    Krea-2 in Krea's own naming (single files)
+//   minimax_h3::translate_comfy_prefix
+//                              a MiniMax-H3 DiT ComfyUI saved: its
+//                              `model.diffusion_model.` prefix dropped
+//                              (single files)
+//   fp8::translate_torchao     torchao's `_weight_qdata`/`_weight_scale`
+//                              FP8 spelling -> the comfy_quant one
+//   minimax_h3::translate_diffusers
+//                              MiniMax-H3 in the diffusers naming -> H3's
+//   minimax_h3::translate_diffusers_vae
+//                              its video VAE likewise
+//
+// torchao first: the H3 layout test reads `.weight` names.
+void
+translate_names_(std::optional<MetalLlamaWeights>& w, bool single_file)
+{
+  if (!w.has_value()) { return; }
+  if (single_file) {
+    (void)krea2::translate_native(*w);
+    (void)minimax_h3::translate_comfy_prefix(*w);
+  }
+  (void)fp8::translate_torchao(*w);
+  (void)minimax_h3::translate_diffusers(*w);
+  (void)minimax_h3::translate_diffusers_vae(*w);
+}
+
+}  // namespace
+
 std::optional<MetalLlamaWeights>
 MetalLlamaWeights::open_model(const std::string& model_dir)
 {
@@ -171,7 +448,15 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   // already come up. Naming the file is how a caller picks ONE quant out
   // of a repo directory that holds several, so it has to work.
   if (fs::is_regular_file(dir, ec) && !ec && dir.extension() != ".gguf") {
-    return open(model_dir);
+    auto w = open(model_dir);
+    // A Krea-2 DiT in Krea's OWN naming -- the single file community
+    // fine-tunes ship -- is presented under the diffusers names its
+    // loader reads. Here, once, so that every reader of this checkpoint
+    // sees the same namespace (krea2/krea2-native-checkpoint.h). A file
+    // the translation cannot place whole keeps its own names, and then
+    // loads as what it is: a checkpoint the loader does not recognise.
+    translate_names_(w, /*single_file=*/true);
+    return w;
   }
 
   // mlx-optiq stores the (unquantized BF16) vision tower in a SIDECAR
@@ -293,11 +578,18 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
       }
       mapped_any = true;
     }
-    if (!mapped_any) {
-      return std::nullopt;   // every listed shard absent -> nothing to load
+    if (mapped_any) {
+      map_vision_sidecar_(w);
+      std::optional<MetalLlamaWeights> ow(std::move(w));
+      translate_names_(ow, /*single_file=*/false);
+      return ow;
     }
-    map_vision_sidecar_(w);
-    return w;
+    // EVERY listed shard absent: a STALE index, not a partial download.
+    // mlx-community's Ministral-3-14B-Instruct-2512-4bit ships the FP8
+    // upstream's index (four model-0000N-of-00004 shards, FP8 names)
+    // beside its own two 4-bit shards; mlx globs and never reads it.
+    // Fall through to the index-less glob below, which finds the real
+    // shards -- each one's own header names its tensors -- or nothing.
   }
 
   // Index-less sharded layout: some checkpoints (e.g. MOSS-TTS-8B) ship
@@ -325,8 +617,38 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
         }
       }
       map_vision_sidecar_(w);
-      return w;
+      std::optional<MetalLlamaWeights> ow(std::move(w));
+      translate_names_(ow, /*single_file=*/false);
+      return ow;
     }
+  }
+
+  // A COMPONENT DIRECTORY: one freely-named .safetensors beside the
+  // config.json that describes it. That is a Comfy-Org repack's
+  // component (`text_encoders/qwen3vl_4b_bf16.safetensors`) completed
+  // with its model's config and tokenizer -- the repack itself is
+  // weights-only, so a catalogue entry fetches those as companions.
+  // Opened exactly as the file would be, so everything that names the
+  // DIRECTORY -- the config and tokenizer reads, a vision tower in the
+  // same file, the claim and the release -- names one checkpoint.
+  //
+  // Only beside a config.json, and only when the file is the sole
+  // .safetensors: a LoRA folder, or a repository root whose components
+  // sit in subdirectories, is neither and fails as it always did.
+  if (!fs::exists(dir / "model.safetensors", ec)
+      && !fs::exists(dir / "diffusion_pytorch_model.safetensors", ec)
+      && fs::exists(dir / "config.json", ec)) {
+    std::string only;
+    int n = 0;
+    std::error_code lec;
+    for (const auto& de : fs::directory_iterator(dir, lec)) {
+      if (de.is_regular_file(lec) &&
+          de.path().extension() == ".safetensors") {
+        ++n;
+        only = de.path().string();
+      }
+    }
+    if (n == 1) { return open_model(only); }
   }
 
   // Single-file layout (model.safetensors or the diffusers name).
@@ -337,6 +659,7 @@ MetalLlamaWeights::open_model(const std::string& model_dir)
   }
   auto single = open(sf.string());
   if (single) { map_vision_sidecar_(*single); }
+  translate_names_(single, /*single_file=*/false);
   return single;
 }
 
@@ -356,9 +679,15 @@ MetalLlamaWeights::operator=(MetalLlamaWeights&& o) noexcept
       if (sh.fd >= 0) { ::close(sh.fd); }
       if (sh.fd_stream >= 0) { ::close(sh.fd_stream); }
     }
+    // EVERY member, by hand. This is not the compiler's move -- the
+    // mmap release above is why it cannot be -- so a member added to
+    // the class and not to this list is silently dropped by the move
+    // that open() makes on the way out. `_metadata` was exactly that
+    // for as long as it took one test to notice.
     _shards = std::move(o._shards);
     _shard_maps = std::move(o._shard_maps);
     _tensors = std::move(o._tensors);
+    _metadata = std::move(o._metadata);
     _gguf = std::move(o._gguf);
     o._shards.clear();      // moved-from vectors are empty; make it explicit
     o._shard_maps.clear();
@@ -390,6 +719,12 @@ MetalLlamaWeights::info(const std::string& name) const
   return it == _tensors.end() ? nullptr : &it->second;
 }
 
+const std::map<std::string, std::string>&
+MetalLlamaWeights::metadata() const
+{
+  return _metadata;
+}
+
 std::vector<std::string>
 MetalLlamaWeights::tensor_names() const
 {
@@ -397,6 +732,23 @@ MetalLlamaWeights::tensor_names() const
   names.reserve(_tensors.size());
   for (const auto& kv : _tensors) { names.push_back(kv.first); }
   return names;
+}
+
+bool
+MetalLlamaWeights::rename_tensors(const RenameFn& fn)
+{
+  // Built aside and swapped in whole, so a collision leaves the table as
+  // it was rather than half-renamed.
+  std::unordered_map<std::string, TensorInfo> next;
+  next.reserve(_tensors.size());
+  for (const auto& [name, info] : _tensors) {
+    TensorInfo ti = info;
+    std::string to = fn(name, ti);
+    if (to.empty()) { continue; }
+    if (!next.emplace(std::move(to), std::move(ti)).second) { return false; }
+  }
+  _tensors = std::move(next);
+  return true;
 }
 
 MetalLlamaWeights::Alignment
@@ -421,8 +773,172 @@ MetalLlamaWeights::alignment() const
 bool
 MetalLlamaWeights::is_gguf() const noexcept
 {
-  return _gguf != nullptr;
+  return _gguf != nullptr && _gguf->gguf.has_value();
 }
+
+namespace {
+
+// HOW A TENSOR IS READ: in 1 MB pieces on the file's 4 KB grid, four in
+// flight.
+//
+// One read at a time leaves a drive short of its rate. MEASURED on an M4
+// Pro through this function (weight_set.pieces_read_at_the_drive_s_rate:
+// uncached, 2-3 GB of tensors an arm, none in the page cache, arms and
+// binaries interleaved in both orders), GB/s, MiniMax-H3 FL2VA's
+// transformer off a Thunderbolt 5 SSD / Fibo 2.0's off the internal one:
+//
+//   the old read: 8 MB staged reads, one at a time   3.69-3.86 / 3.93-3.96
+//   4 MB pieces    4 threads 5.11-5.21 / 4.39-4.40   8: 4.84-4.89 / 4.09-4.16
+//   2 MB                     5.22-5.31 / 4.46-4.60      5.03-5.10 / 4.40-4.45
+//   1 MB                     5.33-5.41 / 4.74-4.78      5.21-5.36 / 4.64-4.70
+//   512 KB                   5.20-5.25 / 4.80-4.82
+//
+// 1.4x off the dock and 1.2x off the internal SSD, near what either
+// drive gives any read shape (a raw-read study: 5.1-5.5 / 4.9 GB/s,
+// 256 MB reads to 32 small ones in flight, cached or not). Smaller
+// pieces keep four in flight to the end of a tensor (Fibo's average 38
+// MB); 8 threads never beat 4. VPIPE_PREAD_THREADS is the A/B -- 1 is
+// one 1 MB piece at a time (2.5-2.6 GB/s), NOT the old read.
+constexpr std::size_t kReadPiece   = 1ull << 20;
+constexpr std::size_t kReadGrid    = 4096;
+constexpr int         kReadThreads = 4;
+
+// Read per call rather than latched: a tensor read costs milliseconds and
+// a getenv nanoseconds, and an A/B can then interleave its arms in one
+// process.
+int
+read_threads_()
+{
+  const char* e = std::getenv("VPIPE_PREAD_THREADS");
+  if (e == nullptr || *e == '\0') { return kReadThreads; }
+  return std::clamp(std::atoi(e), 1, 64);
+}
+
+// Staging buffers, a piece each and page-aligned, kept for the next read
+// rather than freed: a buffer's pages are faulted in by the first read
+// into it, and a streamed model reads a block's pieces every few
+// milliseconds. At most kKeptStages idle (8 MB): four workers for the
+// streamer's prefetch and four for the forward's own reads; a burst past
+// that frees its extras.
+constexpr std::size_t kKeptStages = 8;
+
+struct StagePool {
+  std::mutex                 mu;
+  std::vector<std::uint8_t*> idle;
+
+  // Never destroyed: a read during exit must not find it gone.
+  static StagePool& get()
+  {
+    static StagePool* p = new StagePool;
+    return *p;
+  }
+  std::uint8_t* take()
+  {
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (!idle.empty()) {
+        std::uint8_t* b = idle.back();
+        idle.pop_back();
+        return b;
+      }
+    }
+    // MAPPED, not malloc'd: a freed large heap block stays dirty in the
+    // footprint on macOS, and munmap gives its pages back. MEASURED, 16
+    // threads reading a staged 13 MB tensor at once: posix_memalign left
+    // +16 MB at one worker a read and +32-47 MB at four, where the pool
+    // keeps 8 MB.
+    void* b = ::mmap(nullptr, kReadPiece, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANON, -1, 0);
+    return b == MAP_FAILED ? nullptr : static_cast<std::uint8_t*>(b);
+  }
+  void give(std::uint8_t* b)
+  {
+    if (b == nullptr) { return; }
+    {
+      std::lock_guard<std::mutex> lk(mu);
+      if (idle.size() < kKeptStages) {
+        idle.push_back(b);
+        return;
+      }
+    }
+    ::munmap(b, kReadPiece);
+  }
+};
+
+// pread(2) until `n` bytes are in.
+//
+// A short read that is not EINTR is a truncated or racing file. The
+// destination is left partly written, which is why this returns false
+// rather than trying to paper over it -- the caller must fall back to a
+// path that rewrites the whole buffer, not top this one up.
+bool
+pread_full_(int fd, std::uint8_t* out, std::size_t n, std::uint64_t off)
+{
+  std::size_t done = 0;
+  while (done < n) {
+    const ssize_t k = ::pread(fd, out + done, n - done,
+                              static_cast<off_t>(off + done));
+    if (k < 0 && errno == EINTR) { continue; }
+    if (k <= 0) { return false; }
+    done += static_cast<std::size_t>(k);
+  }
+  return true;
+}
+
+// Bytes [base, base + n) of `fd` into `out`, piece k being the file's
+// [g0 + k P, g0 + (k + 1) P) cut to the tensor, g0 its start rounded down
+// to the grid. A piece goes straight into `out` unless `stage` says the
+// read must not (see pread_into): then it is read whole into a staging
+// buffer -- an aligned offset into aligned memory -- and copied out.
+bool
+read_pieces_(int fd, std::uint64_t base, std::size_t n, std::uint8_t* out,
+             bool stage)
+{
+  const std::uint64_t end = base + n;
+  const std::uint64_t g0 = base & ~static_cast<std::uint64_t>(kReadGrid - 1);
+  const auto np =
+      static_cast<std::size_t>((end - g0 + kReadPiece - 1) / kReadPiece);
+  std::atomic<std::size_t> next{0};
+  std::atomic<bool> ok{true};
+  auto work = [&]() {
+    std::uint8_t* buf = nullptr;
+    for (;;) {
+      const std::size_t c = next.fetch_add(1, std::memory_order_relaxed);
+      if (c >= np || !ok.load(std::memory_order_relaxed)) { break; }
+      const std::uint64_t p0 = g0 + static_cast<std::uint64_t>(c) * kReadPiece;
+      const std::uint64_t lo = p0 < base ? base : p0;
+      const std::uint64_t hi = p0 + kReadPiece < end ? p0 + kReadPiece : end;
+      bool good = false;
+      if (!stage) {
+        good = pread_full_(fd, out + (lo - base),
+                           static_cast<std::size_t>(hi - lo), lo);
+      } else {
+        if (buf == nullptr) { buf = StagePool::get().take(); }
+        good = buf != nullptr &&
+               pread_full_(fd, buf, static_cast<std::size_t>(hi - p0), p0);
+        if (good) {
+          std::memcpy(out + (lo - base), buf + (lo - p0),
+                      static_cast<std::size_t>(hi - lo));
+        }
+      }
+      if (!good) { ok.store(false, std::memory_order_relaxed); }
+    }
+    StagePool::get().give(buf);
+  };
+  const std::size_t workers =
+      std::min(static_cast<std::size_t>(read_threads_()), np);
+  if (workers <= 1) {
+    work();
+    return ok.load();
+  }
+  auto* const wp = &work;
+  dispatch_apply(workers,
+                 dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+                 ^(std::size_t) { (*wp)(); });
+  return ok.load();
+}
+
+}  // namespace
 
 bool
 MetalLlamaWeights::pread_into(const std::string& name, void* dst,
@@ -443,72 +959,61 @@ MetalLlamaWeights::pread_into(const std::string& name, void* dst,
   const int fd = uncached && sh.fd_stream >= 0 ? sh.fd_stream : sh.fd;
   if (fd < 0) { return false; }
   const std::uint64_t base = sh.data_start + ti->offset;
-  auto* out = static_cast<std::uint8_t*>(dst);
 
-  // F_NOCACHE ONLY BYPASSES THE BUFFER CACHE ON A PAGE-ALIGNED OFFSET.
+  // AN UNCACHED READ GOES STRAIGHT INTO `dst` ONLY WHEN THE FILE OFFSET
+  // AND THE MEMORY ADDRESS ARE BOTH 4 KB MULTIPLES.
   //
   // Unbuffered I/O has alignment requirements, and a read that does not
-  // meet them does not fail -- it silently falls back to the buffered
-  // path and fills the cache with exactly the bytes the caller asked not
-  // to keep. MEASURED, 4 GB read from one file with F_NOCACHE set: a
-  // page-aligned offset grows file-backed pages by 0 MB, the SAME read
-  // at offset+8 grows them by 1813 MB.
+  // meet them does not fail -- it silently takes the buffered path and
+  // fills the cache with exactly the bytes the caller asked not to keep.
+  // MEASURED with mincore over the file's own pages (APFS, M4 Pro), 1 GB
+  // a read: memory 8, 2048 or 4016 bytes off a page cached 896 MB of it,
+  // 4096 or 12288 off nothing; a file offset 4096 into a page, nothing;
+  // the SAME misalignment on both sides (+80 / +80) cached 7/8 of it, so
+  // it is each side's alignment, not the two agreeing. (Earlier, 4 GB at
+  // a page-aligned offset grew file-backed pages by 0 MB and the same
+  // read at offset+8 by 1813 MB.)
   //
   // That matters because a safetensors data section is 8 + header_len
   // into the file, so its alignment is whatever the header length
-  // happened to be -- and every tensor inherits it. On a checkpoint
-  // whose section is off-boundary (Comfy-Org repacks, and anything an
-  // older vpipe quantizer wrote) EVERY streamed read was cached, which
-  // is where the tens of gigabytes of file cache came from that the
-  // wired pool then had to compete with.
-  //
-  // So read on page boundaries and copy the wanted bytes out. The extra
-  // memcpy runs at memory bandwidth; the cache it avoids was costing the
-  // model its resident set.
-  if (uncached && sh.fd_stream >= 0) {
-    const std::size_t page =
-        static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
-    if (page != 0 && (base % page) != 0) {
-      // One page-aligned staging buffer per thread: the streamer calls
-      // this from a prefetch thread while the forward calls it from its
-      // own, and a per-call allocation would be a megabyte-scale malloc
-      // in the middle of every block read.
-      constexpr std::size_t kChunk = 8ull << 20;      // page multiple
-      static thread_local std::vector<std::uint8_t> stage(kChunk + 16384);
-      std::size_t done = 0;
-      std::uint64_t cur = base;
-      while (done < ti->nbytes) {
-        const std::uint64_t off = cur & ~(std::uint64_t)(page - 1);
-        const std::size_t slack = (std::size_t)(cur - off);
-        std::size_t want = kChunk - slack;
-        if (want > ti->nbytes - done) { want = ti->nbytes - done; }
-        const ssize_t n = ::pread(fd, stage.data(), slack + want,
-                                  static_cast<off_t>(off));
-        if (n < 0 && errno == EINTR) { continue; }
-        if (n <= 0 || (std::size_t)n <= slack) { return false; }
-        const std::size_t got = (std::size_t)n - slack;
-        const std::size_t take = got < want ? got : want;
-        std::memcpy(out + done, stage.data() + slack, take);
-        done += take;
-        cur += take;
-      }
-      return true;
-    }
-  }
+  // happened to be -- and every tensor inherits it. Every large Hub file
+  // checked here is off-boundary (all of MiniMax-H3 FL2VA's transformer
+  // and text encoder; Fibo 2.0, LFM3-VL, P-H3-Image, Open-H3-Regenerate),
+  // and since a tensor's offset from its destination is fixed by where it
+  // lies, a misaligned tensor can never be read straight into a
+  // page-aligned buffer. It is STAGED:
+  // each piece read whole on the 4 KB grid, its part copied out. The
+  // copy runs at memory bandwidth, on four threads it hides under the
+  // other pieces' reads, and the cache it avoids was costing the model
+  // its resident set.
+  const bool stage =
+      fd == sh.fd_stream &&
+      ((base | reinterpret_cast<std::uintptr_t>(dst)) % kReadGrid) != 0;
+  return read_pieces_(fd, base, ti->nbytes, static_cast<std::uint8_t*>(dst),
+                      stage);
+}
 
-  std::size_t done = 0;
-  while (done < ti->nbytes) {
-    const ssize_t n = ::pread(fd, out + done, ti->nbytes - done,
-                              static_cast<off_t>(base + done));
-    if (n < 0 && errno == EINTR) { continue; }
-    // A short read that is not EINTR is a truncated or racing file. The
-    // destination is left partly written, which is why this returns
-    // false rather than trying to paper over it -- the caller must fall
-    // back to a path that rewrites the whole buffer, not top this one up.
-    if (n <= 0) { return false; }
-    done += static_cast<std::size_t>(n);
+bool
+MetalLlamaWeights::pread_range_into(const std::string& name,
+                                    std::uint64_t at, std::size_t bytes,
+                                    void* dst, bool uncached) const
+{
+  const TensorInfo* ti = info(name);
+  if (ti == nullptr || dst == nullptr || bytes == 0 ||
+      at + bytes > ti->nbytes || ti->shard < 0 ||
+      static_cast<std::size_t>(ti->shard) >= _shards.size()) {
+    return false;
   }
-  return true;
+  const Shard& sh = _shards[static_cast<std::size_t>(ti->shard)];
+  const int fd = uncached && sh.fd_stream >= 0 ? sh.fd_stream : sh.fd;
+  if (fd < 0) { return false; }
+  const std::uint64_t base = sh.data_start + ti->offset + at;
+  // Staged off the 4 KB grid, as pread_into is (see there).
+  const bool stage =
+      fd == sh.fd_stream &&
+      ((base | reinterpret_cast<std::uintptr_t>(dst)) % kReadGrid) != 0;
+  return read_pieces_(fd, base, bytes, static_cast<std::uint8_t*>(dst),
+                      stage);
 }
 
 metal_compute::SharedBuffer
@@ -536,6 +1041,14 @@ MetalLlamaWeights::load(const std::string& name,
     if (it == _gguf->specs.end() ||
         !_gguf->conv->convert(it->second,
                               static_cast<std::uint8_t*>(buf.contents()))) {
+      return {};
+    }
+    return buf;
+  }
+  // Draw Things: decoded straight into the SharedBuffer.
+  if (ti->shard == -3) {
+    if (!_gguf || !_gguf->dt ||
+        !dt_convert_(*_gguf->dt, *ti, buf.contents())) {
       return {};
     }
     return buf;
@@ -615,6 +1128,9 @@ MetalLlamaWeights::read_into(const std::string& name, void* dst,
     auto it = _gguf->specs.find(name);
     return it != _gguf->specs.end()
         && _gguf->conv->convert(it->second, static_cast<std::uint8_t*>(dst));
+  }
+  if (ti->shard == -3) {
+    return _gguf && _gguf->dt && dt_convert_(*_gguf->dt, *ti, dst);
   }
   if (ti->shard < 0 ||
       static_cast<std::size_t>(ti->shard) >= _shards.size()) {
@@ -722,17 +1238,56 @@ MetalLlamaWeights::load_mapped(const std::string& name,
     return load(name, mc);
   }
 
-  // Lazily wrap the whole shard once (newBufferWithBytesNoCopy over the mmap).
+  // Lazily wrap the whole shard once (newBufferWithBytesNoCopy over the
+  // mmap). One buffer per shard, every tensor a subview of it, which is
+  // both the cheapest and the most shareable arrangement.
   if (_shard_maps.size() < _shards.size()) {
     _shard_maps.resize(_shards.size());
   }
-  if (_shard_maps[si].empty()) {
-    _shard_maps[si] = mc->make_no_copy_buffer(sh.base, sh.map_size);
-    if (_shard_maps[si].empty()) {
-      return load(name, mc);        // wrap failed -> copy
-    }
+  if (_shard_over_max_said.size() < _shards.size()) {
+    _shard_over_max_said.resize(_shards.size(), false);
   }
-  return _shard_maps[si].subview(goff, ti->nbytes);
+  const std::size_t cap = mc->max_buffer_length();
+  const bool over_cap = cap != 0 && sh.map_size > cap;
+
+  // A SHARD CAN BE BIGGER THAN ANY BUFFER THAT COULD DESCRIBE IT, and
+  // that is not a failure to report per tensor. maxBufferLength is a
+  // fraction of installed RAM, so it shrinks exactly where mapping
+  // matters most: LTX-2.5's 24.5 GB bf16 text encoder fits under the
+  // 38.9 GB a 64 GB M4 Pro allows and does not fit on a smaller box.
+  //
+  // The answer is a WINDOW, not a copy. Wrapping the pages this one
+  // tensor needs keeps the whole point of Residency::Mapped -- clean,
+  // file-backed pages the kernel can drop and re-fault -- where falling
+  // back to load() would hand back dirty anonymous memory, which is the
+  // opposite of what the caller asked for and worst on the box that
+  // forced it. It costs one MTL::Buffer per mapped tensor instead of
+  // one per shard; nothing is copied either way.
+  if (!over_cap && _shard_maps[si].empty()) {
+    _shard_maps[si] = mc->make_no_copy_buffer(sh.base, sh.map_size);
+  }
+  if (!_shard_maps[si].empty()) {
+    return _shard_maps[si].subview(goff, ti->nbytes);
+  }
+  if (over_cap && mc->session() != nullptr && !_shard_over_max_said[si]) {
+    _shard_over_max_said[si] = true;
+    mc->session()->log_debug(fmt(
+        "weights: shard {} is {} MB, over this device's {} MB "
+        "maxBufferLength, so it is mapped one WINDOW per tensor rather "
+        "than wrapped whole. Still zero-copy; one Metal buffer per "
+        "mapped tensor instead of one per shard",
+        si, sh.map_size >> 20, cap >> 20));
+  }
+  const std::size_t page =
+      static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+  const std::size_t win_off = goff & ~(page - 1);
+  const std::size_t within  = goff - win_off;
+  metal_compute::SharedBuffer win = mc->make_no_copy_buffer(
+      static_cast<char*>(sh.base) + win_off, within + ti->nbytes);
+  if (win.empty()) {
+    return load(name, mc);          // wrap refused for another reason
+  }
+  return win.subview(within, ti->nbytes);
 }
 
 }  // namespace vpipe::genai

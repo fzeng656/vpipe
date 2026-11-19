@@ -11,15 +11,25 @@
 // path on the VPIPE_BUILD_APPLE_SILICON axis. On non-Apple builds this stage
 // is an inert stub.
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/sol-attention.h"
 #include "generative-models/krea2/flow-sampler.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 #include "generative-models/flux2/metal-flux2-transformer.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
+#include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
 #include "generative-models/boogu/metal-boogu-transformer.h"
-#include "generative-models/mage/metal-mage-flow-transformer.h"
-#include "generative-models/mage/mage-watermark.h"
+#include "generative-models/z-image/metal-z-image-transformer.h"
+#include "generative-models/flux3/metal-flux3-transformer.h"
+#include "generative-models/moss-image/metal-moss-image-transformer.h"
+#include "generative-models/fibo2/metal-fibo2-transformer.h"
+#include "generative-models/vosr/metal-vosr-transformer.h"
+#include "stages/generation-input.h"
+#include "stages/latent-preview.h"
+#include "stages/lora-slots.h"
 #endif
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -29,6 +39,10 @@
 namespace vpipe {
 
 namespace genai { class WeightSet; }   // generative-models/weight-set.h
+// generative-models/image-model-registry.h -- an out-of-tree family and
+// the one resident checkpoint it builds.
+namespace genai { class ImageModelFamily; class ImageGenerator; }
+namespace model_memory { struct StreamPlan; }   // stages/model-memory.h
 
 // Text-to-image (DiT) stage: the denoiser half of the diffusion split -- it
 // consumes ready-made conditioning from a `diffusion-conditioner` stage (which
@@ -80,6 +94,16 @@ namespace genai { class WeightSet; }   // generative-models/weight-set.h
 //
 //   oport0  TensorBeatPayload, an f32 latent [z_dim, H/8, W/8] (channel-first,
 //           unpacked, still whitened -- the vae-decode stage un-whitens).
+//   oport2  OPTIONAL live PREVIEW: planar U8 RGB [3, H, W], one beat per
+//           rendered step -- the model's clean estimate at that step,
+//           decoded by the tiny autoencoder the family's config source
+//           names (`preview_vae` and its three knobs). Feed a `preview`
+//           stage. PUSH-STYLE (DropOldest, one consumer), written from a
+//           thread of this stage's, so a preview nobody reads is dropped
+//           and never slows the generation. Unwired, or with no preview
+//           VAE, nothing is loaded or decoded. Rendered by krea2, flux2,
+//           z-image and qwen-image-21 (RGBA, [4, H, W]), and by a
+//           registered family that hands back `preview_x0`.
 //
 // Config (FlexData object):
 //   hf_dir     (string, OPTIONAL) -- the model dir; the transformer/ subfolder's
@@ -109,11 +133,31 @@ namespace genai { class WeightSet; }   // generative-models/weight-set.h
 // reference latent is wired on iport5, the size is INFERRED from it:
 // ref_latent0 is vae-encode's output for the source image, so the output is
 // its H/W times the family's VAE factor (8 for Krea-2 / Qwen-Image-Edit, 16
-// for FLUX.2 / Mage-Flow -- see latent_scale_). An edit therefore comes out at
+// for FLUX.2 -- see latent_scale_). An edit therefore comes out at
 // the source resolution with no size config at all. Falls back to 256x256 when
 // there is no reference either.
 class GenerateImageStage final : public TypedStage<GenerateImageStage> {
 public:
+  // The CHECKPOINT's own schedule: its scheduler_config.json and the
+  // `sample_sigmas` a distilled checkpoint ships in model_index.json.
+  // Read when the DiT is resolved. The defaults are the base model's,
+  // for a root that carries neither file (a single-file DiT).
+  struct Qi21Schedule {
+    bool        dynamic = true;            // use_dynamic_shifting
+    std::string shift_type = "exponential";
+    double      shift = 1.0;               // the static shift
+    double      shift_terminal = 0.02;     // 0 = none (null)
+    double      base_shift = 0.5;
+    double      max_shift = 0.9;
+    int         base_seq = 256;
+    int         max_seq = 8192;
+    // The raw nodes, terminal excluded; empty = linspace(1, 1/S, S).
+    std::vector<double> sample_sigmas;
+  };
+  // Read from <root>/scheduler/scheduler_config.json and
+  // <root>/model_index.json; see the definition for why it is read.
+  static Qi21Schedule qi21_checkpoint_schedule(const std::string& root);
+
   static constexpr const char* kTypeName = "generate-image";
 
   GenerateImageStage(const SessionContextIntf* session,
@@ -136,11 +180,49 @@ public:
   void apply_constant(unsigned iport, const FlexData& beat) override;
 
 private:
+  // What the int8 layouts (i8_gemm_tier fast / token) add to the DiT's
+  // bytes on disk where this stage's config and box engage them: a w4
+  // pack's projections held at int8 (`held`), or the scratch they are
+  // converted into before each GEMM (`scratch`). Zero where they do not
+  // engage.
+  std::size_t int8_held_bytes_(const std::string& dit) const;
+  std::size_t int8_scratch_bytes_(const std::string& dit) const;
+  // What a streamed DENSE checkpoint's slot pairs add on the int8
+  // layouts (each slot keeps its bf16 source and the layout from it).
+  std::size_t int8_slot_bytes_(const std::string& dit) const;
+  // The DiT this stage will LOAD, named at planning time: `dit_dir`
+  // when the graph names one, else the checkpoint's own.
+  std::string planned_dit_dir_(const std::string& root) const;
+  // Whether the ANE tier declare_resources claimed may run: the plan's
+  // grant for its one unit (`bytes` only sizes the no-plan fallback).
+  // Logs the refusal; the caller turns the tier off.
+  bool ane_granted_(std::size_t bytes, const char* family) const;
+  // The engine's call between the two, from the DiT's streaming plan; it
+  // says which on the log.
+  bool hold_w4_int8_(const model_memory::StreamPlan& plan, bool streamed,
+                     const std::string& dit);
+  // ...as decided at the plan, for the reloads that follow it.
+  bool _i8_hold_w4 = false;
+  // Whether that decision has been made: until it has, declare_memory()
+  // books the layout held (the preload at its largest).
+  bool _i8_hold_decided = false;
   // Tell the manager what a STREAMING DiT actually keeps resident, which
   // is its pinned prefix rather than the whole checkpoint its files
   // suggest. Without this every peer sizes the box against ~20 GB that
   // was never there. No-op when the DiT is not streaming.
   void revise_dit_declaration_(const std::string& dit_dir) const;
+  std::size_t dit_resident_bytes_() const;
+  void release_idle_slots_();
+  void correct_dit_holding_(const char* when) const;
+
+  // The checkpoint whose holding correct_dit_holding_ moves, plus the
+  // two figures that make the correction idempotent: the floor the
+  // load-time read fixed, and the last preload published. Mutable
+  // because the correction is bookkeeping about a plan, asked from the
+  // const side of generation.
+  std::string         _dit_holding_dir;
+  mutable std::size_t _dit_load_floor = 0;
+  mutable std::size_t _dit_revised    = 0;
 public:
   void reset_run_state() override;
   Job process   (RuntimeContext& ctx) override;
@@ -150,13 +232,53 @@ public:
   // Test-only accessors.
   const std::string& hf_dir()        const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _latents_emitted; }
+  // The RESOLVED Sol-Attn config, after the key-block validation. Test-
+  // only, and the reason it exists: whether a rejected block size falls
+  // back or is silently kept is not visible from config_error(), because
+  // a perf knob spelled wrong warns rather than failing the stage.
+  const genai::sol::Config& sol_config() const noexcept { return _sol; }
+  // The bag itself, which is what a registered family gets. A test seam
+  // like sol_config() beside it, and the one that can check the two
+  // agree -- the whole point of writing the settled values in and
+  // reading them straight back out.
+  const FlexData& accel_settings() const noexcept { return _accel; }
+  // The adapter this stage would load with, after its own config and
+  // any model_config beat. Exposed because the interesting failure is
+  // that it is EMPTY when the graph thought it had set one, and every
+  // other way of seeing that needs a checkpoint.
+  const std::string& lora_ref(int slot = 0) const noexcept
+  {
+    return _lora[(std::size_t)(slot > 0 ? 1 : 0)].path;
+  }
+  double lora_scale(int slot = 0) const noexcept
+  {
+    return _lora[(std::size_t)(slot > 0 ? 1 : 0)].scale;
+  }
+  // Whether this stage's DiT was a model kept warm, taken back
+  // (`keep_loaded`) -- a test's proof the take ran rather than a build.
+  bool dit_taken_warm() const noexcept { return _dit_taken_warm; }
 
 private:
+  // Copies the settled ANE tier from the accel bag onto a family config
+  // that has the fields. See the definition -- the bag is filled whether
+  // or not anything reads it, so this is the step that makes the tier
+  // reachable from a graph.
+  template <typename Cfg>
+  void apply_ane_(Cfg& cfg) const;
+
+  // The label both halves of the ANE grant use: declare_resources()
+  // claims CoreML residency under it and apply_ane_() reads the grant
+  // back. Per STAGE, so two generate-image stages in one graph are
+  // granted separately rather than sharing one allowance.
+  std::string ane_claim_label_() const;
+
   // Stamp the generating model onto a latent beat's sideband. The chain
   // generate-image -> vae-decode -> save-image carries it through so a saved
   // file can record WHAT produced it (save-image writes it into EXIF
-  // Software). Merges into any sideband already present.
-  void tag_model_(TensorBeat& tb) const;
+  // Software). Merges into any sideband already present. And when the
+  // latent is a single reference's padded canvas, that reference's
+  // sideband::kCropBox, for vae-decode to cut the picture back to.
+  void tag_output_(TensorBeat& tb) const;
 
   std::string _hf_dir;
   std::string _dit_dir;
@@ -164,14 +286,106 @@ private:
   int         _height{};
   int         _width{};
   int         _steps{};
+  // True when `steps` came from the config rather than from the
+  // default applied in the constructor.
+  bool        _steps_set = false;
   double      _strength{};      // img2img: 0 => text-to-image (pure noise)
   double      _guidance_scale{};     // CFG scale; 1 => disabled (single pass)
   bool        _infer_size{};    // no width/height configured: size from iport5
   bool        _i8_gemm{};            // LOSSY dynamic-int8 DiT GEMMs (opt-in)
+  bool        _autotune = true;      // kernel tuners measure (kAutotune)
+  double      _keep_loaded{};        // s a built DiT is kept warm after
+  void        keep_models_warm_();
+  // ---- a DiT kept WARM between graphs (`keep_loaded`) ---------------
+  //
+  // What a family built, under a key naming every setting that changed
+  // it -- the tiers, attention, the ANE's share (and whether its modules
+  // were built), its adapters' files (a strength is live, set again on a
+  // take), `extra` for what only the family has. Fields a family's
+  // Config lacks are left out.
+  template <class Cfg, class Spec>
+  static std::string warm_key_(const Cfg& cfg, bool stream,
+                               const std::vector<Spec>& loras,
+                               const std::string& extra = {});
+  // The DiT kept warm under `key` for `dir`, taken back (and `key` kept
+  // as this stage's); null when there is none, keep_loaded is off or the
+  // box is tight (`_dit_bounded`).
+  template <class Dit>
+  std::shared_ptr<Dit> take_warm_dit_(const char* kind,
+                                      const std::string& dir,
+                                      const std::string& key,
+                                      const char* name);
+  // Handed to the manager as the stage ends (keep_models_warm_).
+  template <class Dit>
+  void keep_warm_dit_(const char* kind, const std::string& dir,
+                      std::shared_ptr<Dit>& dit, const char* name);
+  // Set by the family's init: the box is tight, its DiT freed for the
+  // decode -- never kept warm.
+  bool        _dit_bounded = false;
+  bool        _dit_taken_warm = false;   // see dit_taken_warm()
+  // The settings this stage's DiT was built with; empty before.
+  std::string _dit_warm_key;
+  int         _i8_tier{};            // ...its tier: 0 accurate, 1 fast,
+                                     // 2 token, 3 token_plain
+                                     // (i8_gemm_tier)
+  // ---- an out-of-tree family, when one claimed this checkpoint ------
+  //
+  // Consulted BEFORE the built-in _class_name chain and, when it claims,
+  // INSTEAD of it: `_family` is then the plugin's tag and every built-in
+  // DiT member stays null. See generative-models/image-model-registry.h
+  // for why the seam is the generation rather than the step.
+  //
+  // The family pointer is the registry's and outlives the stage; the
+  // generator is this stage's one resident checkpoint.
+  genai::ImageModelFamily*             _plugin_family = nullptr;
+  std::unique_ptr<genai::ImageGenerator> _plugin_gen;
+  // The acceleration settings as the open bag a family reads, built once
+  // from the typed members below and then read BACK into them -- two
+  // spellings of one decision drift, one spelling with two readers
+  // cannot. See generative-models/shared/accel-settings.h.
+  FlexData _accel{};
+  // The sampler / scheduler beats as they ARRIVED, beside the typed
+  // specs parsed from them. A registered family reads these: the typed
+  // form is this tree's vocabulary, and a plugin's integrator need not
+  // be in it.
+  FlexData _sampler_raw{};
+  FlexData _scheduler_raw{};
+
+  // SageAttention (LOSSY int8 QK^T), family-agnostic like _i8_gemm.
+  genai::sage::Config _sage{};
+  // Sol-Attn (LOSSY block routing), the third cross-family tier. Kept as
+  // a typed member for the same reason the other two are -- it is what
+  // the settled values are read back into, so the log line and the bag
+  // cannot disagree. Krea-2 takes it (the config goes onto its Config
+  // beside `sage`); the other built-ins ignore it, and a registered
+  // family reads the bag rather than this member.
+  genai::sol::Config _sol{};
+  // THE SEED. `_seed_base` is what the graph configured; `_seed` is what
+  // THIS generation uses, settled at the top of each one by
+  // `seed_sequence` -- so every path below reads `_seed` and none of
+  // them has to know which generation of the run it is in.
+  SeedSequence  _seed_seq = SeedSequence::kIncrement;
+  std::uint64_t _seed_base{};
   std::uint64_t _seed{};
+  // Generations started this run, the one in progress included. Counted
+  // when the inputs are settled, BEFORE a refusal or a dropped beat can
+  // end one early, so generation n always gets the same seed however
+  // the ones before it went.
+  std::uint64_t _generation = 0;
   std::uint64_t _latents_emitted = 0;
 
-  // "krea2" | "flux2" | "qwen-image-edit" | "mage-flow" | "boogu-image" (from
+  // The conditioning (iport0) and its paired negative (iport1), HELD
+  // across generations: a conditioning beat followed by the end of its
+  // stream serves every generation of the run (stages/generation-input.h).
+  // The negative is not an input of its own -- the conditioner emits it
+  // just before the positive it belongs to, and only for prompts that
+  // have one -- so it is read with each FRESH conditioning and held with
+  // a held one.
+  GenerationInput                  _cond_in;
+  std::unique_ptr<BeatPayloadIntf> _cond_beat;
+  std::unique_ptr<BeatPayloadIntf> _neg_beat;
+
+  // "krea2" | "flux2" | "qwen-image-edit" | "boogu-image" (from
   // the transformer _class_name).
   std::string _family = "krea2";
 
@@ -180,20 +394,26 @@ private:
   // beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
-  bool _cfg_latched    = false;
+  // The model config (iport7): read per generation, broadcast when its
+  // source sends once -- which a config source without a trigger does.
+  GenerationInput _cfg_in;
 
   // The last model-config beat, held UNPARSED. Which family's parser
   // reads it is not known until the checkpoint resolves, and the two
   // beats arrive on different ports in either order.
   FlexData _model_cfg;
+  // The model-config beat as a CONSTANT (apply_constant), for
+  // declare_resources alone -- the runtime latch above stays the one
+  // every generation reads. Cleared by reset_run_state, which runs after
+  // the plan, so a relaunch without the source plans without it.
+  FlexData _plan_model_cfg;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // The resident family's own parameters, as ITS model layer defines
   // them. Both held rather than one variant: the families share no keys,
   // and a struct wide enough for both would describe neither.
   genai::MetalFlux2Transformer::GenerationParams _flux2_params;
-  genai::mage_wm::Params _wm_params;
-  // Re-parse `_model_cfg` for the family that is now resident. Called
+   // Re-parse `_model_cfg` for the family that is now resident. Called
   // when either input changes -- a new config beat, or a model that just
   // resolved. Returns false when the beat is for another family, which
   // is reported and then ignored.
@@ -207,18 +427,25 @@ private:
   // Loaded lazily by ensure_loaded_ (one DiT per the detected family); left
   // null on failure (stage stays inert). The text encoder + tokenizer + vision
   // tower live in the paired diffusion-conditioner stage, not here.
-  std::unique_ptr<genai::MetalKrea2Transformer>   _dit;
-  std::unique_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
+  // The live-preview renderer (oport2), built on the first model_config
+  // latch and kept, so its TAE survives from image to image.
+  std::unique_ptr<LatentPreviewer> _preview;
+  // Said once: a registered family handed back a preview_x0 of the wrong
+  // shape.
+  bool _preview_shape_said = false;
+
+  // Shared, so each can outlive the stage kept warm (keep_models_warm_).
+  std::shared_ptr<genai::MetalKrea2Transformer>   _dit;
+  std::shared_ptr<genai::MetalFlux2Transformer>   _flux2_dit;
   std::unique_ptr<genai::MetalQwenImageTransformer> _qie_dit;
-  // Mage-Flow's NR-MMDiT IS MetalQwenImageTransformer (a different Config);
-  // kept in its own handle so the two families never share load state.
-  std::unique_ptr<genai::MetalMageFlowTransformer> _mage_dit;
   // Boogu-Image's 10B NextDiT (its own class: five block kinds and three
   // refiner stacks share nothing with the MMDiTs above).
   std::unique_ptr<genai::MetalBooguTransformer> _boogu_dit;
-  // Mage-Flow's STATIC flow shift from <root>/scheduler/scheduler_config.json
-  // (6.0 in every published checkpoint; use_dynamic_shifting is false).
-  double _mage_shift = 6.0;
+  // VOSR's restorer. Not a generator: it takes the low-quality latent on
+  // ref_latent0 and the DINOv2 grid as its conditioning, and every
+  // knob this stage owns for a text-to-image run -- guidance, negative,
+  // sampler, strength -- is meaningless to it.
+  std::unique_ptr<genai::MetalVosrTransformer> _vosr;
   // On a memory-bounded box (DiT + the conditioner's resident encoder can't fit
   // a large decode too), drop the DiT's per-forward scratch after each
   // generation so it doesn't crowd out the downstream vae-decode. Set from the
@@ -232,10 +459,86 @@ private:
   // latent is published, then reload lazily when the next prompt arrives. The
   // load params are cached here so process() can reload without re-deriving.
   std::string _flux2_dit_dir;            // resolved transformer dir (reload)
+  // Same pair for Qwen-Image-Edit. The 20B DiT is the largest of the
+  // image families, so it is the one a 1024px vae-decode is most likely
+  // to need the room from -- see free_qie_dit_for_decode_.
+  std::string _qie_dit_dir;
+  bool        _qie_stream = false;
   bool        _flux2_stream   = false;   // streaming mode used at load
   std::string _krea2_dit_dir;            // resolved Krea-2 DiT dir (reload)
+  // Streaming mode used at load. Cached for the SAME reason
+  // _flux2_stream is: a memory-driven free after a generation
+  // reloads through load_krea2_dit_(), and a reload that forgot the
+  // flag would come back PRELOADED -- quietly undoing the decision
+  // on the box that needed it most.
+  bool        _krea2_stream   = false;
+  // The runtime adapter. The PATH is LOAD-TIME -- it decides whether a
+  // fused-activation weave can be built at all -- so a later beat that
+  // changes it is warned about rather than silently ignored; the scale
+  // is live and is pushed straight at the model.
+  //
+  // Held as the REFERENCE the config gave (a registry key, a directory
+  // or a file), not as a resolved path: it is compared against the next
+  // beat's, and resolving first would make two spellings of one adapter
+  // read as a change.
+  // ONE pair, not one per family: a stage holds exactly one DiT, so it
+  // has exactly one adapter. Seeded from this stage's OWN `lora` /
+  // `lora_scale` config and overridden by a model_config beat that
+  // names them.
+  // The runtime LoRA SLOTS, off this stage's own config and any
+  // model_config beat, in the order the DiT binds them. Eight (`lora` ..
+  // `lora8`, stages/lora-slots.h), so a distillation or identity adapter
+  // and style ones can ride together -- see kMaxLoraSlots on the
+  // transformers. The PATH is load-time; the STRENGTH is not, and each
+  // slot's moves on its own.
+  struct LoraSlot {
+    std::string path;
+    double      scale = 1.0;
+  };
+  static constexpr int kLoraSlots = lora_slots::kSlots;
+  std::array<LoraSlot, kLoraSlots> _lora;
+  // Config slot -> the model's adapter slot, as lora_specs_() packed them
+  // (-1: not loaded). Mutable: recorded by the const builder.
+  mutable std::array<int, kLoraSlots> _lora_model_slot;
   int         _vae_base       = 128;     // VAE base ch (decode-peak est.)
   bool        _dit_unloaded   = false;   // freed after a gen; reload next beat
+
+  // Turn what the config named -- a registry key, a directory holding
+  // one .safetensors, or a file -- into the single file a loader opens.
+  // Empty (with a warning naming the reason) when it cannot, so the
+  // caller generates WITHOUT the adapter rather than failing the graph.
+  std::string adapter_file_(const std::string& ref) const;
+
+  // The slots as the family's own LoraSpec list, in the order the graph
+  // named them -- which is the order the DiT binds and the order
+  // `lora_scale(i)` addresses afterwards. A slot whose file cannot be
+  // resolved is DROPPED rather than left as a hole, so the surviving
+  // adapters keep consecutive indices and a strength beat still reaches
+  // them. Templated because the two families spell LoraSpec separately
+  // (they are the same two fields, but a shared type would put one
+  // family's adapter contract in the other's header).
+  template <class Spec>
+  std::vector<Spec> lora_specs_() const
+  {
+    std::vector<Spec> out;
+    // COMPACTED, so the model's slot is not the config's: `lora2` set
+    // alone is the model's slot 0. The mapping is recorded here, at the
+    // one place the list is built, and every live strength goes through
+    // it -- without it `lora2_scale` was sent to the model's EMPTY slot 1
+    // and silently ignored.
+    for (int i = 0; i < kLoraSlots; ++i) {
+      _lora_model_slot[(std::size_t)i] = -1;
+      const LoraSlot& sl = _lora[(std::size_t)i];
+      if (sl.path.empty()) { continue; }
+      Spec sp;
+      sp.path = adapter_file_(sl.path);
+      if (sp.path.empty()) { continue; }   // adapter_file_ warned
+      sp.scale = (float)sl.scale;
+      _lora_model_slot[(std::size_t)i] = (int)out.size();
+      out.push_back(std::move(sp));
+    }
+    return out;
+  }
 
   // (Re)load the FLUX.2 DiT from the cached params. Returns false on failure.
   bool load_flux2_dit_();
@@ -249,21 +552,49 @@ private:
   // the shared MetalKrea2Vae's 1024px decode); reloaded on the next prompt.
   bool load_krea2_dit_();
   void free_krea2_dit_for_decode_(int gen_w, int gen_h);
+  // Qwen-Image-Edit's pair of the same. The DiT is idle once its latent
+  // is read back, so on a box that cannot hold 20B of weights beside the
+  // decode arena it is given to the pool and reloaded on the next prompt.
+  bool load_qie_dit_();
+  void free_qie_dit_for_decode_(int gen_w, int gen_h);
   // Same, for Boogu-Image. Its 10B NextDiT is the largest DiT here (~20 GB
   // bf16, ~5.6 GB at 4-bit) and it shares the box with a resident Qwen3-VL
   // mllm, so on a 16 GB box it is freed for the decode even at 4-bit.
   std::string _boogu_dit_dir;
+  std::string _vosr_dir;
+  genai::MetalVosrTransformer::Config _vosr_cfg;
+  // Latent-space tiling for the restorer, in PIXELS as the reference
+  // spells it. 0 disables, which is the reference default.
+  int _tile_size = 0;
+  bool _tile_size_set = false;
+  int _tile_overlap = 32;
+  // The colour fix the release applies to the restored picture
+  // (vosr-model-config `color_fix`: wavelet, adain or none), announced on
+  // each latent for vae-decode to run against the picture.
+  std::string _vosr_color_fix = "wavelet";
   bool        _boogu_stream   = false;
   bool load_boogu_dit_();
+  bool load_vosr_dit_();
+
+  // How the reference latents pair with the conditioning beats: the
+  // `reference_mode` config key, as the mode of each reference input.
+  // "auto" is the general rule (one beat broadcasts, several are
+  // consumed), which serves an edit graph and a restoration graph alike.
+  GenerationInput::Mode _ref_mode = GenerationInput::Mode::kAuto;
   // The manager's shared view of a checkpoint's weights (weight-set.h).
   std::shared_ptr<genai::WeightSet> weight_set_(const std::string& dir) const;
   void free_boogu_dit_for_decode_(int gen_w, int gen_h);
 
   // The active sampler (integrator) + scheduler (sigma schedule) specs. Seeded
   // from config (euler + simple / _steps / shift 1.15) and each overridden by
-  // the first beat latched off the sampler / scheduler iports.
+  // the beats on the sampler / scheduler iports -- one per generation, or
+  // the only one for all of them.
   genai::FlowSamplerSpec   _sampler_spec;
   genai::FlowSchedulerSpec _scheduler_spec;
+  GenerationInput          _sampler_in;
+  GenerationInput          _scheduler_in;
+  // Whether a spec beat has arrived at all: the families' own schedule
+  // defaults apply only when none has.
   bool                     _sampler_latched   = false;
   bool                     _scheduler_latched = false;
 
@@ -273,11 +604,218 @@ private:
   struct RefLatent {
     std::vector<float> chw;
     int c = 0, h = 0, w = 0;
+    // sideband::kCropBox off the latent's beat: the picture's rectangle on
+    // the canvas it was padded to (image-resample `pad_to_grid`). Null:
+    // none.
+    FlexData crop_box;
     bool empty() const { return chw.empty(); }
   };
-  // Cached reference latents from iport4 / iport5 (read once when a beat is
-  // available, reused for every later prompt like the negative prompt).
-  RefLatent _ref[2];
+  // What each reference INPUT holds: ref_latent0 / ref_latent1, then
+  // the ref_latents list, each paired with the conditioning by the
+  // generation rule (stages/generation-input.h) in `reference_mode`.
+  RefLatent              _ref_port[2];
+  GenerationInput        _ref_port_in[2];
+  std::vector<RefLatent> _ref_list;
+  GenerationInput        _ref_list_in;
+  // THE REFERENCES, as every family sees them: the two ports, then the
+  // list, packed -- so "reference i" is the i-th one wired even when the
+  // first port is not. Rebuilt whenever an input brings a new beat.
+  std::vector<RefLatent> _ref;
+  // Reference `i`, or an empty one past the end.
+  const RefLatent&
+  ref_(std::size_t i) const
+  {
+    static const RefLatent kNone;
+    return i < _ref.size() ? _ref[i] : kNone;
+  }
+
+  // ---- Qwen-Image-2.1 ------------------------------------------------
+  // Shared, so it can outlive the stage kept warm (keep_models_warm_).
+  std::shared_ptr<genai::MetalQwenImage21Transformer> _qi21_dit;
+  std::string _qi21_dit_dir;
+  bool _qi21_stream = false;
+  // qwen-image-21-model-config's `use_kv_cache`. Defaults ON, matching
+  // the reference; an unset key is "no opinion", not `false`.
+  bool _qi21_use_kv_cache = true;
+  // A few-step adapter's own schedule, off qwen-image-21-model-config:
+  // raw sigma nodes (empty = the checkpoint's grid) and the terminal
+  // stretch (< 0 = the checkpoint's). Reset between runs.
+  std::vector<double> _qi21_sigmas;
+  double _qi21_shift_terminal = -1.0;
+  // The checkpoint's own schedule (Qi21Schedule above), read when the
+  // DiT is resolved.
+  Qi21Schedule _qi21_ck;
+  // Whether the schedule notes have been said this run.
+  mutable bool _qi21_sched_noted = false;
+  // The joint-sequence bookkeeping the CONDITIONER publishes on its
+  // beat's sideband. Nothing here can reconstruct it: which conditioning
+  // rows are image slots depends on where the tower's rows were spliced
+  // in, and an image row carries no token id.
+  std::vector<std::uint8_t> _qi21_slots;
+  std::vector<int> _qi21_ref_gh, _qi21_ref_gw;
+  // The NEGATIVE beat's own mask: its text is another length and its
+  // image slots sit at other rows, so it runs its own layout.
+  std::vector<std::uint8_t> _qi21_slots_neg;
+  bool load_qwen_image21_dit_();
+  void free_qwen_image21_dit_for_decode_(int gen_w, int gen_h);
+  std::vector<float> generate_qwen_image21_(
+      const metal_compute::SharedBuffer& txt_pos, int n_real,
+      const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+      int gen_h, int gen_w, const std::vector<RefLatent>& refs,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- Z-Image -------------------------------------------------------
+  std::shared_ptr<genai::MetalZImageTransformer> _zi_dit;
+  std::string _zi_dit_dir;
+  bool _zi_stream = false;
+  // z-image-model-config's knobs. The DISTILLED Turbo checkpoint wants
+  // guidance 0 (no CFG at all) and ~8 steps; the undistilled base wants
+  // 3-5 and 28-50. They ship byte-identical transformer configs, so
+  // nothing can be inferred -- the default is Turbo's and a graph that
+  // loads the base model sets the key.
+  double _zi_guidance = 0.0;
+  // The reference's two CFG refinements, both off by default there.
+  // `cfg_normalization` clamps |pred| to that multiple of |pos|;
+  // `cfg_truncation` drops guidance once (1 - sigma) passes it.
+  double _zi_cfg_norm = 0.0;
+  double _zi_cfg_trunc = 1.0;
+  // The flow shift from the CHECKPOINT's own scheduler_config.json --
+  // 3.0 for Turbo and 6.0 for the undistilled base, and the one number
+  // that has to come off disk rather than from a default, because the
+  // two repos are otherwise identical and a graph with no
+  // scheduler-select stage would take neither.
+  double _zi_shift = 0.0;
+  bool load_z_image_dit_();
+  void free_z_image_dit_for_decode_(int gen_w, int gen_h);
+  std::vector<float> generate_z_image_(
+      const metal_compute::SharedBuffer& txt_pos, int n_real,
+      const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+      int gen_h, int gen_w,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- FLUX.3 Image Klein ---------------------------------------------
+  std::shared_ptr<genai::MetalFlux3Transformer> _flux3_dit;
+  std::string _flux3_dit_dir;
+  bool _flux3_stream = false;
+  // TENSOR PARALLEL (`tensor_parallel`; generative-models/tensor-
+  // parallel.h): this stage one RANK of the DiT split across machines --
+  // FLUX.3's, Qwen-Image-2.1's, Krea-2's, MOSS-Image's, Z-Image's or Fibo
+  // 2.0's -- the bag as given, and the share it reads to. Inactive: the
+  // whole model.
+  FlexData _tp_cfg;
+  genai::TpShare _tp_share;
+  // The share read from the bag against the DiT's widths, the transport
+  // it names checked; false (said) when it does not fit.
+  bool take_tp_share_(int n_heads, int n_ffn);
+  // THE SAME SHARE FOR THE PLAN, before anything loads: the bag read
+  // against `dit`'s widths, FLUX.3's, Qwen-Image-2.1's, Krea-2's
+  // (Turbo's, as every Krea-2 Config here), MOSS-Image's, Z-Image's or
+  // Fibo 2.0's. Inactive where there is no bag, the family is another, or
+  // the share does not fit (ensure_loaded_ then says why).
+  genai::TpShare plan_tp_share_(const std::string& dit) const;
+  // What this RANK holds with every block kept, off the headers (its
+  // share in the layout its tier takes; the transformers' tp_held_bytes),
+  // and its streaming floor -- the trunk and two blocks' shares. 0 when
+  // this stage is not a rank.
+  std::size_t tp_held_bytes_(const std::string& dit,
+                             std::size_t* floor = nullptr) const;
+  // This picture's channel to the other ranks, opened before its first
+  // forward (the transport the bag names).
+  std::shared_ptr<genai::TpChannel> open_tp_channel_(std::string* err);
+  // The sampler the CHECKPOINT states (<root>/config.json `sampler`):
+  // the schedule's alpha (6.93) and its step count (16 for the distilled
+  // Klein). Read at load, because the two Klein checkpoints differ here
+  // and in nothing a transformer config says.
+  double _flux3_alpha = 6.93;
+  int _flux3_steps = 16;
+  // flux3-model-config's `alpha`: 0 = no opinion (the checkpoint's own).
+  // Reset per launch with the other parsed model-config values.
+  double _flux3_alpha_cfg = 0.0;
+  bool load_flux3_dit_();
+  void free_flux3_dit_for_decode_(int gen_w, int gen_h);
+  // Text (+ references) -> the packed latent, unpacked to [128, H/16,
+  // W/16]: the flow map's own loop -- each step hands the DiT the time
+  // it jumps TO, which FlowSampler's denoise callback has no way to
+  // pass.
+  std::vector<float> generate_flux3_(
+      const metal_compute::SharedBuffer& text, int n_rows, int gen_h,
+      int gen_w, const std::vector<RefLatent>& refs,
+      const std::vector<float>* init_packed,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- Fibo 2.0 ---------------------------------------------------------
+  std::shared_ptr<genai::MetalFibo2Transformer> _fibo2_dit;
+  std::string _fibo2_dit_dir;
+  bool _fibo2_stream = false;
+  // The schedule the checkpoint states (scheduler/scheduler_config.json:
+  // the dynamic shift's base / max sequence and shift), read at load.
+  double _fibo2_base_shift = 0.5, _fibo2_max_shift = 1.15;
+  int _fibo2_base_seq = 256, _fibo2_max_seq = 4096;
+  // The step counts when the graph names none: the distilled Edit
+  // Turbo's 4, and a guided run's (Fibo 2.0 Dev) 30 -- the reference
+  // pipeline's default. A graph's own count wins.
+  int _fibo2_steps = 4;
+  int _fibo2_guided_steps = 30;
+  // fibo2-model-config's `guidance_scale`; < 0 is "no opinion" (then the
+  // stage's own guidance_scale, 1 by default: Edit Turbo's). The two
+  // checkpoints cannot be told apart by their files, so guidance is the
+  // graph's decision, as on Z-Image.
+  double _fibo2_guidance_cfg = -1.0;
+  // fibo2-model-config's `megapixels`; <= 0 is "no opinion" (1, the
+  // trained area). The size of a text-to-image left unsized, and the area
+  // the plan books an edit at.
+  double _fibo2_megapixels = 0.0;
+  // The 1:1 size about `megapixels` (<= 0: 1) -- the reference's own
+  // default size, 1024 x 1024, at 1.
+  static std::pair<int, int> fibo2_default_size_(double megapixels);
+  // The plan's copy of `megapixels` (the model-config constant), else 0.
+  double fibo2_plan_megapixels_() const;
+  bool load_fibo2_dit_();
+  void free_fibo2_dit_for_decode_(int gen_w, int gen_h);
+  // Text bundles [6, n_rows, cap] (+ the pictures to edit, as latents)
+  // -> [128, H/16, W/16], FLUX.2's VAE's latent: the reference pipeline's
+  // loop (linspace sigmas dynamically shifted in f32, torch noise, f32
+  // Euler), guided against `neg` (its bundles, n_neg rows) when the
+  // guidance is above 1.
+  std::vector<float> generate_fibo2_(
+      const metal_compute::SharedBuffer& text, int n_rows,
+      const metal_compute::SharedBuffer& neg, int n_neg, int gen_h,
+      int gen_w, const std::vector<RefLatent>& refs,
+      const std::vector<float>* init_packed,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
+
+  // ---- MOSS-Image -------------------------------------------------------
+  std::shared_ptr<genai::MetalMossImageTransformer> _moss_dit;
+  std::string _moss_dit_dir;
+  bool _moss_stream = false;
+  // The sampler the CHECKPOINT states (scheduler/scheduler_config.json:
+  // shift 5, training_shift 1, 1000 training steps), read at load.
+  double _moss_shift = 5.0;
+  double _moss_train_shift = 1.0;
+  int _moss_train_steps = 1000;
+  // moss-image-model-config's keys, each "no opinion" when absent (reset
+  // per launch): guidance (the reference's 3), the negative branch's
+  // skipped blocks (its [22]) and a shift override.
+  double _moss_guidance_cfg = -1.0;
+  bool _moss_skip_set = false;
+  std::vector<int> _moss_skip_cfg;
+  double _moss_shift_cfg = 0.0;
+  // Skip-layer guidance on the positive branch (a third forward) and the
+  // window that gates it AND the negative branch's skip.
+  std::vector<int> _moss_slg_layers;
+  double _moss_slg_scale = 0.0;
+  double _moss_slg_start = 0.0;
+  double _moss_slg_stop = 1.0;
+  bool load_moss_image_dit_();
+  void free_moss_image_dit_for_decode_(int gen_w, int gen_h);
+  // Text (+ the negative) -> [128, H/16, W/16], FLUX.2's VAE's latent:
+  // the reference pipeline's own loop (snapped schedule, f32 Euler, CFG
+  // against the negative run with its blocks skipped).
+  std::vector<float> generate_moss_image_(
+      const metal_compute::SharedBuffer& txt_pos, int n_real,
+      const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
+      int gen_h, int gen_w, const std::vector<float>* init_packed,
+      const std::function<void(const std::vector<float>&)>& emit_step) const;
 
   // The conditioning -> unpacked-latent forward: fuse the tapped text
   // conditioning through the DiT's text tower, sample the FlowMatchEuler turbo
@@ -324,24 +862,6 @@ private:
   // [16, h, w]) packed 2x2 to DiT tokens + appended in their own RoPE frame
   // bands. Returns the unpacked, whitened latent [16, H/8, W/8] (channel-first)
   // or empty.
-  // Mage-Flow forward: `txt` is the diffusion-conditioner's mage-flow
-  // conditioning (bf16 [n_real, 2560] single last-hidden tap, POST final
-  // norm). MageVAE downsamples 16x and the DiT is patch_size 1, so a latent
-  // pixel IS a token: no 2x2 pack/unpack anywhere on this path. `refs` are
-  // MageVAE reference latents ([128, h, w] channel-first from vae-encode),
-  // appended CLEAN after the target in their own RoPE frame bands -- the
-  // sampler steps only the target tokens. FlowMatchEuler with the checkpoint's
-  // STATIC shift 6.0 (scheduler_config.json, use_dynamic_shifting false).
-  // Returns the latent [128, H/16, W/16] (channel-first) or empty.
-  std::vector<float>
-  generate_mage_(const metal_compute::SharedBuffer& txt, int n_real,
-                 const metal_compute::SharedBuffer& txt_neg, int n_real_neg,
-                 int gen_h, int gen_w,
-                 const std::vector<float>* init_packed,
-                 const std::vector<RefLatent>& refs,
-                 const std::function<void(const std::vector<float>&)>&
-                     emit_step = {}) const;
-
   // Boogu-Image forward: `txt` is the diffusion-conditioner's boogu-image
   // conditioning (bf16 [n_real, 4096] mllm last-hidden POST final norm, over
   // the WHOLE templated sequence -- Boogu drops no prefix). Runs the NextDiT

@@ -1,5 +1,8 @@
 #include "generative-models/vae-model-registry.h"
 
+#include "pipeline/stage-config.h"
+#include "pipeline/stage-consumer-types.h"
+
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
@@ -31,7 +34,7 @@ VaeModelRegistry::add(std::unique_ptr<VaeModelFamily> f)
   // every log line ambiguous about which code decoded the clip -- and
   // dispatch is pointer-guarded, so a collision would read as a
   // built-in while running plugin code.
-  for (const char* built_in : {"krea2", "flux2", "mage", "wan",
+  for (const char* built_in : {"krea2", "flux2", "wan",
                                "minimax-h3"}) {
     if (tag == built_in) { return false; }
   }
@@ -40,6 +43,16 @@ VaeModelRegistry::add(std::unique_ptr<VaeModelFamily> f)
     if (e->tag() == tag) { return false; }   // first-wins
   }
   _families.push_back(std::move(f));
+  // Same reason as the video registry: a VAE family registered here is
+  // one vae-decode can now decode, and the channel is what carries that
+  // to the picker. Redundant when the plugin also registered a video
+  // family under the same tag -- the channel dedups -- and load-bearing
+  // for an image-only family that registers just this one.
+  register_channel_types("diffusion-model", tag);
+  // ...and on the picker of the stage that RUNS it, whose own list is
+  // a channel consumer's and does not see the channel's additions.
+  register_consumer_types("vae-decode", tag);
+  register_consumer_types("vae-encode", tag);
   return true;
 }
 

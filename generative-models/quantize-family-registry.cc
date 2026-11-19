@@ -28,8 +28,10 @@ QuantizeFamilyRegistry::add(std::unique_ptr<QuantizableFamily> f)
   // log line ambiguous about which path packaged the model -- and the
   // registry is consulted FIRST, so a collision would read as a built-in
   // while running the plugin's component list.
-  for (const char* built_in : {"krea2", "flux2", "mage", "wan", "boogu",
-                               "qwen-image", "minimax-h3"}) {
+  for (const char* built_in : {"krea2", "flux2", "flux3", "wan", "boogu",
+                               "qwen-image", "qwen-image-21", "z-image",
+                               "moss-image", "fibo2",
+                               "minimax-h3"}) {
     if (tag == built_in) { return false; }
   }
   std::lock_guard<std::mutex> lk(_mu);

@@ -474,6 +474,158 @@ kernel void transpose_rope_pair_ftab_f16(
   out[ob + 1] = VPIPE_ELT(x1 * s + x2 * c);
 }
 
+// transpose_rope_pair_ftab with the per-head RMSNorm FUSED in front of it:
+// reads TOKEN-major in[(t*H+h)*D + d], normalizes the head in f32
+// (x * rsqrt(mean(x^2) + eps) * gamma), rotates its interleaved pairs with
+// token t's f32 table, and writes HEAD-major out[(h*T+t)*D + d] -- ONE
+// rounding to the storage type, where a norm pass then a rope pass rounds
+// twice. FLUX.3's reference (and diffusers', which keeps norm_q/norm_k in
+// fp32 for this reason) does exactly that, and the second rounding is not
+// free there: a few late joint blocks attend sharply enough that q/k
+// precision shows up in the velocity. One simdgroup per (t, h).
+//   0:in 1:out 2:cos 3:sin 4:gamma[D] 5:H 6:T 7:D 8:eps
+//   grid {32, T, H}, tg {32, 1, 1}.
+kernel void transpose_rms_rope_pair_ftab_f16(
+    const device VPIPE_ELT* in    [[buffer(0)]],
+    device VPIPE_ELT*       out   [[buffer(1)]],
+    const device float*     cosb  [[buffer(2)]],
+    const device float*     sinb  [[buffer(3)]],
+    const device VPIPE_ELT* gamma [[buffer(4)]],
+    constant int&           H     [[buffer(5)]],
+    constant int&           T     [[buffer(6)]],
+    constant int&           D     [[buffer(7)]],
+    constant float&         eps   [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  lid [[thread_index_in_simdgroup]])
+{
+  const int t = (int)tid.y;
+  const int h = (int)tid.z;
+  if (t >= T || h >= H) { return; }
+  const uint ib = ((uint)t * (uint)H + (uint)h) * (uint)D;
+  float acc = 0.0f;
+  for (int i = (int)lid; i < D; i += 32) {
+    const float v = float(in[ib + i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  const float inv = rsqrt(acc / (float)D + eps);
+  const uint ob = ((uint)h * (uint)T + (uint)t) * (uint)D;
+  const uint cb = (uint)t * (uint)D;
+  for (int p = (int)lid; p < D / 2; p += 32) {
+    const int d = 2 * p;
+    const float x1 = float(in[ib + d]) * inv * float(gamma[d]);
+    const float x2 = float(in[ib + d + 1]) * inv * float(gamma[d + 1]);
+    const float c = cosb[cb + d];
+    const float s = sinb[cb + d];
+    out[ob + d]     = VPIPE_ELT(x1 * c - x2 * s);
+    out[ob + d + 1] = VPIPE_ELT(x1 * s + x2 * c);
+  }
+}
+
+// The per-head RMSNorm and the pair rope IN PLACE, TOKEN-major in and out:
+// for a consumer that reads q/k through strides (the steel / NAX flash
+// kernels take a head stride and a row stride), so no transpose follows.
+// It rounds TWICE, as rms_norm_fast then transpose_rope_pair_ftab do -- the
+// normalized value is stored to the element type before it is rotated --
+// which is the reference's own order when norm_q/norm_k run in the
+// model's bf16 (Qwen-Image-2.1). in == out is allowed: each lane reads its
+// pair before writing it, and the sum is taken before any write.
+// One simdgroup per (t, h).
+//   0:in 1:out 2:cos 3:sin 4:gamma[D] 5:H 6:T 7:D 8:eps
+//   grid {32, T, H}, tg {32, 1, 1}.
+kernel void rms_rope_pair_ftab_tm_f16(
+    const device VPIPE_ELT* in    [[buffer(0)]],
+    device VPIPE_ELT*       out   [[buffer(1)]],
+    const device float*     cosb  [[buffer(2)]],
+    const device float*     sinb  [[buffer(3)]],
+    const device VPIPE_ELT* gamma [[buffer(4)]],
+    constant int&           H     [[buffer(5)]],
+    constant int&           T     [[buffer(6)]],
+    constant int&           D     [[buffer(7)]],
+    constant float&         eps   [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  lid [[thread_index_in_simdgroup]])
+{
+  const int t = (int)tid.y;
+  const int h = (int)tid.z;
+  if (t >= T || h >= H) { return; }
+  const uint ib = ((uint)t * (uint)H + (uint)h) * (uint)D;
+  float acc = 0.0f;
+  for (int i = (int)lid; i < D; i += 32) {
+    const float v = float(in[ib + i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  const float inv = rsqrt(acc / (float)D + eps);
+  const uint cb = (uint)t * (uint)D;
+  for (int p = (int)lid; p < D / 2; p += 32) {
+    const int d = 2 * p;
+    const float x1 =
+        float(VPIPE_ELT(float(in[ib + d]) * inv * float(gamma[d])));
+    const float x2 =
+        float(VPIPE_ELT(float(in[ib + d + 1]) * inv * float(gamma[d + 1])));
+    const float c = cosb[cb + d];
+    const float s = sinb[cb + d];
+    out[ib + d]     = VPIPE_ELT(x1 * c - x2 * s);
+    out[ib + d + 1] = VPIPE_ELT(x1 * s + x2 * c);
+  }
+}
+
+// The per-head RMSNorm and a HALF-SPLIT (NeoX, rotate_half) rope over
+// the WHOLE head, IN PLACE, token-major and STRIDED: row (t, h) lives at
+// x[t*stride + h*D], so the same kernel serves a [rows, H*D] projection
+// (stride H*D) and one slice of a fused [rows, 3*H*D] q|k|v (stride
+// 3*H*D, the slice bound at its column offset). MOSS-Image takes it for
+// both. Tables are f32 [T, D/2]: dim p pairs with p + D/2 and both
+// read entry p.
+//
+// The norm rounds as the reference's _RMSNorm does -- the normalized
+// value stored to the element type, multiplied by gamma and stored
+// again -- and the rotation then rounds once.
+//
+// IN PLACE IS SAFE HERE: a lane reads and writes only its own pairs
+// (p, p + D/2), and the sum of squares is reduced before any write.
+//   0:x 1:cos[T,D/2] 2:sin[T,D/2] 3:gamma[D] 4:H 5:T 6:D 7:stride 8:eps
+//   grid {32, T, H}, tg {32, 1, 1}.
+kernel void rms_rope_half_ftab_tm_f16(
+    device VPIPE_ELT*       x      [[buffer(0)]],
+    const device float*     cosb   [[buffer(1)]],
+    const device float*     sinb   [[buffer(2)]],
+    const device VPIPE_ELT* gamma  [[buffer(3)]],
+    constant int&           H      [[buffer(4)]],
+    constant int&           T      [[buffer(5)]],
+    constant int&           D      [[buffer(6)]],
+    constant int&           stride [[buffer(7)]],
+    constant float&         eps    [[buffer(8)]],
+    uint3 tid [[threadgroup_position_in_grid]],
+    uint  lid [[thread_index_in_simdgroup]])
+{
+  const int t = (int)tid.y;
+  const int h = (int)tid.z;
+  if (t >= T || h >= H) { return; }
+  const uint ib = (uint)t * (uint)stride + (uint)h * (uint)D;
+  float acc = 0.0f;
+  for (int i = (int)lid; i < D; i += 32) {
+    const float v = float(x[ib + i]);
+    acc += v * v;
+  }
+  acc = simd_sum(acc);
+  const float inv = rsqrt(acc / (float)D + eps);
+  const int half_d = D / 2;
+  const uint cb = (uint)t * (uint)half_d;
+  for (int p = (int)lid; p < half_d; p += 32) {
+    const float a = float(VPIPE_ELT(
+        float(VPIPE_ELT(float(x[ib + p]) * inv)) * float(gamma[p])));
+    const float b = float(VPIPE_ELT(
+        float(VPIPE_ELT(float(x[ib + p + half_d]) * inv)) *
+        float(gamma[p + half_d])));
+    const float c = cosb[cb + p];
+    const float s = sinb[cb + p];
+    x[ib + p]          = VPIPE_ELT(a * c - b * s);
+    x[ib + p + half_d] = VPIPE_ELT(b * c + a * s);
+  }
+}
+
 // transpose_rope_pair_ftab with a PADDED output head-dim: reads TOKEN-major
 // in[(t*H+h)*D + 2i(,+1)], applies token t's interleaved-pair rope, and writes
 // HEAD-major out[(h*T+t)*Dp + 2i(,+1)] with the [D, Dp) tail ZEROED. The pad
@@ -576,6 +728,49 @@ kernel void rope_partial_f16(
   const float x2 = float(x[base + i + half_r]);
   x[base + i]          = VPIPE_ELT(x1 * c - x2 * s);
   x[base + i + half_r] = VPIPE_ELT(x1 * s + x2 * c);
+}
+
+// rope_partial_f16 for QUERIES under the Llama-4 attention temperature
+// (Ministral-3): after the rotation the whole head -- the rotated pairs
+// and any pass-through tail -- is scaled by
+//   1 + beta * log(1 + floor(pos / orig))
+// at the row's own position. That is exactly 1.0f below `orig`, so a
+// shorter context is bit-identical to rope_partial_f16.
+//   0..6 as rope_partial_f16, 7:beta 8:orig. Same grid.
+kernel void rope_partial_qscale_f16(
+    device VPIPE_ELT*        x          [[buffer(0)]],
+    const device float* inv_freq   [[buffer(1)]],
+    constant int&       H          [[buffer(2)]],
+    constant int&       T          [[buffer(3)]],
+    constant int&       D          [[buffer(4)]],
+    constant int&       rotary_dim [[buffer(5)]],
+    constant int&       offset     [[buffer(6)]],
+    constant float&     beta       [[buffer(7)]],
+    constant int&       orig       [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  (void)H;
+  const int half_r = rotary_dim / 2;
+  const int i = (int)gid.x;
+  if (i >= half_r) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+
+  const int pos = offset + t;
+  const float angle = float(pos) * inv_freq[i];
+  const float c = cos(angle);
+  const float s = sin(angle);
+  const float qs =
+      1.0f + beta * metal::precise::log(1.0f + float(pos / orig));
+
+  const uint base = ((uint)h * T + t) * D;
+  const float x1 = float(x[base + i]);
+  const float x2 = float(x[base + i + half_r]);
+  x[base + i]          = VPIPE_ELT((x1 * c - x2 * s) * qs);
+  x[base + i + half_r] = VPIPE_ELT((x1 * s + x2 * c) * qs);
+  for (int d = rotary_dim + i; d < D; d += half_r) {
+    x[base + d] = VPIPE_ELT(float(x[base + d]) * qs);
+  }
 }
 
 // Multimodal partial RoPE (Qwen3-VL prefill): like rope_partial_f16, but
@@ -747,24 +942,154 @@ kernel void transpose_rope_half_part_ftab_f16(
   // the grid up to a threadgroup multiple would otherwise write past
   // `out` rather than be clamped.
   if (h >= H) { return; }
-  const uint src = (uint)t * (uint)in_stride + (uint)in_off +
-                   (uint)h * (uint)in_head_stride;
-  const uint dst = ((uint)h * (uint)S + (uint)t) * (uint)D;
+  // 64-BIT OFFSETS. The source is a whole sequence's fused [S, 3*H*D]
+  // projection and the destination [H, S, D]: at S rows a 32-bit offset
+  // wraps once S * in_stride or H * S * D passes 2^32 -- 199,728 rows at
+  // MiniMax-H3's 21,504-wide q|k|v, 599,186 at its 56 x 128 heads -- and
+  // the loads and stores land elsewhere in the same buffer, silently.
+  const ulong src = (ulong)t * (ulong)in_stride + (ulong)in_off +
+                    (ulong)h * (ulong)in_head_stride;
+  const ulong dst = ((ulong)h * (ulong)S + (ulong)t) * (ulong)D;
   if (d >= rot) {
-    out[dst + (uint)d] = in[src + (uint)d];   // pass-through tail
+    out[dst + (ulong)d] = in[src + (ulong)d];   // pass-through tail
     return;
   }
   const int half_r = rot / 2;
   // Angles repeat across the two halves, so both halves index [0, half_r).
   const int i = (d < half_r) ? d : (d - half_r);
-  const uint cb = (uint)t * (uint)half_r + (uint)i;
+  const ulong cb = (ulong)t * (ulong)half_r + (ulong)i;
   const float c = cosb[cb];
   const float s = sinb[cb];
-  const float x1 = float(in[src + (uint)(d < half_r ? d : d - half_r)]);
-  const float x2 = float(in[src + (uint)(d < half_r ? d + half_r : d)]);
+  const float x1 = float(in[src + (ulong)(d < half_r ? d : d - half_r)]);
+  const float x2 = float(in[src + (ulong)(d < half_r ? d + half_r : d)]);
   // rotate_half: out[:half] = x1*c - x2*s, out[half:] = x2*c + x1*s.
-  out[dst + (uint)d] =
+  out[dst + (ulong)d] =
       VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
+}
+
+// The same transpose, for a ROW BAND of the sequence: the band's rows
+// written into a whole-sequence head-major buffer [H, out_rows, D] from
+// row `out_row0`. The cos/sin tables are bound at the band's first row,
+// so `t` indexes them band-locally, as it does the input. MiniMax-H3's
+// banded forward writes every band's q / k / v this way and attends each
+// band's queries against every row's keys.
+//
+//   0..10 as transpose_rope_half_part_ftab_f16 (5:S = the band's rows),
+//   11:out_rows 12:out_row0. grid {D, S, H}, tg {D, 1, 1}.
+kernel void transpose_rope_half_part_ftab_band_f16(
+    const device VPIPE_ELT* in   [[buffer(0)]],
+    device VPIPE_ELT*       out  [[buffer(1)]],
+    const device float*     cosb [[buffer(2)]],
+    const device float*     sinb [[buffer(3)]],
+    constant int&      H         [[buffer(4)]],
+    constant int&      S         [[buffer(5)]],
+    constant int&      D         [[buffer(6)]],
+    constant int&      rot       [[buffer(7)]],
+    constant int&      in_stride [[buffer(8)]],
+    constant int&      in_off    [[buffer(9)]],
+    constant int&      in_head_stride [[buffer(10)]],
+    constant int&      out_rows  [[buffer(11)]],
+    constant int&      out_row0  [[buffer(12)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x;
+  if (d >= D) { return; }
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  if (h >= H || t >= S) { return; }
+  // 64-BIT OFFSETS, as above: the destination is the WHOLE sequence's
+  // [H, out_rows, D], which passes 2^32 elements at 599,186 rows of
+  // MiniMax-H3's 56 x 128 heads (a 2560 x 1440 refine past ~566 frames).
+  // In 32 bits the later heads' rows wrapped onto the earlier heads'.
+  const ulong src = (ulong)t * (ulong)in_stride + (ulong)in_off +
+                    (ulong)h * (ulong)in_head_stride;
+  const ulong dst =
+      ((ulong)h * (ulong)out_rows + (ulong)out_row0 + (ulong)t) *
+      (ulong)D;
+  if (d >= rot) {
+    out[dst + (ulong)d] = in[src + (ulong)d];
+    return;
+  }
+  const int half_r = rot / 2;
+  const int i = (d < half_r) ? d : (d - half_r);
+  const ulong cb = (ulong)t * (ulong)half_r + (ulong)i;
+  const float c = cosb[cb];
+  const float s = sinb[cb];
+  const float x1 = float(in[src + (ulong)(d < half_r ? d : d - half_r)]);
+  const float x2 = float(in[src + (ulong)(d < half_r ? d + half_r : d)]);
+  out[dst + (ulong)d] =
+      VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
+}
+
+// The same partial rotate-half RoPE as above, IN PLACE on the fused qkv
+// projection and with NO transpose.
+//
+// The transposing version exists because the steel flash-attention
+// kernel wants [H, seq, D]. It does not have to: steel takes per-axis
+// STRIDES for Q, K, V and O, so it can read the heads straight out of
+// the [seq, 3*H*D] projection where the qkv GEMM left them. Once it
+// does, the only thing the transpose pass was still carrying is the
+// rotation -- and that is a rewrite of the same bytes, which is what
+// this kernel is.
+//
+// The saving is four full passes over a [seq, H*D] activation per block
+// (q, k, v out, o back), each of them a read plus a write of the whole
+// thing. At video sequence lengths that is gigabytes of traffic per
+// block against an arithmetic-free permutation.
+//
+// V never rotates and so needs NOTHING here: the strided read replaces
+// its transpose outright.
+//
+// IN-PLACE MEANS A HAZARD. Channel d is built from d and its partner
+// d +/- rot/2, so a thread that writes before its partner has read hands
+// the partner a rotated value. Both halves live in the SAME threadgroup
+// (the dispatch is one threadgroup per (row, head), D threads wide), so
+// one barrier between the reads and the writes settles it -- and every
+// thread must reach that barrier, including the `d >= rot` tail that has
+// nothing to do, which is why the tail is skipped with a flag rather
+// than an early return.
+//
+//   0:x 1:cos[seq,rot/2] 2:sin[seq,rot/2] 3:H 4:seq 5:D 6:rot 7:stride
+//   8:off 9:head_stride.
+//   grid {D, seq, H}, tg {D, 1, 1}.
+kernel void rope_half_part_ftab_inplace_f16(
+    device VPIPE_ELT*       x    [[buffer(0)]],
+    const device float*     cosb [[buffer(1)]],
+    const device float*     sinb [[buffer(2)]],
+    constant int&      H         [[buffer(3)]],
+    constant int&      S        [[buffer(4)]],
+    constant int&      D         [[buffer(5)]],
+    constant int&      rot       [[buffer(6)]],
+    constant int&      stride    [[buffer(7)]],
+    constant int&      off       [[buffer(8)]],
+    constant int&      head_stride [[buffer(9)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int d = (int)gid.x;
+  const int t = (int)gid.y;
+  const int h = (int)gid.z;
+  // Both halves of the pair are read before the barrier and the result
+  // written after it, so `live` gates the work and never the barrier.
+  const bool live = d < D && t < S && h < H && d < rot;
+  const int half_r = rot / 2;
+  // 64-bit: a whole sequence's fused projection passes 2^32 elements at
+  // 199,728 rows of a 21,504-wide q|k|v.
+  const ulong src = (ulong)t * (ulong)stride + (ulong)off +
+                    (ulong)h * (ulong)head_stride;
+  float x1 = 0.0f, x2 = 0.0f, c = 0.0f, s = 0.0f;
+  if (live) {
+    const int i = (d < half_r) ? d : (d - half_r);
+    const ulong cb = (ulong)t * (ulong)half_r + (ulong)i;
+    c = cosb[cb];
+    s = sinb[cb];
+    x1 = float(x[src + (ulong)(d < half_r ? d : d - half_r)]);
+    x2 = float(x[src + (ulong)(d < half_r ? d + half_r : d)]);
+  }
+  threadgroup_barrier(mem_flags::mem_device);
+  if (live) {
+    x[src + (ulong)d] =
+        VPIPE_ELT((d < half_r) ? (x1 * c - x2 * s) : (x2 * c + x1 * s));
+  }
 }
 
 // Per-HEAD RMS norm in place over a strided fused projection: the row
@@ -798,8 +1123,9 @@ kernel void rms_norm_heads_strided_f16(
   if (row >= S * H) { return; }
   const int t = row / H;
   const int h = row % H;
-  device VPIPE_ELT* r = x + (uint)t * (uint)stride + (uint)off +
-                        (uint)h * (uint)head_stride;
+  // 64-bit, as the rope passes: a whole sequence's fused projection.
+  device VPIPE_ELT* r = x + (ulong)t * (ulong)stride + (ulong)off +
+                        (ulong)h * (ulong)head_stride;
   const uint lid = ltid.x;
   float acc = 0.0f;
   for (int i = (int)lid; i < D; i += 32) {

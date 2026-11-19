@@ -1,14 +1,17 @@
 #include "generative-models/gemma4/metal-gemma-model.h"
 
-#include "generative-models/shared/stream-pin.h"
+#include "generative-models/shared/stream-sizing.h"
 
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/shared/kernel-autotune.h"
 #include "generative-models/shared/mma-tile.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-encoder.h"
+#include "apple-silicon/metal-compute/compute-library.h"
+#include "apple-silicon/metal-compute/kernel-contract.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -625,6 +628,28 @@ MetalGemmaModel::load(std::shared_ptr<WeightSet> ws_in,
     m->_fn_sdpa_pmma2 = m->_lib_sdpa_mma.function("sdpa_paged_mma2_d512_f16");
     m->_pmma2_attn = m->_fn_sdpa_pmma2.valid()
         && std::getenv("VPIPE_GEMMA_NO_MMA2_ATTN") == nullptr;
+    // MLX's NAX head-dim split at head_dim 512 for the paged GLOBAL prefill
+    // (see _nax512_attn), and the pool gather it reads through. One library
+    // carries both element types, by entry name.
+    namespace mcc = metal_compute::contract;
+    m->_lib_attn_nax = mc->load_library("attn_steel_nax");
+    m->_fn_kv_gather = m->_lib_sdpa.function("kv_gather_paged_f16");
+    const std::string nax = "attn_steel_nax_dsplit_h_bd512" + sfx;
+    bool nax_ok = m->_lib_attn_nax.valid() && m->_fn_kv_gather.valid();
+    for (int aq = 0; aq < 2 && nax_ok; ++aq) {
+      for (int ak = 0; ak < 2 && nax_ok; ++ak) {
+        metal_compute::FunctionConstants fc;
+        fc.set_bool(mcc::kAttnAlignQ, aq != 0)
+            .set_bool(mcc::kAttnAlignK, ak != 0)
+            .set_bool(mcc::kAttnHasMask, false)
+            .set_bool(mcc::kAttnCausal, true)
+            .set_bool(mcc::kAttnSinks, false);
+        m->_fn_nax512[aq][ak] = m->_lib_attn_nax.function(nax, fc);
+        nax_ok = m->_fn_nax512[aq][ak].valid();
+      }
+    }
+    m->_nax512_attn =
+        nax_ok && std::getenv("VPIPE_GEMMA_NO_NAX512") == nullptr;
   }
   // Lazy single-pass prefill: grow a fresh context's sliding ring to fit a
   // one-shot prompt that would otherwise wrap (-> the slow staged sliding
@@ -1657,6 +1682,89 @@ MetalGemmaModel::config_from(const ModelConfig& c)
   return m;
 }
 
+std::size_t
+MetalGemmaModel::run_bytes(const Config& c, std::int64_t kv_tokens,
+                           int contexts, bool plain_mlp, bool double_wide,
+                           bool matrix_cores)
+{
+  const std::size_t ctxs = (std::size_t)std::max(contexts, 1);
+  const std::size_t prompt = (std::size_t)std::max<std::int64_t>(
+      1, std::min<std::int64_t>(kv_tokens, c.max_seq));
+  const std::size_t n = prompt;
+  const std::size_t H = c.hidden, nl = c.n_layers, hpli = c.hpli;
+  const std::size_t qd = (std::size_t)c.n_heads * c.head_dim_full;
+  const std::size_t kd = (std::size_t)c.n_kv_heads * c.head_dim_full;
+  const std::size_t ffn = (std::size_t)c.ffn_inner * (double_wide ? 2 : 1);
+  const std::size_t ple_w = nl * hpli;
+  // forward_chunk_'s buffers, two bytes an element but the int32 ones
+  std::size_t e2 = 0, e4 = 0;
+  e2 += n * (2 * H + qd + 2 * kd + qd + 2 * kd + 2 * qd + H) + 32 * qd;
+  e2 += n * (ffn + H) + (plain_mlp ? n * ffn : 0);
+  if (matrix_cores) { e2 += n * 2 * ffn; }           // gate|up
+  e2 += n * (3 * ple_w + nl * hpli + hpli + H);       // the PLE rows
+  e2 += (std::size_t)c.vocab;
+  e4 += n;                                            // the token ids
+  if (c.is_moe()) {
+    const std::size_t E = c.n_experts, K = c.top_k, I = c.moe_inner;
+    const std::size_t np = n * K;
+    e2 += n * E + np + np * I + np * H + 2 * n * H;
+    e4 += np;
+    if (n >= 64) {
+      const std::size_t tiles = (np + 31) / 32 + E, npad = tiles * 32;
+      e2 += npad * I;
+      e4 += 3 * E + tiles + 1 + 2 * npad;
+    }
+  }
+  // the dequantized weight a GEMM of many rows reads on the matrix cores,
+  // and the head-dim-512 attention's K/V gathered from the pool
+  if (matrix_cores) {
+    e2 += std::max(2 * ffn, qd + 2 * kd) * H;
+    e2 += 2 * kd * n;
+  }
+  // ensure_scratch_: the decode step's buffers, the PLE rows, the
+  // materialized global prefill's scores and V transpose
+  const std::size_t cap =
+      (std::size_t)std::min(c.max_seq, 16384);
+  e2 += cap * cap + kd * cap;
+  e2 += 2 * (std::size_t)c.vocab + 4 * qd + 4 * kd + 3 * ffn + 8 * H +
+        3 * ple_w;
+  e4 += (std::size_t)c.n_heads * 64 * (c.head_dim_full + 2);
+  std::size_t b = 2 * e2 + 4 * e4;
+  // The full layers' paged pool (256-token pages): it doubles toward its
+  // cap as pages are claimed, so it can reach twice the pages `kv_tokens`
+  // fill; while it grows, one layer's old pool beside the new. The
+  // sliding layers' rings, a context each (min(max_seq, window + chunk)
+  // slots and a window-long mirror tail), the prompt's grown to it.
+  const std::size_t pt = 256, max_pages = 4096;
+  const std::size_t pages =
+      ((std::size_t)std::max<std::int64_t>(kv_tokens, 1) + pt - 1) / pt;
+  std::size_t pcap = std::max(pages, pages > 1 ? 2 * pages - 2 : 1);
+  pcap = std::min(pcap, max_pages);
+  const std::size_t win = (std::size_t)std::max(c.sliding_window, 0);
+  std::size_t ring = std::min<std::size_t>(
+      (std::size_t)c.max_seq, win + (std::size_t)std::max(c.sliding_chunk, 0));
+  if (c.sliding_chunk <= 0) { ring = (std::size_t)c.max_seq; }
+  const std::size_t tail = ring < (std::size_t)c.max_seq && win > 1
+                               ? win - 1 : 0;
+  const std::size_t grown =
+      std::max(ring + tail, prompt + (prompt < (std::size_t)c.max_seq &&
+                                      win > 1 ? win - 1 : 0));
+  std::size_t full_page = 0;
+  for (int L = 0; L < c.first_shared(); ++L) {
+    const std::size_t nkv = (std::size_t)c.n_kv(L);
+    if (c.layer_is_full(L)) {
+      const std::size_t page = nkv * pt * c.head_dim_full * 2;
+      b += 2 * pcap * page;
+      full_page = std::max(full_page, page);
+    } else {
+      const std::size_t slot = nkv * c.head_dim_sliding * 2 * 2;
+      b += slot * (grown + (ctxs - 1) * (ring + tail));
+    }
+  }
+  b += 2 * pcap * full_page;   // one layer's pool while it grows
+  return b;
+}
+
 // Per-machine decode-attention SPLIT autotune (gtile-vec flash-decode). The
 // split count sp trades parallelism against the merge cost; the sweet spot is a
 // GPU property. Two regimes: the GLOBAL (head_dim_full, long-context) layers --
@@ -1688,6 +1796,29 @@ MetalGemmaModel::tune_decode_attn_(TuningReport& rep)
   const bool global_ok  = (Dg % 128 == 0);     // gtile-vec needs D % 128 == 0
   const bool sliding_ok = (Ds % 128 == 0);
   if (!global_ok && !sliding_ok) { return; }
+
+  // What this session measured for these dims before (tuned-answers.h).
+  // The defaults the margins are judged against and the locks go in the
+  // key: they decide what the probe may move. The kernel is named by its
+  // pipeline state, which MetalCompute keeps for the session.
+  KernelTuningCache* const answers = tuning_cache(_mc);
+  const TuneKey key = TuneKey("gemma-decode-attn/1")("Hq", Hq)("Hkv", Hkv)
+      ("Dg", Dg)("Ds", Ds)("win", c.sliding_window)
+      ("split", _gtile_split)("kps", _gtile_kps)
+      ("split_locked", split_locked)("kps_locked", kps_locked)
+      ("fn", std::to_string(
+          (std::uintptr_t)_fn_sdpa_gqa_vec.mtl_pso()));
+  {
+    std::vector<int> kept;
+    if (find_tuned(answers, key, kept) && kept.size() == 2) {
+      if (!split_locked) { _gtile_split = kept[0]; }
+      if (!kps_locked) { _gtile_kps = kept[1]; }
+      rep.add("gemma-decode-attn", 0.0,
+              "split=" + std::to_string(_gtile_split) + "/kps=" +
+                  std::to_string(_gtile_kps) + ", the session's");
+      return;
+    }
+  }
 
   // Synthetic q[Hq,D] attends a contiguous KV pool [Hkv,cap,D]. Buffers sized
   // for the largest regime (global D, long T_kv, sp cap 256 -- matching the
@@ -1829,6 +1960,7 @@ MetalGemmaModel::tune_decode_attn_(TuningReport& rep)
   const double ms = std::chrono::duration<double>(
       std::chrono::steady_clock::now() - t0).count() * 1e3;
   rep.add("gemma-decode-attn", ms, detail);
+  store_tuned(answers, key, std::vector<int>{_gtile_split, _gtile_kps});
   if (log) {
     std::fprintf(stderr, "[gemma] decode-attn tuning %.0fms -> %s\n", ms,
                  detail.c_str());
@@ -1946,7 +2078,8 @@ MetalGemmaModel::ensure_scratch_()
   }
   // Autotune the decode-attention split for THIS GPU first -- the partials
   // below derive from _gtile_split, so the probe must set it beforehand.
-  if (_gtile_attn || _gqa_attn || _pgqa_attn) {
+  // Untuned (Config::autotune), the default split stands.
+  if (_cfg.autotune && (_gtile_attn || _gqa_attn || _pgqa_attn)) {
     TuningReport tuning;
     tune_decode_attn_(tuning);
     if (std::getenv("VPIPE_GEMMA_AUTOTUNE_LOG") && !tuning.empty()) {
@@ -4358,7 +4491,8 @@ MetalGemmaModel::tap_(ComputeEncoder& enc, int hf_index,
 metal_compute::SharedBuffer
 MetalGemmaModel::forward_embeddings_taps(
     ContextId cid, const std::vector<std::int32_t>& ids,
-    const std::vector<int>& hf_indices, int key_valid_len, std::string* err)
+    const std::vector<int>& hf_indices, int key_valid_len, std::string* err,
+    bool skip_final_norm)
 {
   const Config& c = _cfg;
   auto fail = [&](std::string m) {
@@ -4442,6 +4576,7 @@ MetalGemmaModel::forward_embeddings_taps(
   }
 
   TapState st;
+  st.skip_final_norm = skip_final_norm;
   st.out = &out;
   st.slot_of = std::move(slot_of);
   st.n = n;
@@ -5305,6 +5440,7 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         const char* path =
             skip_attn ? "skip"
           : !paged_full ? (rows == 1 ? "sdpa_mb" : "non-paged")
+          : (rows > 1 && _nax512_attn && D == 512) ? "nax512"
           : (mat_ok && ly.is_full && D == 512) ? "materialized"
           : (rows > 1 && _pmma2_attn) ? "pmma2"
           : (rows > 1 && _pflash_attn && D == 512) ? "pflash"
@@ -5320,11 +5456,67 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
         // intentionally no SDPA dispatch (probe)
       } else if (paged_full) {
         // PAGED full-layer attention over the shared pool + page table. The
-        // bulk (n_q>1) uses the matrix-core paged mma2 (M5) or, on a non-
-        // matrix-core GPU (M4), the simdgroup_matrix paged flash; only the
-        // shared-KV tail (n_q=1) falls to the scalar paged kernel (q3/qt match
-        // the q[Hq,n_q,D] layout all three read).
-        if (mat_ok && ly.is_full && D == 512) {
+        // bulk (n_q>1) uses the NAX head-dim split over gathered K/V (M5) or,
+        // on a non-matrix-core GPU (M4), the materialized path or the
+        // simdgroup_matrix paged flash; only the shared-KV tail (n_q=1) falls
+        // to the scalar paged kernel (q3/qt match the q[Hq,n_q,D] layout all
+        // of them read).
+        if (rows > 1 && _nax512_attn && D == 512) {
+          // The pool, prefix and chunk, into contiguous [Hkv, kL, D] K/V --
+          // the gather walks the page table -- then MLX's four-way head-dim
+          // split attention over them, causal from the chunk's position.
+          const int kL = qpos + rows;
+          const std::size_t need = (std::size_t)Hkv * kL * D * 2;
+          if (_d_nax_k.byte_size() < need || _d_nax_v.byte_size() < need) {
+            _d_nax_k = _mc->make_shared_buffer(need);
+            _d_nax_v = _mc->make_shared_buffer(need);
+          }
+          enc.set_function(_fn_kv_gather);
+          enc.set_buffer(0, *Kuse);
+          enc.set_buffer(1, *Vuse);
+          enc.set_buffer(2, _d_nax_k);
+          enc.set_buffer(3, _d_nax_v);
+          enc.set_constant(4, Hkv);
+          enc.set_constant(5, D);
+          enc.set_constant(6, page_tokens);
+          enc.set_constant(7, kL);
+          enc.set_buffer(8, _d_pgtab);
+          enc.dispatch({(unsigned)page_tokens, (unsigned)Hkv,
+                        (unsigned)n_pages},
+                       {32, 1, 1});
+          constexpr int kBQ = 32, kBK = 32;    // the bd512 instantiation's
+          metal_compute::contract::SteelAttnParams p{};
+          p.B = 1; p.H = Hq; p.D = D; p.qL = rows; p.kL = kL;
+          p.gqa_factor = Hq / Hkv;
+          p.scale = one_scale;
+          p.NQ = (rows + kBQ - 1) / kBQ;
+          p.NK = (kL + kBK - 1) / kBK;
+          p.NQ_aligned = rows / kBQ;
+          p.NK_aligned = kL / kBK;
+          p.qL_rem = rows - p.NQ_aligned * kBQ;
+          p.kL_rem = kL - p.NK_aligned * kBK;
+          p.qL_off = kL - rows;
+          p.Q_strides[0] = (std::int64_t)Hq * rows * D;
+          p.Q_strides[1] = (std::int64_t)rows * D;
+          p.Q_strides[2] = D;
+          p.K_strides[0] = (std::int64_t)Hkv * kL * D;
+          p.K_strides[1] = (std::int64_t)kL * D;
+          p.K_strides[2] = D;
+          for (int i = 0; i < 3; ++i) {
+            p.V_strides[i] = p.K_strides[i];
+            p.O_strides[i] = p.Q_strides[i];
+          }
+          enc.set_function(
+              _fn_nax512[p.qL_rem == 0 ? 1 : 0][p.kL_rem == 0 ? 1 : 0]);
+          enc.set_buffer(0, *qsrc);
+          enc.set_buffer(1, _d_nax_k);
+          enc.set_buffer(2, _d_nax_v);
+          enc.set_buffer(3, at);
+          enc.set_constant(4, p);
+          // threadgroup (32, WM = 2, WN = 4): 256 threads.
+          enc.dispatch({32u * (unsigned)p.NQ, 2u * (unsigned)Hq, 4u},
+                       {32u, 2u, 4u});
+        } else if (mat_ok && ly.is_full && D == 512) {
           // MATERIALIZED global prefill (window=0: pure causal). _full_paged
           // still wrote K/V to the pool above (for later decode); we attend
           // over the chunk-local kt/vt, which ARE the whole prefix at qpos==0.
@@ -5914,8 +6106,16 @@ MetalGemmaModel::forward_chunk_(ContextId cid,
     // below norms the LAST ROW only, so this is a second, all-rows norm
     // rather than a reuse of it, and it runs only when a tap wants it.
     if (_taps != nullptr && _taps->slot_of[(std::size_t)nl] >= 0) {
-      rms(*xcur, 0, _final_ln, hn, 0, rows, H);
-      tap_(enc, nl, hn, 0, rows);
+      if (_taps->skip_final_norm) {
+        // The RAW residual: HF's hidden_states[-1] with self.norm
+        // neutralized. See HiddenTapRequest::skip_final_norm -- the two
+        // differ by a scale a consumer cannot detect downstream, so the
+        // caller has to say which it wants.
+        tap_(enc, nl, *xcur, 0, rows);
+      } else {
+        rms(*xcur, 0, _final_ln, hn, 0, rows, H);
+        tap_(enc, nl, hn, 0, rows);
+      }
     }
 
     // ---- final norm (last token) + lm_head + softcap ---------------

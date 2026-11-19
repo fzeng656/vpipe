@@ -10,21 +10,28 @@
 // builds the stage is an inert stub (the constructor errors through session()
 // and every beat emits nothing).
 #ifdef VPIPE_BUILD_APPLE_SILICON
+#include "apple-silicon/tensor-beat.h"
 #include "stages/model-memory.h"
 #include "generative-models/krea2/metal-krea2-vae.h"
+#include "generative-models/flashvsr/flashvsr-tiny-decoder.h"
 #include "generative-models/flux2/metal-flux2-vae.h"
-#include "generative-models/mage/metal-mage-vae.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-fast-vae.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/vae-model-registry.h"
 #include "generative-models/wan/metal-wan-vae.h"
+#include "stages/wavelet-color-fix.h"
 #endif
 
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 namespace vpipe {
+
+namespace genai { class TpChannel; }
 
 // VAE decode stage: the second half of the `krea2` (Krea-2-Turbo) text-to-
 // image split -- it turns a latent tensor into an RGB image. Runs the
@@ -46,6 +53,40 @@ namespace vpipe {
 //           0..255) -- the same format load-image emits, so it flows into the
 //           image sinks. The decoded [-1,1] float is mapped (x+1)/2*255.
 //
+//   oport1  OPTIONAL TensorBeatPayload, the same pixels as ONE CLIP:
+//           planar U8 RGB [frames, 3, H, W], one beat per VIDEO latent,
+//           sideband {frames, fps}. The shape temporal-stack builds for
+//           a clip reference, so it is what a reference-conditioned
+//           model takes.
+//
+//           WHY A SECOND PORT AND NOT A MODE. oport0 is unchanged, so
+//           every graph that decodes to frames -- save-image,
+//           rgb-to-video -> save-video, a preview -- is untouched and
+//           needs no unpacking stage to get back what it already had.
+//           The two ports are the same pixels at two granularities, and
+//           a graph wires whichever it wants (or both).
+//
+//           It is written ONLY for a video latent, and only when a
+//           consumer is wired (ctx.has_consumers). An image latent has
+//           no time axis, and emitting [1, 3, H, W] for one would
+//           invent a one-frame CLIP where the model draws a real
+//           distinction between that and a still.
+//
+//           BUILDING IT COSTS A COPY OF THE CLIP -- ~380 MB at
+//           960x544x243 -- which is why it is conditional on the
+//           wiring. It is not a new memory regime: the families that
+//           decode video already hold the whole clip before they emit
+//           anything (the wan and plugin paths collect their frames,
+//           the MiniMax-H3 one decodes into a single bf16 buffer),
+//           because ctx.write is a coroutine and a VAE frame sink is a
+//           plain callback.
+//
+//           A CONSUMER THAT HOLDS THIS BEAT HOLDS THE WHOLE CLIP. Where
+//           the point is one frame -- seeding the next generation from
+//           the last frame of this one -- slice it down BEFORE anything
+//           caches it, or a feedback register pins 380 MB for the
+//           length of the next generation instead of 1.5 MB.
+//
 // Config (FlexData object on the 4th constructor parameter):
 //   hf_dir     (string, OPTIONAL) -- the Krea-2-Turbo model directory; the VAE
 //                                    weights are read from <hf_dir>/vae (or
@@ -61,6 +102,11 @@ public:
                  std::vector<InEdge>       iports,
                  FlexData                  config);
   ~VaeDecodeStage() override;
+
+  // The settled acceleration bag (i8_gemm, i8_gemm_tier, ...): what a
+  // registered family is handed and the Qwen-Image codec is set from. A
+  // test seam, as GenerateImageStage's.
+  const FlexData& accel_settings() const noexcept { return _accel; }
 
   Job initialize(RuntimeContext& ctx) override;
 
@@ -96,12 +142,107 @@ private:
   // claim and its release cannot name different things.
   std::string vae_dir_for_release_() const;
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // ---- a decode split between hosts (`tensor_parallel`) ----
+  //
+  // This rank's share of the clip's units (each chunk's tiles) and the
+  // channel its part crosses on: opened before the decode, so the link is
+  // made while the GPU decodes, let go once the parts are added -- or on
+  // any other way out (decode_split_release_). The buffers handed to the
+  // channel go with it.
+  struct DecodeSplit {
+    std::shared_ptr<genai::TpChannel> ch;
+    int rank = 0, units = 0, u0 = 0, u1 = 0;
+    std::unique_ptr<std::uint8_t[]> hs, hr, sbuf, rbuf;
+    std::size_t hbytes = 0, piece = 0;
+  };
+  // Null `ch` (the decode whole) when this stage is no share, or the
+  // channel cannot be opened (said).
+  DecodeSplit decode_split_open_(int LT, int lh, int lw,
+                                 RuntimeContext& ctx);
+  // The ranks' headers swapped and checked, then the other rank's part
+  // added into `rgb` ([3, F, H, W] bf16) on rank 0; false, with `err`,
+  // when they disagree or the exchange failed. Lets the channel go either
+  // way.
+  bool decode_split_join_(DecodeSplit& split,
+                          metal_compute::SharedBuffer& rgb, int F, int H,
+                          int W, int LT, std::string* err);
+  // The channel's stop cleared, its buffers forgotten and the channel let
+  // go, off the clip's path (an RDMA teardown takes a third of a second).
+  void decode_split_release_(DecodeSplit& split);
+  // Whether `tensor_parallel` asks this stage to be a share at all: a
+  // clip decoded whole while it does is said.
+  bool tp_split_asked_() const;
+
+  // ---- the clip oport (oport1) ----
+  //
+  // Allocate the [F, 3, H, W] clip, or return null when nothing is
+  // wired to oport1 -- the null IS the "do not build it" answer, so
+  // every caller is one `if (clip)` rather than a flag plus a pointer
+  // that can disagree with it.
+  std::unique_ptr<TensorBeatPayload>
+  begin_clip_(RuntimeContext& ctx, int F, int H, int W) const;
+  // Copy frame `f`'s [3, H, W] planar bytes into the clip. Silently
+  // does nothing when `clip` is null, so a caller need not re-test.
+  static void
+  add_to_clip_(TensorBeatPayload* clip, int f,
+               const TensorBeatPayload& frame);
+  // Stamp {frames, fps} and the producer's model name, matching what
+  // temporal-stack puts on a stacked video group.
+  void
+  finish_clip_(TensorBeatPayload* clip, double fps,
+               const TensorBeatPayload& src) const;
+#endif
+
   // See Stage::declare_memory.
   StageMemory declare_memory() const override;
 
+public:
+  // THE TWO OPORTS DO NOT ADVANCE AT THE SAME RATE, and which rate
+  // oport0 runs at depends on the checkpoint.
+  //
+  //   * oport1, the clip, is ONE beat per latent by construction, so it
+  //     always shares the latent iport's clock.
+  //   * oport0 is one beat per latent for an IMAGE checkpoint and one
+  //     PER FRAME for a video one. Those are different clocks, and only
+  //     the family says which.
+  //
+  // It matters because a feedback pair must stay inside one clock
+  // domain. Reporting the image answer for a video checkpoint -- which
+  // is what this stage did before it could tell them apart -- admits a
+  // loop that closes through the FRAME stream, where `feedback-rx`
+  // caches whichever frame won the scheduling. The clip oport is the
+  // one that can carry a loop, and now it is the one that says so.
+  //
+  // The family is probed from the checkpoint, so this answer needs
+  // `_hf_dir` -- which for the graphs that matter arrives as a
+  // model-select constant. That is why the runtime's clock-domain
+  // analysis runs after constant folding; see Phase 3.7 in
+  // pipeline-runtime.cc. With no checkpoint to probe it falls back to
+  // the image answer, i.e. exactly what it reported before.
+  unsigned oport_clock_group(unsigned p) const noexcept override;
+
+private:
+  // Resolved once, lazily, from the checkpoint: 0 = one beat per
+  // latent, 1 = one per frame. -1 = not yet asked.
+  mutable int _oport0_group = -1;
+
   std::string _hf_dir;
+  // `vae_dir`: the VAE's WEIGHTS when they are not the model's own (a
+  // Draw Things .ckpt); the config is still the model's. Empty: none.
+  std::string _vae_weights;
+  // `_vae_weights` resolved (a registry key or a path); empty when unset.
+  std::string vae_weights_() const;
+  // `fast_decoder`: MiniMax-H3's FAST decoder (Open-H3-Regenerate-2K's
+  // vae_fast/) in place of the released one -- a registry key, its
+  // directory or the file. Empty: the released decoder.
+  std::string _fast_decoder;
+  // The file it names, when the model is MiniMax-H3; empty otherwise (no
+  // other family reads it).
+  std::string fast_decoder_file_() const;
   // "krea2" (Qwen-Image VAE) | "flux2" (AutoencoderKLFlux2) |
-  // "mage" (MageVAE) | "wan" (AutoencoderKLWan, the VIDEO one)
+  // "wan" (AutoencoderKLWan, the VIDEO one) | "minimax-h3" | a registered
+  // family's tag
   std::string _family;
   std::uint64_t _images_emitted = 0;
 
@@ -110,20 +251,87 @@ private:
   // the beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
+  // The plan's key for the MiniMax-H3 VAE's ANE module, and the bytes the
+  // module holds while the loaded VAE has it armed (0 otherwise) -- counted
+  // in the per-beat unload decision beside the decode arena.
+  std::string ane_claim_label_() const;
+  std::size_t _ane_bytes = 0;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Loaded lazily (exactly one per the detected family) by ensure_loaded_ --
   // from initialize() when the model comes from config, or from process() when
   // it arrives on the model iport. Left null on failure so the stage stays
   // inert (process() warns + emits nothing).
-  std::unique_ptr<genai::MetalKrea2Vae> _vae;
-  std::unique_ptr<genai::MetalFlux2Vae> _flux2_vae;
-  std::unique_ptr<genai::MetalMageVae>  _mage_vae;
+  // Shared, so it can outlive the stage kept warm (~VaeDecodeStage).
+  std::shared_ptr<genai::MetalKrea2Vae> _vae;
+  double      _keep_loaded = 0.0;    // s it is kept warm after the stage
+  // `tensor_parallel`: this stage as one share of a MiniMax H3 decode
+  // split between hosts (decode_split_), null when it decodes whole.
+  FlexData    _tp_cfg;
+  // A split decode's channel let go off the clip's path (its RDMA queue
+  // pairs and registrations take a third of a second): joined before the
+  // next split opens one, and as the stage goes.
+  std::thread _tp_teardown;
+  std::string _vae_warm_key;         // what it was built with
+  static constexpr const char* kKrea2VaeWarmKind = "krea2-vae-decoder";
+  static constexpr const char* kFlux2VaeWarmKind = "flux2-vae-decoder";
+  std::shared_ptr<genai::MetalFlux2Vae> _flux2_vae;
   std::unique_ptr<genai::MetalWanVae>   _wan_vae;
+  // A STREAM's decode carries (sideband::kStreamContinues), held from one
+  // latent beat to the next so the decode continues across the cut. Kept
+  // apart from the VAE itself, so an idle unload of the weights between
+  // beats does not end the stream; dropped at its final beat.
+  std::unique_ptr<genai::MetalWanVae::DecodeStream> _wan_stream;
+  // OVERLAPPING clips (sideband::kBlendTail / kBlendHead): a beat's last
+  // frames held back, as 0..1 planes, for the next beat to cross-fade into
+  // its first ones; emitted as they are if no such beat comes.
+  struct HeldFrame {
+    std::vector<float> unit;     // [3, H, W]
+    int                H = 0, W = 0;
+    FlexData           sb;
+  };
+  std::vector<HeldFrame> _held;
+  // The wavelet colour fix, made at the first latent that asks for it,
+  // and whether a missing color_reference input has been said.
+  std::unique_ptr<WaveletColorFix> _wavelet;
+  bool _ref_port_noted = false;
+  // An image latent's colour fix (VOSR's): said once when it first runs,
+  // warned once when one it asked for could not.
+  bool _image_fix_noted = false;
+  bool _image_fix_said = false;
+  void note_image_color_fix_(const std::string& why,
+                             const std::string& method, double sigma);
+  bool _h3_cut_said = false;     // one note per run of a trim / crop
+  // FlashVSR's TINY decoder (sideband::kDecoder "tiny"), loaded at the
+  // first latent that asks for it, and its stream: the MemBlocks'
+  // memories live in the decoder's scratch, so an idle unload leaves it
+  // loaded while a stream is open. `_want_tiny` is the latent in hand's
+  // ask, read before anything loads -- such a latent needs no VAE, so the
+  // Wan VAE's weights are deferred (`_wan_deferred`) until one that does.
+  std::unique_ptr<genai::FlashVsrTinyDecoder> _tiny;
+  std::unique_ptr<genai::FlashVsrTinyDecoder::Stream> _tiny_stream;
+  std::string _tiny_path;
+  bool _tiny_tried = false;
+  bool _want_tiny = false;
+  bool _wan_deferred = false;
+  bool ensure_tiny_();
+  bool ensure_wan_vae_();
+  std::unique_ptr<TensorBeatPayload> held_beat_(const HeldFrame& h) const;
   // MiniMax-H3's video VAE. Its decoder is a ViT rather than an
   // upsampling conv stack, so it tiles STRUCTURALLY and returns the whole
   // clip at once instead of streaming chunks through a sink.
-  std::unique_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
+  // Shared: kept warm (keep_loaded) as the stage ends, as the 2D VAEs.
+  std::shared_ptr<genai::MetalMiniMaxH3VideoVae> _h3_vae;
+  // ...or its fast decoder, when `fast_decoder` names one: the released
+  // VAE's weights are then never read, only its config.
+  std::shared_ptr<genai::MetalMiniMaxH3FastVae> _h3_fast;
+  // What the H3 decoder in use was built with, as its warm hold's key.
+  std::string _h3_vae_warm_key;
+  static constexpr const char* kH3VaeWarmKind = "minimax-h3-video-vae";
+  static constexpr const char* kH3FastWarmKind = "minimax-h3-fast-vae";
+  // The i8 tier the fast decoder runs at on this box (-1 none), as the
+  // plan books it.
+  int fast_i8_tier_() const;
 
   // ---- an out-of-tree family (VaeModelRegistry) -------------------------
   // Consulted BEFORE the built-in `_class_name` chain, mirroring how
@@ -155,6 +363,16 @@ private:
   // the same rule the DiT and conditioner stages use.
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   bool _unload_idle   = false;
+  // The phase the idle rule weighs the peers in ("" all: a picture's
+  // decoder runs between denoises; MiniMax-H3's decode phase, and every
+  // other phase it would sit through kept).
+  std::string_view _idle_phase;
+  std::size_t idle_footprint_(std::size_t decode_need) const;
+  bool _autotune      = true;     // kernel tuners measure (kAutotune)
+  // `dtype`: the pictures this emits. U8 (the default) quantizes the
+  // decoder's samples to 8 bits; F16 keeps them (0..1, clamped) -- for
+  // a 16-bit or OpenEXR file, or a 10-bit video, nothing is lost here.
+  TensorBeat::DType _out_dtype = TensorBeat::DType::U8;
   bool _unload_resolved = false;
   bool _unloaded      = false;
   bool _quiet_reload  = false;   // reload logs at debug, not info
@@ -166,7 +384,53 @@ private:
   void publish_image_arena_(int px_w, int px_h);
   void reload_vae_();
 #endif
+  // The acceleration settings as a BAG, for a registered VAE family.
+  // See generative-models/shared/accel-settings.h. Every tier in it is
+  // off unless a graph asks: a codec's output is looked at directly, so
+  // an approximation here has nowhere to be absorbed.
+  FlexData _accel{};
 };
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// A MiniMax H3 clip's decode split between two ranks (vae-decode's
+// `tensor_parallel`): what the ranks swap before their parts cross, and
+// how rank 0 takes the other's part in. Free functions, so a test drives
+// them through a channel of its own.
+namespace vae_decode_split {
+
+// What a rank states first -- the clip it decoded and the units it took
+// -- swapped as the channel's exchange 0. Both parts are the whole clip's
+// buffer whatever either rank decoded, so ranks that would not add to one
+// clip (shares that do not tile the units, another tiling, another
+// latent) cross the same bytes; only this tells them apart.
+struct Header {
+  static constexpr std::int32_t kMagic = 0x56504453;   // "VPDS"
+  std::int32_t magic = kMagic, version = 1;
+  std::int32_t rank = 0, ranks = 0;
+  std::int32_t units = 0, u0 = 0, u1 = 0;
+  std::int32_t frames = 0, h = 0, w = 0, lt = 0;
+  std::int32_t reserved = 0;
+};
+
+// Whether two ranks' headers describe one clip whose two shares tile its
+// units; `why` not.
+bool agree(const Header& a, const Header& b, std::string* why);
+
+// Rank 1's frames `theirs` [first, end) of a [C, F, plane] bf16 clip
+// cross to rank 0, `piece` bytes at a time through `sbuf` / `rbuf`, as
+// `ch`'s exchanges seq0, seq0 + 1, ...: each rank hands its own bytes of
+// those frames (rank 0's are never read), and rank 0 ADDS each piece
+// where its own frames `mine` are too -- the two fade across each other
+// there -- and copies it everywhere else. Rank 1's clip is left as it is.
+// False, with `err`, when an exchange fails.
+bool cross(genai::TpChannel& ch, int rank, std::uint16_t* clip, int C,
+           int F, std::size_t plane, std::pair<int, int> theirs,
+           std::pair<int, int> mine, std::uint8_t* sbuf, std::uint8_t* rbuf,
+           std::size_t piece, std::uint64_t seq0, std::string* err,
+           double* merge_ms = nullptr);
+
+}  // namespace vae_decode_split
+#endif
 
 }
 

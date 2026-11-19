@@ -55,6 +55,7 @@
 
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "generative-models/shared/kernel-autotune.h"
+#include "generative-models/shared/tuned-answers.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -62,8 +63,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
+
+// TOOLKIT: compiled into each plugin (libvpipe_toolkit.a), not exported
+// by libvpipe -- see the vpipe_toolkit target and plugin/plugin-abi.h.
 
 namespace vpipe::genai {
 
@@ -106,6 +111,9 @@ struct MmaSplitK {
   // enabling a depth nothing has measured. VPIPE_LM_SPLITK_MIN_K lowers it
   // for that experiment.
   static constexpr int kMinSplitK = 12288;
+  // ...or a model's own floor, where it measured one: Qwen3.8-Flash-Next's
+  // hyper-connection mixers contract 4 x 2560 = 10240 (S = 5 of kc 2048).
+  int min_k = kMinSplitK;
 
   // ...and below this many ROWS. The deficit a split fixes is a large-M
   // phenomenon: at 128-256 rows the whole GEMM is small enough that the
@@ -139,6 +147,21 @@ struct MmaSplitK {
   // which is why plan() must distinguish "tuned to none" from "untuned".
   struct Tuned { int N, K, M, splits; };
   std::vector<Tuned> tuned;
+
+  // Row count above which two callers share one tuned entry. 0 keys on
+  // the exact M, which is what the LM callers want -- their M is the
+  // prompt length and the answer really can move with it.
+  //
+  // A caller that always MEASURES at a ceiling should set this to that
+  // ceiling: above one row block the split decision stops moving with M
+  // (encode walks M in blocks of its own choosing), so keying two
+  // geometries apart there buys nothing and costs a full re-tune. The
+  // video DiT sets it; nothing else does.
+  int m_bucket = 0;
+  int m_key_(int M) const
+  {
+    return m_bucket > 0 ? std::min(M, m_bucket) : M;
+  }
 
   void load(metal_compute::MetalCompute* mc,
             metal_compute::ComputeLibrary& lib_dense,
@@ -213,14 +236,14 @@ struct MmaSplitK {
     // floors are guesses about where a split pays and the measurement is
     // not.
     for (const Tuned& t : tuned) {
-      if (t.N == N && t.K == K && t.M == M) {
+      if (t.N == N && t.K == K && t.M == m_key_(M)) {
         if (t.splits <= 0) { return best; }
         const metal_compute::ComputeFunction* fn = fn_for_kc(K / t.splits);
         if (fn != nullptr) { best = Plan{fn, t.splits}; }
         return best;
       }
     }
-    if (K < env_int_("VPIPE_LM_SPLITK_MIN_K", kMinSplitK)) { return best; }
+    if (K < env_int_("VPIPE_LM_SPLITK_MIN_K", min_k)) { return best; }
     if (M < env_int_("VPIPE_LM_SPLITK_MIN_M", kMinSplitM)) { return best; }
     const int target = env_int_("VPIPE_LM_SPLITK_TARGET_KC", kTargetKC);
     const int forced = env_int_("VPIPE_LM_SPLITK_S", 0);
@@ -280,12 +303,31 @@ struct MmaSplitK {
   // 0.5% of outputs, so a tuner free to choose differently on the next run
   // makes the output irreproducible. Tune once, then keep the result for the
   // process (which is what `tuned` does) -- do not re-tune per turn.
+  //
+  // `caller` names what `run` encodes -- the family, its tile and weight
+  // format ("h3-dit mma128x256 w4g64") -- which this struct cannot see.
+  // Given one, the answer is filed in the session's kept answers and the
+  // next instance to ask it reads it instead of measuring
+  // (tuned-answers.h), which is also what keeps a reloaded model's
+  // output reproducible. Without one it stays this instance's.
   template <class Run>
-  int tune(metal_compute::MetalCompute* mc, int K, int N, int M, Run&& run)
+  int tune(metal_compute::MetalCompute* mc, int K, int N, int M, Run&& run,
+           std::string_view caller = {})
   {
     if (!enabled || mc == nullptr) { return 0; }
+    const int key = m_key_(M);
     for (const Tuned& t : tuned) {
-      if (t.N == N && t.K == K && t.M == M) { return t.splits; }
+      if (t.N == N && t.K == K && t.M == key) { return t.splits; }
+    }
+    KernelTuningCache* const answers =
+        caller.empty() ? nullptr : tuning_cache(mc);
+    const TuneKey skey = TuneKey("mma-splitk/1")("caller", caller)
+        ("plane_mb", (long long)(budget_bytes() >> 20))
+        ("N", N)("K", K)("M", key);
+    int kept = 0;
+    if (find_tuned(answers, skey, kept)) {
+      tuned.push_back(Tuned{N, K, key, kept});
+      return kept;
     }
     // Candidate 0 is "no split". The rest are every exact chunk with a
     // kernel and a row block that fits -- the same filter plan() applies,
@@ -298,7 +340,8 @@ struct MmaSplitK {
       cands.push_back(S);
     }
     if (cands.size() < 2) {
-      tuned.push_back(Tuned{N, K, M, 0});
+      tuned.push_back(Tuned{N, K, key, 0});
+      store_tuned(answers, skey, 0);
       return 0;
     }
     const int w = autotune_vote((int)cands.size(), /*rounds=*/3,
@@ -312,7 +355,8 @@ struct MmaSplitK {
           return t;
         });
     const int splits = cands[(std::size_t)w];
-    tuned.push_back(Tuned{N, K, M, splits});
+    tuned.push_back(Tuned{N, K, key, splits});
+    store_tuned(answers, skey, splits);
     return splits;
   }
 

@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 
 #include <memory>
 #include <string>
@@ -157,6 +158,12 @@ class MetalMiniMaxH3AudioVae {
   // Samples `frames` latent frames decode to, per channel.
   int decoded_samples(int frames) const;
 
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every conv and linear
+  // GEMM (a transposed conv as the GEMM it runs) and the encoder's
+  // causal attention, credited as each command buffer retires.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
   // Encode `[stereo, samples]` PLANAR f32 into the posterior MEAN,
   // `[stereo * frames, latent_channels]` row-major -- which is already
   // the CHANNEL-MAJOR row order the packed sequence wants, since the
@@ -184,6 +191,19 @@ class MetalMiniMaxH3AudioVae {
   // Latent frames `samples` samples encode to, per channel: the
   // right-pad makes this a CEILING, not a truncation.
   int encoded_frames(int samples) const;
+
+  // What encode() ALLOCATES on the device for `samples` per channel of
+  // `stereo` channels, freed when it returns: the trunk's three
+  // activation buffers at its widest (the input convolution's output,
+  // stereo x padded samples x encoder_dim -- ~768 bytes a sample on the
+  // released checkpoint, 25 MB a second of soundtrack), the 16 MB
+  // im2col band and the posterior head's buffers. From the config alone,
+  // so a plan can book it before anything loads; the head's MLP width
+  // is the released one's (2 x latent_channels), ~1% of the whole. The
+  // encoder half's WEIGHTS are not in it. 0 when `samples` is not
+  // positive.
+  static std::size_t encode_scratch_bytes(const Config& cfg, int samples,
+                                          int stereo = 2);
 
   // Whether the encoder half is loaded. It is built on first encode()
   // and released with the model; a decode-only pipeline never pays for
@@ -368,6 +388,7 @@ class MetalMiniMaxH3AudioVae {
   metal_compute::ComputeFunction _fn_dense_mma, _fn_dense_mma_deep,
       _fn_bias_add;
   bool _use_mma2 = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   // Shape gate. The win regime measured on this decoder is the trunk's
   // resblock convolutions (M 3k-9k, N 128-256, K 0.9k-2.8k), which carry
   // ~75% of the decode's GEMM FLOPs. The rest of the stack is a very

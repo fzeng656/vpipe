@@ -1,14 +1,19 @@
 #ifndef GENERATIVE_MODELS_MINIMAX_H3_METAL_MINIMAX_H3_VIDEO_VAE_H
 #define GENERATIVE_MODELS_MINIMAX_H3_METAL_MINIMAX_H3_VIDEO_VAE_H
 
+#include "generative-models/shared/ane-ffn.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/mma-splitk.h"
 
 #include <cstddef>
+#include <functional>
+#include <limits>
 #include <memory>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -92,11 +97,68 @@ class MetalMiniMaxH3VideoVae {
     // merely seaming differently.
     int tile_size        = 256;
     int tile_overlap_min = 64;
+
+    // ---- the ANE tier (LOSSY, opt-in) -------------------------------
+    // The decoder blocks' feed-forward split between the GPU and the Neural
+    // Engine by ROWS, per tile, per block (see shared/ane-ffn.h). About 70%
+    // of the decode's arithmetic is that feed-forward; attention stays on the
+    // GPU, where the ANE measured 1.8 TOPS for a whole block. `ane_rows` is
+    // the ANE's share, 0 auto-balancing; `ane_layers` caps the blocks, 0 all.
+    // Set from vae-decode's `ane_*` keys once the plan has granted the
+    // module; VPIPE_H3_VVAE_ANE_CHUNK / VPIPE_H3_VVAE_ANE_PROFILE for tuning.
+    bool  ane_ffn    = false;
+    float ane_rows   = 0.0f;
+    // Whether the encoder's GEMM tile, split-K and hardware conv tile are
+    // chosen by timing (the accel key `autotune`, accel-keys.h): false
+    // keeps each one's rule -- the wide tile from K 6144, MmaSplitK's
+    // plan, the c128 conv tile -- timing nothing.
+    bool  autotune   = true;
+    int   ane_layers = 0;
     // Per-channel latent whitening. The DiT works in NORMALIZED latent
     // space -- `(z - mean) / std` -- so a decode has to undo it first.
     // Empty when the checkpoint states neither, which means identity.
     std::vector<float> latents_mean;
     std::vector<float> latents_std;
+
+    // ---- the single-latent-frame IMAGE decode (checkpoint-declared) --
+    // Whether this checkpoint's decoder was trained to turn ONE latent
+    // frame straight into one picture, and which of the `patch_t` pixel
+    // frames that token expands to is that picture.
+    //
+    // A CAPABILITY OF THE WEIGHTS, never of the request, which is why it
+    // is read from the file rather than configured. Every H3 checkpoint
+    // has the same geometry and the same tensor names, so nothing about
+    // the shapes distinguishes the two -- the stock video decoder handed
+    // one token alone returns a picture-shaped buffer full of the wrong
+    // thing (its `decode_image` reads a chunk of copies instead). The
+    // released image checkpoint says so in its
+    // `__metadata__` (`h3_t1_direct` / `h3_t1_output_slice`); a
+    // checkpoint that says nothing does not have it.
+    //
+    // WHY A SLICE AND NOT FRAME 0. The decoder emits a whole `patch_t`
+    // block per token and the chunked video path throws the leading
+    // `frame_pre_pad()` of them away as an implicit pad, so the first
+    // frame a chunk really carries is index 3 -- which is exactly the
+    // slice the released checkpoint names. Read it anyway: agreeing with
+    // a derivation is not the same as being one, and a future fine-tune
+    // is free to park the picture somewhere else.
+    bool t1_direct       = false;
+    int  t1_output_slice = 0;
+    // An IMAGE-ONLY decoder (P-H3-Image's `AutoencoderKLPH3Image`): the
+    // released encoder -- byte for byte, so the latent space is H3's --
+    // with a ViT decoder retrained to expand a token into ONE pixel
+    // frame rather than `patch_t`, its rotary time PINNED where a
+    // 7-token chunk's first token sits (2 * (0.5 / 7) - 1) instead of
+    // normalized over the frames it is handed. `dec_patch_t` 0 is the
+    // video decoder's (`patch_t`); `t1_time` NaN normalizes as ever.
+    // Such a checkpoint decodes single frames only (decode_image).
+    int    dec_patch_t = 0;
+    double t1_time     = std::numeric_limits<double>::quiet_NaN();
+    // The decoder's ROTARY AXES: 3 -- (t, h, w), the video decoder's and
+    // P-H3-Image's -- or 2, (h, w) alone: MiniMax-H3-Image's 2D decoder
+    // (`MiniMaxH3ImageVAE`, `vit_decoder_2d`), which decodes one latent
+    // frame and carries no time at all.
+    int    rope_axes   = 3;
 
     // Derived temporal-chunk geometry. `clip_length` is deliberately
     // NOT a multiple of `patch_t`, so a chunk's leading `frame_pre_pad`
@@ -121,14 +183,24 @@ class MetalMiniMaxH3VideoVae {
       return f > 0 ? f : 0;
     }
 
-    // int(head_dim * rope_dim_ratio) = 48 of 64 channels rotate. The
-    // angles are 3 axes x (rope_dim / (2*3)) frequencies concatenated and
-    // then duplicated, so the table needs rope_dim/2 entries per row.
+    // int(head_dim * rope_dim_ratio) = 48 of 64 channels rotate (32 on
+    // the 2D decoder). The angles are `rope_axes` axes x (rope_dim /
+    // (2 * rope_axes)) frequencies concatenated and then duplicated, so
+    // the table needs rope_dim/2 entries per row.
     int rope_dim() const { return (int)((double)head_dim * rope_dim_ratio); }
-    int rope_freqs() const { return rope_dim() / 6; }
+    int rope_freqs() const { return rope_dim() / (2 * rope_axes); }
+    // The table's width a row: rope_axes x rope_freqs(), rope_dim() / 2.
+    int rope_half() const { return rope_axes * rope_freqs(); }
+    // The pixel frames one decoder token expands to.
+    int out_patch_t() const
+    {
+      return dec_patch_t > 0 ? dec_patch_t : patch_t;
+    }
+    // Whether the decoder is the video one (decode_video runs).
+    bool decodes_video() const { return out_patch_t() == patch_t; }
     int patch_elems() const
     {
-      return out_channels * patch_t * patch * patch;   // 3072
+      return out_channels * out_patch_t() * patch * patch;   // 3072
     }
   };
 
@@ -150,6 +222,33 @@ class MetalMiniMaxH3VideoVae {
 
   ~MetalMiniMaxH3VideoVae();
 
+  // What each half holds once it has loaded, off the checkpoint's headers
+  // (bf16, or a pack as stored). Each half loads at its first use -- the
+  // encoder at the first encode, the decoder at the first decode -- so a
+  // stage that only encodes holds the encoder alone.
+  enum class Half { kEncoder, kDecoder };
+  static std::size_t held_bytes(const std::string& vae_dir, Half half);
+
+  // What decode_video() allocates beside the weights for an LT x lh x lw
+  // latent, the clip it returns included: the clip ([out_channels,
+  // frames, H, W] bf16, written in place chunk by chunk), the padded
+  // latent, and one chunk's working set -- two rows of tile decodes (each
+  // tile is stitched as it finishes), the stitched chunk, the ViT scratch
+  // of the widest tile, the cross-fade partner. decode_working_bytes is that last part
+  // and the latent, without the clip.
+  static std::size_t decode_video_bytes(const Config& c, int LT, int lh,
+                                        int lw);
+  static std::size_t decode_working_bytes(const Config& c, int LT, int lh,
+                                          int lw);
+  // What decode_image() allocates beside the weights for an lh x lw
+  // still, the picture it returns included: the latent and the chunk of
+  // copies decoded in its place, one tile's decode at every frame it
+  // expands to (cut to the kept frame as it finishes), two rows of kept
+  // frames, the stitched picture, and the ViT scratch of the widest
+  // tile. 0 for a decoder that reads no still. An image-only decoder's
+  // decode_working_bytes is this figure.
+  static std::size_t still_decode_bytes(const Config& c, int lh, int lw);
+
   // Decode one latent grid. `z` is CHANNEL-FIRST [z_channels, T, h, w]
   // bf16 -- the layout the DiT's unpatchify produces -- and the result is
   // channel-first [out_channels, T*4, h*16, w*16] bf16.
@@ -162,6 +261,62 @@ class MetalMiniMaxH3VideoVae {
   metal_compute::SharedBuffer
   decode(const metal_compute::SharedBuffer& z, int T, int h, int w,
          std::string* err = nullptr);
+
+  // Decode ONE latent frame as ONE picture: channel-first
+  // [z_channels, 1, h, w] bf16 in, channel-first
+  // [out_channels, h*patch, w*patch] bf16 out -- a still, with no time
+  // axis at all rather than a length-1 one.
+  //
+  // This is the decode `decode_video` CANNOT do. Its chunking spends
+  // `token_drop` latent frames priming the temporal window, so it needs
+  // `tokens_per_chunk() + token_drop` = 7 latent frames before it will
+  // decode anything and refuses 1 outright -- while `encode_video`
+  // turns a single still into exactly 1 latent frame. A checkpoint with
+  // `t1_direct` closes that gap: its decoder was fine-tuned to read one
+  // token on its own.
+  //
+  // The STOCK video decoder cannot read a lone token -- it returns a
+  // correctly shaped picture that merely looks wrong, and the rope is
+  // why: `build_rope_` normalizes the temporal axis by `T` ITSELF, so a
+  // lone latent lands at coordinate 0.0, a grid no voxel occupies during
+  // a video decode. So it reads a still as the reference's ComfyUI VAE
+  // does (`MiniMaxH3VideoVAE.decode`, a still latent): `tokens_per_chunk()`
+  // copies of the token decoded as one chunk, frame `frame_pre_pad()`
+  // kept -- the first frame a chunk really carries, the slice the image
+  // checkpoint names too. MEASURED on a 512 crop of a photo: 33.00 dB
+  // PSNR as 5 copies, 17.15 dB alone (the image checkpoint reports 30.44
+  // over its own 512 set). That is how a stored reference's still (a
+  // RefMod's picture) reaches a vision tower with no image checkpoint.
+  // Only the kept frame is stitched (decode_tiled_'s `keep`): the copies
+  // expand to 20 pixel frames, and stitching them all held 297 MB at
+  // 1024^2 against 119 MB for the one kept. still_decode_bytes is what
+  // it holds.
+  //
+  // Spatially tiled exactly as `decode_video` tiles, and the tiling is
+  // REQUIRED rather than an optimization. MEASURED on a 512px centre
+  // crop round-tripped through the released image checkpoint: 30.97 dB
+  // PSNR at the checkpoint's own 256 tile against 23.27 dB decoding the
+  // whole 512 in one go -- and the checkpoint reports 30.44 dB over a
+  // 64-image 512px set, so the tiled arm is the one that reproduces it.
+  //
+  // The reason is the rope and not the seams. `build_rope_` normalizes
+  // each axis to the extent it is HANDED, so decoding a whole image puts
+  // every token at a coordinate no 256px tile occupies, and this decoder
+  // was fine-tuned on a 256 -> 384 px curriculum. Raising `tile_size`
+  // for an image therefore does not trade seam for compute; it computes
+  // a different and worse function.
+  //
+  // Empty on failure, with a reason in `err`.
+  metal_compute::SharedBuffer
+  decode_image(const metal_compute::SharedBuffer& z, int h, int w,
+               std::string* err = nullptr);
+
+  // Whether `decode_image` will run at all: a checkpoint fine-tuned for
+  // it, or a video decoder (a chunk of copies).
+  bool can_decode_image() const
+  {
+    return _cfg.t1_direct || _cfg.decodes_video();
+  }
 
   // Encode ONE temporal clip -- the reference's `_encode_clip` with
   // tiling off. `x` is CHANNEL-FIRST [in_channels, T, H, W] bf16 in
@@ -233,20 +388,96 @@ class MetalMiniMaxH3VideoVae {
   // it started. 0 when `LT` is too short to form a chunk.
   int video_latent_frames(int T) const;
   int decoded_frames(int LT) const;
+  static int decoded_frames_for(const Config& c, int LT);
 
   const Config& config() const { return _cfg; }
 
-  // Per-TILE progress out of decode_video / decode_tiled_. A 960x544
-  // clip is ~15 tiles per chunk of a 2.4B ViT -- around a minute during
-  // which nothing else this class does is observable -- so without it a
-  // caller can only report the decode as one indivisible step.
+  // Per-TILE progress out of decode_video / decode_tiled_, and out of
+  // encode_video / encode_tiled_ the same way. A 960x544 clip is ~15
+  // tiles per chunk of a 2.4B ViT -- around a minute during which
+  // nothing else this class does is observable -- so without it a
+  // caller can only report the decode as one indivisible step. The
+  // encode is the same shape and as long: MEASURED ~1.8 s per frame at
+  // 896x512 on an M5 Pro before the hardware conv route, so a 90-frame
+  // reference was two and a half silent minutes (1.06 s per frame at
+  // 832x480 on the 10-core M5 with it, against 3.95 without).
+  // encode_video reports against clips x tiles for the whole clip.
   //
   // Fires on the encode thread between tiles; must be cheap and must not
   // re-enter the decoder. See VaeTileProgressFn for the counting rule.
+  // Bytes the ANE feed-forward tier holds for this config's tile shape;
+  // see AneFeedForward::runtime_bytes. Static: the plan asks before load.
+  static std::size_t ane_runtime_bytes(const Config& c) noexcept;
+  // Rows per ANE predict: VPIPE_H3_VVAE_ANE_CHUNK, or 1024 -- a tile is
+  // 1797 rows, so one 1024-row chunk is a 57% share, near the balance.
+  static int ane_chunk_rows() noexcept;
+  // Whether the encoder's 3x3x3 convs run on the hardware convolution
+  // (M5 matrix cores; VPIPE_VAE_NO_HWCONV turns it off), and how many
+  // conv shapes have been tuned on it -- non-zero once an encode has.
+  bool uses_hwconv() const noexcept { return _use_hwconv; }
+  int  hwconv_tuned_shapes() const noexcept { return (int)_c3_tuned.size(); }
+  // Whether the tier tried to arm, and whether it did.
+  bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_armed() const noexcept { return _ane != nullptr; }
+
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every projection and
+  // conv GEMM and the decoder's attention, counted as encoded and
+  // credited as each command buffer retires. Rows the ANE tier takes
+  // are credited by the tier itself, to the ANE. For a test.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return _ane != nullptr && _ane->gpu_only();
+  }
+
+  // A SHARE OF THE DECODE, for a decode split between hosts. A clip
+  // decodes in UNITS -- each chunk's rows of tiles, chunk by chunk, row
+  // by row -- and the next decode_video() decodes only units [u0, u1),
+  // writing the WHOLE clip's buffer: zero outside what those units make,
+  // and where a unit of another share fades with one of these (the tile
+  // row below, the next chunk) only this share's weighted part. Every
+  // stitch and fade is a weighted sum, so the shares' buffers ADD to the
+  // clip decoded whole (to bf16 rounding where two shares fade across
+  // each other). Set again for every decode; (0, -1) is the whole clip.
+  void set_unit_range(int u0, int u1)
+  {
+    _unit0 = u0;
+    _unit1 = u1;
+  }
+  // How many units an LT x lh x lw latent decodes in, and the pixel
+  // frames [first, end) units [u0, u1) write into (end past the fade
+  // into the next chunk's head). 0 / {0, 0} when there is no clip.
+  int decode_units(int LT, int lh, int lw) const;
+  std::pair<int, int> unit_frames(int LT, int lh, int lw, int u0,
+                                  int u1) const;
+
   void set_tile_progress(genai::VaeTileProgressFn fn)
   {
     _tile_progress = std::move(fn);
   }
+
+  // A COOPERATIVE STOP, checked between tiles and between clips of an
+  // ENCODE. Optional; unset means nothing ever stops.
+  //
+  // Those are real interruption points and not merely convenient ones:
+  // a tile commits its command stream and WAITS on it, so a check
+  // between two of them is reached with the GPU idle and the stop is
+  // bounded by one tile. That is the distinction this tree keeps having
+  // to make -- checking between units of work only interrupts anything
+  // when the units are separately committed, and where a loop encodes
+  // the whole job into one command buffer the same check can only
+  // observe a request that was already set.
+  //
+  // On a stop the call returns an EMPTY buffer and leaves `err`
+  // untouched, because a stop is not a failure. A caller distinguishes
+  // it from a real failure by asking its own stop predicate, which is
+  // what encode_references does.
+  void set_stop(std::function<bool()> fn) { _stop = std::move(fn); }
+  bool stopping() const { return _stop && _stop(); }
 
  private:
   MetalMiniMaxH3VideoVae() = default;
@@ -264,16 +495,23 @@ class MetalMiniMaxH3VideoVae {
     Linear qkv, out, w1, w2;
   };
 
-  // A causal conv3d flattened into a GEMM. `spatial` distinguishes the
-  // 3x3x3 convolutions, whose weight is [cout, 27*cin] laid out
-  // (kt, ky, kx, cin) to pair with the im2col, from the 1x1x1 shortcut
-  // and quant convolutions, which need no gather at all and run as a
-  // plain [cout, cin] Linear over every voxel at once.
+  // A causal conv3d. `spatial` distinguishes the 3x3x3 convolutions from
+  // the 1x1x1 shortcut and quant convolutions, which need no gather at all
+  // and run as a plain [cout, cin] Linear over every voxel at once.
+  //
+  // A 3x3x3 conv holds its weight in the layout of the route it takes,
+  // decided at load: `l.w` [cout, 27*cin] laid out (kt, ky, kx, cin) for
+  // the im2col GEMM, or `whwio` [kt, ky, kx, cin, cout] -- one HWIO block
+  // a temporal tap -- for the hardware convolution (see enc_conv_hw_).
+  // `l.b` is the bias either way. A hardware conv handed an extent it
+  // cannot take builds the GEMM layout on demand (gemm_weight_).
   struct Conv3d {
     Linear l;
+    metal_compute::SharedBuffer whwio;
+    std::string name;
     int  cin = 0, cout = 0, k = 0;
     bool spatial = false;
-    bool empty() const { return l.empty(); }
+    bool empty() const { return l.empty() && whwio.empty(); }
   };
 
   struct EncResnet {
@@ -291,13 +529,30 @@ class MetalMiniMaxH3VideoVae {
 
   metal_compute::SharedBuffer weight_(WeightSet& ws, const std::string& nm);
   Linear linear_(WeightSet& ws, const std::string& nm);
-  Conv3d conv3d_(WeightSet& ws, const std::string& nm);
+  // `hw`: the conv may take the hardware route (cout a multiple of a
+  // 128- or 16-channel tile, and a bias), so its weight is built HWIO.
+  Conv3d conv3d_(WeightSet& ws, const std::string& nm, bool hw);
+  // One 3x3x3 weight permuted out of the checkpoint into either layout.
+  metal_compute::SharedBuffer
+  c3d_weight_(WeightSet& ws, const std::string& nm, int cin, int cout,
+              bool hwio);
+  // The GEMM layout of a conv loaded for the hardware route, for an
+  // extent that route declines. Cached in the weight set.
+  metal_compute::SharedBuffer gemm_weight_(const Conv3d& c);
   bool   load_encoder_(WeightSet& ws);
+  bool   load_decoder_(WeightSet& ws);
 
   void gemm_(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t x_off,
              const Linear& l, const metal_compute::SharedBuffer& y,
              std::size_t y_off, int M, int N, int K);
+  // gemm_ without counting it toward gpu_flops(): for a caller that
+  // counts its own arithmetic (a causal conv, by its live taps).
+  void gemm_uncounted_(metal_compute::ComputeEncoder& enc,
+                       const metal_compute::SharedBuffer& x,
+                       std::size_t x_off, const Linear& l,
+                       const metal_compute::SharedBuffer& y,
+                       std::size_t y_off, int M, int N, int K);
   // Rows one dispatch may write into an N-wide destination.
   //
   // Two limits, and the tighter one is the same number. The mma tiles
@@ -313,8 +568,13 @@ class MetalMiniMaxH3VideoVae {
   // hands it the WHOLE frame when the frame does not tile. A 1344x768
   // clip through that path is [17547264, 128] = 4.5 GB, twice over the
   // line, and `t * rows * cout` overflows the int it was narrowed to.
-  // VPIPE_H3_VVAE_ROW_BAND forces one.
-  int row_band_(int N) const;
+  // VPIPE_H3_VVAE_ROW_BAND forces one (smaller only -- see the clamp).
+  //
+  // `widest` is the WIDEST ROW of any operand in elements, i.e.
+  // max(N, K) and not N: the mma kernels wrap x, W and y alike in
+  // int32 extents, so the x operand crosses the line first whenever
+  // K > N. Callers pass the max; see gemm_.
+  int row_band_(int widest) const;
   // Dequant-once into _w_deq (quantized) or the weight as-is (dense), then
   // one dense matmul2d tile. False when the shape or the machine does not
   // take it, which leaves gemm_ on its existing path.
@@ -337,6 +597,17 @@ class MetalMiniMaxH3VideoVae {
   bool ensure_scratch_(int rows, int voxels);
   Scratch _s;
 
+  // ---- the ANE tier ------------------------------------------------
+  // Built at the first decode, from its tile's row count. Null == every
+  // block keeps the GPU feed-forward.
+  std::unique_ptr<AneFeedForward> _ane;
+  bool _ane_tried       = false;
+  bool _ane_skip_warned = false;
+  bool ane_setup_(int rows);
+  bool ane_eligible_(int L, const Block& b);
+  // w1 is [gate | up] rows with a [2*ffn] bias, gate first; w2 [dim, ffn].
+  void ane_stage_(int L, const Block& b);
+
   // One causal conv3d over a whole clip: `in` is [Ti, H*W, cin] and
   // `out` becomes [To, Ho*Wo, cout], with the output frame count that
   // `strides` implies. Returns it, or 0 on a bad shape.
@@ -344,12 +615,39 @@ class MetalMiniMaxH3VideoVae {
                 const metal_compute::SharedBuffer& in, int Ti, int H, int W,
                 const metal_compute::SharedBuffer& out, int stride_t,
                 int stride_s);
+  // Whether `c` runs on the hardware convolution at this input extent:
+  // loaded for it, an extent reflection is defined on (H, W >= 2), and a
+  // padded frame the op can address. `from_norm`: its input is a norm's
+  // output, which the norm pads -- so it must be able to
+  // (gn_coalesced_); otherwise the caller pads it (enc_pad_).
+  bool hw_route_(const Conv3d& c, int H, int W, int stride_s,
+                 bool from_norm) const;
+  // The same convolution on the hardware op, over `in` already
+  // REFLECT-PADDED for the stride: [Ti, H+2, W+2, cin] at stride 1 (the
+  // norm writes it so), [Ti, H+1, W+1, cin] at stride 2 (enc_pad_). H, W
+  // are the UNPADDED extent. With `res`, the output is conv + res -- the
+  // resnet's residual add, read at the output's own position.
+  int enc_conv_hw_(metal_compute::ComputeEncoder& enc, const Conv3d& c,
+                   const metal_compute::SharedBuffer& in, int Ti, int H,
+                   int W, const metal_compute::SharedBuffer& out,
+                   int stride_t, int stride_s,
+                   const metal_compute::SharedBuffer* res);
+  // Reflect-pad [T, H, W, C] by `lo` before and `hi` after, both axes.
+  void enc_pad_(metal_compute::ComputeEncoder& enc,
+                const metal_compute::SharedBuffer& in, int T, int H, int W,
+                int C, int lo, int hi, const metal_compute::SharedBuffer& out);
+  // Per-frame GroupNorm (+ SiLU). `pad` writes the output reflect-padded
+  // by one pixel, [T, H+2, W+2, C], for a hardware conv to read; it needs
+  // gn_coalesced_(C).
   void enc_gn_(metal_compute::ComputeEncoder& enc,
                const metal_compute::SharedBuffer& in,
                const metal_compute::SharedBuffer& gamma,
                const metal_compute::SharedBuffer& beta,
-               const metal_compute::SharedBuffer& out, int T, int rows,
-               int C, bool silu);
+               const metal_compute::SharedBuffer& out, int T, int H, int W,
+               int C, bool silu, bool pad);
+  // Whether the three-pass norm takes C channels: C/4 divides 256 and a
+  // group is whole vec4s. Every width this encoder has does.
+  bool gn_coalesced_(int C) const;
 
   // Three interchangeable activation buffers, each sized for the WIDEST
   // level, plus one im2col band. Three is what a resnet needs: its
@@ -359,7 +657,10 @@ class MetalMiniMaxH3VideoVae {
     int T = -1, H = -1, W = -1;
     metal_compute::SharedBuffer a, b, c, col;
     std::size_t col_cap = 0;          // elements, not rows: the band a
-  };                                  // conv can afford depends on its cin
+                                      // conv can afford depends on its cin
+    // The three-pass norm's per-band partials and per-group statistics.
+    metal_compute::SharedBuffer gn_part, gn_stats;
+  };
   bool ensure_enc_scratch_(int T, int H, int W);
   EncScratch _es;
 
@@ -369,9 +670,14 @@ class MetalMiniMaxH3VideoVae {
   metal_compute::SharedBuffer
   encode_tiled_(const metal_compute::SharedBuffer& x, int T, int H, int W,
                 std::string* err);
+  // `keep` >= 0 stitches that one pixel frame of the LT * out_patch_t()
+  // a decode expands to, each tile cut to it as it finishes -- a still
+  // needs one, and the stitch is per frame, so it is the same frame the
+  // whole decode would give, bit for bit. -1 stitches every frame.
   metal_compute::SharedBuffer
   decode_tiled_(const metal_compute::SharedBuffer& z, int LT, int lh, int lw,
-                std::string* err);
+                std::string* err, int keep = -1, int row0 = 0,
+                int row1 = -1);
 
   // Cross-fade a grid of channel-first [C, T, th, tw] tiles into one
   // [C, T, out_h, out_w]. `ratio` converts the split's PIXEL units into
@@ -380,6 +686,15 @@ class MetalMiniMaxH3VideoVae {
   stitch_(const std::vector<metal_compute::SharedBuffer>& tiles,
           const minimax_h3::TileSplit& ys, const minimax_h3::TileSplit& xs,
           int ratio, int C, int T, int out_h, int out_w);
+  // One tile of stitch_: its region of `dst` ([C, T, out_h, out_w]),
+  // cross-faded with the ORIGINAL bytes of the tile above and the one to
+  // its left (null where there is none) -- all a tile's region reads, so
+  // a tiled decode stitches each tile as it finishes.
+  void stitch_tile_(std::uint16_t* dst, const std::uint16_t* cur,
+                    const std::uint16_t* up, const std::uint16_t* lf, int i,
+                    int j, const minimax_h3::TileSplit& ys,
+                    const minimax_h3::TileSplit& xs, int ratio, int C,
+                    int T, int out_h, int out_w, std::vector<float>& tmp);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -426,13 +741,51 @@ class MetalMiniMaxH3VideoVae {
   struct TileTune { int N, K, M; bool wide; };
   std::vector<TileTune> _tile_tuned;
   int _force_tile = 0;
+  // VPIPE_H3_VVAE_ENC_PROFILE: an encode_video's time by bucket -- each
+  // level's convs, the norms, the adds, and the host's copies -- logged
+  // when it returns. Every GPU bucket is a commit AND a wait.
+  struct ProfBucket { std::string name; double ms; long marks; };
+  std::vector<ProfBucket> _enc_prof;
+  void prof_add_(const std::string& name, double ms);
+  void prof_log_(int T, int H, int W);
   // Tile progress, and the counters it reports against. `_prog_total`
   // is set by decode_video (chunks x tiles) so the bar spans the whole
   // clip; a bare decode_tiled_ call sets it to its own tile count.
   genai::VaeTileProgressFn _tile_progress;
+  std::function<bool()>    _stop;
   int _prog_done = 0;
+  // set_unit_range's [u0, u1): the next decode_video's share.
+  int _unit0 = 0, _unit1 = -1;
   int _prog_total = 0;
   bool _use_mma2 = false;
+  // M5: the encoder's 3x3x3 convs on the hardware convolution op
+  // (conv3d_hw_causal_*) instead of im2col + GEMM. VPIPE_VAE_NO_HWCONV.
+  bool _use_hwconv = false;
+  metal_compute::ComputeLibrary _lib_convhw;
+  // conv3d_hw_causal_s{1,2}_*: the three tuned tiles (kC3Cands), then the
+  // partial-tile entry, then (stride 1 only) the 16-channel one for a
+  // cout that is not a multiple of 128. Indexed [stride - 1][candidate].
+  static constexpr int kC3Cands = 3;
+  static constexpr int kC3Tail  = kC3Cands;
+  static constexpr int kC3C16   = kC3Cands + 1;
+  metal_compute::ComputeFunction _fn_c3hw[2][kC3Cands + 2];
+  metal_compute::ComputeFunction _fn_pad;
+  // The tile each conv shape measured fastest on, at its first encode.
+  struct C3Tune { int stride, cin, cout, H, W, pick; };
+  std::vector<C3Tune> _c3_tuned;
+  int  c3_pick_(int stride, int cin, int cout, int H, int W) const;
+  void c3_tune_(const Conv3d& c, int Ti, int H, int W, int stride_t,
+                int stride_s);
+  void c3_dispatch_(metal_compute::ComputeEncoder& enc, const Conv3d& c,
+                    int cand, const metal_compute::SharedBuffer& in, int Ti,
+                    int H, int W, const metal_compute::SharedBuffer& out,
+                    int stride_t, int stride_s,
+                    const metal_compute::SharedBuffer* res);
+  // The three-pass GroupNorm (any GPU). VPIPE_H3_VVAE_GN_ONEPASS keeps the
+  // one-pass kernel, for the A/B.
+  metal_compute::ComputeFunction _fn_gn_stats, _fn_gn_fin, _fn_gn_apply;
+  bool _gn3 = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   int _mma_min_m = 64;
   bool _attn_nax = false;
   metal_compute::ComputeFunction _fn_gemm, _fn_rms, _fn_rms_heads, _fn_trope,

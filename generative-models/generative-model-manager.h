@@ -1,19 +1,29 @@
 #ifndef VPIPE_GENERATIVE_MODELS_GENERATIVE_MODEL_MANAGER_H
 #define VPIPE_GENERATIVE_MODELS_GENERATIVE_MODEL_MANAGER_H
 
+#include "common/flex-data.h"
 #include "common/session-member.h"
+#include "generative-models/loaded-language-model.h"
 #include "generative-models/weight-registry.h"
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class SessionContextIntf;
@@ -56,7 +66,67 @@ struct LoadSpec {
   // Page-pool capacity. seq_len <= page_tokens * max_pages across
   // all contexts of this model combined.
   std::uint32_t max_pages     = 4096;
+
+  // Anything this struct has no field for: see common/flex-bag.h. Keys
+  // read here: load_spec::* below.
+  FlexData extra;
 };
+
+// LoadSpec::extra keys.
+namespace load_spec {
+// string: a SEPARATE MTP drafter to decode with -- a directory holding the
+// draft head's own model.safetensors (+ config.json, model_type
+// "qwen3_5_mtp"): mlx-community's Qwen3.8-27B-MTP-4bit beside its
+// Qwen3.8-27B-4bit, whose conversion drops the head. Absent / "": only the
+// head the model's own directory carries (optiq/mtp.safetensors, in-shard
+// mtp.*). Part of the cache key: the drafter changes what is loaded.
+inline constexpr std::string_view kMtpDir = "mtp_dir";
+// string: a separate DFlash / DFlash 2 block DRAFTER's directory (its
+// config.json names DFlashDraftModel or DFlash2DraftModel), attached after
+// the model loads; see speculative-decode.h. Absent / "": none. Part of the
+// cache key.
+inline constexpr std::string_view kDraftDir = "draft_dir";
+// int: the precision that drafter is held at in memory -- 0 as stored, 8
+// or 4 affine group-64. Absent: 8. Part of the cache key.
+inline constexpr std::string_view kDraftBits = "draft_bits";
+// bool: WIRE the model's buffers as they are allocated, so the compressor
+// never takes the weights while they are read (on a box without that much
+// free, the first forward then spent 30 s bringing them back; wired, 2 s).
+// The GPU wires them at first use anyway: no memory is held that the model
+// would not hold. What it wired is charged to the wired pool while the
+// model lives. Absent: false. Not part of the cache key -- it changes how
+// the model is held, not what is loaded.
+inline constexpr std::string_view kWireWeights = "wire_weights";
+// int: the most the model may hold in all, MB -- its weights as held, a
+// Mixture of Experts' expert cache, a conversation's state and working
+// memory. A model whose routed experts can live in a cache (DeepSeek-
+// V4.1-Flash, a Qwen3.x MoE) sizes the cache within it, and a draft head
+// that loads only where every expert is resident loads only where they
+// all are within it; a dense model loads whole regardless. Absent / 0:
+// the box's memory alone. Not part of the cache key, as wire_weights: a
+// model loaded already is handed over at the size it was loaded at.
+inline constexpr std::string_view kMemoryLimitMb = "memory_limit_mb";
+// int: the routed experts' cache of a Mixture of Experts whose experts can
+// live in one (DeepSeek-V4.1-Flash, a Qwen3.x MoE), MB -- at most this,
+// within kMemoryLimitMb and the box as the model sizes it: smaller leaves
+// room for a longer context and for models beside it, larger decodes
+// faster (fewer experts read from disk). Every expert stays resident only
+// where all of them fit within it, and a draft head that loads only with
+// every expert resident (DeepSeek's DSpark) loads only then. A dense
+// model ignores it. Absent / 0: the model's own sizing. Not part of the
+// cache key, as kMemoryLimitMb: a model loaded already is handed over at
+// the size it was loaded at, and the plan books it at what it holds.
+inline constexpr std::string_view kExpertCacheMb = "expert_cache_mb";
+// bool: a model with an n-gram embedding table read by row from disk
+// (Qwen3.8-Flash-Next's, tens of GB) holds it in memory instead -- filled
+// after the load, so loading takes no longer, and a prompt's rows then
+// come from memory rather than a few hundred thousand disk reads. Taken
+// only where the model with every routed expert resident and the table
+// fit (within kMemoryLimitMb and kExpertCacheMb as well); otherwise the
+// rows are read from disk as without it. Absent / false: from disk. Not
+// part of the cache key, as kMemoryLimitMb.
+inline constexpr std::string_view kNgramResident = "ngram_resident";
+}  // namespace load_spec
 
 // Session-shared cache of loaded language models. Two loads with the
 // same LoadSpec (including dtype + page sizing) share one in-memory
@@ -75,24 +145,26 @@ struct LoadSpec {
 // returns nullptr. The full pipeline (ModelLoader -> Tokenizer ->
 // ContextManager -> LlamaModelExec) lands in subsequent commits.
 class GenerativeModelManager final : public SessionMember {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   explicit GenerativeModelManager(const SessionContextIntf* session);
 
   GenerativeModelManager(const GenerativeModelManager&)            = delete;
   GenerativeModelManager& operator=(const GenerativeModelManager&) = delete;
 
-  // NOT defaulted: the removable pool has to go first.
+  // NOT defaulted: the weight sets have to go first.
   //
   // Members destruct in REVERSE declaration order, so `_weights` -- the
-  // WeightRegistry every set deregisters from -- dies before `_pool`.
-  // A defaulted destructor therefore has the pooled sets deregistering
-  // against a destroyed registry, which aborts on a lock of a dead mutex
-  // ("mutex lock failed: Invalid argument") AFTER the run has finished
-  // its work, at teardown, where it reads as a crash with no cause.
+  // WeightRegistry every set deregisters from -- dies before
+  // `_weight_sets`. A defaulted destructor therefore has the sets
+  // deregistering against a destroyed registry, which aborts on a lock
+  // of a dead mutex ("mutex lock failed: Invalid argument") AFTER the
+  // run has finished its work, at teardown, where it reads as a crash
+  // with no cause.
   //
-  // This was unreachable until the pool existed: `_weight_sets` holds
-  // WEAK references, so the manager owned no set and none of them
-  // outlived the models. Pooling is what made the manager an owner.
+  // This was unreachable while the map held WEAK references: the manager
+  // owned no set, and none of them outlived the models. Owning them is
+  // what made it reachable.
   //
   // Clearing here rather than reordering the members, because the order
   // that fixes it is not visibly load-bearing and the next person to
@@ -108,6 +180,163 @@ public:
   // Diagnostics / tests: number of live entries in the cache. Walks
   // the map under `_mu`; not on any hot path.
   std::size_t cached_count() const;
+
+  // ---- a language model kept WARM ------------------------------------
+  //
+  // A host that runs a graph per request -- an app's assistant, asked to
+  // rewrite one prompt and then another -- would read the whole
+  // checkpoint again for each, and make it resident to the GPU again.
+  // MEASURED on a 24 GB M5 Pro with Qwen3.8-27B 4-bit (16 GB): the read
+  // 3-4 s, the first command buffer's residency 2.5 s on a quiet box and
+  // 31 s on one already 3.5 GB into swap -- before every first token.
+  //
+  // A model kept warm outlives its last user by `seconds`: the next load
+  // of the same spec is handed it, no read, no warmup (load()'s weak
+  // cache entry stays alive). Each call renews the time. It goes sooner
+  // when a launch declares weights but not its directory -- what is
+  // starting needs the room more (release_warm_unclaimed, from the weight
+  // planner's end_plan) -- and at the manager's end. 0 drops it now.
+  //
+  // PLUGIN ABI 8: these three methods are ADDITIONS (vpipe_sdk_check);
+  // the class is opaque, so the members behind them are not. Nothing else
+  // of the hold is exported -- its reaper is a lambda, see `_warm`.
+  void keep_warm(const std::shared_ptr<LoadedLanguageModel>& lm,
+                 const std::string& dir, double seconds);
+  // Drop the warm models whose directory this launch has not declared --
+  // the language models and the models stages built (keep_model_warm,
+  // below). Nothing when it declares no weights at all (an export, a
+  // probe): those compete for nothing a model holds. Returns how many
+  // went.
+  std::size_t release_warm_unclaimed();
+  // The language models kept warm; not the models stages built.
+  std::size_t warm_count() const;
+  // The directories of the models kept warm now -- both kinds, each once
+  // -- and the bytes of K/V the language models hold, their parked
+  // conversations' too. The weights planner (stages/model-memory.cc)
+  // weighs the directories against a launch.
+  std::vector<std::string> warm_dirs() const;
+  std::size_t warm_kv_bytes() const;
+
+  // ---- any other model kept WARM ------------------------------------
+  //
+  // The same hold for what a stage BUILDS from a checkpoint -- a DiT, a
+  // VAE, a conditioning encoder. A host running a graph per picture had
+  // each built again for every one: the weights read into the model's
+  // own buffers (a streamed DiT's resident set, an int8 layout, a VAE's
+  // converted convs), and handed back as the graph went. MEASURED on an
+  // M5 Ultra, Qwen-Image-2.1 Turbo 1024^2 x 8 steps from Draw Things'
+  // i8x DiT, the same prompt again: 5.4 s a picture, of which 0.85 s
+  // the DiT's blocks read back in its first step and 0.69 s the VAE's
+  // load and int8 conversion -- the steps themselves 0.36 s each.
+  //
+  // A stage that built a model hands it here as it ends
+  // (keep_model_warm), under its `kind` (the class, which is what
+  // take_warm casts back to), the checkpoint's `dir` (what launches
+  // claim) and a `key` naming every setting that changed what was
+  // built -- precision tier, attention, adapters. The next stage asking
+  // for all three is handed it (take_warm_model), built and resident;
+  // one hold a key. Another model of the same kind and directory under
+  // another key is let go when one is kept or taken: its settings
+  // changed, and the old build would only take room.
+  //
+  // It lives `seconds` from the keep (0 lets it go now), goes when a
+  // launch that does not claim its directory would not fit beside it
+  // (release_warm_unclaimed, as a warm language model) and at the
+  // manager's end -- which the session runs while its MetalCompute is
+  // still there, for a DiT gives its wired buffers back through it as it
+  // goes. `bytes` is what it holds, for that test. A plugin may keep its
+  // own models: plugins are never unloaded, so the deleter `model`
+  // carries outlives the hold.
+  //
+  // PLUGIN ABI 8: ADDITIONS, as keep_warm's; the members behind them sit
+  // after `_phase_asserted`. A plugin built before them never calls them
+  // and sees the same answers from the calls above until a host keeps a
+  // stage's model; one that calls them does not load on an ABI 8 host
+  // without them (the symbol is missing; no feature names them).
+  void keep_model_warm(const std::string& kind, const std::string& dir,
+                       const std::string& key, std::shared_ptr<void> model,
+                       std::size_t bytes, double seconds);
+  std::shared_ptr<void> take_warm_model(const std::string& kind,
+                                        const std::string& dir,
+                                        const std::string& key);
+  // The bytes the models kept warm for `dir` hold (0: none).
+  std::size_t warm_model_bytes(const std::string& dir) const;
+
+  // What each hold above keeps NOW, one entry a hold -- for a host's
+  // view of its memory (SessionIntf::memory_report). A language model's:
+  // `kind` "language-model", its directory, `bytes` what its load left
+  // WIRED (0 when it loaded unwired: an LM reads its weights into its
+  // own members, which nothing else counts), `kv_bytes` its K/V with its
+  // parked conversations'. A model a stage built: its kind, directory
+  // and the `bytes` it was kept with (0 where the stage said none) --
+  // which take in what it keeps through its checkpoint's weight set (a
+  // DiT's trunk), so they OVERLAP that set's weight_report() bytes.
+  // `seconds`: how long it stays unless it is used again.
+  //
+  // PLUGIN ABI 8: an ADDITION, as warm_model_bytes; WarmUsage is a new
+  // type of its own, no member of the class.
+  struct WarmUsage {
+    std::string kind;
+    std::string dir;
+    std::size_t bytes    = 0;
+    std::size_t kv_bytes = 0;
+    double      seconds  = 0;
+  };
+  std::vector<WarmUsage> warm_report() const;
+  // The same report, with what each hold HOLDS beside it in `held`, one
+  // entry an entry of the report and in its order: a language model's
+  // whole hold as a launch weighs it beside itself (warm_held_bytes, but
+  // of THIS hold -- two loads of one directory under other settings are
+  // two holds) -- its wired bytes, what a full pool left unwired, what it
+  // filled after its load (an n-gram table held in memory, never wired);
+  // nullopt where nothing counted it (a model that loaded unwired) and
+  // for a model a stage built. Taken under the one lock the report is.
+  // Host-only, as warm_held_bytes: no symbol, the report's type unchanged.
+  __attribute__((visibility("hidden"))) std::vector<WarmUsage>
+  warm_report(std::vector<std::optional<std::size_t>>* held) const;
+
+  template <class T>
+  std::shared_ptr<T>
+  take_warm(const std::string& kind, const std::string& dir,
+            const std::string& key)
+  {
+    return std::static_pointer_cast<T>(take_warm_model(kind, dir, key));
+  }
+
+  // ---- a CONVERSATION kept by key ------------------------------------
+  //
+  // A host that runs a graph per turn of a conversation -- an agent that
+  // asks, acts on the answer, then asks again -- would prefill the whole
+  // conversation each turn: seconds per thousand tokens on a large
+  // model, and the conversation only grows. The context it ended on is
+  // PARKED here instead, under the host's key, with the model while it is
+  // kept warm: the next graph naming the key takes it back and prefills
+  // only what is new (text-chat's `context`).
+  //
+  // It lives as long as the warm hold. When the hold goes -- its time
+  // out, a launch that needs the room (release_warm_unclaimed), the
+  // manager's end -- a context parked with a `spill_path` is SAVED there
+  // first (LoadedLanguageModel::save_context), and the next turn reads it
+  // back rather than prefilling it again; without one it is let go.
+  // Parked on a model not kept warm, it is saved (or let go) at once.
+  // One context a key: parking another replaces it. `meta` is the
+  // caller's own -- what the context covers.
+  //
+  // PLUGIN ABI 8: ADDITIONS, as the hold's three above.
+  void park_context(const std::string&                          key,
+                    const std::shared_ptr<LoadedLanguageModel>& lm,
+                    LoadedLanguageModel::Context                ctx,
+                    std::string                                 meta,
+                    const std::string&                          spill_path);
+  // Taken back: the context parked under `key` on `lm`, with its meta;
+  // false when there is none (another model's under the key stays).
+  bool take_context(const std::string&                          key,
+                    const std::shared_ptr<LoadedLanguageModel>& lm,
+                    LoadedLanguageModel::Context*               ctx,
+                    std::string*                                meta);
+  // Let go, unsaved: the conversation is over. A file saved for it
+  // before is the caller's to remove. False when none was parked.
+  bool drop_context(const std::string& key);
 
   // ---- shared non-LM models ----------------------------------------
   //
@@ -172,8 +401,13 @@ public:
   // The single place a checkpoint's weights are opened and cached. Ask
   // for a directory and get the ONE WeightSet for it; a second caller
   // naming the same directory gets the same object, so its weights are
-  // reference-counted rather than loaded again. The set is unmapped
-  // when the last holder drops it.
+  // loaded once and borrowed by everyone who names it.
+  //
+  // The MANAGER owns it. A caller holds a borrow, and dropping the last
+  // borrow does not unmap the checkpoint -- it hands the decision to
+  // release_unheld_(), which parks a recyclable set and drops one that
+  // is not. So two pipelines over one model share its bytes whether or
+  // not their lifetimes overlap.
   //
   // This is dedup at the TENSOR level, which is what makes it robust:
   // two models over one checkpoint share every tensor they have in
@@ -277,16 +511,33 @@ public:
   // 20 GB checkpoint streamed block-by-block keeps only its pinned
   // prefix, and left at its on-disk estimate it would push every peer
   // into streaming they do not need.
+  //
+  // HELD AT THE DECLARED FLOOR: a nonzero revision below it is raised to
+  // it, because a model reporting straight after load has not built its
+  // streaming slots yet, and the floor already counts them. 0 still
+  // withdraws the declaration outright.
   void revise_declaration(const std::string& dir, std::size_t bytes);
 
   // Drop every declaration. PipelineRuntime calls this at the start of
   // each launch, so one run's estimates never leak into the next.
   void clear_declarations();
+  // Launches seen: clear_declarations() counts one, and every launch's
+  // plan opens with it, before any stage initializes. A stage tags its
+  // request to a SHARED model with it (LoadedLanguageModel::
+  // request_i8_prefill), so a request of an earlier launch -- one a warm
+  // model still carries -- is told from this launch's. Host-only.
+  __attribute__((visibility("hidden"))) std::uint64_t
+  launch_epoch() const noexcept;
 
   // True when `dir` is already accounted for -- open, or declared. The
   // question a footprint calculation asks before adding a directory's
   // on-disk size, so it does not count the same checkpoint twice.
   bool accounts_for(const std::string& dir) const;
+  // True when THIS launch has declared `dir` (declare_weights) -- unlike
+  // accounts_for(), which a checkpoint merely open also satisfies. What
+  // tells a model kept warm that the launch uses it apart from one it
+  // only sits beside.
+  bool declares(const std::string& dir) const;
 
   // ---- the streaming signal ------------------------------------------
   //
@@ -383,6 +634,56 @@ public:
   // Declared scratch for `phase`; with an empty phase, the widest single
   // phase plus anything unphased -- the peak rule weights use.
   std::size_t scratch_bytes(const std::string& phase) const;
+
+  // One declared arena's bytes (0 when `label` was never declared) -- so a
+  // model sizing itself beside the plan can leave its OWN arena out of the
+  // peers it counts. Host-only: NOT exported (no plugin sizes a host
+  // model, and an exported method would be a new symbol a plugin built
+  // against this header fails to load without on an older ABI-8 host).
+  __attribute__((visibility("hidden"))) std::size_t
+  declared_scratch(const std::string& label) const;
+  // What the plan counts for `dir`'s weights -- the larger of what its
+  // set holds and what was declared, as phase_footprint() adds it; 0 when
+  // neither -- so a model sizing itself beside the plan leaves out
+  // exactly its own share (a checkpoint booked under its size on disk, as
+  // a limited expert cache's is, would otherwise take its peers' room
+  // with it). Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  planned_weight_bytes(const std::string& dir) const;
+  // Whether phase_footprint(`phase`) counts `dir`'s weights: declared
+  // unphased (or open and undeclared), or in a phase its claims put it
+  // in. False for a checkpoint the plan has not heard of. Host-only, as
+  // declared_scratch.
+  __attribute__((visibility("hidden"))) bool
+  counts_in_phase(const std::string& dir, const std::string& phase) const;
+  // What the language models kept warm for `dir` hold in WEIGHTS, as
+  // their loads measured it (wired, or kept unwired by a full pool); 0
+  // when none was measured (a load not wired). A Mixture of Experts holds
+  // its expert cache, not the experts it reads from disk: DeepSeek-V4.1-
+  // Flash's oQ4e under a 32 GB cache ~41 GB of a 432 GB checkpoint.
+  // Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  warm_held_bytes(const std::string& dir) const;
+  // What they hold for their RUNS beside the weights and the K/V
+  // (resident_kv_bytes counts that): the forward's scratch, grown to the
+  // largest piece a turn needed and kept -- exact where the model says
+  // (LoadedLanguageModel::run_state_bytes), else the run arena the plan
+  // booked for it when it was let go (its K/V's capacity in it: a bound
+  // from above). Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  warm_run_bytes(const std::string& dir) const;
+  // What their loads left wired, charged to the wired pool while they
+  // live -- the language models' and, where a stage noted it
+  // (note_warm_wired), a built model's: a DiT kept warm stays wired.
+  // Host-only, as declared_scratch.
+  __attribute__((visibility("hidden"))) std::size_t
+  warm_wired_bytes(const std::string& dir) const;
+  // What a model a stage keeps warm (keep_model_warm: its kind, dir and
+  // key) holds WIRED, for the pool test a launch makes beside it --
+  // MiniMax-H3's DiT keeps its blocks wired, 15-60 GB. Host-only.
+  __attribute__((visibility("hidden"))) void
+  note_warm_wired(const std::string& kind, const std::string& dir,
+                  const std::string& key, std::size_t bytes);
 
   // Correct a declared arena to its real size.
   //
@@ -490,7 +791,7 @@ public:
   // `pct` is an UP-TO, not a reservation. When mlock refuses -- another
   // process holds wired memory, or the system limit is nearer than the
   // fraction implies -- the pool collapses to what was actually granted
-  // (note_pool_refused) and callers stop asking for more. So the figure
+  // (note_wired_pool_refused) and callers stop asking for more. So the figure
   // is a ceiling on ambition, never a promise.
   //
   // 0 turns wiring off entirely and is the answer for a box where
@@ -539,16 +840,53 @@ public:
   std::size_t wired_pool_limit() const;
   std::size_t wired_pool_used() const;
 
+  // The CONFIGURED ceiling: the ask capped by the device maximum, before
+  // any refusal lowered it. wired_pool_limit() below this means the pool
+  // is collapsed -- by whichever model or tier met the refusal -- and a
+  // model that did not see it can tell, which is how it knows to ask
+  // again rather than live inside someone else's cap.
+  std::size_t wired_pool_ask() const;
+
+  // Collapse the ceiling to what is held now. What wire_into_pool() does
+  // on a real shortage; public so the policy built on it can be exercised
+  // without having to provoke the kernel.
+  void        note_wired_pool_refused();
+
   // Would `bytes` more fit? Asked before an allocation the caller could
   // still decline to make, so it does not have to be undone.
   bool        wired_pool_can_take(std::size_t bytes) const;
 
   // Wire `b` and charge it to the pool, returning the bytes actually
-  // wired (0 when wiring is off, the pool is full, or mlock refused).
-  // A refusal COLLAPSES the pool to what is held, because a box that
-  // said no once will say no again and the alternative is a caller
-  // spinning against a ceiling it can never reach.
+  // wired (0 when wiring is off, the pool is full, `b` is not a buffer the
+  // pool wires -- see pool_wirable() -- or mlock refused).
+  //
+  // Only a SHORTAGE collapses the pool to what is held: ENOMEM / EAGAIN on
+  // anonymous memory, because a box that said no once will say no again
+  // and the alternative is a caller spinning against a ceiling it can
+  // never reach. A refusal that is the BUFFER's own property -- a
+  // file-backed page, a heap slice's EPERM -- skips that buffer and leaves
+  // the ceiling alone. A caller tells the two apart afterwards with
+  // wired_pool_can_take(): still true means "skipped, go on".
   std::size_t wire_into_pool(metal_compute::SharedBuffer& b);
+
+  // Buffers below this are not a pool question and are never wired. They
+  // come from MetalCompute's shared small-buffer heap -- a slice of pages
+  // the heap owns -- or are a few scalars, and mlock on them fails for
+  // reasons that say nothing about the box. MEASURED on an M4 Pro:
+  // identical LTX-2.5 runs froze the pool at 5.7, 7.6 and 15.6 GB because
+  // the first refusal was a 64-byte buffer (ENOMEM) or an 8 KB heap slice
+  // (EPERM), and the collapse left every later block unwired.
+  static constexpr std::size_t kMinWiredBytes = 64 * 1024;
+  static bool pool_wirable(const metal_compute::SharedBuffer& b) noexcept;
+
+  // Memory WIRED ON THIS PROCESS'S BEHALF by someone else -- CoreML pins
+  // an ANE module's program and IOSurface weight slots itself (MEASURED
+  // ~500 MB at LTX-2.5's 4096x16384 feed-forward) -- charged against the
+  // pool so every model sizing its resident set plans around it. Not
+  // capped: the pages are wired whether or not the pool agrees, and an
+  // honest overdraft beats a pool that believes it has room.
+  void        charge_external_wired(std::size_t bytes);
+  void        release_external_wired(std::size_t bytes);
 
   // Give `b`'s pages back: munlock, and drop the pool's charge for them.
   //
@@ -585,32 +923,175 @@ public:
   void        set_wired_pool_enforced(bool on);
   bool        wired_pool_enforced() const;
 
-  // ---- the REMOVABLE POOL, which outlives a launch ---------------------
+  // ---- letting go of a checkpoint --------------------------------------
   //
-  // A checkpoint a stage is finished with, kept alive and purgeable
-  // instead of dropped. Two things fall out of that:
+  // The manager owns every set it opened (see `_weight_sets`), so a
+  // stage that is finished has only to drop its own reference. What
+  // happens next is release_unheld_()'s to decide, and there are exactly
+  // two answers:
   //
-  //   * A RELAUNCH over the same model pays no reload. This is why the
-  //     pool is on the manager and not on the runtime -- a launch-scoped
-  //     pool could not do the one thing it exists for.
-  //   * Under pressure the pages go, because pooling marks them
-  //     purgeable. Nothing pooled is holding the box hostage; it is
-  //     spare capacity that happens to still be useful.
+  //   * RECYCLABLE -> kept and PARKED. A relaunch, or a second pipeline
+  //     over the same model, pays neither a reopen nor -- unless the box
+  //     actually took the pages -- a re-read. Nothing is holding the box
+  //     hostage either: parked pages are purgeable, so an unborrowed
+  //     checkpoint is spare capacity that happens to still be useful.
+  //   * NOT RECYCLABLE -> dropped. A set specialised to a run's
+  //     parameters would be silently wrong for a launch that does not
+  //     share them; see WeightSet::recyclable().
   //
-  // Only a RECYCLABLE set is pooled. A set specialised to a run's
-  // parameters would be silently wrong for a launch that does not share
-  // them, so it is dropped instead -- see WeightSet::recyclable().
+  // pool_weights() asks for that settling to happen NOW rather than at
+  // whatever unrelated moment reaches release_unheld_() next. It is safe
+  // in either order against the caller's own resets -- before, it finds
+  // the caller still borrowing and settles nothing; after, it settles
+  // immediately -- and it can no longer be the only thing standing
+  // between a checkpoint and oblivion, which is what it was when this
+  // map held weak references.
+  //
+  // NOTHING PARKS A BORROWED SET -- not this, not park_weights(), not
+  // the memory cap, not reclaim_at_least(). They all go through
+  // park_if_unborrowed_(), which is the only thing in this class that
+  // parks.
+  //
+  // The rule exists because a borrower holds ALIASES of the very buffers
+  // a park makes purgeable, and reads them in a forward pass that never
+  // asks the set for anything. Any access through the SET repairs every
+  // alias at once; a forward pass that reads one first is unordered with
+  // that, and if the kernel took the pages it reads zeros with nothing
+  // on its path to notice. The manager cannot tell a live model that is
+  // idle from one mid-forward, so it does not try.
+  //
+  // The cost is that the cap and reclaim_at_least() can only take what
+  // nobody is using, and they SAY so when they fall short rather than
+  // reporting the standing mapped-and-KV excuse. What returns borrowed
+  // bytes is a stage letting go -- an `unload_when_idle` policy, or the
+  // explicit free the image and video stages do before a large decode --
+  // not a smaller cap.
+  //
+  // The other way to close it would be a model registering as its own
+  // WeightOwner and reactivating at a forward boundary, which is the
+  // shape WeightOwner::note_parked() makes possible. That buys back
+  // reclaim from a loaded-but-idle model, at the price of a hook every
+  // model has to remember; the borrow rule needs nothing remembered.
   void        pool_weights(const std::string& dir,
                            const std::string& variant = std::string());
-  // Bytes the pool is holding. Reclaimable in full, so this is capacity
-  // rather than occupancy -- report it as such.
+  // Give a checkpoint's bytes BACK, rather than merely making them
+  // reclaimable. What `unload_when_idle: destroy` means, and the one
+  // thing release_unheld_() will not do for a recyclable set.
+  //
+  // Refuses a BORROWED set for the same reason parking does: a stage
+  // does not get to unmap a checkpoint a peer is reading. Returns the
+  // bytes actually dropped.
+  std::size_t drop_weights(const std::string& dir);
+
+  // Bytes of checkpoints NOBODY is borrowing -- reclaimable in full, so
+  // this is capacity rather than occupancy. Report it as such.
   std::size_t pooled_bytes() const;
+  // SETTLE every checkpoint nobody is borrowing, now: park the recyclable,
+  // drop the rest (release_unheld_). Session::unload_pipeline asks it once
+  // the pipeline is gone. Settling ran only when something asked for it
+  // -- a text encoder's own pool_weights() -- so a finished graph's DiT
+  // and VAE stayed resident and UNPARKED, counted against the process and
+  // never reclaimable, until some later call happened to settle them.
+  // Returns the bytes parked.
+  std::size_t settle_unborrowed();
+  // DROP every checkpoint nobody is borrowing: its bytes given back now,
+  // not kept for a later run (which reads it again). What stays is what
+  // is BORROWED at this moment -- by a loaded pipeline's stages, launched
+  // or not, or by a model kept warm -- and nothing else: a running
+  // pipeline's stage that has let its model go for now loses it. Returns
+  // the bytes dropped (a parked set counts in full).
+  std::size_t drop_unborrowed();
   // Drop pooled sets until `want` bytes have been given back. Returns
   // what was actually freed.
   std::size_t pool_evict(std::size_t want);
+  // TEST HOOK: run once, by the next settle (release_unheld_), after it
+  // has chosen what to park and let go of its lock, and before it parks
+  // -- the window a concurrent weight_set() could hand a chosen set out
+  // in. A test fills it with that hand-out.
+  void        set_before_park_for_test(std::function<void()> hook);
 
   void        set_memory_cap(std::size_t bytes);
   std::size_t memory_cap() const;
+
+  // THE SWAP ALLOWANCE: how much memory a preflight may plan to displace
+  // into the compressor or the swap file, on top of what the OS reports
+  // as reclaimable.
+  //
+  // It is the OPPOSITE KNOB to the wired pool, and the two are set
+  // independently on purpose. The pool bounds what this process makes
+  // unswappable -- over-allocating there takes the machine down, so it
+  // keeps its cushion. This bounds what a run may push OUT, which costs
+  // throughput and nothing else: the pages that go are other processes'
+  // resident anonymous ones, and the failure mode is a slower box, not a
+  // dead one.
+  //
+  // It exists because `available_physical` counts free + purgeable +
+  // file-backed pages and deliberately excludes dirty anonymous memory
+  // that would need swap. That exclusion is right for a durable
+  // decision, and too strict for a single clip: macOS 27 keeps less in
+  // the file cache and pushes less to the compressor unasked than 26
+  // did, so a pipeline that ran before the upgrade reads as short by a
+  // couple of GB while the memory is still there -- it is merely
+  // somebody else's anonymous pages rather than cache.
+  //
+  // WHAT IT DOES NOT GRANT. Nothing is reserved, held or promised. The
+  // figure only widens the arithmetic of a preflight gate, so it can be
+  // raised or lowered at any moment -- including mid-run -- with nothing
+  // to give back. That is why, unlike the wired pool, there is no
+  // shrink-while-running refusal.
+  //
+  // Honoured by the video preflight (GenerateVideoStage). The image
+  // stage still gates on the unwidened figure.
+  void        set_swap_allowance_bytes(std::size_t bytes);
+  std::size_t swap_allowance_bytes() const;
+
+  // WHAT THE BOX COULD ACTUALLY GIVE UP: resident anonymous memory
+  // belonging to OTHER processes, which the OS can compress or swap but
+  // which `available_physical` excludes by design.
+  //
+  // The allowance above is a ceiling on spending this; this is the
+  // supply. A caller wants min() of the two -- permission and
+  // availability are different questions, and on a box whose memory is
+  // mostly wired or already compressed this returns little or nothing,
+  // so the gate stays strict without the allowance having to change.
+  //
+  // DELIBERATELY UNDER-COUNTED, three ways. Purgeable pages come off
+  // because available_physical already counts them. The WHOLE
+  // system-wide wired figure comes off, including its file-backed part,
+  // which errs low. And THIS PROCESS'S OWN anonymous bytes come off:
+  // swapping vpipe to make room for vpipe buys nothing and thrashes the
+  // forward we are sizing. Self-WIRED bytes are deliberately NOT
+  // subtracted -- they are unswappable and already counted in the
+  // system wired figure, so removing them again would double-count.
+  //
+  // A system query, not manager state: static, and 0 when the kernel
+  // will not answer.
+  static std::size_t swappable_other_bytes();
+
+  // The same query with its TERMS, for a caller that has to explain the
+  // answer rather than only use it.
+  //
+  // A zero `spare` reads two ways that call for opposite responses: an
+  // idle box with no other-process anonymous memory to give (correct --
+  // the allowance is simply not needed), or a box whose wired total
+  // already exceeds its anonymous pages, which is the subtraction being
+  // pessimistic. MEASURED on an idle 24 GB M5 Pro: 2.27 GB anonymous
+  // against 2.26 GB wired, so `spare` clamped to 0 while 18456 MB of
+  // reclaimable RAM carried the clip unaided. Without the terms those
+  // two are indistinguishable from each other and from a bug.
+  //
+  // ONE SAMPLE, which is why this is a struct rather than an accessor
+  // per term: four separate queries would read the machine at four
+  // instants and print terms that do not add up to the figure the gate
+  // actually used.
+  struct SwapSupply {
+    std::size_t anon      = 0;  // internal_page_count, bytes
+    std::size_t purgeable = 0;
+    std::size_t wired     = 0;  // system-wide, subtracted in full
+    std::size_t self_anon = 0;  // this task's own anonymous bytes
+    std::size_t spare     = 0;  // what swappable_other_bytes() returns
+  };
+  static SwapSupply swap_supply();
 
   // Weights currently held UNPARKED, plus KV. This is the number the cap
   // is compared against; resident_bytes() counts parked sets too.
@@ -655,7 +1136,11 @@ public:
     std::size_t copied_bytes = 0;   // owned; parkable + reloadable
     std::size_t tensors      = 0;
     std::size_t parts        = 0;
-    long        holders      = 0;   // models keeping this set alive
+    long        holders      = 0;   // models BORROWING it; 0 = idle
+    // Handed to the kernel as purgeable. The main residency fact about
+    // a checkpoint, and the only one a caller cannot work out from the
+    // byte counts: a parked set still shows its full `bytes`.
+    bool        parked       = false;
   };
   std::vector<WeightUsage> weight_report() const;
 
@@ -672,13 +1157,19 @@ private:
     std::string   compute_dtype;
     int           page_tokens;
     std::uint32_t max_pages;
+    std::string   mtp_dir;
+    std::string   draft_dir;     // load_spec::kDraftDir, canonical
+    int           draft_bits = 8;
 
     bool operator==(const Key& o) const noexcept
     {
       return page_tokens == o.page_tokens
           && max_pages   == o.max_pages
           && compute_dtype == o.compute_dtype
-          && hf_dir       == o.hf_dir;
+          && hf_dir       == o.hf_dir
+          && mtp_dir      == o.mtp_dir
+          && draft_dir    == o.draft_dir
+          && draft_bits   == o.draft_bits;
     }
   };
   struct KeyHash {
@@ -707,14 +1198,61 @@ private:
   std::size_t phase_footprint_(const std::string& phase,
                                bool use_floor) const;
 
+  // The BORROW RULE, and the only place in this class that parks.
+  // Declines a set anything is borrowing; see the definition for why
+  // `borrowers` is passed in rather than derived. `epoch` is the set's
+  // hand-out count read in the same walk, under _ws_mu: the park is
+  // abandoned if the set was handed out since
+  // (WeightSet::park_unless_borrowed_since).
+  std::size_t park_if_unborrowed_(const std::shared_ptr<WeightSet>& ws,
+                                  long borrowers, std::uint64_t epoch);
+  // The form without a hand-out count PARKS NOTHING. It is kept only
+  // because ABI 8's snapshot lists it as an exported symbol; without the
+  // count noted where the park was decided, it cannot tell that a
+  // borrower arrived after that.
+  std::size_t park_if_unborrowed_(const std::shared_ptr<WeightSet>& ws,
+                                  long borrowers);
+
+  // Settle every checkpoint nobody is borrowing: PARK it if it is
+  // recyclable, DROP it if it is not. Returns the bytes parked.
+  //
+  // This is what replaces "dies with its last holder". A shared_ptr has
+  // no hook for "the count just fell", and polling for one would cost
+  // more than the sweep does, so it runs wherever the manager is already
+  // doing work -- an open, a release, a cap pass. The consequence worth
+  // knowing is that a checkpoint stays UNPARKED between the moment its
+  // last borrower lets go and the next such moment; pool_weights() is
+  // how a stage that has just finished asks for it to be settled now.
+  //
+  // Parks nothing that is still borrowed, which is the whole point: the
+  // manager cannot know a live model is idle, and a set parked under one
+  // hands its reader pages the kernel may discard.
+  std::size_t release_unheld_();
+
   mutable std::mutex                                          _shared_mu;
   std::unordered_map<std::string, std::weak_ptr<void>>        _shared;
   mutable std::mutex                                          _ws_mu;
-  std::unordered_map<std::string, std::weak_ptr<WeightSet>>   _weight_sets;
-  // The removable pool: a STRONG reference, which is the whole
-  // difference -- it is what keeps a set alive once its last model has
-  // gone, and what lets the next launch find it.
-  std::unordered_map<std::string, std::shared_ptr<WeightSet>>  _pool;
+  // THE MANAGER OWNS EVERY CHECKPOINT IT OPENED -- a STRONG reference,
+  // and the single fact the rest of this file's residency policy rests
+  // on. A stage that loads a model borrows from here; a stage that is
+  // finished lets go of its borrow. Neither can take a checkpoint away
+  // from a peer, and neither has to re-read one a peer already paid for.
+  //
+  // It used to be weak, which made the FIRST stage to load the owner and
+  // the last to let go the undertaker. Sharing then worked only for
+  // OVERLAPPING lifetimes: a second pipeline over the same model, opened
+  // one second after the first ended, re-read the whole checkpoint from
+  // disk. The removable pool was a strong reference bolted alongside to
+  // recover that one case, entered only when a stage explicitly handed a
+  // set over; it is gone, because this map now is it.
+  //
+  // What replaces "dies with its last holder" is release_unheld_():
+  // a set nothing borrows is PARKED (kept, purgeable, reactivated on the
+  // next read) if it is recyclable, and DROPPED if it is not. So the
+  // bytes are still reclaimable -- by the kernel, or by evict_unheld_()
+  // under an explicit ask -- but they are reclaimable on the manager's
+  // terms rather than on whichever stage happened to finish last.
+  std::unordered_map<std::string, std::shared_ptr<WeightSet>> _weight_sets;
   // canonical dir -> estimated bytes; see declare_weights().
   std::unordered_map<std::string, std::size_t>                _declared;
   // canonical dir -> the floor it can be reduced to, when it has one.
@@ -743,6 +1281,11 @@ private:
   std::unordered_map<std::string, ScratchClaim>               _scratch;
   WeightRegistry                                              _weights;
   std::atomic<std::size_t>                                    _memory_cap{0};
+  // The swap allowance, in bytes. 4 GB by default -- see
+  // set_swap_allowance_bytes for why a default above zero is the honest
+  // setting and why it carries no shrink-while-running rule.
+  std::atomic<std::size_t>                                    _swap_allowance{
+      4ull << 30};
   // The wired pool. `_pool_pct` is what was asked for; `_pool_granted`
   // is the ceiling after the box refused, 0 meaning "not refused yet".
   std::atomic<int>                                            _pool_pct{0};
@@ -760,8 +1303,99 @@ private:
   std::unordered_map<Key,
                      std::weak_ptr<LoadedLanguageModel>,
                      KeyHash>                                 _cache;
+
+  // Kept warm (keep_warm): each model, its canonical directory, until
+  // when. The reaper thread (started by the first keep_warm, stopped and
+  // joined by the destructor) drops each at its time. Its loop is a
+  // LAMBDA in keep_warm, deliberately not a private method: this class
+  // sits in an exported region, so every method of it -- private ones
+  // too -- is a libvpipe symbol the ABI snapshot records, and once
+  // recorded it could not be removed within ABI 8. (It briefly was one,
+  // reap_warm_(), before any ABI 8 build with it was published.)
+  // A conversation parked on a warm model (park_context): its key, its
+  // context, the caller's meta, where it is saved when the hold goes.
+  struct Parked {
+    std::string                  key;
+    LoadedLanguageModel::Context ctx;
+    std::string                  meta;
+    std::string                  spill;
+  };
+  // `parked` after `lm`: members go in reverse, so the contexts are
+  // released while the model they live in is still there.
+  // `run_booked`: the run arena the plan booked for it (lm_run_label)
+  // when it was let go -- warm_run_bytes' figure where the model cannot
+  // say what its runs hold.
+  struct Warm {
+    std::shared_ptr<LoadedLanguageModel>  lm;
+    std::string                           dir;
+    std::chrono::steady_clock::time_point until;
+    std::vector<Parked>                   parked;
+    std::size_t                           run_booked = 0;
+  };
+  // Models loaded with load_spec::kWireWeights and the bytes their load
+  // left wired, charged to the pool; given back once the model is gone
+  // (checked at each load, keep_warm, release and expiry). `held`: what
+  // it holds (warm_held_bytes) -- its wired bytes, what a full pool
+  // kept unwired, which counts the load's freed temporaries too (a bound
+  // from above), and what it fills after the load
+  // (LoadedLanguageModel::filled_after_load_bytes). Guarded by _warm_mu.
+  struct Wired {
+    std::weak_ptr<LoadedLanguageModel> lm;
+    std::size_t                        bytes;
+    std::size_t                        held = 0;
+  };
+  std::vector<Wired>       _wired_lms;
+  mutable std::mutex       _warm_mu;
+  std::condition_variable  _warm_cv;
+  std::vector<Warm>        _warm;
+  std::thread              _warm_reaper;
+  bool                     _warm_stop = false;
+  // See set_before_park_for_test(). Guarded by _ws_mu.
+  std::function<void()>    _before_park_for_test;
+  // canonical dir -> the phase interval stages ASSERTED for it at declare
+  // time ({first, last} positions in the running order), kept apart from
+  // `_phase`: an unphased declaration of the same key clears `_phase` to
+  // "undecided", and a later refinement must widen to these rather than
+  // replace them -- see set_declaration_phase.
+  //
+  // LAST, and new members go after it: this class is opaque, but the
+  // inline weights() above reads `_weights` at an offset compiled into
+  // every plugin that calls it, so nothing may be inserted ahead of it
+  // within ABI 8 (the snapshot records it: "read inline").
+  std::unordered_map<std::string, std::pair<int, int>> _phase_asserted;
+
+  // Models kept warm that are not language models (keep_model_warm),
+  // under _warm_mu with `_warm`, expired by the same reaper. Its loop is
+  // `_warm_reap`, a lambda the constructor makes, so keep_warm and
+  // keep_model_warm start one thread for both without a method of its
+  // own (see `_warm`).
+  struct WarmModel {
+    std::string                           kind;
+    std::string                           dir;
+    std::string                           key;
+    std::shared_ptr<void>                 model;
+    std::size_t                           bytes = 0;
+    std::chrono::steady_clock::time_point until;
+    std::size_t                           wired = 0;   // note_warm_wired
+  };
+  std::vector<WarmModel>   _warm_models;
+  std::function<void()>    _warm_reap;
+
+  // canonical dir -> every phase a PHASED statement placed it in (bit i
+  // = position i of the running order), declared or decided: what a
+  // phased checkpoint is counted in. `_phase` / `_phase_last` keep the
+  // hull, and the hull is wrong for a checkpoint two stages hold apart --
+  // MiniMax-H3's video VAE, encoding references in the condition and
+  // decoding in the decode, put 5 GB into a denoise neither holds it in.
+  // Unphased (`_phase` empty) still means the whole run. Last, as above.
+  std::unordered_map<std::string, std::uint64_t> _phase_bits;
+
+  // launch_epoch(): bumped by clear_declarations(). Last, as above.
+  std::atomic<std::uint64_t> _launch_epoch{0};
 };
 
 }
+
+VPIPE_API_END
 
 #endif

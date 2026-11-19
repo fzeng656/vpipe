@@ -27,12 +27,15 @@ public:
   //   biases [vocab, hidden/64] f16   (group_size 64, affine)
   // bf16=true selects the bf16 embed-gather metallib (scales/biases must
   // then be bf16); default false = f16. quant_bits is 4 (default) or 8
-  // (Qwen3-ASR) and selects the nibble vs byte gather kernel.
+  // (Qwen3-ASR) and selects the nibble vs byte gather kernel; `group` is
+  // 64, or 32 for an 8-bit table (Qwen3.8-Flash-Next's MLX 4-bit pack,
+  // re-encoded).
   MetalTokenMuxer(metal_compute::MetalCompute* mc,
                   const metal_compute::SharedBuffer* w,
                   const metal_compute::SharedBuffer* scales,
                   const metal_compute::SharedBuffer* biases,
-                  int hidden, bool bf16 = false, int quant_bits = 4);
+                  int hidden, bool bf16 = false, int quant_bits = 4,
+                  int group = 64);
 
   // Native Q6_K embedding table (GGUF, no affine requant): gathers rows
   // with embed_gather_q6k_f16. `q6k` is the raw [vocab, hidden] Q6_K
@@ -61,6 +64,12 @@ public:
 
   bool valid() const noexcept;
 
+  // A table stored ROTATED (Prism Hadamard v1, Ternary-Bonsai 2): every
+  // fetched row is taken back, h = s . (H z), before it is returned.
+  // `signs` is [hidden] f32 and must outlive the muxer. False when the
+  // kernel did not load (fetch_text is then unchanged).
+  bool set_inverse_rotation(const metal_compute::SharedBuffer* signs);
+
   // Gather + dequantize the rows for `ids` into a fresh [n, hidden]
   // f16 SharedBuffer. Empty buffer on failure / empty input.
   metal_compute::SharedBuffer
@@ -76,6 +85,8 @@ private:
   const metal_compute::SharedBuffer* _q6k_table = nullptr;
   metal_compute::ComputeLibrary      _lib;
   metal_compute::ComputeFunction     _fn;
+  const metal_compute::SharedBuffer* _rot_signs = nullptr;
+  metal_compute::ComputeFunction     _fn_rot;
 };
 
 }  // namespace vpipe::genai

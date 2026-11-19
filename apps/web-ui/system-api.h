@@ -18,14 +18,16 @@
 #include <memory>
 #include <vector>
 
-namespace vpipe::webui {
+namespace vpipe {
+class SystemMonitor;
+}
 
-class SystemStatusPoller;
+namespace vpipe::webui {
 
 class SystemApi {
 public:
   SystemApi(ApiContext& ctx, PipelineApi& pipelines);
-  // Out-of-line so SystemStatusPoller can be incomplete here.
+  // Out-of-line so SystemMonitor can be incomplete here.
   ~SystemApi();
 
   void register_routes(HttpServer& s);
@@ -41,6 +43,7 @@ private:
   // through IOKit). Always available; no auth state needed beyond the
   // existing /api/* gating.
   HttpResponse h_system_status_(const HttpRequest&);
+  HttpResponse h_release_memory_(const HttpRequest&);
 
   // Startup permission self-test results, set once at boot. The browser
   // fetches this when it connects and shows the report in a dialog.
@@ -69,6 +72,19 @@ private:
   // SessionIntf::set_wired_pool_mb.
   HttpResponse h_wired_pool_get_(const HttpRequest&);
   HttpResponse h_wired_pool_set_(const HttpRequest&);
+
+  // The SWAP ALLOWANCE -- how much memory a run may plan to push out to
+  // the compressor or swap, on top of what the OS reports reclaimable.
+  // GET returns {mb, swappable_mb}; PUT {mb} sets it and returns the
+  // same document.
+  //
+  // NO 409 HERE, deliberately, and the asymmetry with the wired pool
+  // above is the point: that one refuses a shrink mid-run because the
+  // bytes are already wired and giving them back means unwiring buffers
+  // a model is reading. This reserves nothing, so both directions are
+  // accepted at any time.
+  HttpResponse h_swap_allowance_get_(const HttpRequest&);
+  HttpResponse h_swap_allowance_set_(const HttpRequest&);
   // True while any pipeline is not "stopped".
   bool any_running_() const;
 
@@ -80,11 +96,10 @@ private:
 
   ApiContext&  _ctx;
   PipelineApi& _pipelines;
-  // Stateful poller for the bottom status bar: owns the IOReport
-  // "Energy Model" subscription used to derive ANE power. Created in
-  // the ctor so a non-Apple build doesn't pay for it (the class is
-  // Apple-only by virtue of its .cc file).
-  std::unique_ptr<SystemStatusPoller> _status;
+  // Stateful poller for the bottom status bar (vpipe/system-monitor.h,
+  // the library's, so a host embedding vpipe reads the same): owns the
+  // IOReport subscription used to derive ANE utilisation.
+  std::unique_ptr<SystemMonitor> _status;
   // Startup permission-check report (FlexData object), set once at boot
   // and served by /api/startup-checks. Null (not an object) until the
   // probes finish -> the endpoint reports ready:false.

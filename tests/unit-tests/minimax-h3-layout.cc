@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 using namespace vpipe::genai;
@@ -799,9 +800,9 @@ TEST(minimax_h3_layout, ref2va_rejects_bad_requests)
   const std::vector<int> tags(16, 1);
   h3::PackedLayout L;
 
-  // No references at all is a t2va request, not a degenerate ref2va.
-  EXPECT_FALSE(h3::build_ref2va_packed_sequence(tags, {}, 7, 16, 16, 37, 2, 2,
-                                                h3::kAudioChannels, &L));
+  // (No references at all is NOT refused -- it is the prompt-only form;
+  // see an_empty_reference_list_packs_the_t2va_layout.)
+  //
   // A reference is encoded at a resolution of ITS OWN, so the target's
   // divisibility says nothing about whether the reference's divides.
   EXPECT_FALSE(h3::build_ref2va_packed_sequence(
@@ -818,6 +819,132 @@ TEST(minimax_h3_layout, ref2va_rejects_bad_requests)
   EXPECT_FALSE(h3::build_ref2va_packed_sequence(
       tags, {Ref{Kind::kAudio, 0, 0, 0, 0}}, 7, 16, 16, 37, 2, 2,
       h3::kAudioChannels, &L));
+}
+
+// An EMPTY reference list is Ref2VA's prompt-only form, and what it
+// packs is the t2va layout -- not something like it, the same one, in
+// every field a reader could look at. That is the claim that makes the
+// mode safe to offer: the Ref2VA weights see exactly the sequence shape
+// text-to-video gives the FL2VA ones, and nothing in the layout is left
+// over from a reference block that is not there.
+//
+// Checked over two geometries, one with an odd latent frame count and a
+// non-square grid and one with no audio at all, because the audio rows'
+// width pins and the rotary clock are the two things most likely to
+// have been computed from a reference cursor that never moved.
+TEST(minimax_h3_layout, an_empty_reference_list_packs_the_t2va_layout)
+{
+  struct Case { int frames, lh, lw, alat; };
+  const Case cases[] = {{7, 32, 56, 37}, {5, 16, 16, 0}};
+  // A tag run that is not uniform, so the text pass is visibly the
+  // caller's rather than a default that happens to agree.
+  std::vector<int> tags(19, h3::kTextTag);
+  tags[3] = h3::kVideoTag;
+
+  for (const Case& c : cases) {
+    h3::PackedLayout t2va, r2va;
+    ASSERT_TRUE(h3::build_packed_sequence(tags, c.frames, c.lh, c.lw, c.alat,
+                                          2, 2, h3::kAudioChannels, {},
+                                          &t2va));
+    ASSERT_TRUE(h3::build_ref2va_packed_sequence(tags, {}, c.frames, c.lh,
+                                                 c.lw, c.alat, 2, 2,
+                                                 h3::kAudioChannels, &r2va));
+    EXPECT_TRUE(r2va.seq_len == t2va.seq_len);
+    EXPECT_TRUE(r2va.num_text_rows == t2va.num_text_rows);
+    // Bitwise: the two builders place every row from the same grids.
+    EXPECT_TRUE(r2va.position_ids == t2va.position_ids);
+    EXPECT_TRUE(r2va.token_tags == t2va.token_tags);
+    EXPECT_TRUE(r2va.condition_start == t2va.condition_start);
+    EXPECT_TRUE(r2va.num_condition_rows == 0 && t2va.num_condition_rows == 0);
+    EXPECT_TRUE(r2va.audio_start == t2va.audio_start);
+    EXPECT_TRUE(r2va.num_audio_rows == t2va.num_audio_rows);
+    EXPECT_TRUE(r2va.video_start == t2va.video_start);
+    EXPECT_TRUE(r2va.num_video_rows == t2va.num_video_rows);
+    EXPECT_TRUE(r2va.video_indices == t2va.video_indices);
+    EXPECT_TRUE(r2va.audio_indices == t2va.audio_indices);
+    auto same_runs = [](const std::vector<h3::RowRun>& a,
+                        const std::vector<h3::RowRun>& b) {
+      if (a.size() != b.size()) { return false; }
+      for (std::size_t i = 0; i < a.size(); ++i) {
+        if (a[i].start != b[i].start || a[i].count != b[i].count) {
+          return false;
+        }
+      }
+      return true;
+    };
+    EXPECT_TRUE(same_runs(r2va.video_runs, t2va.video_runs));
+    EXPECT_TRUE(same_runs(r2va.audio_runs, t2va.audio_runs));
+    EXPECT_TRUE(r2va.num_condition_video_rows == 0);
+    EXPECT_TRUE(r2va.num_condition_audio_rows == 0);
+    // Only the builder's name differs -- and with no conditioning rows,
+    // the one reader of it (the VDN branch's report) has nothing to say.
+    EXPECT_TRUE(r2va.ref2va);
+    EXPECT_FALSE(t2va.ref2va);
+    // Not vacuous: the case carries target rows of both kinds it can.
+    EXPECT_TRUE(r2va.num_video_rows > 0);
+    EXPECT_TRUE((c.alat > 0) == (r2va.num_audio_rows > 0));
+    std::printf("[minimax_h3_layout] prompt-only ref2va %dx%dx%d, %d audio "
+                "latents: %d rows, identical to t2va\n", c.frames, c.lh,
+                c.lw, c.alat, r2va.seq_len);
+  }
+}
+
+// A one-image reference request and a one-keyframe request can agree on
+// EVERY count in the struct, so nothing downstream could tell them apart
+// until the layout said which builder made it.
+//
+// That stopped being an academic distinction with the Ref2VA-like mode:
+// references now run on FL2VA weights, so the partition no longer
+// answers it either. The reader that cares is the VDN branch, which
+// reports its conditioning rows as a keyframe COUNT -- rows divided by
+// the target's rows-per-frame. A reference carries its own geometry and
+// has no frame count, so on a reference request that division prints a
+// number that means nothing, and it prints it as an INFO line nobody
+// would think to check.
+TEST(minimax_h3_layout, the_layout_says_which_builder_made_it)
+{
+  using Ref  = h3::Reference;
+  using Kind = h3::Reference::Kind;
+  const std::vector<int> tags(16, 1);
+
+  // One keyframe over a 32x56 target...
+  h3::PackedLayout kf;
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 7, 32, 56, 37, 2, 2,
+                                        h3::kAudioChannels,
+                                        {h3::Anchor::kFirst}, &kf));
+  // ...and one image reference encoded at that same 32x56. Both are one
+  // conditioning frame's worth of rows at one geometry.
+  h3::PackedLayout rf;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      tags, {Ref{Kind::kImage, 1, 32, 56, 0}}, 7, 32, 56, 37, 2, 2,
+      h3::kAudioChannels, &rf));
+
+  // The counts that a reader could try to discriminate on: identical.
+  EXPECT_TRUE(kf.seq_len == rf.seq_len);
+  EXPECT_TRUE(kf.num_condition_rows == rf.num_condition_rows);
+  EXPECT_TRUE(kf.num_condition_video_rows == rf.num_condition_video_rows);
+  EXPECT_TRUE(kf.num_condition_audio_rows == rf.num_condition_audio_rows);
+  EXPECT_TRUE(kf.condition_start == rf.condition_start);
+  EXPECT_TRUE(kf.video_start == rf.video_start);
+  EXPECT_TRUE(kf.num_video_rows == rf.num_video_rows);
+  EXPECT_TRUE(kf.video_runs.size() == rf.video_runs.size());
+  EXPECT_TRUE(kf.video_indices == rf.video_indices);
+  EXPECT_TRUE(kf.audio_indices == rf.audio_indices);
+  EXPECT_TRUE(kf.num_condition_rows > 0);   // or the whole case is empty
+
+  // The one field that separates them.
+  EXPECT_FALSE(kf.ref2va);
+  EXPECT_TRUE(rf.ref2va);
+
+  // And it is set by the BUILDER, not left over: a t2va layout built
+  // into a struct a ref2va request just used comes back false.
+  ASSERT_TRUE(h3::build_packed_sequence(tags, 7, 32, 56, 37, 2, 2,
+                                        h3::kAudioChannels, {}, &rf));
+  EXPECT_FALSE(rf.ref2va);
+
+  std::printf("[minimax_h3_layout] one keyframe and one same-size image "
+              "reference agree on every count (%d rows); only .ref2va "
+              "separates them\n", kf.num_condition_rows);
 }
 
 TEST(minimax_h3_layout, ref2va_row_timesteps)
@@ -919,7 +1046,8 @@ TEST(minimax_h3_layout, reference_image_size)
   };
   for (const Case& c : kCases) {
     int oh = 0, ow = 0;
-    ASSERT_TRUE(h3::resolve_reference_image_size(c.h, c.w, 2048, 32, &oh, &ow));
+    ASSERT_TRUE(
+        h3::resolve_reference_image_size(c.h, c.w, 2048, 32, 0, &oh, &ow));
     if (oh != c.oh || ow != c.ow) {
       std::printf("[minimax_h3_layout] image %dx%d -> %dx%d, expected %dx%d\n",
                   c.h, c.w, oh, ow, c.oh, c.ow);
@@ -929,9 +1057,11 @@ TEST(minimax_h3_layout, reference_image_size)
   }
   int oh = 0, ow = 0;
   // Outside 1:4 .. 4:1, and non-positive geometry.
-  EXPECT_FALSE(h3::resolve_reference_image_size(100, 500, 2048, 32, &oh, &ow));
-  EXPECT_FALSE(h3::resolve_reference_image_size(500, 100, 2048, 32, &oh, &ow));
-  EXPECT_FALSE(h3::resolve_reference_image_size(0, 100, 2048, 32, &oh, &ow));
+  EXPECT_FALSE(
+      h3::resolve_reference_image_size(100, 500, 2048, 32, 0, &oh, &ow));
+  EXPECT_FALSE(
+      h3::resolve_reference_image_size(500, 100, 2048, 32, 0, &oh, &ow));
+  EXPECT_FALSE(h3::resolve_reference_image_size(0, 100, 2048, 32, 0, &oh, &ow));
   std::printf("[minimax_h3_layout] reference image sizing matches the "
               "reference (no area cap, upscaling included)\n");
 }
@@ -1049,6 +1179,140 @@ TEST(minimax_h3_layout, reference_video_normalization)
               "rescale compose in the reference's order\n");
 }
 
+// A video reference's canvas comes from a rule the config never sees, so
+// this pins BOTH answers: the released checkpoint's short edge, which
+// scales a small clip up, and the 0 that declines to.
+//
+// The upscale is not free anywhere. At 768 a 960x544 reference lands on
+// 1344x768 -- 1.98x the pixels, interpolated from the same information --
+// and those pixels are paid for twice, once in the VAE encode and again
+// in every denoise step, because the rows they become lead the DiT's
+// video buffer.
+TEST(minimax_h3_layout, reference_video_canvas_short_edge)
+{
+  const int n = 2, H = 64, W = 128;
+  std::vector<std::uint8_t> src((std::size_t)n * 3 * H * W, 0);
+  for (std::size_t i = 0; i < src.size(); ++i) {
+    src[i] = (std::uint8_t)((i * 13) % 251);
+  }
+  std::vector<std::uint8_t> out;
+  int of = 0, oh = 0, ow = 0;
+
+  // The DEFAULT is unchanged: 768 takes a 64x128 clip to the biggest
+  // 2:1 canvas the area cap allows, an 11x upscale.
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 24.0, 2, 32,
+                                            768, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  EXPECT_TRUE(oh == 704 && ow == 1440);
+
+  // 0 means the clip's own short edge. 64x128 is already a whole number
+  // of 32s, so the canvas IS the source and the pixels come through
+  // untouched -- the parity-exact route, and the point of the option.
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 24.0, 2, 32,
+                                            0, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  EXPECT_TRUE(oh == 64 && ow == 128);
+  ASSERT_TRUE(out.size() == src.size());
+  EXPECT_TRUE(std::memcmp(out.data(), src.data(), src.size()) == 0);
+
+  // And 0 does not disable the area cap -- a source LARGER than the
+  // canvas is still brought under it. 800x1600 would resolve to itself;
+  // the cap takes it to 718.4x1436.8, which rounds to 704x1440.
+  const int BH = 800, BW = 1600;
+  std::vector<std::uint8_t> big((std::size_t)3 * BH * BW, 17);
+  ASSERT_TRUE(h3::normalize_video_reference(big.data(), 1, BH, BW, 24.0, 1, 32,
+                                            0, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  EXPECT_TRUE(oh == 704 && ow == 1440);
+  EXPECT_TRUE((std::int64_t)oh * ow <= 768LL * 1344);
+  EXPECT_TRUE(oh <= BH && ow <= BW);
+
+  // NEAREST, not floor. 1080 is 33.75 grid lines and rounds UP to 34,
+  // which costs 8 rows of interpolation; flooring to 33 would have
+  // DISCARDED 24 real ones and landed 2.27% off the source aspect
+  // against 0.74% here. Uncapped, so only the grid is acting.
+  int fh = 0, fw = 0;
+  ASSERT_TRUE(h3::resolve_canvas_within(1080, 1920, 32, 0, &fh, &fw));
+  EXPECT_TRUE(fh == 1088 && fw == 1920);
+  // The case the change exists for: a source safely under ratio 1.75
+  // that flooring would push OVER it, into the regime where the model's
+  // own canvas rule stops holding the short edge at 768. Floor gives
+  // 1376x768 (1.7917); nearest keeps it at 1376x800 (1.7200).
+  ASSERT_TRUE(h3::resolve_canvas_within(799, 1390, 32, 0, &fh, &fw));
+  EXPECT_TRUE(fh == 800 && fw == 1376);
+  // The one upward move it cannot refuse: under a single grid line there
+  // is nowhere else to go, because a latent the DiT patch does not
+  // divide is refused 50 layers later.
+  ASSERT_TRUE(h3::resolve_canvas_within(20, 40, 32, 0, &fh, &fw));
+  EXPECT_TRUE(fh == 32 && fw == 32);
+  // Aspect is a refusal, not a fit.
+  EXPECT_FALSE(h3::resolve_canvas_within(100, 500, 32, 0, &fh, &fw));
+  // The IMAGE path takes the same 0, which is what lets a caller that has
+  // already sized a picture -- a resample stage, a crop, a generated
+  // still -- have it encoded at that size instead of re-resolved against
+  // a per-kind default that would scale it back up.
+  int ih = 0, iw = 0;
+  ASSERT_TRUE(h3::resolve_reference_image_size(768, 768, 0, 32, 0, &ih, &iw));
+  EXPECT_TRUE(ih == 768 && iw == 768);
+  // Against the example's 1024, that same picture is scaled UP -- the
+  // behaviour a pre-sized caller is asking to be spared.
+  ASSERT_TRUE(h3::resolve_reference_image_size(768, 768, 1024, 32, 0, &ih,
+                                               &iw));
+  EXPECT_TRUE(ih == 1024 && iw == 1024);
+  // And the image path's new area cap binds when it is set.
+  ASSERT_TRUE(h3::resolve_reference_image_size(2160, 3840, 0, 32,
+                                               768LL * 1344, &ih, &iw));
+  EXPECT_TRUE((std::int64_t)ih * iw <= 768LL * 1344);
+  EXPECT_TRUE(ih <= 2160 && iw <= 3840);
+  std::printf("[minimax_h3_layout] video canvas: 768 -> 1440x704, 0 -> the "
+              "clip's own (rounded to the grid), cap holds either way\n");
+}
+
+// The prepared resize against the one-shot, frame for frame.
+//
+// normalize_video_reference builds ONE PlanarResize for the clip and
+// runs every frame through it, straight into the destination; the
+// one-shot spelling rebuilds the coefficients, the intermediate and the
+// tap bounds per frame and stages through a scratch buffer. That is a
+// restructure of the same filter and the two must agree BYTE for byte --
+// "close enough" here is a reference conditioned on pixels the golden
+// never saw.
+TEST(minimax_h3_layout, prepared_resize_matches_the_one_shot)
+{
+  const int n = 4, H = 36, W = 64;
+  std::vector<std::uint8_t> src((std::size_t)n * 3 * H * W, 0);
+  for (int f = 0; f < n; ++f) {
+    for (std::size_t i = 0; i < (std::size_t)3 * H * W; ++i) {
+      src[(std::size_t)f * 3 * H * W + i] =
+          (std::uint8_t)((i * 7 + f * 61) % 251);
+    }
+  }
+  std::vector<std::uint8_t> out;
+  int of = 0, oh = 0, ow = 0;
+  // 12 fps, so every frame is held twice and the run-forward copy is
+  // exercised alongside the resize itself.
+  ASSERT_TRUE(h3::normalize_video_reference(src.data(), n, H, W, 12.0, 8, 32,
+                                            128, 768 * 1344, &out, &of, &oh,
+                                            &ow));
+  ASSERT_TRUE(of == 8);
+  const std::size_t plane = (std::size_t)3 * oh * ow;
+  ASSERT_TRUE(out.size() == (std::size_t)of * plane);
+
+  std::size_t diff = 0;
+  std::vector<std::uint8_t> one;
+  for (int o = 0; o < of; ++o) {
+    ASSERT_TRUE(h3::resize_lanczos_planar_rgb(
+        src.data() + (std::size_t)(o / 2) * 3 * H * W, H, W, oh, ow, &one));
+    ASSERT_TRUE(one.size() == plane);
+    for (std::size_t i = 0; i < plane; ++i) {
+      if (one[i] != out[(std::size_t)o * plane + i]) { ++diff; }
+    }
+  }
+  EXPECT_TRUE(diff == 0);
+  std::printf("[minimax_h3_layout] prepared vs one-shot resize: %zu of %zu "
+              "bytes differ\n", diff, (std::size_t)of * plane);
+}
+
 // The PIL-faithful LANCZOS resize, pixel for pixel.
 //
 // LANCZOS specifically, and it is not interchangeable: the released
@@ -1079,6 +1343,38 @@ TEST(minimax_h3_layout, reference_lanczos_resize)
 }
 
 // ---- rotary grids ---------------------------------------------------
+
+// Cross-implementation check against ComfyUI's PackedLayout. Writes the
+// position_ids so an external harness can diff them element-wise.
+TEST(minimax_h3_layout, dump_ref2va_positions_for_cross_check)
+{
+  const char* dir = std::getenv("VPIPE_H3_POS_DUMP_DIR");
+  if (dir == nullptr) {
+    std::printf("[minimax_h3_layout] VPIPE_H3_POS_DUMP_DIR unset; skipped\n");
+    return;
+  }
+  struct Case { const char* tag; int text; int ref_lt; int ref_alat; };
+  const Case cases[] = {{"g90", 3032, 27, 150}, {"g56", 2576, 17, 94}};
+  for (const Case& c : cases) {
+    std::vector<int> tags((std::size_t)c.text, 1);
+    h3::Reference ref;
+    ref.kind              = h3::Reference::Kind::kVideo;
+    ref.num_latent_frames = c.ref_lt;
+    ref.latent_height     = 512 / 16;
+    ref.latent_width      = 896 / 16;
+    ref.num_audio_latents = c.ref_alat;
+    h3::PackedLayout L;
+    ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+        tags, {ref}, 57, 512 / 16, 896 / 16, 320, 2, 2, 2, &L));
+    const std::string path = std::string(dir) + "/vpipe-pos-" + c.tag + ".f64";
+    FILE* f = std::fopen(path.c_str(), "wb");
+    ASSERT_TRUE(f != nullptr);
+    std::fwrite(L.position_ids.data(), sizeof(double), L.position_ids.size(), f);
+    std::fclose(f);
+    std::printf("[minimax_h3_layout] %s: seq_len %d -> %s\n", c.tag, L.seq_len,
+                path.c_str());
+  }
+}
 
 TEST(minimax_h3_layout, rotary_grids)
 {
@@ -1175,6 +1471,255 @@ TEST(minimax_h3_layout, packed_sequence)
   }
 }
 
+// A LAST frame alone (`l2va`) against the reference's own numbers. The
+// reference packs every anchor independently -- "last" at the same time
+// whatever else is there, every target row on a clock that starts where
+// the text ends -- so [text | last | audio | video] is fl2va_both's
+// layout with its FIRST block cut out: its text rows, then its second
+// block's rows, then its audio and video rows, row for row. The golden
+// arrays are the reference's, so this holds the lone anchor to them
+// without a golden of its own.
+TEST(minimax_h3_layout, a_last_frame_alone_is_first_and_last_less_the_first)
+{
+  const std::vector<PackedCase> cases = packed_cases();
+  const PackedCase& both = cases[2];
+  ASSERT_TRUE(std::string(both.name) == "fl2va_both");
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_packed_sequence(both.text_tags, both.nlat, both.lh,
+                                        both.lw, both.naud, 2, 2,
+                                        h3::kAudioChannels,
+                                        {h3::Anchor::kLast}, &L));
+  const int rpf = (both.lh / 2) * (both.lw / 2);
+  const int nt = (int)both.text_tags.size();
+  EXPECT_TRUE(L.num_condition_rows == rpf);
+  // Row r of this layout is row src(r) of fl2va_both's.
+  auto src = [&](int r) { return r < nt ? r : r + rpf; };
+  double worst = 0.0;
+  int tag_bad = 0, ada_bad = 0;
+  std::vector<float> uniq;
+  std::vector<int>   row_idx;
+  h3::build_row_timesteps(L, 0.3125f, 0.5f, 0.75f, &uniq, &row_idx);
+  const std::vector<int> adaln = h3::build_adaln_indices(L, row_idx);
+  for (int r = 0; r < L.seq_len; ++r) {
+    for (int a = 0; a < 3; ++a) {
+      worst = std::max(
+          worst, std::fabs(L.position_ids[(std::size_t)r * 3 + a] -
+                           both.pos[(std::size_t)src(r) * 3 + a]));
+    }
+    if (L.token_tags[(std::size_t)r] != both.tags[src(r)]) { ++tag_bad; }
+    if (adaln[(std::size_t)r] != both.adaln[src(r)]) { ++ada_bad; }
+  }
+  // Its video rows are fl2va_both's less the first block's, each one
+  // block earlier.
+  int idx_bad = 0;
+  for (std::size_t i = 0; i < L.video_indices.size(); ++i) {
+    if (L.video_indices[i] != both.vidx[(std::size_t)rpf + i] - rpf) {
+      ++idx_bad;
+    }
+  }
+  EXPECT_TRUE(L.seq_len + rpf ==
+              nt + 2 * rpf + both.naud * h3::kAudioChannels +
+                  both.nlat * rpf);
+  EXPECT_TRUE(worst < 1e-12);
+  EXPECT_TRUE(tag_bad == 0);
+  EXPECT_TRUE(ada_bad == 0);
+  EXPECT_TRUE(idx_bad == 0);
+  // And it is NOT the first frame's time: a lone last anchor that fell
+  // back to "first" would sit where the text ends.
+  EXPECT_TRUE(L.position_ids[(std::size_t)nt * 3] > (double)nt + 1.0);
+  std::printf("[minimax_h3_layout] l2va seq=%d: the last block at t %.4f, "
+              "pos diff=%.3e tags=%d adaln=%d vidx=%d against fl2va_both "
+              "less its first block\n", L.seq_len,
+              L.position_ids[(std::size_t)nt * 3], worst, tag_bad, ada_bad,
+              idx_bad);
+}
+
+// A GUIDE's rows lie where the frames they stand for lie: a latent
+// frame of it at the rotary time, height and width of the target frame
+// it is pinned over, its audio on the target soundtrack's clock -- so a
+// guide at frame 0 sits exactly on the clip's first frames (a
+// continuation's overlap) and one at frame 17 on the second chunk's.
+// Conditioning rows both: the video at the keyframe level, the audio at
+// the reference soundtrack's; the generated rows untouched behind them.
+TEST(minimax_h3_layout, a_guide_lies_where_it_is_pinned)
+{
+  const std::vector<int> tags(5, h3::kTextTag);
+  const int nt = 5, lt = 12, lh = 4, lw = 6;
+  const int naud = h3::audio_latent_num_frames(39);
+  const int rpf = (lh / 2) * (lw / 2);
+  ASSERT_TRUE(h3::guide_pixel_frames(7) == 22);
+  ASSERT_TRUE(h3::guide_pixel_frames(lt) == 39);
+  for (int frame : {0, 17}) {
+    const int m = frame == 0 ? 37 : 36;
+    h3::PackedLayout L;
+    ASSERT_TRUE(h3::build_packed_sequence(
+        tags, lt, lh, lw, naud, 2, 2, h3::kAudioChannels,
+        {h3::Anchor::kFirst}, &L, {{frame, 7, m}}));
+    EXPECT_TRUE(L.num_condition_rows == 8 * rpf);
+    EXPECT_TRUE(L.num_condition_audio_rows == 2 * m);
+    EXPECT_TRUE(L.audio_start == nt + 8 * rpf + 2 * m);
+    EXPECT_TRUE(L.video_start == L.audio_start + 2 * naud);
+    EXPECT_TRUE(L.seq_len == nt + 8 * rpf + 2 * m + 2 * naud + lt * rpf);
+    EXPECT_TRUE(L.video_runs.size() == 2 &&
+                L.video_runs[0].count == 8 * rpf);
+    EXPECT_TRUE(L.audio_runs.size() == 1 &&
+                L.audio_runs[0].start == nt + 8 * rpf &&
+                L.audio_runs[0].count == 2 * (m + naud));
+    auto P = [&](int row, int a) {
+      return L.position_ids[(std::size_t)row * 3 + (std::size_t)a];
+    };
+    // Guide frame f is target frame (frame's latent + f), cell by cell.
+    const int first = frame == 0 ? 0 : 5;
+    double worst = 0.0;
+    for (int f = 0; f < 7; ++f) {
+      for (int r = 0; r < rpf; ++r) {
+        const int g = nt + (1 + f) * rpf + r;
+        const int t = L.video_start + (first + f) * rpf + r;
+        for (int a = 0; a < 3; ++a) {
+          worst = std::max(worst, std::fabs(P(g, a) - P(t, a)));
+        }
+      }
+    }
+    // Its audio on the target's clock from the same origin: 5/3 latents
+    // a pixel frame, so at frame 17 a third of a latent off the grid.
+    double aworst = 0.0;
+    const int ga = nt + 8 * rpf;
+    for (int ch = 0; ch < 2; ++ch) {
+      for (int i = 0; i < m; ++i) {
+        const int g = ga + ch * m + i;
+        const int t = L.audio_start + ch * naud + i;
+        aworst = std::max(aworst,
+                          std::fabs(P(g, 0) - (P(t, 0) + 5.0 / 3.0 * frame)));
+        aworst = std::max(aworst, std::fabs(P(g, 2) - P(t, 2)));
+        EXPECT_TRUE(L.token_tags[(std::size_t)g] == h3::kAudioTag);
+      }
+    }
+    std::vector<float> uniq;
+    std::vector<int> ri;
+    h3::build_row_timesteps(L, 0.25f, 0.5f, 0.75f, &uniq, &ri, 0.875f);
+    auto ts = [&](int row) { return uniq[(std::size_t)ri[(std::size_t)row]]; };
+    EXPECT_TRUE(ts(nt + 3 * rpf) == 0.75f);              // guide video
+    EXPECT_TRUE(ts(ga) == 0.875f && ts(ga + 2 * m - 1) == 0.875f);
+    EXPECT_TRUE(ts(L.audio_start) == 0.5f);               // generated
+    EXPECT_TRUE(ts(L.video_start) == 0.25f);
+    std::printf("[minimax_h3_layout] a guide at frame %d: video pos diff "
+                "%.3e, audio %.3e, seq %d\n", frame, worst, aworst,
+                L.seq_len);
+    EXPECT_TRUE(worst < 1e-12);
+    EXPECT_TRUE(aworst < 1e-12);
+  }
+  // Outside the clip: past its last frame, its audio past the
+  // soundtrack, nothing in it.
+  h3::PackedLayout L;
+  EXPECT_FALSE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                         h3::kAudioChannels, {}, &L,
+                                         {{18, 7, 0}}));
+  EXPECT_FALSE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                         h3::kAudioChannels, {}, &L,
+                                         {{17, 0, 37}}));
+  EXPECT_FALSE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                         h3::kAudioChannels, {}, &L,
+                                         {{0, 0, 0}}));
+  // Audio alone is a guide too.
+  EXPECT_TRUE(h3::build_packed_sequence(tags, lt, lh, lw, naud, 2, 2,
+                                        h3::kAudioChannels, {}, &L,
+                                        {{0, 0, naud}}));
+  EXPECT_TRUE(L.num_condition_rows == 0 &&
+              L.num_condition_audio_rows == 2 * naud);
+}
+
+// THE ROW ORDER generate-video packs a guide (and an anchor) in, and
+// reads its output back through, is the layout's: cell r of a frame is
+// the (patch_h, patch_w) block at height r / gw, width r % gw of every
+// channel -- the cell build_packed_sequence gives (h_grid[r / pw],
+// w_grid[r % pw]). So a guide's frame t holds exactly the rows the clip
+// it came from had at that frame, and reads back as that latent. Audio
+// the same: the first m columns of [2, channels, stride], channel-major.
+TEST(minimax_h3_layout, guide_rows_are_the_rows_of_the_clip_they_came_from)
+{
+  const int z = 4, T = 7, lh = 6, lw = 8, ph = 2, pw = 2;
+  const int gw = lw / pw, rpf = (lh / ph) * gw, PE = z * ph * pw;
+  std::vector<float> clip((std::size_t)z * T * lh * lw);
+  for (std::size_t i = 0; i < clip.size(); ++i) {
+    clip[i] = std::sin(0.37f * (float)i) + 0.001f * (float)i;
+  }
+  // The whole clip's rows, and its last 3 frames packed as a guide.
+  std::vector<float> all((std::size_t)T * rpf * PE);
+  h3::patchify_latent_frames(clip.data(), z, T, 0, T, lh, lw, ph, pw,
+                             all.data());
+  std::vector<float> guide((std::size_t)3 * rpf * PE);
+  h3::patchify_latent_frames(clip.data(), z, T, T - 3, 3, lh, lw, ph, pw,
+                             guide.data());
+  EXPECT_TRUE(std::memcmp(guide.data(),
+                          all.data() + (std::size_t)(T - 3) * rpf * PE,
+                          guide.size() * sizeof(float)) == 0);
+  // Cell by definition: frame 5, cell 7 (block row 1, column 3).
+  int bad_cell = 0;
+  {
+    const int t = 5, r = 7, by = (r / gw) * ph, bx = (r % gw) * pw;
+    const float* row = all.data() + ((std::size_t)t * rpf + r) * PE;
+    for (int ch = 0; ch < z; ++ch) {
+      for (int y = 0; y < ph; ++y) {
+        for (int x = 0; x < pw; ++x) {
+          const float want =
+              clip[(((std::size_t)ch * T + t) * lh + by + y) * lw + bx + x];
+          if (row[(ch * ph + y) * pw + x] != want) { ++bad_cell; }
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(bad_cell == 0);
+  // And the guide reads back as the latent frames it was cut from.
+  std::vector<float> back;
+  h3::unpatchify_latent_rows(guide.data(), 3 * rpf, z, 3, lh, lw, ph, pw,
+                             &back);
+  int bad_back = 0;
+  for (int ch = 0; ch < z; ++ch) {
+    for (int t = 0; t < 3; ++t) {
+      for (int i = 0; i < lh * lw; ++i) {
+        if (back[((std::size_t)ch * 3 + t) * lh * lw + i] !=
+            clip[((std::size_t)ch * T + (T - 3 + t)) * lh * lw + i]) {
+          ++bad_back;
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(bad_back == 0);
+
+  // Audio: the first 5 of 9 latents of [2, 3, 9], channel-major.
+  const int AC = 3, stride = 9, m = 5;
+  std::vector<float> aud((std::size_t)2 * AC * stride);
+  for (std::size_t i = 0; i < aud.size(); ++i) { aud[i] = (float)i; }
+  std::vector<float> arows((std::size_t)2 * m * AC);
+  h3::pack_audio_latent_rows(aud.data(), AC, stride, m, arows.data());
+  int bad_audio = 0;
+  for (int s = 0; s < 2; ++s) {
+    for (int i = 0; i < m; ++i) {
+      for (int k = 0; k < AC; ++k) {
+        if (arows[((std::size_t)s * m + i) * AC + k] !=
+            aud[((std::size_t)s * AC + k) * stride + i]) {
+          ++bad_audio;
+        }
+      }
+    }
+  }
+  std::vector<float> aback;
+  h3::unpack_audio_latent_rows(arows.data(), AC, m, &aback);
+  for (int s = 0; s < 2; ++s) {
+    for (int k = 0; k < AC; ++k) {
+      for (int i = 0; i < m; ++i) {
+        if (aback[((std::size_t)s * AC + k) * m + i] !=
+            aud[((std::size_t)s * AC + k) * stride + i]) {
+          ++bad_audio;
+        }
+      }
+    }
+  }
+  std::printf("[minimax_h3_layout] guide rows: cell %d, read back %d, "
+              "audio %d values off\n", bad_cell, bad_back, bad_audio);
+  EXPECT_TRUE(bad_audio == 0);
+}
+
 TEST(minimax_h3_layout, packed_sequence_rejects_bad_geometry)
 {
   h3::PackedLayout L;
@@ -1230,6 +1775,103 @@ TEST(minimax_h3_sched, sigma_schedules)
   ASSERT_TRUE(v.set_timesteps(20) && a.set_timesteps(20));
   EXPECT_TRUE(std::fabs(v.sigmas()[10] - a.sigmas()[10]) > 0.05f);
   EXPECT_FALSE(v.set_timesteps(1));
+}
+
+// HyperFlow's flow-map grid: 9 raw points pushed through each modality's
+// own shift and installed verbatim, plus each step's ENDPOINT.
+//
+// Expected values are UPSTREAM's, not re-derived: hyperflow_h3.schedule
+// .shift_sigmas + endpoints_from_sigmas, installed through diffusers'
+// MiniMaxH3Scheduler.set_timesteps(sigmas=...) -- the exact calls its
+// HyperFlowSetTimestepsStep makes (dump_hyperflow_golden.py, printed at
+// %.9g so every float32 round-trips). Held BIT-EXACT: the shift is the
+// same four float32 operations in the same order, so there is no ulp of
+// slack to explain away.
+TEST(minimax_h3_sched, flow_map_grid)
+{
+  const std::vector<float> raw = {1.0f,     0.931506f, 0.839236f,
+                                  0.703462f, 0.5f,      0.296538f,
+                                  0.160764f, 0.068494f, 0.0f};
+  struct Want {
+    double shift;
+    std::vector<float> sig, t, r;
+  };
+  const Want want[] = {
+      {12.0,
+       {1.0f, 0.993909776f, 0.9842875f, 0.966063678f, 0.923076928f,
+        0.834942341f, 0.696852028f, 0.468753338f, 0.0f},
+       {0.0f, 0.00609022379f, 0.0157124996f, 0.0339363217f, 0.0769230723f,
+        0.165057659f, 0.303147972f, 0.531246662f},
+       {0.00609022379f, 0.0157124996f, 0.0339363217f, 0.0769230723f,
+        0.165057659f, 0.303147972f, 0.531246662f, 1.0f}},
+      {3.0,
+       {1.0f, 0.976076305f, 0.939979196f, 0.876797915f, 0.75f,
+        0.558425307f, 0.364950269f, 0.180724859f, 0.0f},
+       {0.0f, 0.0239236951f, 0.0600208044f, 0.123202085f, 0.25f,
+        0.441574693f, 0.635049701f, 0.819275141f},
+       {0.0239236951f, 0.0600208044f, 0.123202085f, 0.25f, 0.441574693f,
+        0.635049701f, 0.819275141f, 1.0f}},
+  };
+  for (const Want& w : want) {
+    MiniMaxH3Scheduler s(w.shift);
+    ASSERT_TRUE(s.set_sigmas(raw));
+    ASSERT_TRUE(s.sigmas() == w.sig);
+    ASSERT_TRUE(s.timesteps() == w.t);
+    ASSERT_TRUE(s.endpoints() == w.r);
+    // Eight model evaluations from nine points, and the last step lands
+    // on clean.
+    EXPECT_TRUE(s.num_inference_steps() == 8);
+    EXPECT_TRUE(s.endpoints().back() == 1.0f);
+  }
+  // The linspace path grows endpoints too, by the same rule.
+  MiniMaxH3Scheduler l(12.0);
+  ASSERT_TRUE(l.set_timesteps(20));
+  ASSERT_TRUE(l.endpoints().size() == l.timesteps().size());
+  for (std::size_t i = 0; i < l.endpoints().size(); ++i) {
+    EXPECT_TRUE(l.endpoints()[i] == 1.0f - l.sigmas()[i + 1]);
+  }
+  // What diffusers' set_timesteps(sigmas=) refuses, this refuses: not
+  // ending at exactly 0, not strictly decreasing, starting above 1.
+  MiniMaxH3Scheduler b(12.0);
+  EXPECT_FALSE(b.set_sigmas({1.0f, 0.5f, 0.01f}));
+  EXPECT_FALSE(b.set_sigmas({1.0f, 0.5f, 0.5f, 0.0f}));
+  EXPECT_FALSE(b.set_sigmas({1.5f, 0.5f, 0.0f}));
+  EXPECT_FALSE(b.set_sigmas({0.0f}));
+}
+
+// Per-row (t, r) pairs: the pin rule of build_row_timesteps, with each
+// row also carrying where its step lands, deduplicated as PAIRS.
+//
+// Expected values are upstream's build_row_time_pairs on the same
+// hand-built layout (dump_hyperflow_golden.py): 3 text rows, 2
+// conditioning + 4 generated video rows, 1 reference + 3 generated audio
+// rows. Video and audio are handed the SAME t on purpose, with different
+// endpoints -- the case a t-only dedup gets wrong, collapsing the two
+// into one entry and giving the audio rows the video's endpoint.
+TEST(minimax_h3_layout, row_time_pairs)
+{
+  h3::PackedLayout L;
+  L.seq_len = 13;
+  L.video_indices = {3, 4, 5, 6, 7, 8};
+  L.audio_indices = {9, 10, 11, 12};
+  L.num_condition_video_rows = 2;
+  L.num_condition_audio_rows = 1;
+  std::vector<float> t, r;
+  std::vector<int> idx;
+  h3::build_row_time_pairs(L, 0.25f, 0.5f, 0.25f, 0.75f, 0.999f, &t, &r,
+                           &idx, 1.0f);
+  EXPECT_TRUE((t == std::vector<float>{0.25f, 0.25f, 0.999f, 1.0f}));
+  EXPECT_TRUE((r == std::vector<float>{0.5f, 0.75f, 0.999f, 1.0f}));
+  EXPECT_TRUE((idx == std::vector<int>{0, 0, 0, 2, 2, 0, 0, 0, 0, 3, 1, 1,
+                                       1}));
+  // With r == t everywhere the pairs collapse to build_row_timesteps'
+  // answer exactly -- the flow-map plan is a strict extension of it.
+  std::vector<float> t1, r1, t2;
+  std::vector<int> i1, i2;
+  h3::build_row_time_pairs(L, 0.3f, 0.3f, 0.6f, 0.6f, 0.999f, &t1, &r1,
+                           &i1, 1.0f);
+  h3::build_row_timesteps(L, 0.3f, 0.6f, 0.999f, &t2, &i2, 1.0f);
+  EXPECT_TRUE(t1 == t2 && t1 == r1 && i1 == i2);
 }
 
 TEST(minimax_h3_sched, euler_trajectory)
@@ -1381,4 +2023,37 @@ TEST(minimax_h3_layout, audio_channels_is_the_stereo_count)
                                         &L32));
   EXPECT_TRUE(L32.num_audio_rows == naud * 32);
   EXPECT_TRUE(L32.seq_len > L.seq_len);
+}
+
+// WHY the VAE refuses a tile geometry that is not a whole number of
+// patches -- the check in `MetalMiniMaxH3VideoVae::config_from_json`.
+//
+// `split_tiles` pays the leftover slack back in whole `ratio` steps, so
+// the union it lays ends at `length + (slack % ratio)`. At the
+// checkpoint's own 256 / 64 that remainder is always 0 and the coverage
+// is exact; let either number off the patch grid and the last tile ends
+// PAST the axis. Nothing downstream re-checks it: both tilers index the
+// source by the tile's start and extent, and `stitch_` WRITES by them,
+// so an overrun is out-of-bounds memory rather than a wrong picture.
+TEST(minimax_h3_layout, vae_tile_split_needs_patch_aligned_geometry)
+{
+  // Exact for every length that is a whole number of latent cells.
+  for (int len = 16; len <= 4096; len += 16) {
+    const auto s = minimax_h3::split_tiles(len, 256, 64, 16);
+    ASSERT_TRUE(!s.start.empty() && s.start.size() == s.length.size());
+    if (s.start.empty()) { continue; }
+    EXPECT_TRUE(s.start.back() + s.length.back() == len);
+  }
+
+  // A tile that is not a multiple of the patch: 6 tiles ending at 1036
+  // for a 1024 axis, 12 pixels of out-of-bounds.
+  const auto t = minimax_h3::split_tiles(1024, 250, 64, 16);
+  ASSERT_TRUE(!t.start.empty());
+  EXPECT_TRUE(t.start.back() + t.length.back() == 1036);
+
+  // And the minimum OVERLAP matters the same way, which is why the
+  // refusal names both: 3 tiles ending at 520 for a 512 axis.
+  const auto o = minimax_h3::split_tiles(512, 256, 60, 16);
+  ASSERT_TRUE(!o.start.empty());
+  EXPECT_TRUE(o.start.back() + o.length.back() == 520);
 }

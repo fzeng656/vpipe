@@ -1,8 +1,12 @@
 #include "common/session.h"
+#include "common/host-report.h"
+#include "common/memory-owner.h"
 #include "common/db-log-delegate.h"
+#include "common/diagnostic-capture.h"
 #include "common/ffmpeg-libraries.h"
 #include "common/flex-data.h"
 #include "common/i18n.h"
+#include "common/kernel-tuning-cache.h"
 #include "common/library-handle.h"
 #include "common/lmdb-env.h"
 #include "common/session-config.h"
@@ -23,6 +27,7 @@
 #include "pipeline/stage.h"
 #include "plugin/plugin-manager.h"
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -39,6 +44,7 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -100,9 +106,52 @@ parse_log_config(const FlexData& config, LogConfigState* out)
   }
 }
 
+// WHERE THE DATABASES ARE when the config does not say.
+//
+// Normally the process CWD. The exception is a CLI run started INSIDE
+// the web-ui's sandbox: the web-ui confines every stage's file I/O to a
+// `sandbox` directory under its own starting CWD, so a pipeline authored
+// there names its files relative to THAT directory while the session's
+// LMDB -- model registry, catalogue, log -- sits one level up beside it.
+// Running the same pipeline from the CLI therefore means `cd sandbox`,
+// and opening the env at "." would CREATE a second, empty database
+// there: every registered model would miss, and a pipeline that works in
+// the web-ui would fail on the model reference it resolves fine from.
+//
+// So when the CWD holds no database and its parent does, the parent's is
+// the one meant. Asymmetric on purpose: EITHER file in the CWD means the
+// CWD has a database (a half-written pair is still one, and adopting the
+// parent's over it would be the silent wrong answer), while the parent
+// must have the DATA file before it is adopted -- a stray lock.mdb is
+// not a database.
+//
+// Only the default is affected. A configured `db.path` is used as given.
+string
+default_db_path_()
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path cwd = fs::current_path(ec);
+  if (ec) {
+    return ".";
+  }
+  auto exists_ = [](const fs::path& p) {
+    std::error_code e;
+    return fs::exists(p, e) && !e;
+  };
+  if (exists_(cwd / "data.mdb") || exists_(cwd / "lock.mdb")) {
+    return ".";
+  }
+  const fs::path up = cwd.parent_path();
+  if (up.empty() || up == cwd || !exists_(up / "data.mdb")) {
+    return ".";
+  }
+  return up.lexically_normal().string();
+}
+
 // Reads the top-level `db.path` / `db.map_size_mb` from the session
 // config. An empty `db.path` is fine: `Session::lmdb_env()` falls
-// back to the process CWD (".") at first-open time.
+// back to default_db_path_() at first-open time.
 void
 parse_db_config(const FlexData& config,
                 string*         out_path,
@@ -199,6 +248,34 @@ parse_sandbox_config(const FlexData& config)
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
   return PathSandbox{std::filesystem::path(dir), std::move(whitelist)};
+}
+
+// Whether the session keeps its kernel tuners' answers
+// (KernelTuningCache): `kernel_tuning: { cache: bool }`, on by default
+// -- a model loaded again then reads what it measured the first time
+// instead of measuring it again. VPIPE_TUNING_CACHE=0|1 overrides the
+// config either way (an A/B of the tuners themselves wants it off).
+bool
+parse_tuning_cache_config(const FlexData& config)
+{
+  bool on = true;
+  if (config.is_object()) {
+    auto root = config.as_object();
+    if (root.contains("kernel_tuning")) {
+      FlexData kt = root.at("kernel_tuning");
+      if (kt.is_object()) {
+        auto obj = kt.as_object();
+        if (obj.contains("cache")) {
+          FlexData v = obj.at("cache");
+          if (v.is_bool()) { on = v.get_bool(); }
+        }
+      }
+    }
+  }
+  if (const char* e = std::getenv("VPIPE_TUNING_CACHE")) {
+    on = std::atoi(e) != 0;
+  }
+  return on;
 }
 
 // Read the top-level "language" config key (an IETF tag) and normalize
@@ -322,6 +399,40 @@ parse_wired_pool_mb_config(const FlexData& config)
                            ? std::atoll(std::string(v.get_string()).c_str())
                            : 0;
   return mb_to_bytes(mb);
+}
+
+// THE SWAP ALLOWANCE, in megabytes. Config key `swap_allowance_mb`;
+// VPIPE_SWAP_ALLOWANCE_MB overrides it, and both apps forward their
+// --swap-allowance-mb flag through it, for the reason the two knobs
+// above do: the manager is not reachable through the public SessionIntf
+// at construction time.
+//
+// The DEFAULT is stated in the manager rather than here (unlike the
+// wired pool's percentage) because it is not a share of anything -- it
+// is an absolute number of megabytes a clip may push out, and the same
+// 4 GB is the right answer on a 16 GB box and a 64 GB one. A sentinel
+// distinguishes "not configured" from an explicit 0, which is a real
+// setting: gate on reclaimable RAM alone.
+constexpr long long kSwapAllowanceUnset = -1;
+
+long long
+parse_swap_allowance_mb_config(const FlexData& config)
+{
+  auto clamp = [](long long mb) -> long long {
+    return mb < 0 ? 0 : mb;
+  };
+  if (const char* e = std::getenv("VPIPE_SWAP_ALLOWANCE_MB")) {
+    return clamp(std::atoll(e));
+  }
+  if (!config.is_object()) { return kSwapAllowanceUnset; }
+  auto root = config.as_object();
+  if (!root.contains("swap_allowance_mb")) { return kSwapAllowanceUnset; }
+  FlexData v = root.at("swap_allowance_mb");
+  if (v.is_int()) { return clamp(v.as_int(0)); }
+  if (v.is_string()) {
+    return clamp(std::atoll(std::string(v.get_string()).c_str()));
+  }
+  return kSwapAllowanceUnset;
 }
 
 std::size_t
@@ -485,20 +596,41 @@ collect_plugin_paths_(const FlexData& config)
   return paths;
 }
 
+Session::ParsedConfig
+Session::parse_config_(string_view cfg)
+{
+  try {
+    return {parse_session_config(cfg), {}};
+  } catch (const exception& e) {
+    return {FlexData::make_object(),
+            fmt("session config parse failed: {}", e.what())()};
+  }
+}
+
 Session::Session(string_view cfg)
-  : _config(FlexData::make_object())
+  : Session(parse_config_(cfg))
+{
+}
+
+Session::Session(const FlexData& cfg)
+  : Session(cfg.is_object() ? ParsedConfig{cfg, {}}
+            : cfg.is_null() ? ParsedConfig{FlexData::make_object(), {}}
+                            : ParsedConfig{FlexData::make_object(),
+                                           "session config is not an object"})
+{
+}
+
+Session::Session(ParsedConfig parsed)
+  : _config(std::move(parsed.config))
   , _delegate(make_unique<StdoutLogDelegate>(LogLevel::Normal))
   , _ui_delegate(make_unique<StdioUiDelegate>())
   , _db_map_size(DbLogDelegate::kDefaultMapSize)
 {
-  // Phase 1: parse config. Fail-soft: a parse error becomes a warning
-  // through the bootstrap stdout delegate, and we keep going with an
-  // empty config object.
-  try {
-    _config = parse_session_config(cfg);
-  } catch (const exception& e) {
-    warn(fmt("session config parse failed: {}; using defaults",
-             e.what()));
+  // Phase 1 (the caller's): the config document. Fail-soft: a config
+  // that could not be had becomes a warning through the bootstrap
+  // stdout delegate, and we keep going with an empty config object.
+  if (!parsed.error.empty()) {
+    warn(fmt("{}; using defaults", parsed.error));
     _config = FlexData::make_object();
     _pool = make_unique<ThreadPool>(default_workers(), this);
     attach_if_stdout_(_delegate.get(), this);
@@ -580,6 +712,13 @@ Session::~Session()
   // would do the same thing -- explicit reset just makes the
   // dependency on the include obvious.
   _ffmpeg.reset();
+  // The model manager before MetalCompute, which is declared after it and
+  // so would go first: what the manager still holds as the session ends
+  // -- a DiT or a VAE kept warm (keep_model_warm) -- gives its wired
+  // buffers back through MetalCompute as it goes. With MetalCompute gone
+  // first, that read freed memory: a segfault at the end of every process
+  // that ended with a DiT kept warm.
+  _llm_mgr.reset();
   // _config destroyed by member dtor as usual.
 }
 
@@ -630,6 +769,17 @@ Session::metal_compute() const
 #endif
 }
 
+KernelTuningCache*
+Session::kernel_tuning_cache() const
+{
+  std::call_once(_tuning_once, [this] {
+    if (parse_tuning_cache_config(_config)) {
+      _tuning = make_unique<SessionKernelTuningCache>();
+    }
+  });
+  return _tuning.get();
+}
+
 genai::GenerativeModelManager*
 Session::generative_model_manager() const
 {
@@ -653,6 +803,13 @@ Session::generative_model_manager() const
     const std::size_t wired = parse_wired_pool_mb_config(_config);
     if (wired > 0) { _llm_mgr->set_wired_pool_bytes(wired); }
     _llm_mgr->set_wired_pool_enforced(parse_wired_pool_enforce_config(_config));
+    // Only when configured: the manager's own default is the shipped
+    // figure, and applying an unset sentinel would overwrite it with 0
+    // -- which is a real setting meaning something else entirely.
+    const long long swap = parse_swap_allowance_mb_config(_config);
+    if (swap != kSwapAllowanceUnset) {
+      _llm_mgr->set_swap_allowance_bytes((std::size_t)swap << 20);
+    }
   });
   return _llm_mgr.get();
 #else
@@ -670,20 +827,28 @@ Session::confine_path(std::string_view user_path, bool for_write,
 LmdbEnv*
 Session::lmdb_env() const
 {
-  // Resolve the path: if the config didn't set db.path we fall
-  // back to "." (the process CWD at first-open time). LMDB
-  // resolves "." against CWD inside mdb_env_open, so we capture
-  // whatever the caller's working directory is when the env is
-  // first materialized.
-  const string path = _db_path.empty() ? string(".") : _db_path;
-
   // Lazy open. If the open throws, _env stays null and the
   // once_flag is *not* fulfilled -- a later call will retry. The
   // env reports its construction failures through `this` (the
   // session), so the message lands in the active log delegate.
-  std::call_once(_env_once, [this, &path] {
+  //
+  // The path is resolved HERE rather than at construction because "."
+  // means the process CWD at FIRST-OPEN time -- LMDB resolves it inside
+  // mdb_env_open -- and default_db_path_() has to read the same CWD to
+  // decide whether the database beside it is the one meant.
+  std::call_once(_env_once, [this] {
+    const string path = _db_path.empty() ? default_db_path_() : _db_path;
     try {
       _env = make_unique<LmdbEnv>(this, path, _db_map_size);
+      if (_db_path.empty() && path != ".") {
+        // Only reachable with a non-db log delegate: the db delegate is
+        // installed after its own lmdb_env() call has fulfilled this
+        // once_flag, so it can never re-enter here.
+        info(fmt(
+          "Session: no database in the working directory; using the one "
+          "beside it at '{}' (a CLI run inside the web-ui's sandbox "
+          "resolves the same models the web-ui does)", path));
+      }
     } catch (const exception& e) {
       warn(fmt(
         "Session: lmdb_env open failed for '{}': {}; lmdb_env() "
@@ -801,6 +966,12 @@ Session::load_pipeline(string_view spec_sv)
     return HandleAccess::make_pipeline(nullptr);
   }
 
+  return load_pipeline_spec(spec, std::move(storage));
+}
+
+PipelineHandle
+Session::load_pipeline_spec(const FlexData& spec, string storage)
+{
   auto pipeline = pipeline_from_spec(spec, this);
   if (!pipeline) {
     // pipeline_from_spec already logged the underlying cause.
@@ -818,6 +989,18 @@ Session::load_pipeline(string_view spec_sv)
     _pipelines.emplace(raw, std::move(impl));
   }
   return HandleAccess::make_pipeline(raw);
+}
+
+// SessionIntf's in-memory form. Non-virtual, so the interface's vtable is
+// what it was; every SessionIntf a caller holds is a Session made here.
+PipelineHandle
+SessionIntf::load_pipeline(const FlexData& spec)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return HandleAccess::make_pipeline(nullptr);
+  }
+  return s->load_pipeline_spec(spec);
 }
 
 PipelineHandle
@@ -885,7 +1068,13 @@ Session::unload_pipeline(PipelineHandle h)
       _pipelines.erase(it);
     }
   }
-  // 'removed' destructed here, after the map lock is released.
+  // Destroyed after the map lock is released -- its stages let go of the
+  // checkpoints they borrowed -- and THEN those are settled: parked, so
+  // the finished graph's weights are reclaimable rather than resident.
+  removed.reset();
+  if (auto* mgr = generative_model_manager()) {
+    (void)mgr->settle_unborrowed();
+  }
   return Status{0};
 }
 
@@ -992,6 +1181,63 @@ Session::wait_pipelines(int timeout_ms)
   return Status{0};
 }
 
+// One pipeline's wait. The impl is resolved under the map lock and
+// waited on outside it: other threads' launches, stops and unloads of
+// OTHER pipelines take that lock and leave this impl alone.
+Status
+Session::wait_one_pipeline(PipelineHandle h, int timeout_ms)
+{
+  PipelineHandleImpl* impl = resolve(h);
+  if (!impl) {
+    return Status{1};
+  }
+  return impl->wait_idle(timeout_ms) ? Status{0} : Status{4};
+}
+
+// SessionIntf's one-pipeline wait. Non-virtual, as load_pipeline(const
+// FlexData&): every SessionIntf a caller holds is a Session made here.
+Status
+SessionIntf::wait_pipeline(PipelineHandle h, int timeout_ms)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return Status{1};
+  }
+  return s->wait_one_pipeline(h, timeout_ms);
+}
+
+// SessionIntf's conversation drop (text-chat's kept contexts, held by
+// the model manager with the models kept warm).
+Status
+SessionIntf::drop_chat_context(std::string_view key)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return Status{1};
+  }
+  auto* mgr = s->generative_model_manager();
+  return mgr != nullptr && mgr->drop_context(std::string(key)) ? Status{0}
+                                                               : Status{1};
+}
+
+// SessionIntf's idle models let go (the model manager's unborrowed
+// checkpoints dropped).
+std::size_t
+SessionIntf::release_idle_models()
+{
+  auto* s = dynamic_cast<Session*>(this);
+  auto* mgr = s != nullptr ? s->generative_model_manager() : nullptr;
+  if (mgr == nullptr) {
+    return 0;
+  }
+  const std::size_t freed = mgr->drop_unborrowed();
+  if (freed > 0) {
+    s->info(fmt("release_idle_models: {} MB of idle model checkpoints "
+                "given back", freed >> 20));
+  }
+  return freed;
+}
+
 Status
 Session::store_pipeline(PipelineHandle h, string_view path_sv)
 {
@@ -1014,47 +1260,93 @@ Session::store_pipeline(PipelineHandle h, string_view path_sv)
 // error/warn/info are the user-facing channel and route to the UI
 // delegate; the lower log_* levels remain diagnostic logging on the
 // log delegate. error() still reports first, then throws.
+//
+// error() and warn() are also where a refusal says WHY, so both offer
+// what they report to any DiagnosticCapture open on this thread --
+// that is how a caller gets the reason its own load or launch was
+// refused for, instead of a bare null handle. Nothing is diverted:
+// the delegate sees exactly what it saw before. The format callable
+// runs ONCE either way (its contract allows it to be expensive), so
+// the capturing path formats first and hands the delegate the string
+// it already has.
 void
 Session::error(const VpipeFormat& f) const
 {
-  _ui_delegate->error(f);
-  throw runtime_error(f() + "\nError reported\n");
+  const string msg = f();
+  if (DiagnosticCapture::active()) {
+    DiagnosticCapture::note(msg);
+  }
+  tell_listener_(LogLevel::Error, msg);
+  _ui_delegate->error(VpipeFormat([msg] { return msg; }));
+  throw runtime_error(msg + "\nError reported\n");
 }
 
 void
 Session::warn(const VpipeFormat& f) const
 {
-  _ui_delegate->warn(f);
+  const bool listened = listener_() != nullptr;
+  if (!DiagnosticCapture::active() && !listened) {
+    _ui_delegate->warn(f);
+    return;
+  }
+  const string msg = f();
+  if (DiagnosticCapture::active()) {
+    DiagnosticCapture::note(msg);
+  }
+  tell_listener_(LogLevel::Warn, msg);
+  _ui_delegate->warn(VpipeFormat([msg] { return msg; }));
 }
 
 void
 Session::info(const VpipeFormat& f) const
 {
-  _ui_delegate->info(f);
+  if (!listener_()) {
+    _ui_delegate->info(f);
+    return;
+  }
+  // Formatted once, for both.
+  const string msg = f();
+  tell_listener_(LogLevel::Info, msg);
+  _ui_delegate->info(VpipeFormat([msg] { return msg; }));
+}
+
+// The diagnostic channels: below the log level a line is not even
+// formatted -- the listener hears what the delegate would print.
+#define VPIPE_SESSION_LOG_(name, level)                                    \
+  void Session::name(const VpipeFormat& f) const                           \
+  {                                                                        \
+    if (!listener_() ||                                                    \
+        (level != LogLevel::Always && level > _delegate->threshold())) {   \
+      _delegate->log(level, f);                                            \
+      return;                                                              \
+    }                                                                      \
+    const string msg = f();                                                \
+    tell_listener_(level, msg);                                            \
+    _delegate->log(level, VpipeFormat([msg] { return msg; }));             \
+  }
+VPIPE_SESSION_LOG_(log_debug, LogLevel::Debug)
+VPIPE_SESSION_LOG_(log_verbose, LogLevel::Verbose)
+VPIPE_SESSION_LOG_(log_normal, LogLevel::Normal)
+VPIPE_SESSION_LOG_(log_always, LogLevel::Always)
+#undef VPIPE_SESSION_LOG_
+
+std::shared_ptr<const SessionIntf::LogListener>
+Session::listener_() const
+{
+  std::lock_guard<std::mutex> lk(_listener_mu);
+  return _listener;
 }
 
 void
-Session::log_debug(const VpipeFormat& f) const
+Session::tell_listener_(LogLevel level, const string& msg) const
 {
-  _delegate->log(LogLevel::Debug, f);
-}
-
-void
-Session::log_verbose(const VpipeFormat& f) const
-{
-  _delegate->log(LogLevel::Verbose, f);
-}
-
-void
-Session::log_normal(const VpipeFormat& f) const
-{
-  _delegate->log(LogLevel::Normal, f);
-}
-
-void
-Session::log_always(const VpipeFormat& f) const
-{
-  _delegate->log(LogLevel::Always, f);
+  if (auto l = listener_()) {
+    try {
+      (*l)(static_cast<int>(level), msg);
+    } catch (...) {
+      // A host's listener failing must not fail the line's stage.
+    }
+  }
 }
 
 UiInputStatus
@@ -1091,6 +1383,219 @@ UiProgress
 Session::open_progress(string desc) const
 {
   return _ui_delegate->open_progress(std::move(desc));
+}
+
+// SessionIntf's progress reports, as /api/io/progress serves them (the
+// web UI reads them here too). Non-virtual, as load_pipeline(const
+// FlexData&): every SessionIntf a caller holds is a Session made here.
+FlexData
+SessionIntf::progress() const
+{
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  FlexData arr = FlexData::make_array();
+  const auto* s = dynamic_cast<const Session*>(this);
+  if (s == nullptr) {
+    oo.insert("version", FlexData::make_uint(0));
+    oo.insert("items", std::move(arr));
+    return o;
+  }
+  const UiDelegateIntf& ui = s->ui_delegate();
+  oo.insert("version", FlexData::make_uint(ui.progress_version()));
+  auto a = arr.as_array();
+  // One instant for the whole snapshot, so concurrent reports that
+  // opened together do not drift apart by the cost of the loop.
+  const auto now = chrono::steady_clock::now();
+  for (const auto& it : ui.progress_snapshot()) {
+    FlexData e = FlexData::make_object();
+    auto eo = e.as_object();
+    eo.insert("id", FlexData::make_uint(it.id));
+    eo.insert("desc", FlexData::make_string(it.desc));
+    eo.insert("done", FlexData::make_uint(it.done));
+    // 0 total means INDETERMINATE; a renderer draws motion, not a fill.
+    eo.insert("total", FlexData::make_uint(it.total));
+    eo.insert("detail", FlexData::make_string(it.detail));
+    eo.insert("seq", FlexData::make_uint(it.seq));
+    // The report's AGE, computed here rather than by the reader from a
+    // first-seen time: a reader that starts polling in the middle of a
+    // four-minute denoise would otherwise start its clock at zero.
+    const auto ms = chrono::duration_cast<chrono::milliseconds>(
+        now - it.started).count();
+    eo.insert("elapsed_ms",
+              FlexData::make_uint(static_cast<uint64_t>(ms < 0 ? 0 : ms)));
+    a.push_back(std::move(e));
+  }
+  oo.insert("items", std::move(arr));
+  return o;
+}
+
+uint64_t
+SessionIntf::progress_version() const
+{
+  const auto* s = dynamic_cast<const Session*>(this);
+  return s != nullptr ? s->ui_delegate().progress_version() : 0;
+}
+
+void
+host_report(const SessionContextIntf* session, string kind, FlexData data)
+{
+  const auto* s = dynamic_cast<const Session*>(session);
+  if (s == nullptr) {
+    return;
+  }
+  auto* self = const_cast<Session*>(s);
+  std::lock_guard<std::mutex> lk(self->_reports_mu);
+  Session::HostReport r;
+  r.id = ++self->_report_id;
+  r.kind = std::move(kind);
+  r.data = std::move(data);
+  r.at = chrono::steady_clock::now();
+  self->_reports.push_back(std::move(r));
+  while (self->_reports.size() > Session::kReportsKept) {
+    self->_reports.pop_front();
+  }
+}
+
+// SessionIntf's structured reports (common/host-report.h). Non-virtual,
+// as progress() is.
+FlexData
+SessionIntf::reports() const
+{
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  FlexData arr = FlexData::make_array();
+  const auto* s = dynamic_cast<const Session*>(this);
+  if (s == nullptr) {
+    oo.insert("version", FlexData::make_uint(0));
+    oo.insert("items", std::move(arr));
+    return o;
+  }
+  std::lock_guard<std::mutex> lk(s->_reports_mu);
+  oo.insert("version", FlexData::make_uint(s->_report_id));
+  auto a = arr.as_array();
+  const auto now = chrono::steady_clock::now();
+  for (const auto& r : s->_reports) {
+    FlexData e = FlexData::make_object();
+    auto eo = e.as_object();
+    eo.insert("id", FlexData::make_uint(r.id));
+    eo.insert("kind", FlexData::make_string(r.kind));
+    eo.insert("data", r.data);
+    const auto ms =
+        chrono::duration_cast<chrono::milliseconds>(now - r.at).count();
+    eo.insert("age_ms",
+              FlexData::make_uint(static_cast<uint64_t>(ms < 0 ? 0 : ms)));
+    a.push_back(std::move(e));
+  }
+  oo.insert("items", std::move(arr));
+  return o;
+}
+
+// SessionIntf's memory, by what holds it (the model manager's warm
+// holds and checkpoints, the wired pool, Metal's allocations).
+// Non-virtual, as reports() is.
+FlexData
+SessionIntf::memory_report() const
+{
+  FlexData o = FlexData::make_object();
+  const auto* s = dynamic_cast<const Session*>(this);
+  auto* mgr = s != nullptr ? s->generative_model_manager() : nullptr;
+  if (mgr == nullptr) {
+    return o;
+  }
+  auto oo = o.as_object();
+  FlexData warm = FlexData::make_array();
+  {
+    auto a = warm.as_array();
+    // Each hold's own whole hold, beside the report and in its order.
+    std::vector<std::optional<std::size_t>> held;
+    const auto report = mgr->warm_report(&held);
+    for (std::size_t i = 0; i < report.size(); ++i) {
+      const auto& w = report[i];
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("kind", FlexData::make_string(w.kind));
+      eo.insert("dir", FlexData::make_string(w.dir));
+      eo.insert("bytes", FlexData::make_uint(w.bytes));
+      // A language model's whole hold, where its load counted it (it
+      // loaded wired): absent otherwise, never a 0 that reads as empty.
+      if (i < held.size() && held[i].has_value()) {
+        eo.insert("held_bytes", FlexData::make_uint(*held[i]));
+      }
+      eo.insert("kv_bytes", FlexData::make_uint(w.kv_bytes));
+      eo.insert("seconds", FlexData::make_real(w.seconds));
+      a.push_back(std::move(e));
+    }
+  }
+  oo.insert("warm", std::move(warm));
+  FlexData weights = FlexData::make_array();
+  {
+    auto a = weights.as_array();
+    for (const auto& w : mgr->weight_report()) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("dir", FlexData::make_string(w.dir));
+      eo.insert("bytes", FlexData::make_uint(w.bytes));
+      eo.insert("mapped_bytes", FlexData::make_uint(w.mapped_bytes));
+      eo.insert("holders", FlexData::make_int(w.holders));
+      eo.insert("parked", FlexData::make_bool(w.parked));
+      a.push_back(std::move(e));
+    }
+  }
+  oo.insert("weights", std::move(weights));
+  // WHOSE the Metal allocations are (common/memory-owner.h): each owner's
+  // live bytes, use by use; and those made where nothing owned them.
+  {
+    std::uint64_t none = 0;
+    FlexData owned = FlexData::make_array();
+    auto a = owned.as_array();
+    for (const OwnedMemory& m : owned_memory(&none)) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("dir", FlexData::make_string(m.dir));
+      eo.insert("kind", FlexData::make_string(m.kind));
+      eo.insert("use", FlexData::make_string(memory_use_name(m.use)));
+      eo.insert("bytes", FlexData::make_uint(m.bytes));
+      a.push_back(std::move(e));
+    }
+    oo.insert("owned", std::move(owned));
+    oo.insert("unowned_bytes", FlexData::make_uint(none));
+  }
+  oo.insert("kv_bytes", FlexData::make_uint(mgr->resident_kv_bytes()));
+  oo.insert("pooled_bytes", FlexData::make_uint(mgr->pooled_bytes()));
+  oo.insert("wired_used", FlexData::make_uint(mgr->wired_pool_used()));
+  oo.insert("wired_limit", FlexData::make_uint(mgr->wired_pool_limit()));
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mc = s->metal_compute();
+  if (mc != nullptr && mc->valid()) {
+    oo.insert("gpu_allocated",
+              FlexData::make_uint(mc->memory_budget().allocated));
+  }
+#endif
+  return o;
+}
+
+uint64_t
+SessionIntf::reports_version() const
+{
+  const auto* s = dynamic_cast<const Session*>(this);
+  if (s == nullptr) {
+    return 0;
+  }
+  std::lock_guard<std::mutex> lk(s->_reports_mu);
+  return s->_report_id;
+}
+
+void
+SessionIntf::set_log_listener(LogListener listener)
+{
+  auto* s = dynamic_cast<Session*>(this);
+  if (s == nullptr) {
+    return;
+  }
+  auto l = listener ? std::make_shared<const LogListener>(std::move(listener))
+                    : nullptr;
+  std::lock_guard<std::mutex> lk(s->_listener_mu);
+  s->_listener = std::move(l);
 }
 
 UiInterruptToken
@@ -1214,6 +1719,39 @@ Session::set_wired_pool_mb(std::size_t mb)
 #else
   (void)mb;
   return Status{2};
+#endif
+}
+
+Status
+Session::set_swap_allowance_mb(std::size_t mb)
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mgr = generative_model_manager();
+  if (mgr == nullptr) {
+    warn(fmt("swap_allowance_mb: rejected -- no model manager in this build"));
+    return Status{2};
+  }
+  // No shrink rule and no clamp. The figure reserves nothing, so a
+  // lowered allowance costs a future preflight room and takes nothing
+  // back from a running one -- unlike the wired pool, where the bytes
+  // are already mlock'd and giving them back means unwiring buffers a
+  // model is still reading.
+  mgr->set_swap_allowance_bytes(mb << 20);
+  return Status{0};
+#else
+  (void)mb;
+  return Status{2};
+#endif
+}
+
+std::size_t
+Session::swap_allowance_mb() const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  auto* mgr = const_cast<Session*>(this)->generative_model_manager();
+  return mgr != nullptr ? mgr->swap_allowance_bytes() >> 20 : 0;
+#else
+  return 0;
 #endif
 }
 
@@ -1676,6 +2214,9 @@ Session::find_service(std::string_view id) const
   }
   if (id == ServiceId<metal_compute::MetalCompute>::value) {
     return metal_compute();
+  }
+  if (id == ServiceId<KernelTuningCache>::value) {
+    return kernel_tuning_cache();
   }
   return nullptr;
 }

@@ -49,9 +49,10 @@ struct TensorBeat;
 //   interactive (default). The stage publishes the reference image and
 //     the current mask to its editor panel and waits. On COMMIT it
 //     emits exactly one beat, then goes back to waiting -- so the
-//     stage is long-lived and one click means one beat. It does NOT
-//     retire when its inputs reach EOS: a still reference image is the
-//     normal case, and the editor must outlive it.
+//     stage is long-lived and one commit means one beat, however many
+//     arrive while it is busy. It does NOT retire when its inputs reach
+//     EOS: a still reference image is the normal case, and the editor
+//     must outlive it.
 //   interactive: false. No GUI at all. The mask arrives on in-mask,
 //     is overlaid / converted per the configuration, and is emitted as
 //     it arrives. The stage retires when its inputs do.
@@ -64,6 +65,19 @@ struct TensorBeat;
 // register regardless of their resolutions. An overlay output is
 // produced at the REFERENCE image's resolution with the mask stretched
 // onto it; a mask output keeps the canvas resolution.
+//
+// COMMANDS (docs/STAGE-COMMANDS.md). A commit is a stage COMMAND, not
+// something only the GUI can do: the editor panel sends `commit` with
+// the PNG it painted, and a program -- the C++ API, Python -- sends the
+// same command with the mask as samples.
+//   commit   in `mask` (u8 / f32, [1,H,W] or [H,W]) or `png`: replace
+//            the mask and emit one beat. Replies once the beat is out.
+//   release  emit the current mask again, unchanged.
+//   read     the current mask [1,H,W] and reference image [H,W,3], in
+//            place; the stage does nothing else until it is closed.
+// Commands are served in both modes: headless, a commit is one more
+// mask arriving, and the stage ends -- refusing what is still queued --
+// once its inputs have.
 //
 // iport 0: ref-image -- planar RGB TensorBeat [3,H,W] (F32 or U8).
 //          Optional: the editor's background, the overlay's base. With
@@ -102,6 +116,8 @@ public:
   Job process(RuntimeContext& ctx) override;
 
   const StageSpec& spec() const noexcept override;
+
+  void reset_run_state() override { _emitted = 0; }
 
   std::shared_ptr<MaskEditorChannel> mask_channel() const override
   { return _channel; }
@@ -173,8 +189,13 @@ private:
   // normalise it to one byte per sample at `*w` x `*h`. False on a
   // malformed or undecodable payload -- a bad commit is dropped, never
   // fatal.
-  bool decode_commit_(const std::vector<std::uint8_t>& png,
+  bool decode_commit_(const std::uint8_t* png, std::size_t n,
                       std::vector<std::uint8_t>* out, int* w, int* h);
+
+  // Answer one command (see COMMANDS above), and emit the current mask
+  // as one beat on behalf of one.
+  Job serve_(RuntimeContext& ctx, std::shared_ptr<StageCommand> cmd);
+  Job emit_(RuntimeContext& ctx, std::shared_ptr<StageCommand> cmd);
 
   // Bring the canvas up to date with what is now known about the
   // geometry, carrying an existing mask across a size change rather
@@ -201,6 +222,8 @@ private:
   int          _cfg_w = 0, _cfg_h = 0;
   bool         _interactive      = true;
   bool         _input_normalized = true;
+  // Binary mode: an in-mask value at or above this is set.
+  std::uint8_t _mask_threshold   = 1;
   std::string  _title;
 
   // Reference image, packed RGB24 at its own size.
@@ -220,9 +243,12 @@ private:
   SwsContext*     _sws     = nullptr;
   bool            _dec_bad = false;
 
-  std::uint64_t _seen_commit = 0;
+  std::uint64_t _emitted = 0;   // beats emitted by commands this run
   bool _roles_resolved = false;
   bool _want_ref       = false;
+  // Headless: a mask beat not yet written (an overlay waiting for its
+  // first reference image).
+  bool _out_pending    = false;
   bool _want_mask      = false;
   bool _torn           = false;
   bool _warned_idle    = false;

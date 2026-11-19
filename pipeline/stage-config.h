@@ -2,12 +2,17 @@
 #define STAGE_CONFIG_H
 
 #include "common/flex-data.h"
+#include "pipeline/spec-extra.h"
 
 #include <cstdint>
 #include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -45,6 +50,10 @@ std::string_view config_type_name(ConfigType) noexcept;
 // (Array/Object) default to an empty container; required keys default
 // to Null. All string_view members must point at static storage
 // (string literals) -- the table outlives every stage instance.
+//
+// Its growth seam, `extra`, is a span of SpecExtra: see
+// pipeline/spec-extra.h.
+
 struct ConfigKey {
   std::string_view key;
   ConfigType       type     = ConfigType::Any;
@@ -72,6 +81,28 @@ struct ConfigKey {
   // type it can actually load. Ignored when suggest_db is unset.
   std::string_view suggest_db_type = {};
 
+  // Optional: the name of a SHARED-MODEL CHANNEL this key belongs to.
+  //
+  // A channel is one model reference travelling from a source stage
+  // (model-select) to every stage that latches it on a `model` iport.
+  // Both ends name the channel here, and the difference between them is
+  // whether they have a suggest_db_type of their own:
+  //
+  //   CONSUMER -- names the channel AND lists the model_types it can
+  //     actually run. Its own picker keeps that narrower list, because
+  //     generate-image cannot run a video family and vice versa.
+  //   SOURCE -- names the channel and leaves suggest_db_type EMPTY.
+  //     resolve_config_params() fills it with the UNION over every
+  //     registered consumer of the channel.
+  //
+  // Derived rather than written down because the source cannot know the
+  // consumers: a PLUGIN registers stages after this table is compiled,
+  // and a hard-coded list at the source is a list that is wrong the
+  // moment a plugin ships a family. It was: minimax-h3-fl2va ran a whole
+  // text-to-video graph while being unpickable, and every out-of-tree
+  // family was unpickable by construction.
+  std::string_view model_channel = {};
+
   // Optional companions to suggest_db: required input / output modalities
   // (comma-separated subset of "text","image","audio","video"). The web-ui
   // model browser keeps only models whose catalogue I/O covers these -- a
@@ -87,7 +118,12 @@ struct ConfigKey {
   // Only meaningful for String keys (or an Array of path strings). NOTE:
   // model-manager paths (hf_dir, model_path, ...) are deliberately NOT
   // flagged here -- they are sandbox-exempt and get a model picker
-  // instead of the sandbox browser.
+  // instead of the sandbox browser. The exception is an ADAPTER field
+  // (`lora`, `lora2`): it sets BOTH this and suggest_db, and the editor
+  // offers both pickers, because a LoRA is as often a downloaded file as
+  // a catalogued model. Its value is then either a registry key or a
+  // path, and resolve_adapter_file() takes both -- a sandbox-relative
+  // path from the browser included.
   bool             is_path    = false;
   // When is_path: true, this path is WRITTEN (a save target) rather than
   // read; the browser opens in "save" mode (offers a filename field).
@@ -96,8 +132,8 @@ struct ConfigKey {
   // anything else (empty) selects a file. Static storage.
   std::string_view path_kind  = {};
   // When is_path: an optional filter category the browser maps to a set
-  // of extensions ("image", "audio", "video", "text"); empty = no
-  // filter (all files). Static storage.
+  // of extensions ("image", "audio", "video", "text", "weights" for
+  // .safetensors); empty = no filter (all files). Static storage.
   //
   // COMMA-SEPARATED for a field that takes more than one kind
   // ("image,video,audio"): the dialog offers the union first and the
@@ -105,7 +141,29 @@ struct ConfigKey {
   // which kind a given file is -- video-ref-encoder's reference list
   // reads that from the file itself.
   std::string_view path_filter = {};
+  // Anything this struct has no field for -- a span of
+  // {name, value} pairs over static storage. See SpecExtra in
+  // pipeline/stage-spec.h for why new metadata goes here rather than
+  // into a new member: this aggregate is built by PLUGINS, so a field
+  // added here moves a layout they already compiled.
+  std::span<const SpecExtra> extra;
 };
+
+// Contribute model_types to a shared-model channel at RUN TIME.
+//
+// The ConfigKey side of a channel covers a plugin that brings its own
+// stage: it declares what it runs and the union picks it up. It does
+// NOT cover the other plugin shape -- a family that plugs into an
+// EXISTING stage's own registry. LTX-2.5 registers a video family with
+// generate-video and a VAE family with vae-decode, so those stages run
+// it while their suggest_db_type, written when this tree was compiled,
+// cannot name it.
+//
+// So the family registries call this, and a plugin that registers a
+// family gets a working picker without knowing this exists. Idempotent
+// per (channel, type); order of first appearance is preserved.
+void register_channel_types(std::string_view channel,
+                            std::string_view csv_model_types);
 
 // Per-instance resolved descriptor: one ConfigKey paired with the
 // value the stage instance was actually given. `default_value` is the
@@ -130,6 +188,12 @@ struct ConfigParam {
   // required I/O modalities the model browser filters on.
   std::string need_inputs;
   std::string need_outputs;
+  // The fixed set of values this key accepts, from its "choices" extra
+  // (empty when it has none). Split and de-duplicated here so every
+  // reader gets the same list rather than re-parsing the CSV. A real
+  // member because ConfigParam is the HOST's own type -- unlike
+  // ConfigKey, which plugins compile against.
+  std::vector<std::string> choices;
   // Mirror ConfigKey's filesystem-path hints (see there). is_path drives
   // the editor's "Browse..." affordance; path_write / path_kind /
   // path_filter shape the file dialog.
@@ -167,5 +231,7 @@ resolve_config_params(std::span<const ConfigKey> spec,
 FlexData config_params_to_flex(const std::vector<ConfigParam>& params);
 
 }
+
+VPIPE_API_END
 
 #endif

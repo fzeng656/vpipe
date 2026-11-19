@@ -1,6 +1,7 @@
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 
 #include <algorithm>
+#include <utility>
 #include <cmath>
 
 namespace vpipe {
@@ -91,6 +92,9 @@ audio_latent_num_frames(int num_frames, double fps, int latents_per_second)
 std::vector<double>
 spatial_position_grid(int dim, int patch, double sqrt_area)
 {
+  // numpy rounds `i * step` and then `+ start`; a fused multiply-add
+  // rounds once, and lands an ulp away on a third of the grid.
+#pragma clang fp contract(off)
   std::vector<double> grid;
   if (dim <= 0 || patch <= 0 || !(sqrt_area > 0.0)) { return grid; }
   const int num = dim / patch;
@@ -98,10 +102,17 @@ spatial_position_grid(int dim, int patch, double sqrt_area)
   const double ratio = (double)dim / sqrt_area;
   const double left  = (1.0 - ratio) / 2.0;
   // numpy linspace(start, stop, num, endpoint=False):
-  //   start + arange(num) * (stop - start) / num, with stop - start =
-  //   ratio. torch.linspace divides by num-1 and includes the endpoint,
-  //   so it is a different grid -- not a rounding difference.
-  const double step = ratio / (double)num;
+  //   start + arange(num) * ((stop - start) / num). torch.linspace
+  //   divides by num-1 and includes the endpoint, so it is a different
+  //   grid -- not a rounding difference.
+  //
+  // The step is (stop - start) as numpy computes it -- from the ROUNDED
+  // stop, `left + ratio` -- not `ratio` itself: the two differ in the
+  // last bit of a double, which is invisible once the rope rounds the
+  // position to float32, but it is what keeps a layout comparable to the
+  // reference's bit for bit.
+  const double right = left + ratio;
+  const double step  = (right - left) / (double)num;
   grid.reserve((std::size_t)num);
   for (int i = 0; i < num; ++i) {
     grid.push_back((left + (double)i * step) * (double)kRopeSpatialScale);
@@ -123,13 +134,106 @@ temporal_position_grid(int num_latent_frames, double origin)
   return grid;
 }
 
+int
+guide_pixel_frames(int num_latent_frames)
+{
+  int frames = 0;
+  for (int i = 0; i < num_latent_frames; ++i) {
+    frames += kRopeFramesPerLatent[i % 5];
+  }
+  return frames;
+}
+
+void
+patchify_latent_frames(const float* latent, int z, int total_frames,
+                       int first, int count, int lh, int lw, int patch_h,
+                       int patch_w, float* rows)
+{
+  const int gh = lh / patch_h, gw = lw / patch_w;
+  const std::size_t PE = (std::size_t)z * patch_h * patch_w;
+  const std::size_t plane = (std::size_t)lh * lw;
+  for (int t = 0; t < count; ++t) {
+    for (int cell = 0; cell < gh * gw; ++cell) {
+      float* row = rows + ((std::size_t)t * gh * gw + cell) * PE;
+      const int by = (cell / gw) * patch_h;
+      const int bx = (cell % gw) * patch_w;
+      for (int ch = 0; ch < z; ++ch) {
+        const float* src =
+            latent + ((std::size_t)ch * total_frames + (first + t)) * plane;
+        for (int y = 0; y < patch_h; ++y) {
+          for (int x = 0; x < patch_w; ++x) {
+            row[((std::size_t)ch * patch_h + y) * patch_w + x] =
+                src[(std::size_t)(by + y) * lw + (bx + x)];
+          }
+        }
+      }
+    }
+  }
+}
+
+void
+unpatchify_latent_rows(const float* rows, int n_rows, int z, int frames,
+                       int lh, int lw, int patch_h, int patch_w,
+                       std::vector<float>* out)
+{
+  const int gh = lh / patch_h, gw = lw / patch_w;
+  const std::size_t PE = (std::size_t)z * patch_h * patch_w;
+  const std::size_t plane = (std::size_t)lh * lw;
+  out->assign((std::size_t)z * frames * plane, 0.0f);
+  for (int r = 0; r < n_rows; ++r) {
+    const float* row = rows + (std::size_t)r * PE;
+    const int cell = r % (gh * gw);
+    const int t    = r / (gh * gw);
+    if (t >= frames) { break; }
+    const int by = (cell / gw) * patch_h, bx = (cell % gw) * patch_w;
+    for (int ch = 0; ch < z; ++ch) {
+      for (int y = 0; y < patch_h; ++y) {
+        for (int x = 0; x < patch_w; ++x) {
+          (*out)[(std::size_t)ch * frames * plane + (std::size_t)t * plane +
+                 (std::size_t)(by + y) * lw + (bx + x)] =
+              row[((std::size_t)ch * patch_h + y) * patch_w + x];
+        }
+      }
+    }
+  }
+}
+
+void
+pack_audio_latent_rows(const float* audio, int channels, int stride,
+                       int latents, float* rows)
+{
+  for (int s = 0; s < 2; ++s) {
+    for (int i = 0; i < latents; ++i) {
+      float* row = rows + ((std::size_t)s * latents + i) * channels;
+      for (int k = 0; k < channels; ++k) {
+        row[k] = audio[((std::size_t)s * channels + k) * stride + i];
+      }
+    }
+  }
+}
+
+void
+unpack_audio_latent_rows(const float* rows, int channels, int latents,
+                         std::vector<float>* out)
+{
+  out->assign((std::size_t)2 * channels * latents, 0.0f);
+  for (int s = 0; s < 2; ++s) {
+    for (int i = 0; i < latents; ++i) {
+      const float* row = rows + ((std::size_t)s * latents + i) * channels;
+      for (int k = 0; k < channels; ++k) {
+        (*out)[((std::size_t)s * channels + k) * latents + i] = row[k];
+      }
+    }
+  }
+}
+
 bool
 build_packed_sequence(const std::vector<int>& text_token_tags,
                       int num_latent_frames, int latent_height,
                       int latent_width, int num_audio_latents, int patch_h,
                       int patch_w, int audio_channels,
                       const std::vector<Anchor>& keyframe_anchors,
-                      PackedLayout* out)
+                      PackedLayout* out, const std::vector<Guide>& guides)
 {
   if (out == nullptr) { return false; }
   if (num_latent_frames <= 0 || latent_height <= 0 || latent_width <= 0 ||
@@ -140,15 +244,41 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   if (latent_height % patch_h != 0 || latent_width % patch_w != 0) {
     return false;
   }
+  // A guide lies INSIDE the clip: its frames end by the last, its audio
+  // by the soundtrack's end. One that does not is a request for rows at
+  // times no generated row has, which the model was never shown.
+  const int clip_frames = guide_pixel_frames(num_latent_frames);
+  int num_guide_video = 0;
+  int num_guide_audio = 0;
+  for (const Guide& g : guides) {
+    if (g.frame < 0 || g.num_latent_frames < 0 ||
+        g.num_audio_latents < 0 ||
+        (g.num_latent_frames == 0 && g.num_audio_latents == 0)) {
+      return false;
+    }
+    if (g.frame + guide_pixel_frames(g.num_latent_frames) > clip_frames) {
+      return false;
+    }
+    const double a0 = kRopeFrameRescale * (double)g.frame;
+    if (a0 + (double)g.num_audio_latents >
+        (double)num_audio_latents + 1e-9) {
+      return false;
+    }
+    num_guide_video += g.num_latent_frames;
+    num_guide_audio += g.num_audio_latents;
+  }
 
   const int ph = latent_height / patch_h;
   const int pw = latent_width / patch_w;
   const int rows_per_frame = ph * pw;
   const int num_text = (int)text_token_tags.size();
-  const int num_cond = (int)keyframe_anchors.size() * rows_per_frame;
+  const int num_cond =
+      ((int)keyframe_anchors.size() + num_guide_video) * rows_per_frame;
+  const int num_cond_audio = num_guide_audio * audio_channels;
   const int num_audio_rows = num_audio_latents * audio_channels;
   const int num_video_rows = num_latent_frames * rows_per_frame;
-  const int seq = num_text + num_cond + num_audio_rows + num_video_rows;
+  const int seq = num_text + num_cond + num_cond_audio + num_audio_rows +
+                  num_video_rows;
   if (seq <= 0) { return false; }
 
   PackedLayout L;
@@ -156,7 +286,8 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   L.num_text_rows      = num_text;
   L.condition_start    = num_text;
   L.num_condition_rows = num_cond;
-  L.audio_start        = num_text + num_cond;
+  const int cond_audio_start = num_text + num_cond;
+  L.audio_start        = cond_audio_start + num_cond_audio;
   L.num_audio_rows     = num_audio_rows;
   L.video_start        = L.audio_start + num_audio_rows;
   L.num_video_rows     = num_video_rows;
@@ -212,6 +343,40 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
     }
   }
 
+  // 3b. The guides, after the anchors: a guide's latent frames on the
+  // target's spatial grid at the rotary times of the target frames they
+  // stand for -- `frame` * 5/3 past the text, then their own spans --
+  // and its audio latents on the shared clock from the same origin, as
+  // a stereo pair pinned to the width grid's extremes like every
+  // soundtrack.
+  {
+    int vrow = L.condition_start +
+               (int)keyframe_anchors.size() * rows_per_frame;
+    int arow = cond_audio_start;
+    for (const Guide& g : guides) {
+      const double origin =
+          (double)num_text + kRopeFrameRescale * (double)g.frame;
+      const std::vector<double> gt =
+          temporal_position_grid(g.num_latent_frames, origin);
+      for (int f = 0; f < g.num_latent_frames; ++f) {
+        for (int r = 0; r < rows_per_frame; ++r) {
+          pos(vrow + r, 0) = gt[(std::size_t)f];
+          pos(vrow + r, 1) = frame_h(r);
+          pos(vrow + r, 2) = frame_w(r);
+        }
+        vrow += rows_per_frame;
+      }
+      for (int c = 0; c < audio_channels; ++c) {
+        for (int i = 0; i < g.num_audio_latents; ++i) {
+          const int row = arow + c * g.num_audio_latents + i;
+          pos(row, 0) = origin + (double)i;
+          pos(row, 2) = (c == 0) ? w_grid.front() : w_grid.back();
+        }
+      }
+      arow += g.num_audio_latents * audio_channels;
+    }
+  }
+
   // 4. Audio rows are CHANNEL-MAJOR and share the video's rotary clock --
   // one unit per latent, since 40 latents/s is exactly 24 fps * 5/3. They
   // carry NO height coordinate and are pinned to the two extremes of the
@@ -244,8 +409,8 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   for (int i = 0; i < num_text; ++i) {
     L.token_tags[(std::size_t)i] = text_token_tags[(std::size_t)i];
   }
-  for (int i = 0; i < num_audio_rows; ++i) {
-    L.token_tags[(std::size_t)(L.audio_start + i)] = kAudioTag;
+  for (int i = 0; i < num_cond_audio + num_audio_rows; ++i) {
+    L.token_tags[(std::size_t)(cond_audio_start + i)] = kAudioTag;
   }
   L.video_indices.reserve((std::size_t)(num_cond + num_video_rows));
   for (int i = 0; i < num_cond; ++i) {
@@ -260,9 +425,12 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   // have to know which task built the layout. Here every modality is
   // one range (video two), which is exactly what `ref2va` stops being
   // true.
-  L.audio_indices.reserve((std::size_t)num_audio_rows);
-  for (int i = 0; i < num_audio_rows; ++i) {
-    L.audio_indices.push_back(L.audio_start + i);
+  // A guide's audio rows lead the audio indices -- conditioning first,
+  // as everywhere -- and are adjacent to the generated ones, so the two
+  // are one run.
+  L.audio_indices.reserve((std::size_t)(num_cond_audio + num_audio_rows));
+  for (int i = 0; i < num_cond_audio + num_audio_rows; ++i) {
+    L.audio_indices.push_back(cond_audio_start + i);
   }
   if (num_cond > 0) {
     L.video_runs.push_back({L.condition_start, num_cond});
@@ -270,11 +438,13 @@ build_packed_sequence(const std::vector<int>& text_token_tags,
   if (num_video_rows > 0) {
     L.video_runs.push_back({L.video_start, num_video_rows});
   }
-  if (num_audio_rows > 0) {
-    L.audio_runs.push_back({L.audio_start, num_audio_rows});
+  if (num_cond_audio + num_audio_rows > 0) {
+    L.audio_runs.push_back({cond_audio_start,
+                            num_cond_audio + num_audio_rows});
   }
   L.num_condition_video_rows = num_cond;
-  L.num_condition_audio_rows = 0;
+  L.num_condition_audio_rows = num_cond_audio;
+  L.ref2va                   = false;
 
   *out = std::move(L);
   return true;
@@ -288,7 +458,11 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
                              int patch_h, int patch_w, int audio_channels,
                              PackedLayout* out)
 {
-  if (out == nullptr || references.empty()) { return false; }
+  // An empty list is NOT refused. It is the prompt-only form, and it
+  // falls out of the general case with no branch: the reference loop
+  // below places nothing, so the generated rows start where the text
+  // ends and the layout is `t2va`'s row for row (the test pins that).
+  if (out == nullptr) { return false; }
   if (num_latent_frames <= 0 || latent_height <= 0 || latent_width <= 0 ||
       patch_h <= 0 || patch_w <= 0 || audio_channels <= 0 ||
       num_audio_latents < 0) {
@@ -504,6 +678,7 @@ build_ref2va_packed_sequence(const std::vector<int>& text_token_tags,
 
   L.num_condition_video_rows = num_ref_video;
   L.num_condition_audio_rows = num_ref_audio;
+  L.ref2va                   = true;
 
   *out = std::move(L);
   return true;
@@ -549,6 +724,57 @@ build_row_timesteps(const PackedLayout& layout, float video_timestep,
                    uniq.begin());
   }
   *timesteps_out = std::move(uniq);
+  *row_index_out = std::move(idx);
+}
+
+void
+build_row_time_pairs(const PackedLayout& layout, float video_timestep,
+                     float video_endpoint, float audio_timestep,
+                     float audio_endpoint, float condition_video_timestep,
+                     std::vector<float>* timesteps_out,
+                     std::vector<float>* endpoints_out,
+                     std::vector<int>* row_index_out,
+                     float condition_audio_timestep)
+{
+  if (timesteps_out == nullptr || endpoints_out == nullptr ||
+      row_index_out == nullptr) {
+    return;
+  }
+  const std::size_t seq = (std::size_t)layout.seq_len;
+  using Pair = std::pair<float, float>;
+  std::vector<Pair> row(seq, Pair{video_timestep, video_endpoint});
+  // The same three overrides, in the same order, as build_row_timesteps
+  // -- the rule for which rows are pinned is unchanged; only what a row
+  // carries grew.
+  const int ncv = layout.num_condition_video_rows;
+  const int nca = layout.num_condition_audio_rows;
+  for (int i = 0; i < ncv && i < (int)layout.video_indices.size(); ++i) {
+    row[(std::size_t)layout.video_indices[(std::size_t)i]] =
+        Pair{condition_video_timestep, condition_video_timestep};
+  }
+  for (int i = nca; i < (int)layout.audio_indices.size(); ++i) {
+    row[(std::size_t)layout.audio_indices[(std::size_t)i]] =
+        Pair{audio_timestep, audio_endpoint};
+  }
+  for (int i = 0; i < nca && i < (int)layout.audio_indices.size(); ++i) {
+    row[(std::size_t)layout.audio_indices[(std::size_t)i]] =
+        Pair{condition_audio_timestep, condition_audio_timestep};
+  }
+
+  std::vector<Pair> uniq = row;
+  std::sort(uniq.begin(), uniq.end());
+  uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+  std::vector<int> idx(seq, 0);
+  for (std::size_t i = 0; i < seq; ++i) {
+    idx[i] = (int)(std::lower_bound(uniq.begin(), uniq.end(), row[i]) -
+                   uniq.begin());
+  }
+  timesteps_out->resize(uniq.size());
+  endpoints_out->resize(uniq.size());
+  for (std::size_t i = 0; i < uniq.size(); ++i) {
+    (*timesteps_out)[i] = uniq[i].first;
+    (*endpoints_out)[i] = uniq[i].second;
+  }
   *row_index_out = std::move(idx);
 }
 

@@ -8,12 +8,14 @@
 // Env: VPIPE_KREA2_TEST_MODEL_PATH = the Krea-2-Turbo model root (uses
 // <root>/transformer), VPIPE_KREA2_GOLDEN = the golden dir. Skips if unset.
 
+#include "ane-int8-expected.h"
 #include "minitest.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
 #include "common/flex-data.h"
+#include "common/perf-flops.h"
 #include "generative-models/krea2/metal-krea2-transformer.h"
 
 #include <chrono>
@@ -24,6 +26,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace vpipe;
@@ -187,6 +190,110 @@ TEST(krea2_dit, text_fusion_mma_matches_steel)
 // mma path writes into `joint` at an ELEMENT OFFSET) plus the block q/k/v/gate/
 // o + SwiGLU projections through gemm_mma_. stream_blocks=true keeps the full
 // 28-block DiT off the heap; only blocks 0..1 are read from the source mmap.
+// STREAMED must equal PRELOADED, byte for byte.
+//
+// The streaming path reads each block into a reusable slot with pread
+// and issues the next block's read under the current block's GPU work
+// (shared/block-slots.h). That moves where the bytes come from and when
+// they arrive; it must not move a single bit of the result.
+//
+// This model is the case with the sharpest trap in it: its RMSNorm
+// weights are stored ZERO-CENTRED and folded to (1 + w) at load, so
+// the bytes in the destination are not the bytes in the checkpoint. A
+// raw refill would place the checkpoint's and be silently wrong -- the
+// buffer is the right size and full of plausible numbers. Those tensors
+// are marked kDerived; this test is what says so.
+//
+// Runs blocks 0..1 in tap mode: enough to exercise the slot pair, the
+// prefetch and the refill without the 28-block residual compounding
+// that random inputs amplify.
+TEST(krea2_dit, streamed_matches_preloaded)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config cfg;
+  const int HID = cfg.hidden, IC = cfg.in_channels;
+  const int text_seq = 128, grid = 8;
+  const int img_seq = grid * grid;
+  // Two blocks by default -- enough to exercise the slot pair, the
+  // prefetch and the refill without a 28-block read on every run.
+  // VPIPE_KREA2_STREAM_BLOCKS=-1 runs the whole stack, which is what a
+  // TIMING comparison needs: with two blocks the one-off allocation of
+  // the second slot is most of what is being measured.
+  int stop = 1;
+  if (const char* sb = std::getenv("VPIPE_KREA2_STREAM_BLOCKS")) {
+    stop = std::atoi(sb);
+  }
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x0badf00du;
+  auto fill = [&](std::vector<float>& v, float amp) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = ((float)(s >> 9) / 4194304.0f - 1.0f) * amp;
+    }
+  };
+  fill(txt, 1.0f);
+  fill(lat, 1.0f);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = stop >= 0
+      ? (std::size_t)(text_seq + img_seq) * HID
+      : (std::size_t)img_seq * cfg.in_channels;
+
+  double fwd_s = 0.0;
+  auto run = [&](bool stream, std::vector<float>& out) -> bool {
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, stream);
+    if (m == nullptr) { return false; }
+    const auto t0 = std::chrono::steady_clock::now();
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    fwd_s = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+    if (o.empty() || o.byte_size() < n * 2) { return false; }
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    out.resize(n);
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return true;
+  };
+
+  std::vector<float> pre, str;
+  ASSERT_TRUE(run(false, pre));
+  const double pre_s = fwd_s;
+  ASSERT_TRUE(run(true, str));
+  std::printf("[krea2_dit] forward: preloaded %.1f s, streamed %.1f s "
+              "(slots %s)\n", pre_s, fwd_s,
+              std::getenv("VPIPE_KREA2_NO_SLOTS") != nullptr ? "OFF" : "on");
+
+  std::size_t diff = 0;
+  double worst = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    if (pre[i] != str[i]) {
+      ++diff;
+      worst = std::max(worst, (double)std::fabs(pre[i] - str[i]));
+    }
+  }
+  std::printf("[krea2_dit] streamed vs preloaded: %zu of %zu differ "
+              "(worst %.3e)\n", diff, n, worst);
+  EXPECT_TRUE(diff == 0);
+
+  if (const char* out = std::getenv("VPIPE_KREA2_STREAM_DUMP")) {
+    std::ofstream f(out, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(str.data()),
+            (std::streamsize)(str.size() * sizeof(float)));
+  }
+}
+
 TEST(krea2_dit, forward_dit_mma_matches_steel)
 {
   const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
@@ -320,6 +427,160 @@ TEST(krea2_dit, forward_dit_i8_matches_f16)
   EXPECT_TRUE(std::isfinite(r) && r < 0.10);
 }
 
+// SOL-ATTN OVER THE JOINT SEQUENCE, and the two things that have to be
+// true of any routing tier before its speed is worth discussing.
+//
+// 1. TURNING IT ON MUST NOT MOVE THE LAYERS IT DOES NOT ROUTE. With
+//    `sol_dense_layers` covering every block the answer has to be
+//    BYTE-IDENTICAL to the tier being off -- same kernel, same rounding.
+//    That is the ablation which says the filter works, and it is also
+//    the bug H3 hit: forcing the routed path off globally sent the dense
+//    layers to the scalar kernel, 19x slower, looking exactly like the
+//    new kernels being slow.
+//
+// 2. WHEN IT DOES ROUTE, THE ANSWER MOVES AND STAYS FINITE. An
+//    approximation that changed nothing would mean the routing kept
+//    everything (or ran nothing at all), and a NaN would mean the merge
+//    lost a partial.
+//
+// The geometry is the i8 test's: joint 1088 tokens is 17 routing blocks
+// at the default key block, which clears the 16-block floor forward_dit
+// applies. Below that the local band, the sink and the always-exact tail
+// cover nearly the whole sequence and the tier declines -- so a smaller
+// grid here would assert on a path that never engaged.
+TEST(krea2_dit, sol_attn_routes_the_joint_attention)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  // THE GRID IS SWEEPABLE TOO, and it matters more than it looks. At
+  // grid 32 the joint sequence is 1088 tokens = 17 routing blocks, and
+  // the local band, the sink and the always-exact tail already force
+  // most of them exact -- so the THRESHOLD decides very few blocks and
+  // tau reads as nearly inert (0.033-0.037 rel-L2 from tau 0.5 to 1.5).
+  // That is a property of the fixture, not of tau. VPIPE_KREA2_SOL_GRID
+  // =64 gives joint 4160 = 65 routing blocks, the regime a real 1024^2
+  // generation is in.
+  const char* genv = std::getenv("VPIPE_KREA2_SOL_GRID");
+  const int text_seq = 64;
+  const int grid = (genv != nullptr && *genv != '\0') ? std::atoi(genv) : 32;
+  const int img_seq = grid * grid;
+  // HOW MANY BLOCKS ACTUALLY ROUTE, which is the quietest limit on what
+  // this test can say. `stop = 1` runs blocks 0..1 and the default
+  // `dense_layers = 1` leaves block 0 dense -- so ONE routed block
+  // carries the whole measurement, and a tau curve drawn from it can be
+  // the behaviour of a single block's proxy score rather than of tau.
+  // VPIPE_KREA2_SOL_STOP raises it; error compounds with depth, so the
+  // numbers are comparable only at equal depth.
+  const char* senv = std::getenv("VPIPE_KREA2_SOL_STOP");
+  const int stop = (senv != nullptr && *senv != '\0') ? std::atoi(senv) : 1;
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x50173a7bu;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = ((float)(s >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)(text_seq + img_seq) * HID;
+
+  // TAU IS SWEEPABLE FROM THE ENVIRONMENT, because this is the cheap
+  // instrument for the question "what does tau do": ~10 s and a small
+  // footprint at seq 1088, against ~7 minutes and a 15 GB peak for one
+  // 1024^2 image. Default 1.0, which is the shipped value and what the
+  // assertions below are written against.
+  const char* tenv = std::getenv("VPIPE_KREA2_SOL_TAU");
+  const float tau = (tenv != nullptr && *tenv != '\0')
+                        ? (float)std::atof(tenv) : 1.0f;
+  auto run = [&](bool on, int dense_layers) {
+    MetalKrea2Transformer::Config cfg;
+    cfg.sol.enabled      = on;
+    cfg.sol.tau          = tau;
+    cfg.sol.dense_layers = dense_layers;
+    cfg.sol.key_block    = 64;
+    cfg.sol.local_radius = 1;
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, /*stream_blocks=*/true);
+    std::vector<float> out;
+    if (m == nullptr) { return out; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (o.empty() || o.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  // COULD THE BASELINE EVEN RUN? minitest's ASSERT_TRUE records a
+  // failure and keeps going, so asserting on the arms below against an
+  // empty baseline would report a Sol bug where the truth is that no
+  // forward happened at all -- a checkpoint this box cannot load, or a
+  // geometry it cannot fit. Say which, and stop.
+  const std::vector<float> off = run(false, 0);
+  if (off.empty()) {
+    std::printf("[krea2_dit] sol: the dense baseline produced no forward "
+                "(load or geometry); nothing to compare\n");
+    ASSERT_TRUE(!off.empty());
+    return;
+  }
+
+  // ALL DENSE: the tier is on and routes nothing, so every block runs
+  // the attention it would have run anyway. Exact equality, not a
+  // tolerance -- a difference here is the tier disturbing layers it was
+  // told to leave alone.
+  const std::vector<float> all_dense = run(true, base.n_layers);
+  ASSERT_TRUE(all_dense.size() == off.size());
+  std::size_t diff = 0;
+  for (std::size_t i = 0; i < off.size(); ++i) {
+    if (off[i] != all_dense[i]) { ++diff; }
+  }
+  std::printf("[krea2_dit] sol all-dense vs off: %zu of %zu elements differ\n",
+              diff, off.size());
+  EXPECT_TRUE(diff == 0);
+
+  // ROUTED: both blocks this forward runs are routed.
+  const std::vector<float> routed = run(true, 0);
+  ASSERT_TRUE(routed.size() == off.size());
+  const double r = rel_l2_(routed.data(), off.data(), routed.size());
+  // REALIZED SPARSITY BESIDE THE ERROR, because rel-L2 alone cannot say
+  // whether a tau did nothing because the threshold was loose or because
+  // the local band and the sink had already kept everything. Sol counts
+  // steel key blocks, so `kept` is in those units and the fraction is
+  // what a speed claim would have to be built on.
+  // The routed arm above runs with dense_layers = 0, so every block this
+  // forward executes is routed. Say that from the arm's own setting
+  // rather than from `base`, whose sol.dense_layers is the shipped
+  // default (1) and would misreport it for every arm.
+  std::printf("[krea2_dit] sol routed vs dense rel-L2 = %.6g (seq=%d, "
+              "grid=%d, tau=%.2f, %d routing blocks, %d routed layer(s))\n",
+              r, text_seq + img_seq, grid, (double)tau,
+              (text_seq + img_seq + 63) / 64, stop + 1);
+  EXPECT_TRUE(std::isfinite(r));
+  // It approximated something...
+  EXPECT_TRUE(r > 1e-5);
+  // ...but it is still attention over the same sequence, not noise. The
+  // bar is loose on purpose: realized sparsity is a property of the
+  // activations, and two blocks of a 28-block stack is not a quality
+  // claim about a generated image.
+  EXPECT_TRUE(r < 0.5);
+}
+
 // Reference-image conditioning (Qwen-Image-Edit multi-reference): forward_dit
 // with reference latents (a) still emits ONLY the generated-token velocity
 // [img_seq, in_channels] (refs dropped from the output), (b) stays finite with
@@ -328,6 +589,240 @@ TEST(krea2_dit, forward_dit_i8_matches_f16)
 // on the RoPE and folded into the joint attention. A dead ref path would give a
 // byte-identical result. Note: this checks the MECHANISM is wired, not that a
 // text-to-image checkpoint semantically uses references. Same random inputs.
+// The ANE feed-forward, against the same forward with the tier off.
+//
+// Rows are independent in a feed-forward, so giving the ANE a band of
+// them is EXACT arithmetic -- the only difference is fp16 on the ANE
+// against bf16 on the GPU, and that is safe here because the FFN is
+// self-contained: only its output re-enters the residual stream, and
+// that addition stays on the GPU. So this is a PRECISION comparison,
+// not a correctness one, and a broken split (wrong rows, wrong offset,
+// stale `o`) lands nowhere near the bar.
+//
+// Runs on the shared runtime-weight module the tier uses -- compiled once
+// per shape (cached after the first), weights staged per block into
+// IOSurface slots -- so it needs no templates and bakes nothing. Capped at
+// the two blocks `stop` runs.
+TEST(krea2_dit, forward_dit_ane_matches_gpu)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  // Default grid 64 == 1024x1024, seq 4160: the ANE path is CHUNKED at
+  // 2048 rows, so a smaller grid gives it fewer than one whole chunk
+  // and the tier correctly switches itself off -- which this test then
+  // reads as "the tier did nothing", because it asserts the two runs
+  // DIFFER.
+  const char* gs = std::getenv("VPIPE_KREA2_ANE_GRID");
+  const int text_seq = 64;
+  const int grid = (gs != nullptr) ? std::atoi(gs) : 64;
+  const int img_seq = grid * grid;
+  const int stop = 1;                        // blocks 0..1
+  const int seq = text_seq + img_seq;
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t sd = 0x51ced00du;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      sd = sd * 1664525u + 1013904223u;
+      e = ((float)(sd >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)seq * HID;
+
+  const char* lora_path = std::getenv("VPIPE_KREA2_ANE_LORA");
+  const bool qkv = std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr;
+  auto run = [&](bool ane, bool with_lora, bool int8 = false,
+                 int* n8 = nullptr) {
+    MetalKrea2Transformer::Config cfg = base;
+    if (ane) {
+      cfg.session       = &sess;
+      cfg.ane_rows      = 0.5f;     // 544 of 1088
+      cfg.ane_layers    = stop + 1;
+      cfg.ane_qkv = qkv;
+      cfg.ane_int8 = int8;
+    }
+    std::vector<float> out;
+    // VPIPE_KREA2_ANE_LORA: a runtime adapter on BOTH arms. The GPU applies
+    // it as side GEMMs; the ANE's rows must get it merged into their staged
+    // weights, or this comparison measures the adapter rather than fp16.
+    std::vector<MetalKrea2Transformer::LoraSpec> loras;
+    if (with_lora && lora_path != nullptr) {
+      MetalKrea2Transformer::LoraSpec sp;
+      sp.path = lora_path;
+      loras.push_back(sp);
+    }
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg,
+                                         /*stream_blocks=*/true, loras);
+    if (m == nullptr) { return out; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (n8 != nullptr) { *n8 = m->ane_int8_modules(); }
+    if (o.empty() || o.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  const std::vector<float> v_gpu = run(false, true);
+  const std::vector<float> v_ane = run(true, true);
+  ASSERT_TRUE(!v_gpu.empty());
+  ASSERT_TRUE(v_ane.size() == v_gpu.size());
+  if (v_ane.size() != v_gpu.size()) { return; }
+  const double r = rel_l2_(v_ane.data(), v_gpu.data(), v_ane.size());
+  std::printf("[krea2_dit] forward_dit ANE-vs-GPU rel-L2 = %.6g "
+              "(%dx%d, seq=%d)\n", r, grid * 16, grid * 16, seq);
+  // The two runs must DIFFER -- an identical result means the tier
+  // silently did nothing, which is the failure mode a tolerance alone
+  // would pass.
+  EXPECT_TRUE(r > 0.0);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+  // ROTATED INT8 (ane_int8): the same tiers in the GPU token tier's
+  // arithmetic, ENGAGED (each module that armed) before measured.
+  {
+    int n8 = -1;
+    const std::vector<float> v8 = run(true, true, true, &n8);
+    ASSERT_TRUE(v8.size() == v_gpu.size());
+    if (v8.size() != v_gpu.size()) { return; }
+    const double r8 = rel_l2_(v8.data(), v_gpu.data(), v8.size());
+    std::printf("[krea2_dit] ... in rotated int8 (%d modules int8): "
+                "rel-L2 = %.6g\n", n8, r8);
+    if (ane_int8_expected()) {
+      EXPECT_TRUE(n8 == (qkv ? 2 : 1));
+      EXPECT_TRUE(r8 > 0.0 && std::isfinite(r8) && r8 < 0.10);
+    }
+  }
+  // With an adapter, the CONTROLS: how far the adapter itself moves the
+  // GPU's output, and the ANE's fp16 floor on the same run WITHOUT it. An
+  // ANE whose rows dropped the adapter adds roughly that effect (over its
+  // share of the rows) on top of the floor; one that merged it sits AT the
+  // floor. The floor is measured, not assumed: with q/k/v/gate on the ANE
+  // too, a 4-bit checkpoint's rises to ~0.011 (the q/k fp16 error goes
+  // through the q/k norms and the attention), above half the ~0.016 effect
+  // a fixed fraction would have demanded.
+  if (lora_path != nullptr) {
+    const std::vector<float> v_base = run(false, false);
+    const std::vector<float> v_ane_base = run(true, false);
+    ASSERT_TRUE(v_base.size() == v_gpu.size() &&
+                v_ane_base.size() == v_gpu.size());
+    if (v_base.size() != v_gpu.size() ||
+        v_ane_base.size() != v_gpu.size()) {
+      return;
+    }
+    const double eff = rel_l2_(v_base.data(), v_gpu.data(), v_gpu.size());
+    const double floor = rel_l2_(v_ane_base.data(), v_base.data(),
+                                 v_base.size());
+    std::printf("[krea2_dit] adapter effect on the GPU output rel-L2 = %.6g, "
+                "ANE fp16 floor without it %.6g (ANE-vs-GPU with it %.6g)\n",
+                eff, floor, r);
+    EXPECT_TRUE(eff > 0.0);
+    EXPECT_TRUE(r < 1.25 * floor + 1e-4);
+  }
+}
+
+// Does the ANE split actually make the block faster?
+//
+// Times the SECOND forward of each arm, so the one-time module compile
+// and first staging are excluded and what is left is the steady
+// state a real run would see. Opt-in, since
+// each arm loads the DiT again.
+TEST(krea2_dit, ane_split_is_faster)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || std::getenv("VPIPE_KREA2_ANE_BENCH") == nullptr) {
+    return;
+  }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  // Krea-2 patches 2x2 over an 8x VAE downsample, so one token is 16
+  // pixels: grid 32 == 512x512, 64 == 1024x1024, 128 == 2048x2048.
+  // The default is the SMALL one because it is quick; 1024x1024 is the
+  // case that matters and is where the GPU's feed-forward should stop
+  // being insensitive to row count.
+  const char* gs = std::getenv("VPIPE_KREA2_ANE_GRID");
+  const int text_seq = 64;
+  const int grid = (gs != nullptr) ? std::atoi(gs) : 32;
+  const int img_seq = grid * grid, stop = 1;
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t sd = 0x1a2b3c4du;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      sd = sd * 1664525u + 1013904223u;
+      e = ((float)(sd >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+
+  auto timed = [&](bool ane) {
+    MetalKrea2Transformer::Config cfg = base;
+    if (ane) {
+      cfg.session = &sess;
+      // Sweepable. The CHUNKED path rounds this down to whole 2048-row
+      // chunks, so one template serves every ratio.
+      // UNSET means 0, which the family reads as "auto-balance".
+      const char* rr = std::getenv("VPIPE_KREA2_ANE_ROWS");
+      cfg.ane_rows = (rr != nullptr) ? (float)std::atof(rr) : 0.0f;
+      cfg.ane_layers = stop + 1;
+      cfg.ane_qkv = std::getenv("VPIPE_KREA2_ANE_QKV") != nullptr;
+    }
+    // PRELOADED, not streamed: a streamed run re-reads ~850 MB per
+    // block per forward, which dwarfs the ~100 ms of feed-forward and
+    // hides the thing being measured. The first attempt timed 1868 ms
+    // per block that way and read 0.93x -- disk, not compute.
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, false);
+    if (m == nullptr) { return 0.0; }
+    m->forward_dit(buf(txt), text_seq, buf(lat), img_seq, grid, grid, 0.5f,
+                   stop);                      // warm + bake
+    const auto t0 = std::chrono::steady_clock::now();
+    m->forward_dit(buf(txt), text_seq, buf(lat), img_seq, grid, grid, 0.5f,
+                   stop);
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t0).count();
+  };
+
+  const double gpu = timed(false);
+  const double ane = timed(true);
+  const char* rs = std::getenv("VPIPE_KREA2_ANE_ROWS");
+  const double share = (rs != nullptr) ? std::atof(rs) : 0.5;
+  std::printf("[krea2_dit] %dx%d, %d blocks, seq %d: GPU-only %.1f ms | "
+              "ANE split (%d/%d) %.1f ms | %.3fx\n", grid * 16, grid * 16,
+              stop + 1, text_seq + img_seq, gpu,
+              (int)((text_seq + img_seq) * share), text_seq + img_seq, ane,
+              gpu > 0 ? gpu / ane : 0.0);
+  EXPECT_TRUE(gpu > 0.0 && ane > 0.0);
+}
+
 TEST(krea2_dit, forward_dit_reference_images_change_output)
 {
   const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
@@ -975,4 +1470,248 @@ TEST(krea2_dit, vec4_elementwise_matches_scalar)
   EXPECT_TRUE(diff == 0);
   std::printf("[krea2_dit] vec4 vs scalar elementwise: %zu/%zu words differ\n",
               diff, a.size());
+}
+
+// SAGE IN THE MODEL, which the driver tests next door cannot show.
+//
+// metal-sage-attention.cc verifies the class against a reference
+// attention. What it cannot verify is that this family HANDS IT THE
+// RIGHT THING: the operands are the head-major transposes, the head
+// counts are HED query and KVH key -- Krea-2 is genuinely grouped -- and
+// the block index gates on `dense_layers`. Every one of those is a
+// number this file passes and that file trusts.
+//
+// So: the same forward twice, differing only in cfg.sage.enabled, and
+// the two required CLOSE but NOT IDENTICAL. Identical would mean the
+// function constant never applied and both arms ran dense, which is the
+// failure a tolerance-only check reads as a pass.
+TEST(krea2_dit, forward_dit_sage_matches_f16)
+{
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config base;
+  const int HID = base.hidden, IC = base.in_channels;
+  const int text_seq = 64, grid = 32;
+  const int img_seq = grid * grid;
+  const int stop = 2;                       // two blocks, both routed
+
+  std::vector<float> txt((std::size_t)text_seq * HID);
+  std::vector<float> lat((std::size_t)img_seq * IC);
+  std::uint32_t s = 0x5a6e12c0u;
+  auto fill = [&](std::vector<float>& v) {
+    for (auto& e : v) {
+      s = s * 1664525u + 1013904223u;
+      e = ((float)(s >> 9) / 4194304.0f - 1.0f);
+    }
+  };
+  fill(txt);
+  fill(lat);
+  auto to_f16buf = [&](const std::vector<float>& src) {
+    SharedBuffer b = mc->make_shared_buffer(src.size() * 2);
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < src.size(); ++i) { d[i] = (_Float16)src[i]; }
+    return b;
+  };
+  const std::size_t n = (std::size_t)(text_seq + img_seq) * HID;
+
+  auto run = [&](bool sage_on) {
+    MetalKrea2Transformer::Config cfg = base;
+    cfg.sage.enabled = sage_on;
+    cfg.sage.dense_layers = 0;
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg,
+                                         /*stream_blocks=*/true);
+    std::vector<float> out;
+    if (m == nullptr) { return out; }
+    SharedBuffer o = m->forward_dit(to_f16buf(txt), text_seq, to_f16buf(lat),
+                                    img_seq, grid, grid, 0.5f, stop);
+    if (o.empty() || o.byte_size() < n * 2) { return out; }
+    out.resize(n);
+    const auto* p = static_cast<const _Float16*>(o.contents());
+    for (std::size_t i = 0; i < n; ++i) { out[i] = (float)p[i]; }
+    return out;
+  };
+
+  const std::vector<float> v_sage = run(true);
+  const std::vector<float> v_f16 = run(false);
+  ASSERT_TRUE(!v_sage.empty());
+  ASSERT_TRUE(v_sage.size() == v_f16.size());
+  const double r = rel_l2_(v_sage.data(), v_f16.data(), v_sage.size());
+  std::size_t differ = 0;
+  for (std::size_t i = 0; i < v_sage.size(); ++i) {
+    differ += (v_sage[i] != v_f16[i]) ? 1 : 0;
+  }
+  std::printf("[krea2_dit] forward_dit sage-vs-f16 rel-L2 = %.6g, %zu of "
+              "%zu differ (seq=%d)\n", r, differ, v_sage.size(),
+              text_seq + img_seq);
+  EXPECT_TRUE(std::isfinite(r) && r < 0.10);
+  // The int8 path RAN. Without this the test passes on two dense arms.
+  EXPECT_TRUE(differ > v_sage.size() / 4);
+}
+
+// ---- perf-flops ----------------------------------------------------
+//
+// Both forwards' arithmetic, as the FLOP/s meter is credited with it
+// (common/perf-flops.h, shared/dit-flops.h):
+//
+//   * the text-fusion tower and a two-block DiT, each EXACT against a
+//     count derived here from the structure, and each credited whole
+//     once its buffers retire;
+//   * with Sol routing every block, the first forward counts the GEMMs
+//     at once and credits the attention Sol kept when it finishes, and
+//     the second counts its routed attention at that ratio as it
+//     encodes -- so the two forwards' attention agree.
+//
+// Grid 32 with 64 prompt tokens is 1088 joint rows, 17 routing blocks:
+// past Sol's floor of 16. Env: VPIPE_KREA2_TEST_MODEL_PATH.
+TEST(krea2_dit, forward_credits_its_flops)
+{
+  namespace pf = vpipe::perf_flops;
+  const char* root = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  const std::string tdir = std::string(root) + "/transformer";
+
+  MetalKrea2Transformer::Config cfg;
+  cfg.n_layers = 2;
+  const int TS = 64, grid = 32, IS = grid * grid, seq = TS + IS;
+  const long long HID = cfg.hidden, IC = cfg.in_channels;
+  const long long TH = cfg.text_hidden, NL = cfg.n_text_layers;
+  const long long TFF = cfg.text_ffn, THD = cfg.text_head_dim();
+  const long long HD = cfg.head_dim, FF = cfg.ffn;
+  const long long qd = (long long)cfg.n_heads * HD;
+  const long long kd = (long long)cfg.n_kv_heads * HD;
+
+  std::uint32_t st = 0x7f10b5e1u;
+  auto f16buf = [&](std::size_t n, float amp) {
+    SharedBuffer b = mc->make_shared_buffer(n * 2);
+    if (b.empty()) { return b; }
+    auto* d = static_cast<_Float16*>(b.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      st = st * 1664525u + 1013904223u;
+      d[i] = (_Float16)(((float)(st >> 9) / 4194304.0f - 1.0f) * amp);
+    }
+    return b;
+  };
+  const SharedBuffer ehs = f16buf((std::size_t)TS * NL * TH, 1.0f);
+  const SharedBuffer txt = f16buf((std::size_t)TS * HID, 1.0f);
+  const SharedBuffer lat = f16buf((std::size_t)IS * IC, 1.0f);
+  ASSERT_TRUE(!ehs.empty() && !txt.empty() && !lat.empty());
+  if (ehs.empty() || txt.empty() || lat.empty()) { return; }
+
+  // The counts, from the structure. A text-fusion block runs `batch`
+  // independent length-T sequences: the layerwise ones over the 12
+  // tapped layers of each token, the refiners over the prompt.
+  auto text_block = [&](long long batch, long long T) {
+    const long long BT = batch * T;
+    return 5 * gemm_flops(BT, TH, TH) + 2 * gemm_flops(BT, TFF, TH) +
+           gemm_flops(BT, TH, TFF) +
+           attention_flops(batch * cfg.text_heads, T * T, THD);
+  };
+  const std::uint64_t want_text =
+      (std::uint64_t)cfg.n_layerwise * text_block(TS, NL) +
+      gemm_flops(TS * TH, 1, NL) +
+      (std::uint64_t)cfg.n_refiner * text_block(1, TS) +
+      gemm_flops(TS, HID, TH) + gemm_flops(TS, HID, HID);
+  const std::uint64_t attn =
+      attention_flops(cfg.n_heads, (long long)seq * seq, HD);
+  const std::uint64_t gemms_per_block =
+      gemm_flops(seq, qd, HID) + 2 * gemm_flops(seq, kd, HID) +
+      2 * gemm_flops(seq, HID, HID) + gemm_flops(seq, 2 * FF, HID) +
+      gemm_flops(seq, HID, FF);
+  const std::uint64_t gemms =
+      gemm_flops(1, HID, cfg.timestep_dim) + gemm_flops(1, HID, HID) +
+      gemm_flops(1, 6 * HID, HID) + gemm_flops(IS, HID, IC) +
+      (std::uint64_t)cfg.n_layers * gemms_per_block +
+      gemm_flops(IS, IC, HID);
+  const std::uint64_t want_dit = gemms + (std::uint64_t)cfg.n_layers * attn;
+
+  // One call; what the tally flushed and the meter was credited.
+  struct Got { std::uint64_t flushed = 0, gpu = 0; bool ok = false; };
+  auto measure = [&](MetalKrea2Transformer& m, auto&& call) {
+    Got g;
+    const std::uint64_t f0 = m.gpu_flops().flushed();
+    const pf::Totals g0 = pf::totals(pf::kGpu);
+    g.ok = call();
+    g.flushed = m.gpu_flops().flushed() - f0;
+    // The last buffer's handler may run after the wait that saw it --
+    // and Sol's finish() credits synchronously, so reaching `flushed` is
+    // not proof that every handler has run. Let them settle.
+    for (int i = 0; i < 400 && pf::totals(pf::kGpu).flops - g0.flops <
+                                   g.flushed; ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    g.gpu = pf::totals(pf::kGpu).flops - g0.flops;
+    return g;
+  };
+  auto dit = [&](MetalKrea2Transformer& m) {
+    return !m.forward_dit(txt, TS, lat, IS, grid, grid, 0.5f).empty();
+  };
+
+  {
+    auto m = MetalKrea2Transformer::load(tdir, mc, cfg, /*stream=*/true);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    const Got t = measure(*m, [&]() {
+      return !m->forward_text(ehs, TS).empty();
+    });
+    const Got d = measure(*m, [&]() { return dit(*m); });
+    std::printf("[krea2_dit] flops: text tower %.4f TFLOP (derived %.4f, "
+                "credited %.4f); DiT %lld rows x %d blocks %.4f TFLOP "
+                "(derived %.4f, credited %.4f)\n", t.flushed / 1e12,
+                want_text / 1e12, t.gpu / 1e12, (long long)seq,
+                cfg.n_layers, d.flushed / 1e12, want_dit / 1e12,
+                d.gpu / 1e12);
+    ASSERT_TRUE(t.ok && d.ok);
+    EXPECT_TRUE(t.flushed == want_text);
+    EXPECT_TRUE(t.gpu == t.flushed);
+    EXPECT_TRUE(d.flushed == want_dit);
+    EXPECT_TRUE(d.gpu == d.flushed);
+  }
+
+  // Sol on every block.
+  MetalKrea2Transformer::Config sc = cfg;
+  sc.sol.enabled      = true;
+  sc.sol.tau          = 1.0f;
+  sc.sol.dense_layers = 0;
+  sc.sol.key_block    = 64;
+  sc.sol.local_radius = 1;
+  auto m = MetalKrea2Transformer::load(tdir, mc, sc, /*stream=*/true);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  const Got a = measure(*m, [&]() { return dit(*m); });
+  ASSERT_TRUE(a.ok);
+  if (!a.ok) { return; }
+  // A dense count means nothing routed: no Sol kernels on this box, or
+  // a geometry it declined.
+  if (a.flushed == want_dit) {
+    std::printf("[krea2_dit] flops: Sol did not route here; its half is "
+                "skipped\n");
+    return;
+  }
+  const Got b = measure(*m, [&]() { return dit(*m); });
+  ASSERT_TRUE(b.ok);
+  // The first forward: GEMMs as encoded, the kept attention at finish.
+  const std::uint64_t kept1 = a.gpu - a.flushed;
+  // The second: the routed attention at that ratio, as encoded -- one
+  // floor per routed call, so within a FLOP a block of the first.
+  const std::uint64_t kept2 = b.flushed - gemms;
+  const std::uint64_t all = (std::uint64_t)cfg.n_layers * attn;
+  std::printf("[krea2_dit] flops with Sol: forward 1 counted %.4f + kept "
+              "%.4f at finish, forward 2 counted %.4f (kept %.4f); dense "
+              "attention %.4f TFLOP\n", a.flushed / 1e12, kept1 / 1e12,
+              b.flushed / 1e12, kept2 / 1e12, all / 1e12);
+  EXPECT_TRUE(a.flushed == gemms);
+  EXPECT_TRUE(a.gpu >= a.flushed);
+  EXPECT_TRUE(kept1 > 0 && kept1 <= all);
+  EXPECT_TRUE(b.gpu == b.flushed);
+  const std::uint64_t gap = kept1 > kept2 ? kept1 - kept2 : kept2 - kept1;
+  EXPECT_TRUE(gap <= (std::uint64_t)cfg.n_layers);
 }

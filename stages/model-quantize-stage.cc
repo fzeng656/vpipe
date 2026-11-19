@@ -7,10 +7,13 @@
 #include "common/lmdb-env.h"
 #include "common/lmdb-txn.h"
 #include "common/vpipe-format.h"
+#include "generative-models/flux3/metal-flux3-transformer.h"
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "generative-models/boogu/metal-boogu-calibration.h"
 #include "generative-models/flux2/metal-flux2-calibration.h"
+#include "generative-models/krea2/krea2-native-checkpoint.h"
 #include "generative-models/krea2/metal-krea2-calibration.h"
+#include "generative-models/quantize-profile.h"
 #include "generative-models/qwen-image/metal-qwen-image-calibration.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
@@ -43,6 +46,20 @@ namespace {
 std::string t2i_target_subdir_(const std::string& target);
 }
 
+namespace {
+
+// `run_dtype` as the quantizer takes it (validated in the constructor).
+genai::QuantizeOptions::RunDtype
+run_dtype_option_(const std::string& v)
+{
+  using R = genai::QuantizeOptions::RunDtype;
+  if (v == "bf16") { return R::kBf16; }
+  if (v == "f16" || v == "fp16") { return R::kF16; }
+  return R::kAsBefore;
+}
+
+}  // namespace
+
 ModelQuantizeStage::ModelQuantizeStage(
     const SessionContextIntf* s,
     std::string               id,
@@ -60,6 +77,7 @@ ModelQuantizeStage::ModelQuantizeStage(
   _target        = attr_str("target");
   _bits          = static_cast<int>(attr_uint("bits"));
   _group_size    = static_cast<int>(attr_uint("group_size"));
+  _run_dtype     = attr_str("run_dtype");
   _skip_existing = attr_bool("skip_existing");
   _awq           = attr_bool("awq");
   _awq_clip      = attr_bool("awq_clip");
@@ -82,9 +100,20 @@ ModelQuantizeStage::ModelQuantizeStage(
     fail_config(fmt("ModelQuantizeStage('{}'): config.output_name is required",
                     this->id()));
   }
-  if (_bits != 4 && _bits != 8) {
-    fail_config(fmt("ModelQuantizeStage('{}'): bits must be 4 or 8 (got {})",
-                    this->id(), _bits));
+  if (_bits != 4 && _bits != 8 && _bits != 16) {
+    fail_config(fmt("ModelQuantizeStage('{}'): bits must be 4 or 8, or 16 "
+                    "for a dense bf16 checkpoint (got {})", this->id(),
+                    _bits));
+  }
+  // 16 is not a bit-width the affine path has: it quantizes nothing, so
+  // every option that shapes a quantization is a contradiction rather
+  // than a no-op, and silently ignoring one would leave a user thinking
+  // it had run.
+  if (_bits == 16 && (_awq || _mixed || _quant_modulation)) {
+    fail_config(fmt(
+        "ModelQuantizeStage('{}'): bits=16 writes a dense checkpoint and "
+        "quantizes nothing, so awq / mixed / quant_modulation do not apply",
+        this->id()));
   }
   if (_group_size != 32 && _group_size != 64) {
     fail_config(fmt(
@@ -94,6 +123,12 @@ ModelQuantizeStage::ModelQuantizeStage(
   if (_awq_clip && !_awq) {
     fail_config(fmt(
         "ModelQuantizeStage('{}'): awq_clip requires awq=true", this->id()));
+  }
+  if (!_run_dtype.empty() && _run_dtype != "bf16" && _run_dtype != "f16" &&
+      _run_dtype != "fp16") {
+    fail_config(fmt(
+        "ModelQuantizeStage('{}'): run_dtype must be bf16 or f16, or empty "
+        "for the original format (got '{}')", this->id(), _run_dtype));
   }
   // `target` is validated at run time: its valid values depend on the model
   // (Krea-2 components dit|text_encoder|vae vs a general-LLM submodule scope
@@ -135,10 +170,14 @@ dit_class_family_(const std::string& class_name)
 {
   if (class_name == "Krea2Transformer2DModel") { return "krea2"; }
   if (class_name == "Flux2Transformer2DModel") { return "flux2"; }
+  if (class_name == "Flux3Transformer2DModel") { return "flux3"; }
+  if (class_name == "QwenImage21Transformer2DModel") {
+    return "qwen-image-21";
+  }
+  if (class_name == "ZImageTransformer2DModel") { return "z-image"; }
+  if (class_name == "BriaFibo2Transformer2DModel") { return "fibo2"; }
+  if (class_name == "MOSSImageTransformer") { return "moss-image"; }
   if (class_name == "QwenImageTransformer2DModel") { return "qwen-image-edit"; }
-  // Mage-Flow's NR-MMDiT is the Qwen-Image dual-stream MMDiT under a different
-  // config (see metal-mage-flow-transformer.h), so it shares that leaf set.
-  if (class_name == "MageFlow") { return "mage-flow"; }
   if (class_name == "BooguImageTransformer2DModel") { return "boogu-image"; }
   // Wan video. Its two A14B experts are separate checkpoints, so each is
   // quantized by pointing src_model at that expert's own directory.
@@ -148,7 +187,17 @@ dit_class_family_(const std::string& class_name)
   // the class name is all there is to go on -- and all there needs to be,
   // since the quant leaf set does not depend on the partition.
   if (class_name == "MiniMaxH3DiTModel") { return "minimax-h3"; }
-  return {};
+  // A REGISTERED family, asked last. The chain above is a closed switch
+  // over the class names this tree implements, so a family published
+  // after it -- or one that lives in a plugin -- falls through
+  // and is not recognised as a text-to-image DiT at all.
+  //
+  // Asked LAST so a class name this host owns cannot be taken away by a
+  // plugin, and matched EXACTLY so a family cannot claim a name that is
+  // not its own: quantizing someone else's weights with your leaf set
+  // produces a checkpoint that loads, runs, and generates the wrong
+  // thing. See generative-models/quantize-profile.h.
+  return genai::quant::family_for_class(class_name);
 }
 
 // Resolve the DiT weight dir + family from what the user pointed `src_model`
@@ -206,6 +255,16 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family,
       }
     }
   }
+  // A Krea-2 DiT in Krea's OWN layout, named directly -- the single
+  // .safetensors community fine-tunes ship (often FP8). No config.json and
+  // no `__metadata__`: it is recognised by its tensor names, and the
+  // quantizer translates it to the diffusers layout on the way through
+  // (krea2/krea2-native-checkpoint.h), so the output is an ordinary
+  // transformer directory.
+  if (genai::krea2::is_native_dit_file(src_dir)) {
+    if (family != nullptr) { *family = "krea2"; }
+    return src_dir;
+  }
   // A repack this stage has ALREADY quantized: the role subdirs survive and
   // the quantized component is a directory checkpoint inside its own, so the
   // DiT is at `diffusion_models/config.json` rather than being a file with
@@ -251,6 +310,36 @@ resolve_t2i_dit_dir_(const std::string& src_dir, std::string* family,
           }
         }
       }
+    }
+  }
+  // Last: ask the MiniMax-H3 loader, which knows a shape this ladder does
+  // not. MiniMaxAI publishes BOTH partitions from one repo, so the fetch
+  // lands them one level down -- <root>/FL2VA/transformer and
+  // <root>/Ref2VA/transformer -- and the root itself carries none of the
+  // files probed above. Pointed at such a root, every rung misses, and
+  // what the caller gets is not "unsupported" but a fall-through to the
+  // LANGUAGE-model quantizer: `arch='unknown' n_layers=0` followed by "no
+  // submodule matching target 'dit'".
+  //
+  // DELEGATED rather than spelled out a fifth time. This is the third
+  // resolver of this question in the tree and the second time one of them
+  // has drifted behind the others (see the note on
+  // minimax_h3_comfy.a_quantized_repack_resolves_like_a_repack, which
+  // called this one out as unreachable and therefore untested). Asking the
+  // loader means the next shape it learns arrives here for free.
+  //
+  // LAST, and confirmed with family_of, because resolve_dit_dir answers
+  // with the path it was handed when nothing matches -- it is a resolver,
+  // not a detector. Only a result that DIFFERS from src_dir and names an
+  // H3 DiT is taken, so no other family's routing moves and the rungs
+  // above keep their order.
+  {
+    const std::string d =
+        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(src_dir, partition);
+    if (!d.empty() && d != src_dir &&
+        family_of(fs::path(d) / "config.json") == "minimax-h3") {
+      if (family != nullptr) { *family = "minimax-h3"; }
+      return d;
     }
   }
   return {};
@@ -432,6 +521,17 @@ resolve_llm_target_(const std::string& src_dir, const std::string& target,
 std::vector<std::string>
 dit_quant_linears_(const std::string& family)
 {
+  // A REGISTERED family's own list, first. It is asked before the
+  // built-ins because a plugin only reaches this function for a family
+  // the chain below has never heard of -- and an EMPTY list from a
+  // profile means "said nothing", not "quantize none", so a family that
+  // registered a profile without one still falls through.
+  {
+    const std::vector<std::string> leaves =
+        genai::quant::strings(genai::quant::find(family),
+                              genai::quant::kQuantLinears);
+    if (!leaves.empty()) { return leaves; }
+  }
   if (family == "flux2") {
     // The big per-block compute Linears only. The embedders (x_embedder K=128
     // -> only 2 groups/row at g64; context_embedder; final proj_out) are left
@@ -441,11 +541,8 @@ dit_quant_linears_(const std::string& family)
             "add_q_proj", "add_k_proj", "add_v_proj", "to_qkv_mlp_proj",
             "linear_in", "linear_out"};
   }
-  if (family == "qwen-image-edit" || family == "mage-flow") {
-    // Dual-stream QwenImageTransformer2DModel -- and Mage-Flow's NR-MMDiT,
-    // whose checkpoint tensor NAMES are identical (that is what let the metal
-    // port reuse the transformer wholesale), so one leaf set covers both.
-    // Mage-Flow simply has no single_transformer_blocks tail.
+  if (family == "qwen-image-edit") {
+    // Dual-stream QwenImageTransformer2DModel.
     // The quantizer matches the LAST
     // dot-component before ".weight", so use those: to_out is "attn.to_out.0"
     // -> "0" (60, unique); both FeedForward up-projs "*_mlp.net.0.proj" ->
@@ -455,6 +552,74 @@ dit_quant_linears_(const std::string& family)
     return {"to_q", "to_k", "to_v", "0",
             "add_q_proj", "add_k_proj", "add_v_proj", "to_add_out",
             "proj", "2"};
+  }
+  if (family == "qwen-image-21") {
+    // SINGLE-stream QwenImage21Transformer2DModel, and biasless. Nine
+    // tensors a block, of which seven are Linears: attention's q/k/v and
+    // to_out.0 (leaf "0"), and the feed-forward's gate_layer / proj /
+    // out. The two left out are attn.norm_q / norm_k, which are
+    // per-head RMSNorm vectors and not matrices at all.
+    //
+    // NO EXCLUDE LIST IS NEEDED, which is worth stating because most
+    // families here need one: the model-level leaves are img_in, "1"
+    // (modulation), linear_1, linear_2, in_layer, out_layer, text_norm,
+    // linear and proj_out, and none of them collides with the seven.
+    // Everything model-level therefore stays bf16 by construction --
+    // which is what is wanted, since all of it is small and
+    // precision-sensitive: every latent enters through img_in, every
+    // velocity leaves through proj_out, and the shared modulation feeds
+    // all 32 blocks.
+    return {"to_q", "to_k", "to_v", "0", "gate_layer", "proj", "out"};
+  }
+  if (family == "flux3") {
+    // FLUX.3 Image Klein: ONE block shape in four stacks (three per-mode,
+    // one joint), six Linears each -- attn.to_q / to_k / to_v, to_out.0
+    // (leaf "0"), and the feed-forward's fused gate|up ff.linear_in and its
+    // ff.linear_out. Every one of those leaves is unique to the blocks.
+    // Model-level stays bf16: the three input embedders (the text one is
+    // K = 20480 and every prompt enters through it), the two timestep
+    // embedders, the modulation tables (leaf "linear", which
+    // quant_modulation opts into at 8 bits) and proj_out, through which
+    // every velocity value leaves.
+    return {"to_q", "to_k", "to_v", "0", "linear_in", "linear_out"};
+  }
+  if (family == "z-image") {
+    // NextDiT / Lumina, single-stream. Seven Linears a block: the
+    // attention's q/k/v and to_out.0 (leaf "0"), and the feed-forward's
+    // w1 (gate), w3 (up) and w2 (down). attention.norm_q / norm_k are
+    // per-head RMSNorm vectors and not matrices; the four sandwich
+    // norms are vectors too.
+    //
+    // THE LEAVES ARE UNAMBIGUOUS HERE, which is unusual and worth
+    // stating: "w1"/"w2"/"w3" appear nowhere else in the checkpoint,
+    // and the only other "0" is `t_embedder.mlp.0`, which the exclude
+    // list below names. What the list must keep out is everything
+    // model-level -- the patch embedder (K = 64, one group at g64, and
+    // every latent enters through it), the caption projection, the
+    // timestep MLP that feeds every modulation vector in the model,
+    // and the final layer, through whose 64 rows every velocity value
+    // leaves.
+    return {"to_q", "to_k", "to_v", "0", "w1", "w2", "w3"};
+  }
+  if (family == "fibo2") {
+    // Fibo 2.0's blocks are Z-Image's: the same seven Linears a block
+    // under the same names, and the adaLN's leaf "0" quantized with them
+    // (as Z-Image's is). The same leaves ALSO name the Perceiver's and the
+    // five injection blocks' cross-attention projections -- the text
+    // path, run once a prompt -- which the exclude list keeps dense with
+    // everything model-level.
+    return {"to_q", "to_k", "to_v", "0", "w1", "w2", "w3"};
+  }
+  if (family == "moss-image") {
+    // Six biasless Linears a main block, all under `proj.`: q / k / v / o
+    // and the feed-forward's fused ffn_up_gate ([hidden | gate]) and
+    // ffn_down. "ffn_down" ALSO names the text blocks' down projection
+    // (text_embedder.blocks.N.ffn_down), which the exclude list keeps
+    // dense along with everything else model-level: the two text
+    // blocks (every prompt passes through them, at prompt rows), the
+    // latent and text embedders, the timestep MLP, the ONE shared
+    // modulation every block reads, and the head.
+    return {"q", "k", "v", "o", "ffn_up_gate", "ffn_down"};
   }
   if (family == "wan") {
     // Wan's single-stream block: self-attention, cross-attention into the
@@ -529,8 +694,11 @@ dit_hidden_size_(const std::string& src_dir)
   FlexData cfg = FlexData::from_json(in);
   if (!cfg.is_object()) { return 0; }
   auto obj = cfg.as_object();
+  // `dim` is Z-Image's spelling (NextDiT), and it is last because it
+  // is the most generic word here -- a config that has both should be
+  // read by its more specific key.
   for (const char* k : {"hidden_size", "joint_attention_dim",
-                        "attention_dim", "inner_dim"}) {
+                        "attention_dim", "inner_dim", "dim"}) {
     if (obj.contains(k)) {
       const int v = (int)obj.at(k).as_int(0);
       if (v > 0) { return v; }
@@ -560,11 +728,18 @@ dit_num_layers_(const std::string& src_dir)
         const int n = (int)obj.at("num_layers").as_int(0);
         if (n > 0) { return n; }
       }
-      // Mage-Flow's transformer/config.json is FLUX-shaped: the block count is
-      // `depth` (12), with no num_layers. Without this the mixed / AWQ
+      // A FLUX-shaped transformer/config.json names the block count
+      // `depth`, with no num_layers. Without this the mixed / AWQ
       // per-layer ranking would silently run over the default 28 blocks.
       if (obj.contains("depth")) {
         const int n = (int)obj.at("depth").as_int(0);
+        if (n > 0) { return n; }
+      }
+      // Z-Image (NextDiT) says `n_layers`, and it means the MAIN stack
+      // only -- the four refiner blocks are counted separately and are
+      // not what the per-layer ranking walks.
+      if (obj.contains("n_layers")) {
+        const int n = (int)obj.at("n_layers").as_int(0);
         if (n > 0) { return n; }
       }
     }
@@ -575,16 +750,31 @@ dit_num_layers_(const std::string& src_dir)
 constexpr ConfigKey kAttrs[] = {
   {.key = "src_model", .type = ConfigType::String, .required = true,
    .doc = "source model: a models-DB key (registered by model-fetch) or a "
-          "bf16/f16 safetensors directory path",
+          "path -- a bf16/f16/fp8 safetensors directory, or ONE .safetensors "
+          "file: a Comfy-Org component, or a Krea-2 DiT in Krea's own layout "
+          "(a community fine-tune), which is written out under diffusers "
+          "names",
    .suggest_db = kModelRegistryDb},
   {.key = "output_name", .type = ConfigType::String, .required = true,
-   .doc = "result name -> <cwd>/models/<output_name> (registered in the "
-          "models DB under this key), or an explicit path (\"/..\", \"./..\") "
-          "used verbatim and not registered"},
+   .doc = "result name -> models/<output_name> beside the database "
+          "(registered in the models DB under this key), or an explicit "
+          "path (\"/..\", \"./..\") used verbatim and not registered"},
   {.key = "bits", .type = ConfigType::Uint,
-   .doc = "backbone affine bit-width (4 | 8)", .def_uint = 8},
+   .doc = "backbone affine bit-width (4 | 8), or 16 for a DENSE output that "
+          "quantizes nothing: FP8 tensors are decoded to bf16 (exactly -- "
+          "every FP8 value is a bf16 value) and everything else is copied, "
+          "so an FP8 checkpoint becomes an ordinary bf16 one",
+   .def_uint = 8},
   {.key = "group_size", .type = ConfigType::Uint,
    .doc = "affine group size (32 | 64)", .def_uint = 64},
+  {.key = "run_dtype", .type = ConfigType::String,
+   .doc = "the dtype the quantized model will RUN in: bf16 | f16. Its "
+          "scales and biases are written in that dtype and the codes fit to "
+          "the rounded pair, so the dequant the model runs is the one the "
+          "codes were fit to. Empty (default): as before -- F16 scales, the "
+          "codes fit to the unrounded scale (MOSS-TTS: bf16), which a bf16 "
+          "model rounds again at load",
+   .def_str = ""},
   {.key = "arch", .type = ConfigType::String,
    .doc = "model family tag; empty => auto-detect from config.json model_type",
    .def_str = ""},
@@ -701,6 +891,9 @@ const StageSpec kSpec = {
                "the output is a SELF-CONTAINED pipeline (all components copied, "
                "the target quantized) usable directly as a generate-image "
                "hf_dir -- chain passes to quantize more than one component. "
+               "FP8 sources (F8_E4M3 / F8_E5M2, plain or scaled) are read "
+               "as bf16; bits=16 writes one out dense instead of "
+               "quantizing it. "
                "Optional trigger in / summary out.",
   .display_name = "Model Quantize",
   .category  = StageCategory::Preparation,
@@ -736,7 +929,9 @@ ModelQuantizeStage::register_output_(const std::string& key,
     auto ro = rec.as_object();
     ro.insert_or_assign("local_path", FlexData::make_string(dir));
     ro.insert_or_assign("source", FlexData::make_string(_src_model));
-    ro.insert_or_assign("quantized", FlexData::make_bool(true));
+    // bits=16 is the dense pass: an FP8 or native-layout source written
+    // out as an ordinary checkpoint, which is not a quantized one.
+    ro.insert_or_assign("quantized", FlexData::make_bool(bits < 16));
     ro.insert_or_assign("bits", FlexData::make_uint((std::uint64_t)bits));
     // Describe the OUTPUT by probing it (model-detect.h), so a quantized
     // model carries the same runtime type + I/O modalities as a fetched
@@ -775,15 +970,16 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   const std::string src_dir =
       resolve_model_dir(session(), _src_model);
 
-  // Resolve the output. A bare name (or "org/name") -> <cwd>/models/<name>,
-  // registered under that key; an absolute/relative path ("/..", "./..") is
-  // used verbatim and NOT registered.
+  // Resolve the output. A bare name (or "org/name") ->
+  // <session_db_dir>/models/<name>, registered under that key; an
+  // absolute/relative path ("/..", "./..") is used verbatim and NOT
+  // registered.
   const bool explicit_path =
       _output_name[0] == '/' ||
       _output_name.rfind("./", 0) == 0 || _output_name.rfind("../", 0) == 0;
   const std::string out_dir = explicit_path
       ? _output_name
-      : (fs::current_path() / "models" / _output_name).string();
+      : (default_models_dir(session()) / _output_name).string();
 
   if (_skip_existing && fs::exists(fs::path(out_dir) / "config.json", ec)) {
     session()->info(fmt(
@@ -868,7 +1064,33 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
       // Self-contained pass: copy every component, quantize the `target` one
       // (default the DiT), register as a full pipeline usable as an hf_dir.
       // Chainable across passes (DiT, then text_encoder, ...).
-      return quantize_t2i_pipeline_(src_dir, t2i_family, out_dir, stop);
+      //
+      // THE PIPELINE ROOT IS THE DiT'S PARENT, which is not always
+      // src_dir. MiniMaxAI publishes both MiniMax-H3 partitions from ONE
+      // repo and the fetch lands them a level down, so the runnable root
+      // is <repo>/FL2VA -- the resolver above already found the DiT
+      // there, and the siblings it needs (text_encoder/, vae/,
+      // model_index.json) sit beside it, not beside the repo.
+      //
+      // Handing src_dir on instead looked for <repo>/transformer, which a
+      // partitioned repo does not have, and reported "root ... has no
+      // 'transformer' component to quantize" for a model that is fully
+      // downloaded. This file already knew the shape -- the diagnostic
+      // below descends into FL2VA/ to explain a missing component -- but
+      // the path that does the work did not, which is the whole bug.
+      //
+      // For an ordinary diffusers tree the parent IS src_dir, so nothing
+      // moves there. For the partitioned one it also means the copy takes
+      // the partition that was ASKED for rather than both halves of a
+      // 133 GB repo.
+      const std::string pipe_root = pipeline_root_for(src_dir, dit_dir);
+      if (pipe_root != src_dir) {
+        session()->info(fmt(
+            "ModelQuantizeStage('{}'): '{}' is a partitioned repo; "
+            "quantizing the pipeline at '{}'",
+            this->id(), src_dir, pipe_root));
+      }
+      return quantize_t2i_pipeline_(pipe_root, t2i_family, out_dir, stop);
     }
     // A single component named DIRECTLY (a path to one .safetensors, not
     // to the repo around it). Sibling selection is not possible from here
@@ -900,10 +1122,16 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
                                  stop)) {
       return false;
     }
-    session()->log_normal(fmt(
-        "ModelQuantizeStage('{}'): quantized {} DiT '{}' -> '{}' ({}-bit "
-        "g{}{}{})", this->id(), t2i_family, src_dir, out_dir, _bits,
-        _group_size, _mixed ? " mixed" : "", _awq ? " awq-clip" : ""));
+    if (_bits == 16) {
+      session()->log_normal(fmt(
+          "ModelQuantizeStage('{}'): wrote {} DiT '{}' -> '{}' dense (bf16, "
+          "nothing quantized)", this->id(), t2i_family, src_dir, out_dir));
+    } else {
+      session()->log_normal(fmt(
+          "ModelQuantizeStage('{}'): quantized {} DiT '{}' -> '{}' ({}-bit "
+          "g{}{}{})", this->id(), t2i_family, src_dir, out_dir, _bits,
+          _group_size, _mixed ? " mixed" : "", _awq ? " awq-clip" : ""));
+    }
     // "<family>-dit" (transformer-only) -> the generate-image dit_dir slot.
     if (!explicit_path) {
       register_output_(_output_name, out_dir, t2i_family + "-dit", _bits);
@@ -919,8 +1147,30 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // when the actual cause is almost always that the component is not on disk
   // yet, an interrupted or still-running download. Say which it is, here.
   {
-    const bool has_index = fs::exists(fs::path(src_dir) / "model_index.json");
-    const fs::path tdir = fs::path(src_dir) / "transformer";
+    // WHERE to look. Normally src_dir -- but MiniMaxAI publishes both
+    // MiniMax-H3 partitions one level down, so a root holding FL2VA/ or
+    // Ref2VA/ has to be diagnosed THERE. Probing only the root misses by
+    // one directory, this guard does not fire, and the stage reports a
+    // video pipeline as a language model of unknown architecture: the
+    // most misleading thing it can say, and the reason this block exists.
+    //
+    // Reached only when the resolver above declined, so for H3 that means
+    // a component is genuinely absent -- an interrupted or still-running
+    // download -- which is exactly what it is here to name.
+    fs::path root(src_dir);
+    if (!fs::exists(root / "model_index.json") &&
+        !fs::is_directory(root / "transformer", ec)) {
+      for (const char* part : {"FL2VA", "Ref2VA"}) {
+        const fs::path sub = root / part;
+        if (fs::exists(sub / "model_index.json") ||
+            fs::is_directory(sub / "transformer", ec)) {
+          root = sub;
+          break;
+        }
+      }
+    }
+    const bool has_index = fs::exists(root / "model_index.json");
+    const fs::path tdir = root / "transformer";
     if (has_index || fs::is_directory(tdir, ec)) {
       std::string why;
       if (!fs::is_directory(tdir, ec)) {
@@ -949,7 +1199,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
           "but {}. If the model is still downloading, wait for it to finish; "
           "otherwise this build does not support that DiT. (Not falling back "
           "to the language-model quantizer -- there is no LM at this path.)",
-          this->id(), src_dir, why));
+          this->id(), root.string(), why));
       return false;
     }
   }
@@ -958,6 +1208,18 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // (config.json + a probe of the safetensors layer layout); explicit config
   // wins over the detection.
   const genai::QuantArchInfo meta = genai::detect_quant_arch(session(), src_dir);
+  // Fish Audio Drama 3 is read only as published: its routed experts are
+  // already block-FP8 (the bulk of the bytes), and the text-to-speech
+  // stage reads no pack of it -- a quantized copy would not load.
+  if (meta.arch == "fish_omni") {
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): {} is Fish Audio Drama 3, which runs as "
+        "published (its experts are already FP8); the text-to-speech stage "
+        "reads no quantized copy of it. For a smaller one, fetch "
+        "fishaudio/drama-3-int4 (~22 GB held), which it reads natively",
+        this->id(), src_dir));
+    return false;
+  }
   const std::string eff_arch = _arch.empty() ? meta.arch : _arch;
   const std::string eff_layer_prefix =
       _layer_prefix.empty() ? meta.layer_prefix : _layer_prefix;
@@ -1042,6 +1304,7 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   }
 
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits  = _bits;
   opt.group = _group_size;
   // Standard LMs (Qwen/Llama/Gemma) quantize the embed table + lm_head (MLX
@@ -1051,6 +1314,9 @@ ModelQuantizeStage::quantize_once(const std::function<bool()>& stop)
   // tied text head reads language_model.embed_tokens), so leave it off.
   const bool moss = eff_arch.rfind("moss-tts", 0) == 0;
   opt.quant_embeddings = !eff_arch.empty() && !moss;
+  // Every MOSS backbone runs bf16: write the scales it will hold (bf16,
+  // codes fit to them), not F16 ones it would round at load.
+  opt.bf16_scales = moss;
   // Qwen3.5/3.6 store zero-centered RMSNorm weights and apply (1 + weight)
   // (Gemma-style); vpipe's RMSNorm kernel multiplies by `weight` directly (as
   // MLX-converted checkpoints, which pre-fold the +1), so fold +1 into the
@@ -1152,11 +1418,13 @@ ModelQuantizeStage::quantize_dit_component_(
   if (mc == nullptr) { return false; }
 
   const bool is_flux2 = (family == "flux2");
-  const bool is_mage  = (family == "mage-flow");
+  // A REGISTERED family: one whose leaf set and class name came from a
+  // profile rather than from this file. Used below for the two things
+  // the host cannot do for it -- there is no in-tree AWQ collector for a
+  // family it has never seen, and its modulation leaves are its own.
+  const FlexData* qprof = genai::quant::find(family);
   const bool is_boogu = (family == "boogu-image");
-  // Mage-Flow shares Qwen-Image's block topology and tensor names, so the
-  // modulation handling below applies to it too.
-  const bool is_qie   = (family == "qwen-image-edit") || is_mage;
+  const bool is_qie   = (family == "qwen-image-edit");
   const bool awq = _awq;
 
   // Plain group-affine over the DiT leaf set (no LM arch-detect / embedding
@@ -1164,6 +1432,7 @@ ModelQuantizeStage::quantize_dit_component_(
   // norm_offset stays off). dit_family lets the quantizer pick the flux2
   // AWQ-calib mapping + smoothing fold + two-prefix mixed ranking.
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits  = _bits;
   opt.group = _group_size;
   // The group size has to DIVIDE the projections' input width or the quantizer
@@ -1172,7 +1441,7 @@ ModelQuantizeStage::quantize_dit_component_(
   // gate/up projections are all group-32 work. Pick the largest supported group
   // that divides the DiT's hidden width and say so, rather than shipping a
   // checkpoint that only quantized the layers that happened to fit.
-  {
+  if (_bits != 16) {
     const int hid = dit_hidden_size_(dit_dir);
     if (hid > 0 && (hid % opt.group) != 0) {
       int g = 0;
@@ -1216,12 +1485,75 @@ ModelQuantizeStage::quantize_dit_component_(
         "(adaln_proj.linear, 13B of 33B) at 8-bit; body stays {}-bit",
         this->id(), _bits));
   }
-  if (_quant_modulation && (is_qie || is_boogu || is_wan)) {
+  // A registered family's modulation leaves, from its profile. Same rule
+  // as the built-ins below -- opt-in, and forced to 8 bits whatever the
+  // body runs, because the modulation is what the residual scale rides
+  // on and 4-bit wrecks it.
+  if (_quant_modulation && qprof != nullptr) {
+    const std::vector<std::string> mods =
+        genai::quant::strings(qprof, genai::quant::kModulationLinears);
+    if (mods.empty()) {
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): quant_modulation is set and the '{}' "
+          "family named no modulation leaves, so nothing extra is "
+          "quantized", this->id(), family));
+    }
+    for (const std::string& leaf : mods) {
+      opt.quant_linears.push_back(leaf);
+      opt.high_bit_leaves.push_back(leaf);
+    }
+    if (!mods.empty()) {
+      opt.high_bits = 8;
+      session()->info(fmt(
+          "ModelQuantizeStage('{}'): quantizing the AdaLN modulation ({}) at "
+          "8-bit (precision-sensitive; body stays {}-bit)", this->id(),
+          genai::quant::text(qprof, genai::quant::kModulationLabel,
+                             "the family's modulation leaves"),
+          _bits));
+    }
+  }
+  const bool is_qi21 = (family == "qwen-image-21");
+  const bool is_zimage = (family == "z-image");
+  const bool is_flux3 = (family == "flux3");
+  if (_quant_modulation && is_flux3) {
+    // FLUX.3's modulation is SIX model-level tables (early_ and
+    // single_stream_modulations, per mode) plus norm_out's -- leaf
+    // "linear" for all seven, and nothing else in the checkpoint shares
+    // it. Shared by every block, so 8-bit regardless of the body.
+    opt.quant_linears.push_back("linear");
+    opt.high_bit_leaves.push_back("linear");
+    opt.high_bits = 8;
+    session()->info(fmt(
+        "ModelQuantizeStage('{}'): quantizing FLUX.3's modulation tables "
+        "(*_stream_modulations.*.linear, norm_out.linear) at 8-bit; body "
+        "stays {}-bit", this->id(), _bits));
+  }
+  if (_quant_modulation && (is_zimage || family == "fibo2")) {
+    // Z-Image's per-block adaLN is `adaLN_modulation.0` -> leaf "0",
+    // which is ALSO attention.to_out.0 and is therefore already in the
+    // quant set. So there is nothing to add here: asking to quantize
+    // the modulation on this family is a no-op, and saying so is
+    // better than looking like it did something.
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): {}'s adaLN_modulation.0 shares the "
+        "leaf \"0\" with attention.to_out.0, so quant_modulation cannot "
+        "separate them -- the modulation is quantized either way and this "
+        "key changes nothing", this->id(), family));
+  }
+  if (_quant_modulation && family == "moss-image") {
+    // ONE shared Linear (113 MB) feeds every block's modulation; there is
+    // no per-block table to quantize, and this one stays bf16.
+    session()->warn(fmt(
+        "ModelQuantizeStage('{}'): moss-image's modulation is one shared "
+        "113 MB Linear, kept bf16 -- quant_modulation changes nothing",
+        this->id()));
+  }
+  if (_quant_modulation && (is_qie || is_boogu || is_wan || is_qi21)) {
     // The adaLN modulation projections are the largest weights in these DiTs
     // and are kept bf16 by default because they are what the residual scale
     // rides on. This is the opt-in that quantizes them anyway, for a box that
     // cannot otherwise hold the DiT.
-    //   Qwen-Image-Edit / Mage-Flow: `*_mod.1`             -> leaf "1"
+    //   Qwen-Image-Edit: `*_mod.1`                         -> leaf "1"
     //   Boogu-Image: `norm1.linear` (refiners + single) and
     //     `img_norm{1,2,3}.linear` / `instruct_norm{1,2}.linear` (dual-stream)
     //                                                       -> leaf "linear"
@@ -1232,6 +1564,12 @@ ModelQuantizeStage::quantize_dit_component_(
     //     condition_embedder.time_proj      -> leaf "time_proj"
     //   (scale_shift_table is 3-D and never quantized at all, and the
     //   per-block modulation is that table plus this projection's output).
+    //   Qwen-Image-2.1: ONE shared `modulation.1` for all 32 blocks
+    //     -> leaf "1", the same leaf as the dual-stream sibling's
+    //     per-block `*_mod.1`. It is also the one family here where
+    //     this opt-in buys almost nothing: 0.12 GB of a 13.25 GB
+    //     checkpoint, against 40% of the model on MiniMax-H3. Offered
+    //     for completeness, not because it is a lever.
     const char* leaf = is_boogu ? "linear" : is_wan ? "time_proj" : "1";
     opt.quant_linears.push_back(leaf);
     // The modulation carries large-magnitude scale/gate values (on QIE they
@@ -1246,6 +1584,44 @@ ModelQuantizeStage::quantize_dit_component_(
         "8-bit (precision-sensitive; body stays {}-bit)", this->id(),
         is_boogu ? "norm*.linear" : is_wan ? "condition_embedder.time_proj"
                                             : "*_mod.1", _bits));
+  }
+  // A registered family's dense-keeps, appended to whatever the stage
+  // already excludes rather than replacing it. Leaves are short -- the
+  // last dot-component -- so collisions are the norm and this is how a
+  // family keeps a timestep embedder out of a feed-forward's leaf.
+  if (qprof != nullptr) {
+    for (const std::string& e :
+         genai::quant::strings(qprof, genai::quant::kQuantExclude)) {
+      opt.quant_exclude.push_back(e);
+    }
+  }
+  if (is_flux3) {
+    // Named, though no block leaf reaches them: a family's exclude list is
+    // what keeps a later leaf added to the set from catching an embedder.
+    opt.quant_exclude = {"x_embedders.", "context_embedder",
+                         "timestep_embedder.", "target_timestep_embedder.",
+                         "proj_out"};
+  }
+  if (family == "moss-image") {
+    opt.quant_exclude = {"text_embedder.", "video_embedder",
+                         "time_embedding.", "shared_block_modulation",
+                         "video_head_modulation", "final_linear_video"};
+  }
+  if (family == "z-image") {
+    // The model-level weights, kept bf16 on the usual grounds: all of
+    // them are small and every value in the model passes through one of
+    // them. `t_embedder.` also shields the leaf "0" that
+    // `t_embedder.mlp.0` would otherwise match.
+    opt.quant_exclude = {"all_x_embedder", "cap_embedder", "t_embedder.",
+                         "all_final_layer"};
+  }
+  if (family == "fibo2") {
+    // Z-Image's model-level keeps, plus the TEXT PATH: the Perceiver
+    // (whose output is every gist row) and the injection blocks'
+    // cross-attention (keys and values off the 7680-wide text bundles),
+    // both run once a prompt. `t_embedder.` also shields the leaf "0".
+    opt.quant_exclude = {"x_embedder", "t_embedder.", "final_layer.",
+                         "perceiver.", ".cross_attention."};
   }
   if (is_boogu) {
     // Keep the precision-sensitive heads out despite their shared leaf names
@@ -1270,7 +1646,33 @@ ModelQuantizeStage::quantize_dit_component_(
     opt.high_bits  = _high_bits;
     opt.mixed_frac = _mixed_frac;
     opt.n_layers   = dit_layers;
-    if (is_boogu) {
+    if (is_zimage) {
+      // Rank the MAIN stack: 30 of the 34 blocks and the bulk of the
+      // weights. The four refiner blocks keep the base width -- two of
+      // them are the only place the caption is processed at all.
+      opt.layer_prefix = "layers.";
+    } else if (is_flux3) {
+      // Rank the JOINT stack: 28 of the 43 blocks. The 15 per-mode blocks
+      // keep the base width -- they are the only place each mode is
+      // processed on its own, the text's included. config.json's
+      // num_layers is the PER-MODE count (5), so the joint one is read.
+      opt.layer_prefix = "single_transformer_blocks.";
+      genai::MetalFlux3Transformer::Config fc;
+      if (genai::MetalFlux3Transformer::Config::read_dims(dit_dir, &fc)) {
+        opt.n_layers = fc.n_single;
+      }
+    } else if (family == "fibo2") {
+      // Rank the 44 main blocks (`layers.N`; n_layers counts only them);
+      // the two noise-refiner blocks keep the base width.
+      opt.layer_prefix = "layers.";
+    } else if (family == "moss-image") {
+      // Rank the 42 main blocks (`layers.N`; num_layers counts only
+      // them). The two text blocks (`text_embedder.blocks.N`) keep the
+      // base width. The default arm's `transformer_blocks.` matches no
+      // MOSS-Image tensor, so mixed ranked NOTHING and wrote a uniform
+      // pack while saying it was mixed.
+      opt.layer_prefix = "layers.";
+    } else if (is_boogu) {
       // Rank Boogu's single-stream tail: 32 of its 46 blocks and the bulk of
       // the weights. (The 8 dual-stream blocks and the 6 refiners keep the
       // base width -- the dual-stream blocks carry the joint attention that
@@ -1286,15 +1688,69 @@ ModelQuantizeStage::quantize_dit_component_(
     // no calib_dir is supplied. Krea-2 and FLUX.2 use family-specific collectors
     // (different encoder / template / tap groups); the quantizer reads the
     // right calib layout via opt.dit_family.
-    if (is_mage && _calib_dir.empty()) {
-      // The on-device collectors drive a family's own encoder + template; no
-      // Mage-Flow collector exists yet, and the Qwen-Image one would build a
-      // QIE DiT config against Mage weights. Refuse rather than silently
-      // calibrate the wrong model -- an explicit calib_dir still works.
+    // THE FALL-THROUGH BELOW IS KREA-2'S COLLECTOR, so a built-in
+    // family without one of its own would be calibrated by building a
+    // Krea-2 DiT config over its weights. Refuse instead. Plain and
+    // mixed quantization are unaffected, and an explicit calib_dir
+    // still works.
+    if (fs::is_regular_file(fs::path(dit_dir), ec) && _calib_dir.empty()) {
+      // On-device calibration drives the family's text encoder, which it
+      // finds BESIDE the DiT -- and a DiT named as one file has nothing
+      // beside it. Say so here rather than let the collector fail on a
+      // missing encoder under the file's parent directory.
       session()->warn(fmt(
-          "ModelQuantizeStage('{}'): Mage-Flow DiT AWQ has no on-device "
-          "collector yet; supply calib_dir, or drop awq (plain / mixed "
-          "quantization is supported)", this->id()));
+          "ModelQuantizeStage('{}'): '{}' is a single-file DiT, so there is "
+          "no text encoder beside it to calibrate AWQ with -- supply "
+          "calib_dir, or drop awq", this->id(), dit_dir));
+      return false;
+    }
+    if (family == "fibo2") {
+      // Not even from a calib_dir: the generic DiT fold below reads
+      // Krea-2's tensor names, and no collector drives Fibo 2.0's encoder.
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): fibo2 has no AWQ fold or collector -- "
+          "refusing. Use plain or mixed quantization", this->id()));
+      return false;
+    }
+    if (family == "moss-image") {
+      // Not even from a calib_dir: the generic DiT fold below is
+      // Krea-2's -- its tensor names, and a down <- up smoothing fold
+      // that is exact only where the up half enters LINEARLY (SwiGLU).
+      // MOSS-Image's SITU takes 25 tanh(h / 25) of it, so the fold
+      // would change the function, not just the rounding.
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): moss-image has no AWQ fold -- its "
+          "SITU feed-forward is not linear in the up half the DiT fold "
+          "scales -- refusing. Use plain or mixed quantization",
+          this->id()));
+      return false;
+    }
+    // A NAMED PREDICATE, not a list of refusals: the families with an
+    // on-device collector of their own. Everything else reaches the
+    // fall-through below, which is KREA-2's collector, and would be
+    // calibrated by building a Krea-2 DiT config over its weights.
+    const bool own_collector =
+        family == "krea2" || is_flux2 || is_boogu || is_qie;
+    if (!own_collector && qprof == nullptr && _calib_dir.empty()) {
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): {} has no on-device AWQ collector, "
+          "and the fall-through would calibrate a Krea-2 model over these "
+          "weights -- refusing. Use plain or mixed quantization, or supply "
+          "calib_dir", this->id(), family));
+      return false;
+    }
+    if (qprof != nullptr && _calib_dir.empty()) {
+      // The on-device collectors drive a family's OWN encoder and
+      // template, and they are in-tree code -- so a family the host
+      // learned about from a profile has none by construction, and the
+      // nearest built-in collector would build another family's DiT
+      // config against these weights. Refuse rather than silently
+      // calibrate the wrong model; an explicit calib_dir still works,
+      // and so do plain and mixed quantization.
+      session()->warn(fmt(
+          "ModelQuantizeStage('{}'): '{}' is an out-of-tree family, which has "
+          "no on-device AWQ collector; supply calib_dir, or drop awq (plain "
+          "and mixed quantization are supported)", this->id(), family));
       return false;
     }
     if (!_calib_dir.empty()) {
@@ -1403,6 +1859,7 @@ ModelQuantizeStage::quantize_text_encoder_(
     }
   }
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits  = _bits;
   opt.group = _group_size;
   opt.quant_embeddings = false;
@@ -1764,6 +2221,42 @@ ModelQuantizeStage::comfy_target_subdir_(const std::string& target)
   return {};
 }
 
+std::string
+ModelQuantizeStage::pipeline_root_for(const std::string& src_dir,
+                                      const std::string& dit_dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (dit_dir.empty()) { return src_dir; }
+  // The components live beside the DiT. For an ordinary diffusers tree
+  // that parent IS the source and nothing moves; for MiniMaxAI's
+  // partitioned repo it is <repo>/FL2VA, which is the runnable root.
+  const fs::path parent = fs::path(dit_dir).parent_path();
+  if (parent.empty() || !fs::is_directory(parent, ec)) { return src_dir; }
+  if (parent.lexically_normal() == fs::path(src_dir).lexically_normal()) {
+    return src_dir;
+  }
+  // Only ever DOWNWARD, and only to a directory that actually looks like
+  // a pipeline root. A resolver that answered with something outside the
+  // source would have this pass copy from a tree the caller never named.
+  if (!fs::exists(parent / "model_index.json", ec) &&
+      !fs::is_directory(parent / "transformer", ec)) {
+    return src_dir;
+  }
+  return parent.string();
+}
+
+std::string
+ModelQuantizeStage::resolve_source_dit_dir(const std::string& src_dir,
+                                           std::string* family,
+                                           const std::string& partition)
+{
+  std::string fam;
+  const std::string d = resolve_t2i_dit_dir_(src_dir, &fam, partition);
+  if (family != nullptr) { *family = d.empty() ? std::string() : fam; }
+  return d;
+}
+
 bool
 ModelQuantizeStage::is_comfy_root_(const std::string& dir)
 {
@@ -1774,10 +2267,10 @@ ModelQuantizeStage::is_comfy_root_(const std::string& dir)
   // root never does -- it uses transformer/ (or unet/).
   //
   // The obvious-looking alternative, "scan_repo finds any component", is
-  // WRONG and was caught by model_quantize_stage.mage_flow_dit_quantizes:
+  // WRONG and was caught by a registered family's DiT quantize test:
   // scan_repo's role list includes `vae/`, which every diffusers root also
   // has, and a diffusers VAE's safetensors carries a `__metadata__` like
-  // any other -- so every Krea-2 / FLUX.2 / QIE / Mage / Wan checkpoint
+  // any other -- so every Krea-2 / FLUX.2 / QIE / Wan checkpoint
   // matched and got routed down the repack path, which then failed
   // looking for a diffusion_models/ that a diffusers tree never has.
   //
@@ -1914,6 +2407,7 @@ ModelQuantizeStage::quantize_registered_pipeline_(
   metal_compute::MetalCompute* mc = session()->services()->metal_compute();
   if (mc == nullptr) { return false; }
   genai::QuantizeOptions opt;
+  opt.run_dtype = run_dtype_option_(_run_dtype);
   opt.bits              = _bits;
   opt.group             = _group_size;
   opt.quant_embeddings  = false;
@@ -2124,10 +2618,14 @@ ModelQuantizeStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+  // bits=16 is the dense pass, which has no group and quantizes nothing.
+  const std::string format =
+      _bits == 16 ? std::string("dense bf16")
+                  : fmt("{}-bit g{}", _bits, _group_size)();
   session()->info(fmt(
-      "ModelQuantizeStage('{}'): quantizing '{}' -> '{}' ({}-bit g{}{}{})",
-      this->id(), _src_model, _output_name, _bits, _group_size,
-      _awq ? (_awq_clip ? " awq+clip" : " awq") : "",
+      "ModelQuantizeStage('{}'): {} '{}' -> '{}' ({}{}{})", this->id(),
+      _bits == 16 ? "converting" : "quantizing", _src_model, _output_name,
+      format, _awq ? (_awq_clip ? " awq+clip" : " awq") : "",
       _mixed ? " mixed" : ""));
   const bool ok = quantize_once([&ctx] { return ctx.stop_requested(); });
   // Emit the summary only on success, so a failed quantization halts the
@@ -2142,9 +2640,8 @@ ModelQuantizeStage::process(RuntimeContext& ctx)
     so.insert_or_assign("group_size", FlexData::make_int(_group_size));
     so.insert_or_assign("quantized", FlexData::make_bool(ok));
     so.insert_or_assign("text", FlexData::make_string(
-        fmt("[model-quantize] {} -> {} ({}-bit, group {}) [{}]",
-            _src_model, _output_name, _bits, _group_size,
-            ok ? "ok" : "failed")()));
+        fmt("[model-quantize] {} -> {} ({}) [{}]", _src_model,
+            _output_name, format, ok ? "ok" : "failed")()));
     co_await ctx.write(0, make_payload<FlexDataPayload>(std::move(summary)));
   }
   ctx.signal_done();

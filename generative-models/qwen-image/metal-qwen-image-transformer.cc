@@ -1,3 +1,7 @@
+#include "generative-models/shared/mma-tile.h"
+#include "common/memory-owner.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/dit-gpu-progress.h"
 #include "generative-models/qwen-image/metal-qwen-image-transformer.h"
 
 #include "common/flex-data.h"
@@ -5,7 +9,6 @@
 #include "common/vpipe-format.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/weight-set.h"
-#include "generative-models/shared/stream-pin.h"
 #include "interfaces/session-context-intf.h"
 
 #include <chrono>
@@ -92,7 +95,17 @@ constexpr const char* kKey = "qwen-image-dit/";
 
 }  // namespace
 
-MetalQwenImageTransformer::~MetalQwenImageTransformer() = default;
+MetalQwenImageTransformer::~MetalQwenImageTransformer()
+{
+  // GIVE THE POOL BACK. Freeing a wired buffer unwires it in the kernel,
+  // so the machine recovers either way -- but the pool's own counter
+  // would not, and a DiT destroyed and reloaded per prompt would leak its
+  // whole share of the budget per prompt until nothing could wire at all.
+  if (_wire.on()) {
+    wire_fixed_(false);
+    for (Block& b : _blocks) { wire_block_(b, false); }
+  }
+}
 
 // bf16 view of a checkpoint tensor. Cached ones go through the weight
 // set so a second model over this checkpoint shares them; streamed ones
@@ -174,6 +187,237 @@ MetalQwenImageTransformer::qw_bytes_(const QWeight& w)
          w.qbias.byte_size();
 }
 
+
+// Shorthand for the per-tensor placement the refill needs stated.
+using P = vpipe::genai::Placement;
+
+// ---- the streamed block's reusable destinations ------------------------
+
+// Every (checkpoint name, destination, raw) of block L, in a fixed
+// order. `raw` marks the checkpoint's OWN words -- a quantized pack's
+// u32 codes -- which the REBUILD route must copy rather than read as
+// bf16; the refill itself asks for bf16 either way and places u32
+// untouched.
+void
+MetalQwenImageTransformer::each_block_tensor_(
+    int L, Block& b, const BlockSlots<Block>::TensorFn& fn) const
+{
+  const std::string p = "transformer_blocks." + std::to_string(L) + ".";
+  // A MATRIX is three tensors when quantized and one when dense, and
+  // which it is was decided when the slot was built -- so the layout
+  // comes from the QWeight, not from the checkpoint. A block that
+  // disagrees is not REFILLED at all: same_layout_ has the slot built for
+  // it, because a refill's size check rebuilds the codes yet keeps the
+  // slot's `bits` (a mixed pack's other width).
+  auto qw = [&fn](const std::string& base, QWeight& w) {
+    if (w.quantized) {
+      fn(base + ".weight", w.codes, P::kRaw);
+      fn(base + ".scales", w.scales, P::kBf16);
+      fn(base + ".biases", w.qbias, P::kBf16);
+    } else {
+      fn(base + ".weight", w.w, P::kBf16);
+    }
+  };
+  auto lin = [&](const std::string& base, QWeight& w,
+                 metal_compute::SharedBuffer& bias) {
+    qw(base, w);
+    fn(base + ".bias", bias, P::kBf16);
+  };
+  lin(p + "img_mod.1", b.img_mod_w, b.img_mod_b);
+  lin(p + "txt_mod.1", b.txt_mod_w, b.txt_mod_b);
+  lin(p + "attn.to_q", b.qw, b.qb);
+  lin(p + "attn.to_k", b.kw, b.kb);
+  lin(p + "attn.to_v", b.vw, b.vb);
+  lin(p + "attn.to_out.0", b.ow, b.ob);
+  lin(p + "attn.add_q_proj", b.aqw, b.aqb);
+  lin(p + "attn.add_k_proj", b.akw, b.akb);
+  lin(p + "attn.add_v_proj", b.avw, b.avb);
+  lin(p + "attn.to_add_out", b.aow, b.aob);
+  fn(p + "attn.norm_q.weight", b.nq, P::kBf16);
+  fn(p + "attn.norm_k.weight", b.nk, P::kBf16);
+  fn(p + "attn.norm_added_q.weight", b.naq, P::kBf16);
+  fn(p + "attn.norm_added_k.weight", b.nak, P::kBf16);
+  lin(p + "img_mlp.net.0.proj", b.img_fc1_w, b.img_fc1_b);
+  lin(p + "img_mlp.net.2", b.img_fc2_w, b.img_fc2_b);
+  lin(p + "txt_mlp.net.0.proj", b.txt_fc1_w, b.txt_fc1_b);
+  lin(p + "txt_mlp.net.2", b.txt_fc2_w, b.txt_fc2_b);
+}
+
+// Widths of block L in the checkpoint against the slot's, per matrix
+// (BlockSlots::Ops::same_layout): a mixed pack holds whole blocks at w8
+// and the rest at w4.
+bool
+MetalQwenImageTransformer::same_layout_(int L, const Block& b) const
+{
+  if (_quant_bits == 0 || _ws == nullptr) { return true; }
+  const std::string p = "transformer_blocks." + std::to_string(L) + ".";
+  const std::pair<const QWeight*, const char*> all[] = {
+      {&b.img_mod_w, "img_mod.1"},        {&b.txt_mod_w, "txt_mod.1"},
+      {&b.qw, "attn.to_q"},               {&b.kw, "attn.to_k"},
+      {&b.vw, "attn.to_v"},               {&b.ow, "attn.to_out.0"},
+      {&b.aqw, "attn.add_q_proj"},        {&b.akw, "attn.add_k_proj"},
+      {&b.avw, "attn.add_v_proj"},        {&b.aow, "attn.to_add_out"},
+      {&b.img_fc1_w, "img_mlp.net.0.proj"}, {&b.img_fc2_w, "img_mlp.net.2"},
+      {&b.txt_fc1_w, "txt_mlp.net.0.proj"}, {&b.txt_fc2_w, "txt_mlp.net.2"}};
+  for (const auto& [w, nm] : all) {
+    if (stored_affine_bits(*_ws, p + nm, _quant_group) !=
+        (w->quantized ? w->bits : 0)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Allocate `dst` with `src`'s shapes and flags, optionally copying the
+// bytes. One function for two uses: a promotion and a second slot
+// differ only in whether the contents come along.
+bool
+MetalQwenImageTransformer::clone_block_(const Block& src, Block& dst,
+                                        bool copy) const
+{
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
+  bool ok = true;
+  auto one = [&](const metal_compute::SharedBuffer& s,
+                 metal_compute::SharedBuffer& d) {
+    if (!ok || s.empty()) { d = metal_compute::SharedBuffer{}; return; }
+    d = _mc->make_shared_buffer(s.byte_size());
+    if (d.empty()) { ok = false; return; }
+    if (copy) { std::memcpy(d.contents(), s.contents(), s.byte_size()); }
+  };
+  auto qw = [&](const QWeight& s, QWeight& d) {
+    d.quantized = s.quantized;
+    d.bits      = s.bits;
+    one(s.w, d.w);
+    one(s.codes, d.codes);
+    one(s.scales, d.scales);
+    one(s.qbias, d.qbias);
+  };
+  qw(src.img_mod_w, dst.img_mod_w); qw(src.txt_mod_w, dst.txt_mod_w);
+  one(src.img_mod_b, dst.img_mod_b); one(src.txt_mod_b, dst.txt_mod_b);
+  qw(src.qw, dst.qw); qw(src.kw, dst.kw);
+  qw(src.vw, dst.vw); qw(src.ow, dst.ow);
+  one(src.qb, dst.qb); one(src.kb, dst.kb);
+  one(src.vb, dst.vb); one(src.ob, dst.ob);
+  qw(src.aqw, dst.aqw); qw(src.akw, dst.akw);
+  qw(src.avw, dst.avw); qw(src.aow, dst.aow);
+  one(src.aqb, dst.aqb); one(src.akb, dst.akb);
+  one(src.avb, dst.avb); one(src.aob, dst.aob);
+  one(src.nq, dst.nq); one(src.nk, dst.nk);
+  one(src.naq, dst.naq); one(src.nak, dst.nak);
+  qw(src.img_fc1_w, dst.img_fc1_w); qw(src.img_fc2_w, dst.img_fc2_w);
+  qw(src.txt_fc1_w, dst.txt_fc1_w); qw(src.txt_fc2_w, dst.txt_fc2_w);
+  one(src.img_fc1_b, dst.img_fc1_b); one(src.img_fc2_b, dst.img_fc2_b);
+  one(src.txt_fc1_b, dst.txt_fc1_b); one(src.txt_fc2_b, dst.txt_fc2_b);
+  if (!ok) { dst = Block{}; }
+  return ok;
+}
+
+// Rebuild ONE tensor a raw read could not place -- an f32 dtype, or a
+// shape that disagrees with the slot. The same two routes load_block_
+// uses, so a repaired tensor is byte-identical to a freshly built one.
+metal_compute::SharedBuffer
+MetalQwenImageTransformer::rebuild_one_(const std::string& nm,
+                                        vpipe::genai::Placement how)
+{
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
+  if (_ws == nullptr) { return {}; }
+  if (how == P::kRaw) {
+    return _ws->stream_tensor(nm, _mc, WeightSet::Residency::Copied);
+  }
+  return to_elt_(*_ws, nm, Retain::Streamed);
+}
+
+void
+MetalQwenImageTransformer::configure_slots_()
+{
+  BlockSlots<Block>::Ops ops;
+  ops.each = [this](int L, Block& b,
+                    const BlockSlots<Block>::TensorFn& fn) {
+    each_block_tensor_(L, b, fn);
+  };
+  ops.rebuild_one = [this](const std::string& nm,
+                           vpipe::genai::Placement how) {
+    return rebuild_one_(nm, how);
+  };
+  ops.build = [this](int L, Block& b) {
+    return _ws != nullptr && load_block_(*_ws, L, b, Retain::Streamed);
+  };
+  ops.clone = [this](const Block& s, Block& d, bool copy) {
+    return clone_block_(s, d, copy);
+  };
+  ops.bytes = [](const Block& b) { return block_bytes_(b); };
+  ops.empty = [](const Block& b) { return b.qw.empty(); };
+  ops.same_layout = [this](int L, const Block& b) {
+    return same_layout_(L, b);
+  };
+  _slots.set_weight_set(_ws.get());
+  _slots.configure(_mc, std::move(ops), "MetalQwenImageTransformer",
+                   "VPIPE_QIE_NO_SLOTS");
+}
+
+// ---- the wired pool ---------------------------------------------------
+//
+// One buffer at a time, STOPPING at the first refusal rather than
+// unwinding: a partly wired block is partly protected, which is strictly
+// better than none -- and giving protection back on the way out means
+// competing for it again on the next block, against a pool that has just
+// said no.
+//
+// The list mirrors block_bytes_ exactly. It has to: wirable() gates
+// admission on the byte count that returns, so a buffer counted there and
+// not wired here is a block the model believes is protected and is not.
+std::size_t
+MetalQwenImageTransformer::wire_block_(Block& b, bool on)
+{
+  std::size_t changed = 0;
+  bool stop = false;
+  auto one = [&](metal_compute::SharedBuffer& p) {
+    if (stop) { return; }
+    const std::size_t n = _wire.wire_one(_mc, p, on);
+    if (on && n == 0 && p.byte_size() > 0 && !p.is_wired() &&
+        _wire.refused(_mc, p)) {
+      stop = true;
+      return;
+    }
+    changed += n;
+  };
+  auto qw = [&](QWeight& w) {
+    one(w.w); one(w.codes); one(w.scales); one(w.qbias);
+  };
+  QWeight* q[] = {&b.img_mod_w, &b.txt_mod_w, &b.qw, &b.kw, &b.vw, &b.ow,
+                  &b.aqw, &b.akw, &b.avw, &b.aow, &b.img_fc1_w,
+                  &b.img_fc2_w, &b.txt_fc1_w, &b.txt_fc2_w};
+  for (QWeight* w : q) { qw(*w); }
+  metal_compute::SharedBuffer* p[] = {
+      &b.img_mod_b, &b.txt_mod_b, &b.qb, &b.kb, &b.vb, &b.ob,
+      &b.aqb, &b.akb, &b.avb, &b.aob, &b.nq, &b.nk, &b.naq, &b.nak,
+      &b.img_fc1_b, &b.img_fc2_b, &b.txt_fc1_b, &b.txt_fc2_b};
+  for (metal_compute::SharedBuffer* q2 : p) { one(*q2); }
+  return changed;
+}
+
+// The TRUNK: everything the weight set cached for this model, which for a
+// streaming DiT is the non-block tensors it holds for the whole run. Read
+// on every block of every forward and never shed, so it has a better
+// claim on the pool than any single resident block does -- which is why
+// the forward wires this BEFORE it starts admitting blocks.
+//
+// The activation scratch is deliberately not here: this model allocates
+// it as locals inside forward_dit, so there is nothing that persists to
+// wire. See the note in shared/wired-pool.h.
+std::size_t
+MetalQwenImageTransformer::wire_fixed_(bool on)
+{
+  if (!_ws) { return 0; }
+  std::size_t changed = 0;
+  _ws->for_each_weight([&](metal_compute::SharedBuffer& b) {
+    changed += _wire.wire_one(_mc, b, on);
+  });
+  return changed;
+}
+
 std::size_t
 MetalQwenImageTransformer::block_bytes_(const Block& b)
 {
@@ -214,6 +458,18 @@ MetalQwenImageTransformer::resident_pages_(std::size_t* examined,
         &b.txt_fc2_w.w, &b.txt_fc2_w.codes};
     for (const metal_compute::SharedBuffer* p : all) {
       if (p->byte_size() == 0) { continue; }
+      // A WIRED BUFFER CANNOT HAVE LEFT RAM, so asking is spending the
+      // walk to be told what mlock already guarantees. Skipped PER BUFFER
+      // rather than per block, because wire_block_ stops at the first
+      // refusal and leaves the rest of that block unwired -- the
+      // remainder is exactly what still needs measuring. With everything
+      // wired `examined` stays 0, which the caller reads as "no evidence"
+      // rather than as a shortfall, and that is the correct answer.
+      if (p->is_wired()) { continue; }
+      // Nor one below the pool's minimum: never wired, heap-owned pages
+      // that read partly out of RAM for reasons unrelated to this block.
+      // See GenerativeModelManager::pool_wirable.
+      if (!GenerativeModelManager::pool_wirable(*p)) { continue; }
       const auto r = p->page_residency(64);
       if (!r.valid) { continue; }
       *examined += r.examined;
@@ -224,13 +480,17 @@ MetalQwenImageTransformer::resident_pages_(std::size_t* examined,
 }
 
 std::size_t
-MetalQwenImageTransformer::evict_tail_block_(bool allow_pinned)
+MetalQwenImageTransformer::evict_tail_block_()
 {
-  const int floor = allow_pinned ? 0 : _pinned;
-  for (int i = (int)_blocks.size() - 1; i >= floor; --i) {
+  for (int i = (int)_blocks.size() - 1; i >= 0; --i) {
     Block& b = _blocks[(std::size_t)i];
     const std::size_t n = block_bytes_(b);
     if (n == 0) { continue; }
+    // Before the buffers go: give the wiring back. Dropping a wired
+    // buffer unwires it in the kernel anyway, but only unwire_from_pool()
+    // decrements the pool's counter -- so doing it here is what keeps the
+    // budget honest instead of leaking a block's worth per eviction.
+    _wire.note_unwired(wire_block_(b, false));
     b = Block{};
     // Taking one out of the pinned prefix UN-pins it: that prefix was
     // sized against what the box was believed to hold, and a measurement
@@ -238,6 +498,59 @@ MetalQwenImageTransformer::evict_tail_block_(bool allow_pinned)
     return n;
   }
   return 0;
+}
+
+// How much the box must have freed since a wiring refusal before it is
+// worth asking again -- one block's worth, so a genuinely full box is
+// never asked. Reopening the pool's ceiling makes its own check pass, and
+// the mlock behind it would then fail and leave that block resident but
+// UNWIRED, one per forward, which is exactly the state the wirable gate
+// exists to avoid.
+//
+// The checkpoint figure when the schedule has been set, the resident
+// average otherwise. Never zero if anything is known: a zero slack
+// re-opens on any increase at all.
+std::size_t
+MetalQwenImageTransformer::wire_retry_slack_() const
+{
+  if (_wire_block_hint > 0) { return _wire_block_hint; }
+  if (_resid.count() > 0) {
+    return _resid.bytes() / (std::size_t)_resid.count();
+  }
+  return 0;
+}
+
+void
+MetalQwenImageTransformer::set_residency_schedule(int steps)
+{
+  // A new run: a pool ceiling some earlier model collapsed may be asked
+  // about again. See WiredPool::retry.
+  _wire.new_run();
+  if (!_ws) { return; }
+  const MetalLlamaWeights& src = _ws->src();
+  const std::size_t blk = widest_block_bytes(
+      src.tensor_names(),
+      [&](const std::string& n) {
+        const auto* ti = src.info(n);
+        return ti != nullptr ? (std::size_t)ti->nbytes : (std::size_t)0;
+      },
+      {"transformer_blocks."});
+  const int nl = _cfg.n_layers;
+  _wire_block_hint = blk;
+  _resid.set_schedule(steps, nl, blk, _wire.on(),
+                      _mc != nullptr ? _mc->memory_budget()
+                                     : metal_compute::MetalCompute::
+                                           MemoryBudget{});
+  if (_mc != nullptr && _mc->session() != nullptr) {
+    _mc->session()->log_debug(fmt(
+        "MetalQwenImageTransformer: residency probe {} blocks of {} "
+        "({} MB each, {} MB reclaimable, wire budget {} MB){}",
+        _resid.per_forward_cap(), nl, blk >> 20,
+        _mc->memory_budget().available_physical >> 20,
+        _wire.budget() >> 20,
+        _wire.on() ? " -- uncapped, the wire budget is the gate"
+                   : ", doubling per healthy forward"));
+  }
 }
 
 std::size_t
@@ -259,6 +572,8 @@ bool
 MetalQwenImageTransformer::load_block_(WeightSet& ws, int L,
                                        Block& b, Retain r)
 {
+  // Its blocks, kept or streamed (common/memory-owner.h).
+  MemoryUseScope blocks_use(MemoryUse::kBlocks);
   const std::string p = "transformer_blocks." + std::to_string(L) + ".";
   bool ok = true;
   // AdaLN modulation: dense bf16 by default, or affine-quantized when the
@@ -316,6 +631,15 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_mc = mc;
   m->_cfg = cfg;
   m->_stream_blocks = stream_blocks;
+  // Join the manager's wired pool. Nothing to decide about residency here
+  // -- this class already reads every weight Copied (see load_qw_) -- so
+  // what this buys is that a kept block can be mlock'd instead of being
+  // the first thing the compressor takes. See shared/wired-pool.h.
+  m->_wire.open(mc);
+  // The reusable read destinations. Configured whether or not this run
+  // streams: they cost nothing until the first streamed block asks for
+  // one, and a model that preloads never gets there.
+  m->configure_slots_();
 
   // Affine group-quant detection: config.json `quantization {bits, group_size}`
   // (written by model-quantize target=dit). Absent => dense bf16.
@@ -377,8 +701,7 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_fn_gated     = m->_lib_elt.function("gated_residual_f16");
   // vec4 twins: same arithmetic per element (bit-identical), 3-4x throughput --
   // one element per thread leaves these at ~37-54 GB/s where the same bytes
-  // through a vec4 2-D grid run at 143-181. Serves Qwen-Image-Edit AND
-  // Mage-Flow (same class, different Config). VPIPE_NO_ELT_V4 reverts.
+  // through a vec4 2-D grid run at 143-181. VPIPE_NO_ELT_V4 reverts.
   if (std::getenv("VPIPE_NO_ELT_V4") == nullptr) {
     m->_fn_adaln4 = m->_lib_elt.function("adaln_modulate_v4_f16");
     m->_fn_gated4 = m->_lib_elt.function("gated_residual_v4_f16");
@@ -400,6 +723,47 @@ MetalQwenImageTransformer::load(std::shared_ptr<WeightSet> ws_in,
   m->_steel_attn_ok = m->_lib_attn.valid() && !m->_attn_params.empty() &&
                       cfg.head_dim == 128 &&
                       std::getenv("VPIPE_QIE_NO_STEEL_ATTN") == nullptr;
+
+  // M5 matrix-core NAX steel flash, on by default where the GPU has
+  // matrix cores -- the same rule krea2, flux2 and boogu have always
+  // used, and this family was the last one still on the ALU kernel
+  // everywhere. VPIPE_QIE_NO_ATTN_NAX forces the ALU steel, which is
+  // both the A/B and the way back if a checkpoint ever disagrees.
+  //
+  // The two kernels are not bit-identical -- they tile differently (64x32
+  // against 32x16) and accumulate in a different order -- so this moves
+  // Qwen-Image's dense output by the amount two correct flash kernels
+  // differ by. MEASURED against the ALU arm below the tile band;
+  // qwen_image_edit_dit.forward_nax_matches_alu is the guard.
+  m->_lib_attn_nax = mc->load_library("attn_steel_nax");
+  m->_use_attn_nax = m->_steel_attn_ok && mc->supports_matrix_cores() &&
+                     m->_lib_attn_nax.valid() &&
+                     std::getenv("VPIPE_QIE_NO_ATTN_NAX") == nullptr;
+
+  // SAGE rides on that entry: the int8 QK exists only there, so a box
+  // that fell back to the ALU kernel runs dense and says so rather than
+  // reporting a Sage run that never happened.
+  {
+    auto i8 = std::make_unique<I8GemmContext>(mc, cfg.i8_gemm,
+                                              /*bf16=*/true);
+    i8->set_autotune(cfg.autotune);
+    if (i8->enabled()) { m->_i8 = std::move(i8); }
+  }
+  {
+    bool sage_fatal = false;
+    m->_sage = MetalSageAttention::load_for_model(
+        mc, /*bf16=*/true, cfg.sage, "MetalQwenImageTransformer",
+        &sage_fatal);
+    if (sage_fatal) { return nullptr; }
+    if (m->_sage && !m->_use_attn_nax) {
+      if (mc->session() != nullptr) {
+        mc->session()->log_normal(fmt(
+            "MetalQwenImageTransformer: sage_attn is off -- the matrix-core "
+            "flash entry is unavailable here"));
+      }
+      m->_sage.reset();
+    }
+  }
 
   // Affine qmm kernels (bf16 variant) -- only when the checkpoint is quantized.
   if (m->_quant_bits > 0) {
@@ -576,29 +940,9 @@ MetalQwenImageTransformer::time_proj_(float sigma) const
   const int C = _cfg.time_proj, half = C / 2;
   std::vector<float> out((std::size_t)C);
   const float sc = 1000.0f;
-  // Round-to-nearest-even down to bf16 (what torch's .to(bfloat16) does).
-  auto to_bf16 = [](float f) {
-    std::uint32_t u;
-    std::memcpy(&u, &f, 4);
-    u += 0x7fffu + ((u >> 16) & 1u);
-    u &= 0xffff0000u;
-    float o;
-    std::memcpy(&o, &u, 4);
-    return o;
-  };
-  // Mage-Flow's forward does `timesteps = timesteps.to(img.dtype)` with the
-  // model in bf16, so the TIMESTEP is rounded before the angle is formed --
-  // the same trap as the frequency table below, and just as consequential:
-  // the angle reaches sigma*1000 ~ 950 rad, so bf16's ~2e-3 ulp near 1.0 is
-  // ~2 RADIANS of phase and moves temb by 30-40%. Only sigmas that are
-  // exactly representable in bf16 (1.0, 0.75, 0.5) are unaffected -- which is
-  // why a golden pinned at sigma 0.75 cannot see this, while the real
-  // FlowMatchEuler schedule (0.947, 0.857, 0.667) is wrong at every step but
-  // the first.
-  if (_cfg.bf16_timestep) { sigma = to_bf16(sigma); }
   for (int i = 0; i < half; ++i) {
-    float freq = std::exp(-std::log(10000.0f) * (float)i / (float)half);
-    if (_cfg.bf16_time_freqs) { freq = to_bf16(freq); }
+    const float freq =
+        std::exp(-std::log(10000.0f) * (float)i / (float)half);
     const float arg = sigma * sc * freq;
     out[(std::size_t)i] = std::cos(arg);
     out[(std::size_t)(half + i)] = std::sin(arg);
@@ -646,17 +990,8 @@ MetalQwenImageTransformer::build_rope_(int txt_seq,
       cb[o] = c; cb[o + 1] = c; sb[o] = s; sb[o + 1] = s;
     }
   };
-  // Text rows first: position = max_vid + tt on all axes. When the model
-  // leaves text unrotated (Mage-Flow), write the identity rotation instead
-  // -- cos 1 / sin 0 -- so the shared roped-attention path needs no branch.
+  // Text rows first: position = max_vid + tt on all axes.
   for (int tt = 0; tt < txt_seq; ++tt) {
-    if (!_cfg.rotate_txt) {
-      for (int j = 0; j < P; ++j) {
-        const std::size_t o = (std::size_t)tt * D + 2 * j;
-        cb[o] = 1.0f; cb[o + 1] = 1.0f; sb[o] = 0.0f; sb[o + 1] = 0.0f;
-      }
-      continue;
-    }
     const double p = (double)(max_vid + tt);
     fill(tt, p, p, p);
   }
@@ -682,6 +1017,30 @@ MetalQwenImageTransformer::gemm_mma_(ComputeEncoder& enc,
   // Matrix-core matmul2d only when present, M amortizes the 128-row tile, and N
   // is non-degenerate. Otherwise the caller keeps its steel path.
   if (!_use_mma2 || M < _mma_min_m || N < 16) { return false; }
+  // And decline a shape whose operands would not survive the tiles'
+  // 32-bit addressing: past 2^31 BYTES on ANY operand the mma tiles stop
+  // storing, silently. DECLINING rather than banding is deliberate here.
+  // The steel path the caller falls back to is int64 and therefore
+  // correct, and this shape is not reachable: K peaks at the ff-down's
+  // 16384, so the line sits at 65536 tokens = a 4096px square, where one
+  // token is 16x16 px. MiniMax-H3's fc2 got a band instead because it was
+  // live at 1376x768x243 and a band is free; paying a restructure of this
+  // GEMM for a resolution nothing can allocate is not the same trade.
+  // See shared/mma-tile.h.
+  if (M > mma_row_band(N, K)) { return false; }
+  // Accelerated mode on the checkpoint's OWN codes, before any dequant
+  // exists: the int8 GEMM against them in the signed layout, converted
+  // per call (I8GemmContext::gemm_affine) -- one pass over the codes in
+  // place of the dequant pass AND the requant pass the route below pays,
+  // and the weight quantized once instead of twice. MEASURED as a route
+  // on the M5 Pro (gemm_i8.w8_against_bf16_routes): 0.98-1.05x a bf16
+  // weight under i8, where dequant + requant ran 0.95-0.98x. A shape it
+  // declines falls through with nothing encoded.
+  if (_i8 && w.quantized && _quant_group == 64 &&
+      _i8->gemm_affine(enc, xin, xe, w.codes, w.scales, w.qbias, w.bits, y,
+                       ye, M, N, K)) {
+    return true;
+  }
   const SharedBuffer* wdense;
   if (w.quantized) {
     const metal_compute::ComputeFunction& dq =
@@ -705,6 +1064,14 @@ MetalQwenImageTransformer::gemm_mma_(ComputeEncoder& enc,
     wdense = &_w_deq;
   } else {
     wdense = &w.w;
+  }
+  // Accelerated mode: int8 activations x int8 weight, quantized per call
+  // from the SAME dense operand the tiles below read -- so it sits after
+  // the dequant and before the tile choice, and a shape it does not
+  // accept falls through with nothing encoded. Biasless, like every arm
+  // in this function; gemm_bias_q adds the bias after either way.
+  if (_i8 && _i8->gemm(enc, xin, xe, *wdense, y, ye, M, N, K)) {
+    return true;
   }
   // Split-K deep-reduction path (K a multiple of kSplitKC, >= 2 chunks): each
   // split gets its own threadgroup plane (grid.z); a residual_add fold sums the
@@ -839,7 +1206,7 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   // output for the image rows BEFORE the output projection and gate, and -5
   // returns the timestep conditioning vector temb. Together they split a
   // mismatch into conditioning / attention / out-proj+gate -- which is how
-  // the Mage-Flow bf16-frequency bug was localized.
+  // a timestep-embedding mismatch is localized.
   bool dbg_att = false;          // stop_after_block == -4 fired
   std::size_t dbg_ioff = 0;
 
@@ -850,17 +1217,19 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
   // absolute step time inflates a little, but the RELATIVE breakdown is
   // faithful. Mirrors the Krea-2 / FLUX.2 DiT profilers.
   const bool prof = !_stream_blocks &&
-                    (std::getenv("VPIPE_QIE_DIT_PROFILE") != nullptr
-                     // Mage-Flow drives this same class, so accept a
-                     // Mage-named alias -- section timing for a Mage run
-                     // should not hide behind a QIE-named variable.
-                     || std::getenv("VPIPE_MAGE_DIT_PROFILE") != nullptr);
+                    std::getenv("VPIPE_QIE_DIT_PROFILE") != nullptr;
   // Measurement-only: skip the modulation GEMVs to isolate their bandwidth cost
   // (imod/tmod left stale -> output is garbage; timing only). VPIPE_QIE_SKIP_MOD.
   const bool skip_mod = std::getenv("VPIPE_QIE_SKIP_MOD") != nullptr;
   double t_embed = 0, t_mod = 0, t_norm = 0, t_qkv = 0, t_attn = 0,
          t_oproj = 0, t_ff = 0, t_final = 0;
   std::chrono::steady_clock::time_point mark;
+
+  // The int8 split's width, for shapes an earlier step recorded. BEFORE
+  // the stream below, because tune_pending runs its own command streams
+  // and every encoder in this forward is open from there to the end.
+  // Step 1 records, step 2 measures, every step after reads the cache.
+  if (_i8) { _i8->tune_pending(_mc); }
 
   CommandStream stream = _mc->make_command_stream();
   {
@@ -872,7 +1241,9 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     auto flush = [&]() {
       enc.end();
       stream.commit().wait();
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
     };
     // Profiling barrier: commit+wait the accumulated ops, add the elapsed slice
@@ -883,7 +1254,9 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       stream.commit().wait();
       acc += std::chrono::duration<double, std::milli>(
                  std::chrono::steady_clock::now() - mark).count();
-      stream = _mc->make_command_stream();
+      // The same stream: a fresh one is a new queue, and its first
+      // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+      // stream_per_commit_costs).
       enc = stream.begin_compute();
       mark = std::chrono::steady_clock::now();
     };
@@ -1172,8 +1545,13 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     // O(JT^2) sdpa at high resolution (mirrors Krea-2 / FLUX.2). Full MHA: NH
     // query heads = NH kv heads (gqa_factor 1); Q/K/V/O are [NH, JT, Hd], exactly
     // what the head-major transposes below produce. Falls back to scalar sdpa.
-    const int A_BQ = 32, A_BK = 16;   // ALU steel bq/bk (bd128)
-    metal_compute::ComputeFunction fn_attn;
+    // The two kernels tile differently, and every NQ/NK below is
+    // computed from these -- so this one line is what makes the params
+    // describe the kernel that will actually run.
+    const bool nax = _use_attn_nax;
+    const int A_BQ = nax ? 64 : 32;   // steel bq/bk (bd128), ALU or NAX
+    const int A_BK = nax ? 32 : 16;
+    metal_compute::ComputeFunction fn_attn, fn_attn_i8;
     bool use_steel = _steel_attn_ok;
     if (use_steel) {
       auto* p = static_cast<SteelAttnParams*>(_attn_params.contents());
@@ -1192,11 +1570,31 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       p->V_strides[1] = p->K_strides[1]; p->V_strides[2] = Hd;
       p->O_strides[0] = p->Q_strides[0];
       p->O_strides[1] = p->Q_strides[1]; p->O_strides[2] = Hd;
-      metal_compute::FunctionConstants fc;
-      fc.set_bool(200, (JT % A_BQ) == 0).set_bool(201, (JT % A_BK) == 0)
-          .set_bool(300, false).set_bool(301, false).set_bool(302, false);
-      fn_attn = _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+      auto build = [&](bool i8) {
+        metal_compute::FunctionConstants fc;
+        fc.set_bool(200, (JT % A_BQ) == 0).set_bool(201, (JT % A_BK) == 0)
+            .set_bool(300, false).set_bool(301, false).set_bool(302, false)
+            .set_bool(sage::kQkInt8Constant, i8);
+        MetalSageAttention::pv8_constants(
+            fc, i8 && _sage && _sage->pv8_for(_cfg.sage));
+        return nax
+            ? _lib_attn_nax.function("attn_steel_nax_h_bd128_bf16", fc)
+            : _lib_attn.function("attn_steel_h_bd128_bf16", fc);
+      };
+      fn_attn = build(false);
       use_steel = fn_attn.valid();
+      // The int8 twin, on the matrix-core entry only, and only when
+      // there is a driver to fill its operands. A function built with
+      // constant 306 true reads buffers 15..18, so it is not a twin of
+      // anything without the prologue that writes them -- and asking
+      // for it while `_sage` is null is how this built a dispatch whose
+      // prepare() had no object to run on. `dense_layers` alone does
+      // not say Sage was asked for: it defaults to zero, which is below
+      // every block count here.
+      if (use_steel && nax && (bool)_sage && _cfg.sage.enabled &&
+          _cfg.sage.dense_layers < _cfg.n_layers) {
+        fn_attn_i8 = build(true);
+      }
     }
     const unsigned a_nqb = (unsigned)((JT + A_BQ - 1) / A_BQ);
 
@@ -1207,13 +1605,29 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     // cache whose future it cannot read -- so what finds it is checking
     // whether the blocks already kept are still in RAM. See
     // BlockResidency::note_weight_residency.
+    if (_wire.on()) {
+      // Retry a pool that refused earlier -- the refusal may have been
+      // another process spiking, and a run that never asks again holds a
+      // small resident set for the whole schedule on the strength of one
+      // syscall. Growth stopped when the budget ran out and cannot see
+      // that the budget moved, so a successful retry has to say so.
+      if (_wire.retry(_mc, wire_retry_slack_())) {
+        _resid.note_landscape_changed();
+      }
+      // OUTSIDE the streaming gate below on purpose: a preloaded stack has
+      // no blocks to shed, but its weights are the same cold read-only
+      // pages the compressor takes first, and the trunk is read on every
+      // block of every forward either way. Before any block admission, so
+      // a pool that runs out runs out on the shed-able half.
+      wire_fixed_(true);
+    }
     if (_stream_blocks) {
       const auto mbudget = _mc->memory_budget();
       _resid.begin_forward(mbudget, [this]() -> std::size_t {
         return evict_tail_block_();
       });
       bool shortfall = false;
-      if ((_resid.count() > 0 || _pinned > 0) &&
+      if (_resid.count() > 0 &&
           _resid.self_compression_grew(mbudget.self_compressed)) {
         std::size_t examined = 0, incore = 0, paged_out = 0;
         resident_pages_(&examined, &incore, &paged_out);
@@ -1223,16 +1637,14 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
               examined, incore, [this]() -> std::size_t {
                 return evict_tail_block_();
               });
-          if (freed == 0 && _pinned > 0) {
-            freed = evict_tail_block_(/*allow_pinned=*/true);
-          }
           if (_mc->session() != nullptr) {
             _mc->session()->log_normal(fmt(
                 "MetalQwenImageTransformer: resident weights are only {}% in "
-                "RAM ({} of {} sampled pages paged out) -- released {} MB, "
-                "now {} blocks resident",
+                "RAM ({} of {} sampled pages paged out, {} MB wired) -- "
+                "released {} MB, now {} blocks resident",
                 (int)(100.0 * (double)incore / (double)examined),
-                paged_out, examined, freed >> 20, _resid.count() + _pinned));
+                paged_out, examined, _wire.wired_bytes() >> 20, freed >> 20,
+                _resid.count()));
           }
         }
       }
@@ -1268,25 +1680,44 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       }
       psplit(t_mod);
     }
+    // JOIN ANY OUTSTANDING READ ON EVERY EXIT FROM THE STACK. A prefetch
+    // may be filling a slot, and this forward returns from a dozen
+    // places -- a stop request, a GPU error, an allocation that failed.
+    // Freeing or reading a slot while a reader thread is writing into it
+    // is a use-after-free, and a scope guard is the only version of this
+    // that cannot be forgotten at the thirteenth return.
+    struct SlotJoin {
+      BlockSlots<Block>* s;
+      ~SlotJoin() { s->join(); }
+    } slot_join{&_slots};
+    (void)_slots.release_if_saturated(_blocks);
+    _slots.begin_forward();
+
     for (int L = 0; L < n_layers; ++L) {
       // Pipeline stop -> abandon the forward. Checked EVERY block (not just the
       // streamed tail) so a slow preloaded step at high resolution responds to a
       // stop request within one block (~ms) instead of running all 60.
       if (_stream_stop && _stream_stop()) { return {}; }
-      if (_block_progress) { _block_progress(L, n_layers); }
-      // Pinned prefix (L < _pinned) is resident in _blocks; the tail streams
-      // from the retained mmap into a loop-local Block, freed at the end of the
-      // iteration (after the flush commits its work).
-      // Resident if it was pinned at load OR promoted by a previous
-      // pass; `_blocks` is sized to n_layers in streaming mode.
+      // On the GPU's clock: only a STREAMED block commits per
+      // iteration, so a resident stack would otherwise report the
+      // encode. See shared/dit-gpu-progress.h.
+      report_block(stream, _block_progress, L, n_layers);
+      // Resident in _blocks once residency has promoted it, and read
+      // into a slot until then. `_blocks` is sized to n_layers in
+      // streaming mode and an unfilled entry reads as empty.
       const bool held = L < (int)_blocks.size() &&
                         !_blocks[(std::size_t)L].qw.empty();
       const bool streaming = _stream_blocks && !held;
-      Block streamed;
+      const Block* streamed = nullptr;
       if (streaming) {
-        if (!load_block_(*_ws, L, streamed, Retain::Streamed)) { return {}; }
+        // Two reusable destinations, refilled in place with pread and
+        // with the next block's read already issued under the previous
+        // block's GPU work. See shared/block-slots.h; the fallback to a
+        // per-block allocation is inside it and is sticky.
+        streamed = _slots.acquire(L);
+        if (streamed == nullptr) { return {}; }
       }
-      const Block& b = streaming ? streamed : _blocks[(std::size_t)L];
+      const Block& b = streaming ? *streamed : _blocks[(std::size_t)L];
       // Modulation params: mod = mod_linear(silu(temb)) [6H]. Precomputed slice
       // (preloaded) or computed per-block (streaming).
       const std::size_t moff = (std::size_t)L * 6 * H * 2;    // bytes
@@ -1364,9 +1795,29 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       if (use_steel) {
         // Register-resident flash attention over the joint sequence: Q/K/V/O
         // [NH, JT, Hd]. Grid (32*NQ, 4*NH, 1), tg (32, 4, 1) per MLX steel.
-        enc.set_function(fn_attn);
+        // SAGE: quantize q/k for THIS block, into the same encoder and
+        // immediately before the dispatch that reads them. qt/kt are the
+        // head-major transposes written just above -- the same tensors
+        // the attention params describe. gqa_factor is 1 here, so the
+        // KV head count is NH.
+        bool i8_ok = false;
+        if (_sage && fn_attn_i8.valid() && L >= _cfg.sage.dense_layers) {
+          const MetalSageAttention::Operand qo{&qt, 0, Hd, JT * Hd};
+          const MetalSageAttention::Operand ko{&kt, 0, Hd, JT * Hd};
+          const MetalSageAttention::Operand vo{&vt, 0, Hd, JT * Hd};
+          std::string gerr;
+          i8_ok = _sage->prepare(enc, qo, ko, NH, NH, JT, JT, Hd, A_BQ,
+                                 A_BK, _cfg.sage, &gerr, &vo);
+          // The int8 function takes the int8 P*V's operands iff pv8_for()
+          // says so: a prologue that made none runs dense.
+          if (i8_ok && _sage->pv8_for(_cfg.sage) != _sage->pv8_ready()) {
+            i8_ok = false;
+          }
+        }
+        enc.set_function(i8_ok ? fn_attn_i8 : fn_attn);
         enc.set_buffer(0, qt); enc.set_buffer(1, kt); enc.set_buffer(2, vt);
         enc.set_buffer(3, at); enc.set_buffer(4, _attn_params);
+        if (i8_ok) { _sage->bind(enc); }
         enc.dispatch({32 * a_nqb, 4 * (unsigned)NH, 1}, {32, 4, 1});
       } else {
         sdpa(qt, kt, vt, at);
@@ -1422,22 +1873,54 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
       // Commit block L before `streamed` (its weights) frees at iteration end.
       // Pinned blocks stay resident, so no per-block flush is needed for them.
       if (streaming) {
-        flush();
-        // The flush above has RETIRED this block's GPU work, which is
-        // why the promotion happens here and not at the top of the
-        // iteration: an encoded GEMM holds these buffers by pointer.
-        // Keeping them costs nothing extra -- the bytes are already
-        // resident -- against the per-step re-read it retires.
+        // COMMIT, then issue the next block's read, then WAIT. Between
+        // the commit and the wait the GPU is busy with block L and this
+        // thread has nothing to do, which is the whole opportunity.
+        enc.end();
+        metal_compute::CommandStream::Fence bf = stream.commit();
+        {
+          // The next block that will actually be STREAMED. Resident ones
+          // are skipped -- prefetching one would read bytes the forward
+          // already has. Safe to look ahead: promotion only ever adds
+          // the block just finished, never one further down the stack.
+          int nxt = -1;
+          for (int n = L + 1; n < n_layers; ++n) {
+            const bool h = n < (int)_blocks.size() &&
+                           !_blocks[(std::size_t)n].qw.empty();
+            if (!h) { nxt = n; break; }
+          }
+          _slots.prefetch(nxt);
+        }
+        bf.wait();
+        // The same stream: a fresh one is a new queue, and its first
+        // commit costs ~1-1.9 ms against ~0.25 reused (gemm_i8.a_fresh_
+        // stream_per_commit_costs).
+        enc = stream.begin_compute();
+        // The commit above has been WAITED for, which is why the
+        // promotion happens here and not at the top of the iteration:
+        // an encoded GEMM holds these buffers by pointer. Keeping them
+        // costs nothing extra -- the bytes are already resident --
+        // against the per-step re-read it retires.
         if (L < (int)_blocks.size()) {
-          const std::size_t nb = block_bytes_(streamed);
-          if (_resid.admit(_mc, nb)) {
-            _blocks[(std::size_t)L] = std::move(streamed);
+          const std::size_t nb = _slots.last_bytes();
+          // Past the wire budget there is nothing to gain: the block would
+          // be kept unprotected, the compressor would take it (it is the
+          // coldest memory in the process), and the next residency walk
+          // would shed a block and ratchet the ceiling over the whole
+          // resident set. Better not to hold it at all.
+          if (_wire.wirable(nb) && _resid.admit(_mc, nb) &&
+              _slots.promote_into(_blocks[(std::size_t)L])) {
+            // Wired LAST, after every write this block will ever get:
+            // mlock pins the pages that exist NOW.
+            _wire.note_wired(_mc,
+                             wire_block_(_blocks[(std::size_t)L], true), nb);
             _resid.note_admitted(nb);
             if (_mc->session() != nullptr) {
               _mc->session()->log_debug(fmt(
                   "MetalQwenImageTransformer: block {} resident ({} of {}, "
-                  "{} MB)", L, _resid.count() + _pinned, _cfg.n_layers,
-                  _resid.bytes() >> 20));
+                  "{} MB, {} MB wired)", L, _resid.count(),
+                  _cfg.n_layers, _resid.bytes() >> 20,
+                  _wire.wired_bytes() >> 20));
             }
           }
         }
@@ -1495,6 +1978,14 @@ MetalQwenImageTransformer::forward(const SharedBuffer& hidden, int gen_seq,
     return out;
   }
   return velo;
+}
+
+void
+MetalQwenImageTransformer::release_forward_scratch()
+{
+  _w_deq = {};
+  _splitk = {};
+  if (_i8) { _i8->release_scratch(); }
 }
 
 }  // namespace genai

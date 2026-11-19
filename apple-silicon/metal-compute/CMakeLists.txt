@@ -78,13 +78,76 @@ add_vpipe_metal_kernel(rms_norm_bf16 SRC ops/rms_norm.metal
 add_vpipe_metal_kernel(llm_elementwise SRC ops/llm_elementwise.metal)
 add_vpipe_metal_kernel(llm_elementwise_bf16 SRC ops/llm_elementwise.metal
                        DEFINES VPIPE_ELT=bfloat)
+# Qwen3.8-Flash-Next (qwen4_exp): hyper-connections and the n-gram PLE
+# block (generative-models/qwen3/metal-qwen-hc.cc).
+add_vpipe_metal_kernel(qwen4_hc SRC ops/qwen4_hc.metal)
+add_vpipe_metal_kernel(qwen4_hc_bf16 SRC ops/qwen4_hc.metal
+                       DEFINES VPIPE_ELT=bfloat)
+# DeepSeek-V4.1-Flash: hyper-connections with Sinkhorn, the compressed
+# sparse attention and its indexer, the FP4 experts, engram
+# (generative-models/deepseek-v41/).
+add_vpipe_metal_kernel(deepseek_v41 SRC ops/deepseek_v41.metal)
+add_vpipe_metal_kernel(deepseek_v41_bf16 SRC ops/deepseek_v41.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(audio_vae_1d SRC ops/audio_vae_1d.metal)
 add_vpipe_metal_kernel(rope SRC ops/rope.metal)
 add_vpipe_metal_kernel(rope_bf16 SRC ops/rope.metal
                        DEFINES VPIPE_ELT=bfloat)
+# The DFlash block-diffusion drafter (speculative decoding):
+# generative-models/shared/dflash-drafter.h.
+# Fish Audio Drama 3's speech LM: the frame embedding, the codebook-MTP
+# tower's own ops and the frame sampler (generative-models/drama3/).
+add_vpipe_metal_kernel(drama3 SRC ops/drama3.metal)
+add_vpipe_metal_kernel(drama3_bf16 SRC ops/drama3.metal
+                       DEFINES VPIPE_ELT=bfloat)
+# Fish Audio's modded DAC (the S2 Pro / Drama 3 codec): its VQ, its
+# windowed transformers' q/k/v and its LayerScale residuals.
+add_vpipe_metal_kernel(fish_dac SRC ops/fish_dac.metal)
+# MiniMax-Music3's depth decoder: its K/V cache append, its causal
+# attention over a frame's few positions, its learned positions
+# (generative-models/minimax-music3/).
+add_vpipe_metal_kernel(minimax_music3 SRC ops/minimax_music3.metal)
+add_vpipe_metal_kernel(minimax_music3_bf16 SRC ops/minimax_music3.metal
+                       DEFINES VPIPE_ELT=bfloat)
+# LFM3 / LFM3-VL: the gated short convolution, the vision tower's gated
+# 3x3 depthwise conv, the per-head attention gate and a few-row GEMV
+# (generative-models/lfm3/).
+add_vpipe_metal_kernel(lfm3 SRC ops/lfm3.metal)
+# RIFE's IFNet frame interpolation (temporal-resample `rife`): the frame
+# upload, the fused warp + resize + concat feeding each block, the
+# pixel-shuffled flow update and the final blend (generative-models/rife/).
+# Its convs are dense_gemm's gather conv, or conv2d_mma's hardware conv
+# on an M5.
+add_vpipe_metal_kernel(rife SRC ops/rife.metal)
+# RelayVSR (generative-models/relayvsr/): the frame upload, the keyframe
+# DiT's source rows, f32 modulation, RoPE and one-step latent, and the
+# decoder's condition rows, per-head norms, RoPE, SwiGLU and output frame.
+add_vpipe_metal_kernel(relayvsr SRC ops/relayvsr.metal)
+add_vpipe_metal_kernel(relayvsr_bf16 SRC ops/relayvsr.metal
+                       DEFINES VPIPE_ELT=bfloat)
+# Open-H3-Regenerate-2K: MiniMax-H3's latent upscaler (its folded-affine
+# GroupNorm, temporal depthwise conv and bilinear resize) and the LMS
+# Sharp curve branch on the DiT's AdaLN (generative-models/minimax-h3/).
+add_vpipe_metal_kernel(minimax_h3_regenerate SRC ops/minimax_h3_regenerate.metal)
+add_vpipe_metal_kernel(minimax_h3_regenerate_bf16
+                       SRC ops/minimax_h3_regenerate.metal
+                       DEFINES VPIPE_ELT=bfloat)
+add_vpipe_metal_kernel(dflash SRC ops/dflash.metal)
+add_vpipe_metal_kernel(dflash_bf16 SRC ops/dflash.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(sdpa SRC attention/sdpa.metal)
 add_vpipe_metal_kernel(sdpa_bf16 SRC attention/sdpa.metal
                        DEFINES VPIPE_ELT=bfloat VPIPE_BF16=1)
+# Sol-Attn (NVlabs/Sana, arXiv:2607.24027) -- see
+# generative-models/shared/sol-attention.h. The EXACT blocks are run by
+# attn_steel above, block-sparse; this is the routing and the
+# approximate half.
+add_vpipe_metal_kernel(sol_attn_mma SRC attention/sol_attn_mma.metal)
+add_vpipe_metal_kernel(sol_attn_mma_bf16 SRC attention/sol_attn_mma.metal
+                       DEFINES VPIPE_ELT=bfloat)
+add_vpipe_metal_kernel(flashvsr_route SRC attention/flashvsr_route.metal)
+add_vpipe_metal_kernel(flashvsr_route_bf16 SRC attention/flashvsr_route.metal
+                       DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(qwen3_5_gated_delta
                        SRC gated-delta/qwen3_5_gated_delta.metal)
 add_vpipe_metal_kernel(qwen3_5_gated_delta_bf16
@@ -92,6 +155,14 @@ add_vpipe_metal_kernel(qwen3_5_gated_delta_bf16
                        DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(qwen3_5_gdn_wy
                        SRC gated-delta/qwen3_5_gdn_wy.metal)
+# VDN-H3's per-frame SPD solve. f32 only: the matrix it factorises is
+# only symmetric to the working precision, and bf16's 8 mantissa bits
+# push the smallest eigenvalue of I + A below the 1 the maths guarantees.
+add_vpipe_metal_kernel(vdn_solve SRC gated-delta/vdn_solve.metal)
+# The linear branch's per-frame statistics. Also f32: A is what the
+# solve above inverts, and its symmetry only holds to the working
+# precision.
+add_vpipe_metal_kernel(vdn_branch SRC gated-delta/vdn_branch.metal)
 add_vpipe_metal_kernel(dense_gemm SRC gemm/dense_gemm.metal)
 add_vpipe_metal_kernel(dense_gemm_bf16 SRC gemm/dense_gemm.metal
                        DEFINES VPIPE_ELT=bfloat)
@@ -138,13 +209,42 @@ add_vpipe_metal_kernel(conv2d_mma SRC gemm/conv2d_mma.metal
 add_vpipe_metal_kernel(conv2d_mma_bf16 SRC gemm/conv2d_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
+
+# Sol-Attn's routing proxy as one batched matmul2d. Its own target
+# because it is metal4.0 + MPP where the rest of sol_attn_mma is not, and
+# the loader asks supports_matrix_cores() before binding it.
+# Can the NAX fragment MMA run int8, and at what rate at attention's
+# 16-deep fragment shape? The probe that decides whether an int8 QK is
+# worth wiring into the flash kernel. Same headers as attn_steel_nax.
+add_vpipe_metal_kernel(attn_qk_i8_probe
+                       SRC attention/attn_qk_i8_probe.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS
+                          vendored/mlx/backend/metal/kernels/steel/attn/nax.h)
+
+# The int8 QK's prologue: per-block quantization of Q and K plus the key
+# mean the smoothing needs. Plain MSL -- no matrix ops -- so it builds
+# everywhere and the f16/bf16 twins are the usual pair.
+add_vpipe_metal_kernel(sage_quant SRC attention/sage_quant.metal)
+add_vpipe_metal_kernel(sage_quant_bf16 SRC attention/sage_quant.metal
+                       DEFINES VPIPE_ELT=bfloat)
+
+add_vpipe_metal_kernel(sol_proxy_mma SRC attention/sol_proxy_mma.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS})
+add_vpipe_metal_kernel(sol_proxy_mma_bf16 SRC attention/sol_proxy_mma.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(qwen3_5_vision SRC encoders/qwen3_5_vision.metal)
-# bf16 twin: the Mage-Flow reference runs its Qwen3-VL tower in bf16
-# (pipeline.py casts txt_enc, tower included), so the tower needs a bf16
-# storage path to reproduce the reference's numerics.
+# bf16 twin: a pipeline that casts its whole text encoder to bf16 runs
+# its Qwen3-VL tower in bf16 too, so the tower needs a bf16 storage path
+# to reproduce that reference's numerics.
 add_vpipe_metal_kernel(qwen3_5_vision_bf16 SRC encoders/qwen3_5_vision.metal
                        DEFINES VPIPE_ELT=bfloat)
 add_vpipe_metal_kernel(audio_encoder SRC encoders/audio_encoder.metal)
+# BS-RoFormer's band split, token-major RoPE, head gates and mask head
+# (generative-models/bs-roformer/).
+add_vpipe_metal_kernel(band_split_roformer
+                       SRC encoders/band_split_roformer.metal)
 set(STEEL_GEMM_HDRS
     vendored/mlx/backend/metal/kernels/steel/defines.h
     vendored/mlx/backend/metal/kernels/steel/utils.h
@@ -155,11 +255,29 @@ set(STEEL_GEMM_HDRS
     vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
 add_vpipe_metal_kernel(affine_qmm_steel
                        SRC quant/affine_qmm_steel.metal
-                       DEPENDS ${STEEL_GEMM_HDRS})
+                       DEPENDS ${STEEL_GEMM_HDRS} quant/affine_qmm_loaders.h)
 add_vpipe_metal_kernel(affine_qmm_steel_bf16
                        SRC quant/affine_qmm_steel.metal
                        DEFINES VPIPE_ELT=bfloat
+                       DEPENDS ${STEEL_GEMM_HDRS} quant/affine_qmm_loaders.h)
+# LoRA training: the backward's elementwise ops, loss and optimizers; the
+# GEMM shapes the forward's NT kernels do not cover (TN over the rows,
+# NN against a small factor); and the flash attention's backward.
+add_vpipe_metal_kernel(train_ops SRC train/train_ops.metal)
+add_vpipe_metal_kernel(train_ops_bf16 SRC train/train_ops.metal
+                       DEFINES VPIPE_ELT=bfloat)
+add_vpipe_metal_kernel(train_gemm SRC train/train_gemm.metal
                        DEPENDS ${STEEL_GEMM_HDRS})
+add_vpipe_metal_kernel(train_gemm_bf16 SRC train/train_gemm.metal
+                       DEFINES VPIPE_ELT=bfloat
+                       DEPENDS ${STEEL_GEMM_HDRS})
+# Their matrix-core (M5+) twins for the attention backward's batched GEMMs;
+# bound only where the GPU has matrix cores.
+add_vpipe_metal_kernel(train_gemm_mma SRC train/train_gemm_mma.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS})
+add_vpipe_metal_kernel(train_gemm_mma_bf16 SRC train/train_gemm_mma.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS})
 # Matrix-core (M5+) 4-bit quantized GEMM via MetalPerformancePrimitives
 # matmul2d. Drop-in for affine_qmm_steel_w4g64; gated at runtime on
 # matrix-core capability (older GPUs keep the steel path).
@@ -170,6 +288,34 @@ add_vpipe_metal_kernel(affine_qmm_mma_bf16
                        SRC quant/affine_qmm_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
+# Matrix-core (M5+) MoE grouped expert GEMMs (NAX): the twins of
+# affine_qmm_steel's affine_qmm_grouped_* (same buffers and sorted-tile
+# contract), the weight tile staged by the shared QuantizedBlockLoader.
+# metal4.0 + MPP; bound only where the GPU has matrix cores.
+set(GROUPED_NAX_HDRS
+    quant/affine_qmm_loaders.h
+    vendored/mlx/backend/metal/kernels/steel/defines.h
+    vendored/mlx/backend/metal/kernels/steel/attn/nax.h
+    vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+    vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
+add_vpipe_metal_kernel(affine_qmm_grouped_nax
+                       SRC quant/affine_qmm_grouped_nax.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
+add_vpipe_metal_kernel(affine_qmm_grouped_nax_bf16
+                       SRC quant/affine_qmm_grouped_nax.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
+# DeepSeek-V4.1's routed experts (affine 2-8 bits, MXFP4) as grouped GEMMs
+# on the matrix cores: the twins of deepseek_v41's _grouped kernels.
+add_vpipe_metal_kernel(deepseek_v41_nax SRC ops/deepseek_v41_nax.metal
+                       STD metal4.0 FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
+add_vpipe_metal_kernel(deepseek_v41_nax_bf16 SRC ops/deepseek_v41_nax.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS ${GROUPED_NAX_HDRS})
 # 4-bit -> dense weight expansion feeding the matrix-core dense GEMM
 # (dequant-once then dense_gemm_mma; faster than fused dequant-in-loop).
 add_vpipe_metal_kernel(affine_dequant SRC quant/affine_dequant.metal)
@@ -189,6 +335,13 @@ add_vpipe_metal_kernel(gdn_mma SRC gated-delta/gdn_mma.metal STD metal4.0
 add_vpipe_metal_kernel(gdn_mma_bf16 SRC gated-delta/gdn_mma.metal
                        STD metal4.0 DEFINES VPIPE_ELT=bfloat
                        FLAGS ${VPIPE_NAX_MIN_OS})
+# VDN-H3's per-frame statistics on the matrix cores. bf16 ONLY, and not
+# for want of a twin: the operands are the branch's FEATURES, which are
+# bf16 exactly when the matrix-core route is on -- an fp32 branch is the
+# goldens' path and keeps the ALU kernel. Capability-gated.
+add_vpipe_metal_kernel(vdn_mma SRC gated-delta/vdn_mma.metal
+                       STD metal4.0 DEFINES VPIPE_ELT=bfloat
+                       FLAGS ${VPIPE_NAX_MIN_OS})
 add_vpipe_metal_kernel(attn_steel
                        SRC attention/attn_steel.metal
                        DEPENDS vendored/mlx/backend/metal/kernels/steel/defines.h
@@ -199,6 +352,50 @@ add_vpipe_metal_kernel(attn_steel
                                vendored/mlx/backend/metal/kernels/steel/attn/params.h
                                vendored/mlx/backend/metal/kernels/steel/attn/transforms.h
                                vendored/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h
+                               vendored/mlx/backend/metal/kernels/steel/gemm/params.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
+
+# Attention through a per-query spatial window over a stack of key planes
+# (RelayVSR): attn_steel_paged's register-resident core with K/V gathered
+# from the union of a query tile's windows. Both element types, by name.
+add_vpipe_metal_kernel(local_window_attn
+                       SRC attention/local_window_attn.metal
+                       DEPENDS vendored/mlx/backend/metal/kernels/steel/defines.h
+                               vendored/mlx/backend/metal/kernels/steel/utils.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/attn.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/loader.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/mma.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/params.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/transforms.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.h
+                               vendored/mlx/backend/metal/kernels/steel/gemm/params.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
+
+# ...the same on the matrix cores (M5+), with SageAttention's int8 QK and
+# int8 P*V behind function constants and the int8 prologue beside it.
+# metal4.0 for the MPP fragments; #if __HAVE_TENSOR__ guards the kernel.
+add_vpipe_metal_kernel(local_window_attn_nax
+                       SRC attention/local_window_attn_nax.metal
+                       STD metal4.0
+                       FLAGS ${VPIPE_NAX_MIN_OS}
+                       DEPENDS vendored/mlx/backend/metal/kernels/steel/defines.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/nax.h
+                               vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h)
+
+# The steel flash attention's backward (LoRA training): dQ, and dK/dV
+# accumulated in f32, in the forward's per-segment band form. Both element
+# types are instantiated in the one library, by name.
+add_vpipe_metal_kernel(attn_bwd
+                       SRC train/attn_bwd.metal
+                       DEPENDS vendored/mlx/backend/metal/kernels/steel/defines.h
+                               vendored/mlx/backend/metal/kernels/steel/utils.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/attn.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/loader.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/mma.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/params.h
+                               vendored/mlx/backend/metal/kernels/steel/attn/transforms.h
                                vendored/mlx/backend/metal/kernels/steel/gemm/params.h
                                vendored/mlx/backend/metal/kernels/steel/utils/integral_constant.h
                                vendored/mlx/backend/metal/kernels/steel/utils/type_traits.h)
@@ -236,6 +433,8 @@ add_vpipe_metal_kernel(letterbox_planar_u8_to_rgb_f16
                        SRC image-processing/letterbox_planar_u8_to_rgb_f16.metal)
 add_vpipe_metal_kernel(resample_lanczos_planar_u8
                        SRC image-processing/resample_lanczos_planar_u8.metal)
+add_vpipe_metal_kernel(resample_planar_float
+                       SRC image-processing/resample_planar_float.metal)
 add_vpipe_metal_kernel(motion_signature_u8
                        SRC image-processing/motion_signature_u8.metal)
 add_vpipe_metal_kernel(motion_diff_u8

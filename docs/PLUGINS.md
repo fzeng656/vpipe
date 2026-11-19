@@ -149,6 +149,43 @@ like it does:
   any stage — which is what lets a plugin extend a family the host does not
   know about.
 
+### Command channels
+
+A plugin stage can accept **commands** while its pipeline runs — requests
+from the C++ API, Python or a GUI view, carrying JSON arguments and buffers
+in either direction, zero-copy. Declare them in the spec and the host does
+the rest: it queues them first in first out, validates each against your
+declaration before your stage sees it, and cancels them at stop.
+
+```cpp
+const vpipe::BufferSpec kFrameOut[] = {
+  {.name = "frame", .type = "u8", .shape = "H,W,3", .contiguous = true},
+};
+const vpipe::CommandSpec kCommands[] = {
+  {.name = "snapshot", .doc = "the current frame, in place",
+   .out = kFrameOut, .holds = true},
+};
+const vpipe::StageSpec kSpec = { .type_name = "acme-camera", /* ... */
+                                 .commands = kCommands };
+
+// In process(): answer between beats, or sleep on beats AND commands.
+co_await ctx.read_any({0}, /*commands=*/true);
+while (auto cmd = ctx.try_command()) {
+  cmd->reply(result, {vpipe::DataBuffer::view("frame", _frame.data(),
+      vpipe::BufferLayout::contiguous(vpipe::ElementType::U8,
+                                      {_h, _w, 3}), _frame_owner)});
+  co_await cmd->until_closed();   // hold: nothing downstream moves
+}
+```
+
+The layout grammar (`type`, `shape`, `format`), the lifecycle and the
+ownership rules are in [STAGE-COMMANDS.md](STAGE-COMMANDS.md). The two
+things a plugin gets wrong: an exposed buffer's `owner` must keep the
+memory alive for as long as the caller holds a view (so a stage that wants
+its memory back checks `use_count()` after the close and copies when the
+caller kept one), and a command taken must be answered — `reply()` or
+`fail()` — or its caller waits until the pipeline stops.
+
 ## Extension point 2 — Metal shaders
 
 Compile a self-contained `.metal` offline and embed its bytes with the
@@ -194,7 +231,10 @@ Available by name include `dense_gemm_bf16` / `dense_gemm_mma_bf16`,
 `attn_steel`, and `llm_elementwise_bf16` — which alone carries adaLN
 modulation, gated residuals, gelu-tanh, bias-add, im2col and nearest-2x
 upsample. Note the entry points keep an `_f16` suffix in **both** dtype
-twins; the LIBRARY name is what selects bf16 or f16.
+twins; the LIBRARY name is what selects bf16 or f16. Revision 2 of the
+contract (`"kernel-contract/2"`) adds the f16 libraries' GEMMs, scalar
+attention and norm, for a model whose reference runs in f16 -- a codec,
+typically; everything elementwise it needs in f16 it copies.
 
 Write a kernel only for what is genuinely your model's own. The LTX-2.5
 plugin ships three entry points and reuses everything else.
@@ -264,6 +304,40 @@ exec. Reuse `ContextManager` by filling its `Spec` (Paged or Contiguous) —
 you do **not** create a new KV manager. v1 targets text-only models;
 multimodal encoders remain a built-in concern.
 
+### Driving a vision-language model from a stage
+
+A plugin stage that wants a VLM to look at frames -- to describe a clip,
+answer about a picture -- cannot reach the towers or the chat templates:
+they are each family's own and are not on the SDK. `genai::VideoTurn`
+(`generative-models/video-turn.h`, feature `video-turn/1`) is the part of
+them a stage needs. Load the model through the session's
+`GenerativeModelManager` as text-chat does (declare its weights in
+`declare_memory` / `declare_resources` first), then:
+
+```cpp
+#include "generative-models/video-turn.h"
+
+auto turn = vpipe::genai::VideoTurn::make(lm, session());  // null: no tower
+for (/* each frame: planar u8 RGB [3, h, w], `t` s into the clip */) {
+  turn->add_frame(rgb, h, w, t);  // through the model's own tower, now
+}
+std::string words = turn->reply(
+    /*before=*/"", /*after=*/"What happens in this part?",
+    sampler_spec,   // a sampler-select beat's FlexData, or null: greedy
+    /*max_tokens=*/256,
+    [&](std::string_view piece) { return !ctx.stop_requested(); });
+```
+
+The frames go into the family's own template as ONE video, each marked
+with its time (`<12.0 seconds>` for Qwen3-VL), between `before` and
+`after`; the reply is decoded with thinking off -- MTP- or DFlash-drafted
+where the model carries a drafter -- and the frames are dropped with it,
+so one turn serves scene after scene. With no frames, `reply` is a turn
+of words alone (a summary of the scenes' answers, say). A frame is
+~180 tokens at 576 x 320 on Qwen3.5: `tokens()` says what the next
+prefill holds. Register the stage only when
+`ctx->has_feature(VPIPE_FEATURE_VIDEO_TURN)`.
+
 ## Extension point 4 — video model families
 
 `generate-video` runs Wan and MiniMax-H3 from concrete types held side by
@@ -328,11 +402,881 @@ look like a hang.
 Ship the family's knobs as a `ModelConfigSourceStage` (above), not as keys
 on `generate-video`.
 
+### Live previews
+
+`generate-video` can stream a **live preview** of the clip while it
+denoises (its `preview` oport, played by a `preview` stage). The host
+decodes each preview with a tiny autoencoder (TAE) and handles the port,
+the pacing, the memory booking and the dropping. Because your family owns
+the denoise loop, one thing is left to you: handing back the model's
+**clean estimate**, through the request's named-output seam:
+
+```cpp
+// after step `s` of `total`, before the scheduler overwrites the state
+if (req.output_wanted(vpipe::genai::kOutputPreviewX0, s, total)) {
+  // x0, not the noisy state: the model's current guess at the clip, in
+  // the SAME space, layout and shape as VideoGenResult::video [z, T, h, w]
+  vpipe::genai::NamedTensor t;
+  t.data = x0.data(); t.shape = {z, T, h, w}; t.elem_size = 4;
+  req.output(vpipe::genai::kOutputPreviewX0, s, total, t);
+}
+```
+
+**Ask before you build.** Unpacking a clip-sized latent every step for a
+host that renders every eighth wastes work. The host always installs both
+calls, so you never null-check them. A test of yours that builds its own
+`VideoGenRequest` has to install them too, as the host does; an empty
+`std::function` throws when called. The tensor is borrowed for the call.
+
+Your config source declares the four preview keys: `preview_vae`,
+`preview_every`, `preview_max_edge` and `preview_frames`. Use the NAMES
+from `genai::preview_key` (`generative-models/gen-input.h`), and emit them
+into your beat. Use the names, not the `LatentPreviewSpec` struct: the key
+names are the contract, while the struct's layout is not ABI and can
+change. The
+TAE a user names must be trained for your latent space; madebyollin's
+`taeltx_2` and `taew2_1` are examples. The host decodes every TAEHV with
+the leading-frame trim (T latent frames give `t_upscale * T - t_upscale +
+1` frames), which is every published one but MiniMax-H3's.
+
+A family that never calls `output` works as before, and its preview port
+simply stays silent.
+
+The host's TAE decode reports its own arithmetic to the FLOP/s meter
+(below), so your family counts only its own forwards.
+
+### Reporting achieved FLOP/s
+
+The host keeps a process-wide meter of the arithmetic the GPU and the ANE
+actually did (`common/perf-flops.h`, feature `perf-flops/1`). A UI reads it
+as TFLOP/s per bin, polled every second or ten:
+`GET /api/profiler/flops?bin_ms=1000&bins=60` in the web UI, or
+`vpipe.perf_flops(bin_ms=1000, bins=60)` from Python. Producers pay one
+lock-free ring write per credit, and the meter is always on.
+
+**It is optional, so do not require it.** A plugin imports the meter's
+functions WEAKLY: built against an SDK that has the meter, it still loads
+on a host that does not, where `perf_flops::available()` is false and
+nothing is credited. The toolkit's helpers below check this for you; code
+that calls `perf_flops::credit()` itself must check `available()` first.
+Never list `perf-flops/1` in `required_features` for this: that would
+refuse a host the plugin runs on perfectly well.
+
+Credit a DiT -- or a VAE, an audio codec, any GPU stage -- on the GPU's
+clock with the toolkit's `GpuFlopsTally`
+(`generative-models/shared/dit-flops.h`). Count as you encode, and flush
+where you commit:
+
+```cpp
+// in your GEMM helper, once per projection, at the rows the GPU computes
+_flops.gemm(M, N, K);                         // 2*M*N*K
+// at each attention dispatch: the (query, key) pairs it attends
+_flops.attention(heads, q_len * k_len, head_dim);
+// per forward
+_flops.begin();                               // before encoding anything
+_flops.flush(stream);                         // at each block's start
+_flops.flush(stream);                         // before EVERY commit
+```
+
+A flush hangs the batch on the command buffer open at that moment, and the
+meter is credited when that buffer **retires**. A forward that encodes its
+whole stack in a millisecond is therefore still reported over the seconds
+the GPU spends on it. Flush before every commit -- a streamed block's,
+an ANE split's drain, a stop drain, the final one -- and at each block's
+start for a stack that commits nothing between blocks. A batch left
+unflushed at a commit rides the next buffer and is credited late (never
+lost, never twice).
+
+Count where the work is ENCODED, so a skipped stage costs nothing: a
+cached caption that bypasses its refiner adds no FLOPs because nothing
+was encoded. If your dispatch helpers live in one ops object, keep the
+tally there (a `mutable` member, so `const` helpers can count) and flush
+it wherever anything commits.
+
+Count what executes, not what it stands in for. A causal run counts its
+triangle (`causal_pairs`). A windowed or masked attention counts the pairs
+it attends -- when the mask is host-visible, count it exactly. Sol-Attn
+counts the key blocks it kept: use `SolFlops`, which counts each forward at
+the keep ratio of the forward before it, and call `finish(exact_blocks())`
+after the final wait (reset the GPU counter at the forward's start).
+A convolution counts `2 * outputs * cout * taps * cin` whichever route runs
+it (an im2col GEMM, a hardware conv, a direct kernel): count it once, where
+the conv is asked for, not inside each route. A causal conv's taps before
+the start of the sequence are padding, not arithmetic -- one route skips
+them and another multiplies their zeros, so count the live taps and the
+figure is the same on every GPU. Padding a kernel adds for its own sake --
+input channels rounded up to a tile's width -- is not arithmetic either:
+count the model's width. A runtime adapter's two GEMMs are work like
+any other (`2*M*r*K` and `2*M*N*r`). Elementwise passes are not counted.
+The ANE needs nothing from you: the ANE
+tier credits every predict itself, at the same per-row FLOPs the GPU's
+GEMMs would have counted, so moving rows between the two units moves no
+FLOPs.
+
+To test it, derive the count from your model's shapes and hold the
+tally's `flushed()` to it EXACTLY; then hold the meter's
+`perf_flops::totals(kGpu)` delta over the forward to `flushed()`, and the
+tally's `pending()` to zero after it (a commit with no flush in front of
+it leaves its batch pending). The last buffer's completion handler can run
+just after the wait that saw it retire, so poll the totals briefly before
+comparing. A route that changes how the arithmetic is done -- a quantized
+GEMM, an int8 attention -- must count what the dense route counts: hold
+the two equal, and tell an arm that engaged from one that declined by its
+answer, or the equality is vacuous.
+
+### Where new things go, and why they do not go in a field
+
+The ABI is a strict-equality cookie, so anything that moves a layout
+costs every plugin a rebuild — including the plugins that never use the
+thing that moved. Four places used to grow that way and no longer do:
+
+| you want to add | it goes in | not in |
+|---|---|---|
+| an acceleration tier | the `accel` bag | a field on the request |
+| a per-family fact the host needs | a **family profile** domain | a switch in the host |
+| a new generation INPUT with a shape | `req.input("name", &t)` | a field on the request |
+| a tensor handed back MID-generation | `req.output("name", step, total, t)`, asked first with `req.output_wanted` | a callback field on the request |
+| a scalar the host states | `req.borrowed_extra` | a field on the request |
+| something a family wants said back | `result.sideband` | a field on the result |
+| a new packaging fact | `ModelCatalogEntry::extra` | a field on the entry |
+| new stage or port metadata | `spec.extra` (a `SpecExtra` span) | a field on the spec |
+| a new VAE codec kind | a `role` NAME | an enumerator |
+
+`VideoGenRequest` is the worked example of the cost. Read its typed
+fields in order: `cond`, `neg`, `audio_cond`, `ref`, `ref_last`, then
+the two reference-row triples. Each arrived with a capability, each
+moved the layout, and each invalidated every family binary including the
+ones that ignore it.
+
+The typed fields that exist **stay** — they work and they are
+documented. What changed is where the next one goes.
+
+Two rules make the bags safe in both directions, and they are the same
+two everywhere: **an unknown key is ignored** (a newer plugin talking to
+an older host) and **a missing key is the documented default** (an older
+plugin talking to a newer host). A third case is not the same as either:
+a key the reader *knows* and cannot honour is **warned**, because being
+treated differently than you asked is silent otherwise.
+
+`req.input` is always installed by the host, so you may call it
+unconditionally; it returns false for every name a graph did not wire,
+which today is every name.
+
+The same four seams are on the **VAE** requests
+(`vae-model-registry.h`), which had none of them: an `accel` bag, the
+named-input lookup, `borrowed_extra`, and a `report` out-parameter a family
+writes what it wants said back into. `report` is on the REQUEST rather
+than a result, because a decode reports through a sink and has no
+result struct to grow -- so a family gains an output without anyone's
+virtual changing signature.
+
+Note what `accel` means on a codec. **Every tier is off by default and
+that is a quality decision, not a missing implementation**: a codec is
+the last thing between a latent and the pixels somebody looks at, so an
+approximation in it has nowhere to be absorbed, where the same trade
+inside a DiT is followed by dozens of blocks and a decode. The settings
+are plumbed so the trade can be measured, which is not the same as
+recommending it.
+
+`VaeModelFamily::Role` is a **name**, not an enumerator: `kRoleVideo`
+and `kRoleAudio` are the two the host asks for today, and a third codec
+costs nobody a rebuild. A family handed a role it does not know must
+return an empty path, never a guess at the nearest one.
+
+### Family profiles: what your model knows that the host cannot
+
+The host has several closed switches over family name. Which prompt
+template to wrap. Which tensor leaves are worth quantizing. Which
+encoder prefix to read. Each is a table of facts about *checkpoints*,
+and each is unextendable from outside — so a model published after the
+host has no way to answer, and moving a family out of the tree means
+finding every table it appears in.
+
+One seam serves all of them:
+
+```cpp
+#include "generative-models/conditioner-profile.h"
+#include "generative-models/quantize-profile.h"
+
+ctx->register_family_profile(std::string(vpipe::genai::cond::kDomain),
+                             "acme-image", my_conditioning_profile());
+ctx->register_family_profile(std::string(vpipe::genai::quant::kDomain),
+                             "acme-image", my_quantize_profile());
+```
+
+A profile is a `FlexData` keyed by **(domain, family tag)**. The domain
+names the subsystem asking; the tag names your family, and is the same
+string your `tag()` returns and a model_config beat carries in
+`model_family`. Each domain's keys live in its own header, beside the
+code that reads them.
+
+**One method, and it will stay one.** The ABI is a strict-equality
+cookie, so every entry point added to this facade is a rebuild every
+plugin author pays for. A domain *string* keeps that decision out of the
+ABI: the next subsystem that wants per-family facts picks a name, writes
+a key header, and needs no new method, no vtable change and no version
+bump. Registration is first-wins per pair, and your two domains do not
+collide with each other.
+
+The same two properties as the acceleration bag make it work: an unknown
+key is **ignored** (a newer plugin talking to an older host) and a
+missing key is the **documented default** (an older plugin talking to a
+newer host). A domain that *knows* a key and cannot honour it **warns** —
+that is a third case, and it is a family being treated differently than
+it asked, which is silent everywhere else.
+
+A profile is **data, never behaviour**. It cannot hand the host code to
+run, reach machinery the host did not offer, or switch off a policy the
+host enforces. If your needs exceed a domain's vocabulary, ship a stage.
+
+#### The `quantize` domain
+
+Two things `model-quantize` cannot work out for itself: what your
+transformer config calls itself (`dit_class_name` — the built-in chain
+is a closed switch over class names, so without this your diffusers
+checkpoint is not recognised as a text-to-image DiT at all) and which
+tensor leaves are matrices (`quant_linears`, with `quant_exclude` for
+the collisions and `modulation_linears` for the adaLN opt-in).
+
+A leaf is the **last dot-component** before `.weight`, which is what the
+matcher compares — `attn.to_out.0` is `"0"`. Short, so collisions are
+the norm; name them in the exclude list rather than narrowing the leaf.
+
+An empty `quant_linears` means "said nothing", never "quantize none".
+And note what is *not* here: the matching rule, the group sizing, the
+mixed-precision ranking and the writer are the stage's, because a family
+that could override them could produce a checkpoint that loads, runs and
+generates the wrong thing.
+
+This is the *second* seam that stage has, and it answers a different
+question from the first: `QuantizableFamily`
+(`quantize-family-registry.h`) describes a **repack** — where each
+component lives, which file to pick. This describes a **diffusers-layout
+DiT**. A checkpoint published both ways wants both, and its leaf set is
+the same either way, because leaf names are a property of the weights.
+
+#### The `detect` domain
+
+How a checkpoint of your family is recognised on disk and what it is
+called: `class_names`, `model_type` (and `model_type_edit` when your
+t2i and edit repos share a transformer config), `label_family`,
+`label_version`, and the `inputs` / `outputs` modalities.
+
+This is a **labelling** answer, not a loading one. What runs a
+checkpoint is `claims()` on the model registry, which reads the weights
+rather than a table. Register both; where they could disagree the
+registry wins, because it looked.
+
+Without it, a checkpoint of your family that arrived any way other than
+through a catalogue fetch shows in a browser as a model type with no
+name — which is the state LTX-2.5 and SenseNova-U1.5 are in today.
+
+#### The `conditioning` domain, and what it is not
+
+Your family's DiT is yours. Its **prompt encoder** probably is not: five
+of the six families in this tree condition through the same Qwen3-VL
+tower, the same tokenizer, the same deepstack injection. So
+`diffusion-conditioner` keeps that machinery and you tell it the facts
+that differ about **your checkpoint**:
+
+```cpp
+namespace c = vpipe::genai::cond;
+FlexData p = FlexData::make_object();
+p.as_object().insert_or_assign(c::kWeightPrefix,
+                               FlexData::make_string("model.language_model."));
+p.as_object().insert_or_assign(c::kDropPrefix, FlexData::make_int(34));
+// ...the template, the reference label, the grounded caps
+```
+
+The host is only consulted for a profile when nothing else identified
+the checkpoint — a `_class_name` the conditioner can read wins, and an
+out-of-tree family cannot take a checkpoint away from a built-in one.
+That matters for a model published as a single file or a ComfyUI
+repack, which has no transformer config at all: your `claims()` is then
+the only thing that can say what it is.
+
+Two things this domain deliberately cannot do:
+
+- **It cannot bring machinery.** If your conditioning needs an encoder
+  or a position scheme the host does not have, ship your own conditioner
+  stage the way LTX-2.5 does.
+- **It cannot switch off a mandatory content screen.** Whether a
+  family's prompts are screened is decided by whether the family provides
+  a screen (below), never by a key in here. A profile that could omit the
+  screen would be a bypass, which is what the screen exists to prevent.
+
+#### A content screen on the conditioner's encoder
+
+Some checkpoints carry a policy classifier on their text encoder: the
+weights that produce the conditioning are asked, in a chat turn, whether
+the request is allowed. The classifier is your model's, so its policy is
+yours; the encoder it runs on is the conditioner's. Implement
+`vpipe::genai::screen::ContentScreen`
+(`generative-models/content-screen.h`) and hand it out from your image
+family's `query_extension`:
+
+```cpp
+#include "generative-models/content-screen.h"
+namespace sc = vpipe::genai::screen;
+
+class AcmeScreen final : public sc::ContentScreen {
+public:
+  sc::Verdict screen(sc::EncoderChat& chat,
+                     const sc::ScreenInput& in) override
+  {
+    sc::ChatRequest req;
+    req.parts = {{sc::ChatPart::Kind::Special, "<|im_start|>"},
+                 {sc::ChatPart::Kind::Text, "system\n" + kPolicy}, /* ... */};
+    if (in.images > 0) {
+      req.parts.push_back({sc::ChatPart::Kind::Image, {}});
+    }
+    req.stop = "<|im_end|>";
+    std::string text, why;
+    sc::Verdict v;                    // blocked by default
+    if (chat.generate(req, &text, &why)) { /* read text into v */ }
+    return v;
+  }
+};
+
+void*
+AcmeFamily::query_extension(std::string_view id) noexcept
+{
+  if (id == sc::kExtension) { return &_screen; }
+  return nullptr;
+}
+```
+
+`diffusion-conditioner` then runs it on every prompt, before encoding,
+on the encoder it already owns -- loaded with its output head whatever
+your profile's `backbone_only` says, because a screen that cannot
+generate can only refuse. What the host guarantees and you cannot turn
+off: every prompt is screened; with references wired the screen runs once
+per reference, each pass bound to that picture, and any refusal refuses
+the prompt; a screen that throws refuses; a refused prompt becomes the
+conditioner's refusal beat, which `generate-image` and `vae-decode` carry
+through as a blank picture of the requested size. The log says that a
+prompt was refused and never which category tripped. What is yours: the
+policy, the turn, the token cap, what an empty prompt means and how the
+answer is read. List `VPIPE_FEATURE_CONTENT_SCREEN` in
+`required_features`: a host without it would load your family and never
+screen.
+
+### The acceleration settings, and what they are not
+
+`VideoModelCreateArgs` and `VideoGenRequest` both carry
+
+```cpp
+const vpipe::FlexData* accel;   // and it stays one pointer
+```
+
+— and so do `ImageModelCreateArgs` and `ImageGenRequest`, from
+`generate-image`. The two generating stages carry the **same three
+attention and GEMM tiers** under the same key spellings, so a family
+that reads the bag reads it identically whichever one it plugs into.
+`generate-video` also carries `motion_cache`, a sampling-loop tier
+described [below](#motion_cache--whether-a-forward-runs-at-all).
+`generate-image` also carries `i8_gemm_tier` (`accel::kI8GemmTier`):
+`"accurate"` (the default, and what an absent key means: groups of 64
+on both operands, each Walsh-Hadamard rotated where `gemm()` quantizes
+a dense weight per call -- `set_g64_rotation`, on by default where the
+host has the rotated quantizers), `"fast"`,
+which `I8GemmContext::Tier::kFast` implements -- the block weights held
+as rotated int8 at a coarse group (`gemm_fast`, `encode_to_fast`) -- or
+`"token"` / `"token_plain"` (`kI8TierToken` / `kI8TierTokenPlain`),
+`Tier::kToken` with and without `set_token_rotation`: int8 per weight
+row and per token over all of K, at `fast_group() == kTokenGroup`
+through the same calls (the GEMM kernel under them is the context's
+own choice). `encode_to_fast` converts a g64 pack at either width
+(`bits`): a w8 one may convert in place, a w4 one goes into int8 codes
+twice its size, and `fast_converts(bits, gc)` says whether the host
+has that converter -- one without it keeps a w4 weight on the accurate
+tier. A family that keeps a w4 weight as its pack converts it per GEMM
+with `encode_to_fast_scratch` and reads `fast_scratch_codes()` /
+`fast_scratch_scales()` -- one scratch the context keeps, the GEMM
+encoded right after the conversion. `generate-video` carries the same
+key under the same name
+in its bag. A family without these tiers runs the accurate one and need
+say nothing.
+
+These are the cross-family settings the graph asked for, as an **open
+bag**. The
+host applies **none** of them on your behalf; nothing outside your family
+touches your forward. They are there because every DiT in this tree runs
+the same steel flash kernel and the same GEMM kernels, so a family that
+wants them has the same decisions to make and no other way to learn what
+was asked.
+
+Implement none and they are ignored, which is what their defaults mean.
+Implement **some** and say which in your own log line — `accel::tiers_on`
+below is there for exactly that — because silence is indistinguishable
+from a knob that did nothing, and the numbers get believed either way.
+
+#### Why a bag and not fields
+
+Because typed fields put the host's vocabulary into **your** ABI. These
+were `sage::Config sage; bool i8_gemm;` until a third tier arrived, and
+adding it changed the struct's layout — which invalidates every plugin
+binary, *including* the ones that implement none of the three. That is a
+rebuild you did not ask for, for a decision you were not part of, and it
+would be due again on the fourth tier.
+
+So the vocabulary lives in a header instead:
+
+```cpp
+#include "generative-models/shared/accel-settings.h"
+```
+
+which ships with the host and is where the keys, their types, their
+defaults and the rules are written down. Everything in it is `inline`
+and compiles into **your** binary. That is what makes the promise
+directional and real:
+
+| | |
+|---|---|
+| host adds a key, your plugin is old | your readers were built without it, so you never ask. Nothing changes, nothing rebuilds. |
+| host is old, your plugin is new | the key is absent and your reader supplies the documented default — the same answer as a graph that left it off. |
+
+Neither direction touches a struct layout. What would break it is
+putting a typed field back.
+
+This makes the acceleration **vocabulary** soft. It does not make the
+whole ABI soft — `FlexData`'s own layout is still shared, as is the
+config struct of any tier you choose to drive. The difference is the
+rate: `FlexData` changes rarely and deliberately, where this list grows
+whenever someone has an idea.
+
+#### Reading it
+
+Scalars, for a tier you drive yourself:
+
+```cpp
+namespace accel = vpipe::genai::accel;
+
+const bool i8 = accel::flag(args.accel, accel::kI8Gemm);
+```
+
+or the tier's own typed config, from that tier's own header — so a family
+that wants none of them includes none of them:
+
+```cpp
+#include "generative-models/shared/sol-attention.h"     // for the Config
+const vpipe::genai::sol::Config sol = sol::config_from_flex(req.accel);
+```
+
+The values are **settled**, not raw: `generate-video` validates and
+corrects before filling the bag — a `sol_key_block` it refused is already
+the value it fell back to — so you can use what you read without
+repeating the check, and two families cannot disagree about what the
+graph asked for.
+
+A null `accel` is legitimate and reads as every default. And the keys are
+**added, never renamed or repurposed**: if a setting's meaning changes it
+gets a new key, and the old one keeps meaning what it always did for as
+long as anything might ask.
+
+```cpp
+// What the graph turned on, so you can name what you do not implement.
+for (auto tier : accel::tiers_on(req.accel)) {
+  if (tier != accel::kSolAttn) {
+    warn(fmt("AcmeVideo: '{}' was asked for and is not implemented here",
+             tier));
+  }
+}
+```
+
+`sage` is [**SageAttention**](https://arxiv.org/abs/2410.02367) — the
+QK^T product of the flash attention in int8, with one scale per
+attention block and the key side quantized as `K - mean(K)` over tokens.
+That smoothing is exact rather than approximate: a per-channel shift
+moves every score in a row by the same amount and softmax does not see
+it. `P*V` stays in the tensor dtype unless `sage_pv8` asks for it too
+(below). Measured on an M5 at 8 heads ×
+20036 rows × 128: 156.6 → 130.6 ms including the quantization prologue,
+at cosine 0.99992 against a double-precision reference where the f16
+kernel is also 0.99992.
+
+Driving it is three steps and asks nothing beyond the strides you
+already pass to the attention:
+
+```cpp
+#include "generative-models/shared/metal-sage-attention.h"
+
+// 1. At load. Returns null when the config did not ask OR the GPU has no
+//    matrix cores -- neither is a failure. `fatal` is set only when it
+//    was asked for and the kernels would not load, and you should refuse
+//    the model then: running dense under a config that asked for Sage
+//    reports a Sage run and its numbers get believed.
+bool fatal = false;
+const auto sage_cfg = vpipe::genai::sage::config_from_flex(args.accel);
+_sage = MetalSageAttention::load_for_model(mc, /*bf16=*/true, sage_cfg,
+                                           "AcmeVideo", &fatal);
+if (fatal) { return nullptr; }
+
+// 2. Build an int8 TWIN of your attention function. Both, not one:
+//    sage_cfg.dense_layers leaves the leading blocks on the f16 kernel.
+fc.set_bool(vpipe::genai::sage::kQkInt8Constant, true);
+
+// 3. Per block, into the SAME encoder, immediately before the dispatch.
+//    The encoder is serial, so the ordering is the encoder's.
+//    Operand is {buffer, element offset, row stride, HEAD stride} --
+//    the head stride is its own number, not L * row, because q/k are
+//    usually read in place inside a fused [rows, 3*I] projection.
+MetalSageAttention::Operand q{&qt, 0, head_dim, seq * head_dim};
+MetalSageAttention::Operand k{&kt, 0, head_dim, seq * head_dim};
+if (_sage->prepare(enc, q, k, n_heads, n_kv_heads, qL, kL, head_dim,
+                   bq, bk, sage_cfg, &err)) {
+  enc.set_function(fn_attn_i8);
+  /* ...your usual binds... */
+  _sage->bind(enc);          // buffers 15..18
+}
+enc.dispatch(/* unchanged */);
+```
+
+`bq` / `bk` are your attention kernel's own query and key block sizes —
+`MetalSageAttention::nax_query_block()` / `nax_key_block()` for the
+matrix-core steel entry at head_dim 128, which is what the in-tree
+families run. The scales are one per those tiles, so a caller that
+guessed them differently would size the scale arrays wrong.
+
+`scratch_bytes()` tells you what one call needs, and `set_arena()` lends
+it two regions to carve from — the same lending the in-tree DiTs do out
+of their forward arena, so Sage costs the process nothing it was not
+already holding. If you lend, **take the loan back before you replace
+it**: the carved buffers are windows that hold your allocation alive.
+
+The scratch follows the geometry of the last call: a `prepare()` at a
+different row count rebuilds it. If your attention runs at several row
+counts in one forward — per-modality stacks, then a joint one — call
+`reserve()` with the largest before the first `prepare()` of every
+forward. Each call it covers (same heads, head dim and tiles, no more
+tokens) then reuses that scratch, and the output is bit-identical to a
+scratch sized for the call. `reserve()` is exact: a smaller reservation
+shrinks the scratch, so a forward at a new size builds it once. Book
+the scratch at that largest geometry.
+
+**`sage_pv8` — the second product in int8 too.** The same kernel can
+also run `P*V` in int8, holding the product in int32 across key blocks:
+`P` as uint8 against the row's running maximum, `V` minus its mean over
+tokens with one scale per channel over the sequence, offset by 128. It is
+lossier than the int8 QK alone (cosine 0.99957 against the dense kernel
+on random keys, Sage 0.99992) and faster (44.0 ms against Sage's 50.6 at
+8 heads × 20036 × 128 on an M5 Pro). Driving it is two more arguments:
+
+```cpp
+// The flash function: its two constants on top of 306, set from what the
+// driver says it will make -- never from the config alone.
+const bool pv8 = _sage->pv8_for(sage_cfg);
+fc.set_bool(vpipe::genai::sage::kQkInt8Constant, true);
+MetalSageAttention::pv8_constants(fc, pv8);
+
+// The prologue takes V's operand too (addressed as q and k are).
+MetalSageAttention::Operand v{&vt, 0, head_dim, seq * head_dim};
+if (_sage->prepare(enc, q, k, n_heads, n_kv_heads, qL, kL, head_dim,
+                   bq, bk, sage_cfg, &err, &v) &&
+    _sage->pv8_ready() == pv8) {
+  enc.set_function(fn_attn_i8);
+  /* ...your usual binds... */
+  _sage->bind(enc);          // buffers 15..18, and V's three at 19..21
+}
+```
+
+Build the function from `pv8_for()`, not from `sage_cfg.pv8`. It is false
+on a host whose kernels predate the int8 P·V, and there `prepare()` makes
+the int8 QK's operands alone: a function built with constants 308 and 310
+over those reads Q's scales in the wrong layout and V from unbound
+buffers. The four quantizers it needs are optional entries in the kernel
+contract, so `load()` never refuses for want of them, and the log says
+when a config asked for the int8 P·V and the host could not give it. Pass
+`pv8` to `scratch_bytes()` / `private_bytes()` so the plan books V's
+uint8 copy and Q's per-token scales; a family that turns it on part way
+through a run calls `reserve_pv8(true)` so the scratch is built once.
+
+#### `autotune` — whether your kernel tuners measure
+
+`accel::kAutotune` (bool, default true) is the graph asking for a run
+that REPEATS. A family that picks a kernel, a tile, a route or a split by
+timing its candidates -- at load, or at a first forward -- picks by a
+race, and the candidates agree to rounding, not to the bit: two runs
+whose races land differently produce different pictures from the same
+seed. False means time nothing, read nothing the session kept
+(`find_tuned`: an answer there was measured, and a run that reads one
+rounds as that measurement did), and take one fixed choice per GPU --
+the one believed fastest without a timing, which may or may not be what
+a tune would have picked. The toolkit's tuners take it directly:
+
+- `I8GemmContext::set_autotune(false)`, before the first forward: every
+  shape runs the untuned split, and nothing is recorded or read.
+- `vae_mid_attn::autotune(..., /*verify=*/true, /*measure=*/false)`: the
+  correctness gate still runs -- it is a comparison, not a race -- and
+  the first member of `believed_order()` that passes it is the answer.
+- `vae_conv3x3::believed(matrix_cores)` in place of a conv-route tune.
+
+Key a model you keep warm across launches by it, so a tuned one is not
+handed to a run that asked for none. An automatic ANE share is balanced
+by timing too: a run that must repeat also pins `ane_rows`. A host
+older than the key never sends it, and the reader's default -- true --
+is the behaviour it had.
+
+A plug-in stage that opens a conditioning encoder through
+`HiddenStateEncoderRegistry` passes the same key in
+`HiddenStateEncoderArgs::extra`; the host's encoders honour it there.
+
+#### `sol_attn` — which key blocks are attended at all
+
+Where Sage changes how a key block is *computed*, [**Sol-Attn**](https://nvlabs.github.io/Sana/Sol-Attn/)
+decides which ones are *read*. They are orthogonal and compose. Per block
+of keys it keeps the keys' centroid and the values' mean; one product
+against those centroids scores every block at 1/BLK of the dense cost; a
+block above the threshold is attended exactly by the same steel flash
+kernel your dense path already dispatches, and one below is folded into
+the same running softmax as if all its keys carried the centroid's score.
+Nothing is dropped, and there is no second pass.
+
+It wants only the head-major `q/k/v` an unfused attention already
+produces, plus the head count, the row count and the scale:
+
+```cpp
+#include "generative-models/shared/metal-sol-attention.h"
+
+// At load, or per generation -- it holds no weights and costs no memory.
+const auto cfg = vpipe::genai::sol::config_from_flex(req.accel);
+if (cfg.enabled) { _sol = MetalSolAttention::load(mc, /*bf16=*/true, &err); }
+
+// Per attention, in place of your dense dispatch.
+_sol->set_arena(dead_a, dead_b);      // see below
+_sol->encode(enc, qh, kh, vh, oh, heads, rows, head_dim, scale, cfg, &err);
+```
+
+Four things decide whether a given attention is a candidate, and three of
+them are yours to check:
+
+- **head_dim 128.** The method is specified there and `encode` refuses
+  anything else.
+- **Self-attention.** A centroid summarises the keys a query is compared
+  against, so a crossing — text, or another modality — is summarising the
+  wrong sequence. Leave those dense.
+- **Long enough to have something to route.** Below ~16 routing blocks
+  the local band and the tail already cover most of the sequence.
+- **`cfg.dense_layers`**, which is yours to honour: it leaves the leading
+  blocks exact, and a family that ignored it would be running a different
+  model than the one the setting describes.
+
+`cfg.sink_tokens` is **not** in the bag and cannot be: it marks where
+your sequence stops being the modality the routing is summarising, and
+only you know that. A model that packs a prompt or a soundtrack in with
+the video fills it; a per-stream self-attention over one modality leaves
+it at zero.
+
+It allocates nothing if you lend it two regions that are idle across the
+call — `scratch_bytes()` says how much it wants, and `set_arena` carves
+from what you give it before allocating any of its own. The same rule as
+Sage: take the loan back before you replace it.
+
+`exact_blocks()` / `total_blocks()` report what the *previous* forward
+actually routed. Realized sparsity is a property of the clip rather than
+of `sol_tau`, so it is worth logging rather than predicting.
+
+#### `motion_cache` — whether a forward runs at all
+
+The tiers above make a forward cheaper. [**MotionCache**](https://github.com/MAC-AutoML/MotionCache)
+skips whole ones, so it composes with every one of them — and it lives
+in your **sampling loop**, not your transformer. `generate-video` sends
+it; `generate-image` does not.
+
+After a warm-up, each step predicts how far the model's output has moved
+since the last forward that ran: a gain measured between the last two
+computed forwards, times how far the input has moved since, over the
+output's size. Every change is weighted per latent position by how much
+the clip is moving there, read from frame-to-frame differences of the
+model's own clean estimate. While that prediction, summed over
+consecutive skips, stays under `motion_cache_threshold`, the step reuses
+the last forward's residual carried to the new input instead of running
+one. This is the step-level form the method's MiniMax-H3 adaptation
+takes; the method's own implementations also route individual tokens
+through a partial forward, which needs a gathered attention per family
+and is not offered here.
+
+The bookkeeping is shared; what only you can supply is **where your
+latent is**:
+
+```cpp
+#include "generative-models/shared/motion-cache.h"
+namespace mc = vpipe::genai::motion_cache;
+
+// Per generation. The window is a fraction of the sampling range, mapped
+// to sigma through YOUR shift -- only you know it.
+const mc::Config cfg = mc::config_from_flex(req.accel);
+mc::Cache cache;
+if (cache.begin(req.accel, mc::percent_to_sigma(cfg.start, shift),
+                mc::percent_to_sigma(cfg.end, shift),
+                /*x0_sign=*/+1.0f)) {   // +1: x0 = x + sigma * v
+  // Offsets into your flat GENERATED state: the latent subsampled every
+  // cache.subsample() rows and columns, in [C][T][H'][W'] order.
+  cache.set_video(gather.data(), C, T, H_sub * W_sub, video_elems);
+  cache.set_audio(agather.data(), agather.size(), audio_elems); // optional
+}
+
+// Per step, with the state the forward WOULD run on.
+if (cache.decide(sigma, x_video, x_audio)) {
+  cache.predict(x_video, v_video, x_audio, v_audio);  // no forward
+} else {
+  run_forward(/* -> v_video, v_audio */);
+  cache.update(sigma, x_video, v_video, x_audio, v_audio);
+}
+step_the_sampler(v_video, v_audio);
+```
+
+Three things decide whether it does what it says:
+
+- **The gather is in LATENT coordinates, not tokens.** The estimate reads
+  every Nth latent row and column and differences whole frames, so a
+  patch-packed state has to be mapped back through its packing — which
+  is why this is yours to build. `motion_cache_gathers()` in
+  `generative-models/minimax-h3/minimax-h3-denoise.h` is a worked
+  example for 2 × 2 patches.
+- **Generated rows only.** Conditioning rows that are never stepped would
+  sit in every mean as zero change and dilute the score.
+- **The velocity sign.** `x0_sign` is +1 when `x0 = x + sigma * v` and -1
+  when `x0 = x - sigma * v`. The motion estimate and the reused residual
+  both depend on it; a wrong sign still runs and still skips steps.
+
+`calls()` / `skipped()` are what to log: a threshold that never triggers
+and a cache that was never consulted read the same on a wall clock. The
+class holds one pointer and is configured from the bag, so holding one
+costs your binary nothing when its settings grow.
+
+## Extension point 4a — image families
+
+`register_image_family` is the same seam for `generate-image`, and it is
+deliberately the video registry's mirror: a family that has shipped one
+can read the other without re-learning anything.
+
+```cpp
+#include "generative-models/image-model-registry.h"
+
+class AcmeImage : public vpipe::genai::ImageModelFamily {
+  std::string_view tag() const noexcept override { return "acme-image"; }
+  bool claims(const std::string& root, const std::string& model_type)
+      const override;
+  std::unique_ptr<vpipe::genai::ImageGenerator>
+  load(const vpipe::genai::ImageModelCreateArgs&) override;
+};
+
+ctx->register_image_family(std::make_unique<AcmeImage>());
+```
+
+The seam is the **generation**, not the step, for the reason the video
+one gives: `generate-image` holds nine built-in denoisers side by side
+because their per-step forwards do not agree — Krea-2 takes a packed
+`[img_seq, z*4]` latent with one timestep, Qwen-Image-Edit runs a dual
+stream, FLUX.2 appends multi-reference tokens with their own RoPE band,
+Qwen-Image-2.1 is block-causal over one joint sequence with a cross-step
+KV cache, Boogu and Z-Image are NextDiTs whose timestep conventions
+run in opposite directions, and FLUX.3 is a flow map that runs three
+token modes through blocks of their own and takes each step's target
+time, and MOSS-Image's one modulation drives every block while its
+negative branch runs with a block skipped. An interface wide enough for
+all nine describes none of them. One level up they all answer the same question: given
+conditioning, geometry, a step count and a seed, produce a latent.
+
+**It returns a latent, not pixels**, and that is what makes an image
+family plus a VAE family a complete model with no stage of its own:
+`generate-image`'s oport0 is exactly what the stock `vae-decode` reads.
+
+What the stage keeps, and what you get:
+
+| the stage owns | you own |
+|---|---|
+| the ports and the beats | the denoise loop |
+| geometry (through your `size_grid`) | the scheduler and the guidance rule |
+| the sampler / scheduler **beats**, handed down unparsed | which of them you understand |
+| the progress bar and cancellation | calling `req.progress` so both work |
+| publishing the latent | its shape |
+
+`req.cond` arrives **family-shaped and family-typed** — the stage does
+not interpret it, so what your conditioner emitted is what your DiT
+reads. `req.accel` is the same acceleration bag described above.
+`req.step_latent`, when non-null, streams each step's latent to a
+downstream preview; a family that cannot produce an intermediate simply
+never calls it. The request also carries the named-output seam described
+under [Live previews](#live-previews), `req.output_wanted` /
+`req.output`. `generate-image` takes `preview_x0` through it exactly as
+`generate-video` does: your latent, shaped like `ImageGenResult::latent`
+(`[z, h, w]`), is decoded as one latent frame by the TAE your config
+source names. That is the same path Krea-2's built-in previews take.
+
+The registry is consulted **before** the built-in `flux2` / `flux3` /
+`krea2` / `qwen-image-edit` / `qwen-image-21` / `boogu-image` /
+`z-image` / `moss-image` / `fibo2` dispatch. The built-ins
+are unchanged and unregistered: this adds a path, it does not reroute the
+existing ones.
+
+Three things worth knowing before you write `claims`:
+
+- It is asked with the model **root**, not a `transformer/` subdir —
+  most new checkpoints are not published diffusers-shaped, which is the
+  case this extension point exists for.
+- It runs for every family on every resolve, so it must be **cheap** and
+  **sure**. Claiming a checkpoint that is not yours loads at full cost
+  and computes nonsense.
+- A throwing probe is skipped and warned, never fatal. That is the
+  registry protecting the host from your bug, not a licence to throw.
+
+Answer `declare_resources` and `declare_holdings` or the planner has a
+hole where your checkpoint is — see `docs/MODEL-MEMORY.md`. And
+`latent_scale` is the one number the stage needs *before* your model
+exists: it infers the output size from a reference latent when the graph
+set neither width nor height, and 0 means "cannot say", which makes it
+fall back to its default size rather than guess your ratio.
+
+What `generate-image` declares around your family, so you do not
+declare it twice or leave it out:
+
+- **The text encoder.** By default the stage books `root/mllm` (or
+  `root/text_encoder`) for the whole run on the conditioner's behalf —
+  the safe answer when nothing else declares it. A family whose
+  conditioner is its own stage, and which lets the encoder go after the
+  prompt, claims the encoder directory itself in `declare_resources`,
+  phased to `condition`; the stage then books nothing for it. An
+  unphased booking would hold the encoder through the denoise and push
+  the DiT into streaming for weights that are no longer there.
+- **The decode arena**, from `root/vae`'s config at the configured size,
+  in the `decode` phase. `vae-decode` revises it per image.
+- **Your DiT's working set, after every generation.** The stage asks
+  `ImageGenerator::resident_bytes()` and revises the holding named by
+  your first `declare_holdings` entry. A streaming DiT that promotes
+  blocks as it runs should report what it holds there, not its floor.
+- **Your ANE module's CoreML claim**, if you declare one
+  (`coreml_claims`, in units): kept only when the graph asked for
+  `ane_ffn`, relabelled to the stage, and its grant read before your
+  load -- a refusal arrives as `ane_ffn` off in the accel bag. The
+  label reaches your `load()` as `genai::create_args::kCoreMLLabel` in
+  `ImageModelCreateArgs::borrowed_extra`; revise what you actually hold
+  under it (`revise_scratch("coreml:" + label, bytes)`).
+- **`ane_int8`**, the graph's ask for the ANE's modules in rotated int8
+  (W8A8, lossy), arrives in the same bag as `accel::kAneInt8` -- true only
+  beside `ane_ffn`, on generate-image and generate-video alike. A family on
+  `ane::Tier` passes it on as the spec's `ane::kInt8`; the tier builds the
+  int8 module where it can (a SwiGLU or a matmul without biases, widths
+  multiples of 256, macOS 26) and fp16 otherwise, saying why in the log,
+  and `info()`'s `int8` says which it built. Which int8 arrives as
+  `accel::kAneInt8Tier` (`ane_int8_tier`: `token`, the default, or
+  `token_plain`, unrotated); pass it on as the spec's `ane::kInt8Tier`,
+  and `info()`'s `int8_tier` names what was built. An unknown tier is
+  refused by name. A host older than these keys ignores them -- fp16 for
+  `int8`, `token` for the tier -- and its `info()` carries neither. Book
+  the fp16 module's bytes either way: the int8 one holds less.
+- **The model pickers.** Registering the family puts its tag on the
+  shared-model channel (model-select offers it) AND on generate-image's
+  own `hf_dir` picker. A directory your `claims()` accepts is also what
+  model detection labels with your tag; give it a `detect` profile for
+  the labels and modalities.
+
 ## Extension point 4b — VAE families
 
 A family that generates latents needs something to turn them into frames,
 and `vae-decode` picks its built-in decoder from a hardcoded `_class_name`
-chain (`wan`, `minimax-h3`, `flux2`, `mage`, `krea2`) that an out-of-tree
+chain (`wan`, `minimax-h3`, `flux2`, `krea2`) that an out-of-tree
 family cannot join. `register_vae_family` is the counterpart to
 `register_video_family`: register **both** and your model needs a stage of
 its own for neither — its graphs use the stock `vae-decode`.
@@ -474,6 +1418,295 @@ same invocation just registered.
 **Pin `files`.** Most modern video repos publish several precisions in one
 repo; fetching the whole thing pulls packings this build cannot read.
 
+**Weights that are not on the Hub.** Some weights live only in a code
+repository; madebyollin's TAEs are in GitHub `safetensors/` folders, for
+example. For those, set the `url_files` key in the entry's `extra` bag:
+`e.extra = vpipe::catalog_url_files_extra({{url, "file.safetensors"}});`,
+and list the same file in `files`. `model-fetch` downloads each URL as-is
+into the entry's directory and registers it as an ordinary model. `hf_path`
+is then only the registry key and directory name. This is a packaging fact
+in the bag, not a field, so it cost no ABI bump.
+
+**Several models as folders of one repo.** When a repository publishes
+models as sibling folders around files they share — FlashVSR+ keeps
+`turbo/` and `base/` beside one VAE — give each its own entry (`name` keeps
+the registry keys apart) and set `catalog_extra::kLocalSubdir` in `extra`
+to the folder. `files` stay repo-relative and the download is shared, but
+the record's `local_path` is the folder itself, so every stage handed the
+model gets the variant it names rather than the repository root. A host
+that predates the key ignores it and registers the root.
+
+**Mirrors.** `hf_path` is a HuggingFace coordinate, and it stays the entry's
+identity — the registry key and the on-disk directory come from it whichever
+server actually served the download. `model-fetch` can pull from a mirror
+instead (`source=modelscope`, or `$VPIPE_MODEL_SOURCE`), and by default it
+looks for the repo there under the **same** `owner/repo`, which is how most of
+them are published. Nothing is needed from a plugin for that to work.
+
+Say something only when the mirror DIFFERS — a different owner, or no copy at
+all:
+
+```cpp
+#include "stages/model-source.h"
+
+// in vpipe_plugin_register (or anywhere the plugin runs while it loads)
+if (vpipe::model_sources_available()) {
+  vpipe::register_mirror_repos({
+      {.source = "modelscope", .hf_path = "acme/video-7b",
+       .path = "AcmeCN/video-7b"},      // mirrored under another name
+      {.source = "modelscope", .hf_path = "acme/lora-pack",
+       .path = ""},                     // not mirrored: refuse by name
+  });
+}
+```
+
+First-wins, built-ins included, so a plugin cannot redirect a repo the tree
+already places. A row whose `path` is empty makes the fetch say the repo has no
+counterpart on that source, instead of relaying a bare 404. Rows added while
+the plugin loads are held back until the host admits it, as its stage types
+are, and dropped if it is refused -- a refused plugin claims no repo. A
+`MirrorEntry`'s later fields arrive as keys in its trailing `extra`, so the
+row's layout does not change.
+
+**It is optional, so check before calling.** The header is installed with the
+SDK since feature `"model-sources/1"`, and a plugin imports its functions
+WEAKLY: built against this SDK, it still loads on an older host, where
+`model_sources_available()` is false and the functions are null. A plugin that
+cannot work without its rows lists `"model-sources/1"` in `required_features`
+instead, and such a host refuses it by name. (The weak import is what makes
+that refusal possible at all: a missing STRONG import fails the plugin's
+`dlopen`, before its `required_features` are read.)
+
+A HOST offering its user a choice of source reads the same table before it
+fetches: `model_source_names()` and `model_source_label(name)` for the
+choice, `mirror_repo(source, hf_path, out)` for whether that source carries a
+repo -- `Absent` greys the choice instead of a fetch failing on it. How each
+source is asked for a listing is the host's own and not part of the SDK.
+
+## Extension point 5b — a transport for a DiT split across hosts
+
+A DiT can run SPLIT across processes on several Macs -- tensor parallelism,
+`generative-models/tensor-parallel.h`: each RANK holds its share of every
+block's attention heads and feed-forward rows, and after each block's out
+projection and fc2 its partial sum is added to the other ranks'. vpipe moves no
+bytes between machines. A plugin registers a TRANSPORT, which opens a CHANNEL
+for each generation (a clip); the channel takes this rank's partial (memory
+the CPU may read, the GPU's work on it finished) and returns the sum of the
+others':
+
+```cpp
+#include "generative-models/tensor-parallel.h"
+
+class MyChannel final : public vpipe::genai::TpChannel {
+  bool exchange(const void* partial, void* others, std::size_t bytes,
+                vpipe::genai::TpDType dtype, std::uint64_t seq,
+                std::string* err) override;
+  void forget(const void* base, std::size_t bytes) override;  // optional
+  void set_stop(std::function<bool()> stop) override;         // optional
+};
+class MyTransport final : public vpipe::genai::TpTransport {
+  std::string_view name() const override { return "my-link"; }
+  std::shared_ptr<vpipe::genai::TpChannel>
+  open(const vpipe::FlexData& params, const vpipe::genai::TpShare& share,
+       std::string* err) override;
+};
+
+void my_register(vpipe::VpipePluginContext*) {
+  if (vpipe::genai::tp_transports_available()) {
+    vpipe::genai::register_tp_transport(std::make_unique<MyTransport>());
+  }
+}
+```
+
+A stage names the transport and hands it its own bag, unread --
+generate-video's `tensor_parallel` is `{rank, ranks, heads: [first, end],
+ffn: [first, end], transport, params}` (shares unsaid split evenly; a slower
+host takes fewer). `seq` counts a generation's exchanges from 0 on every rank
+alike, so a transport can catch ranks out of step; `dtype` is the partial's elements
+(bf16 for MiniMax H3), what a transport adds as when more than one other rank
+answers. `exchange` and `forget` are called one at a time, `exchange` in `seq`
+order, but not always from the stage's thread: a DiT that overlaps its
+exchanges with its GPU work calls them from a worker of its own while the GPU
+runs on, so `exchange` should block only on the link -- its latency is what
+the GPU waits for when the overlap runs dry. Nothing the host calls may throw:
+an exception is caught and taken as the call's failure (`open` null, the
+run failed).
+
+THE MEMORY a channel is handed is the host's few EXCHANGE BUFFERS, each at the
+same address from its first exchange until the host calls `forget` on it --
+before it frees or replaces it, never while an exchange of it is in flight --
+or the channel goes. A transport that registers memory with a device (RDMA)
+may therefore register a buffer the first time it sees it and keep the
+registration until `forget`; one that only copies ignores it.
+
+A run's STOP reaches the channel by `set_stop`: the predicate the DiT polls
+between blocks, set before a generation and cleared (empty) after it, on every
+way out. A channel that polls it while it WAITS -- for its peers to appear,
+for their partials -- lets a stop land there too, rather than when a peer
+gives up; it calls it under a lock of its own `set_stop` also takes, so once
+cleared it is never called.
+
+A CHANNEL IS ONE GENERATION'S. `open` is called as each clip's denoise
+starts -- it may wait there for the other ranks -- and the channel is let go
+when the clip ends, however it ends: finished, stopped part way, failed. A
+rank keeps its share's weights between clips, or lets them go and reloads
+them, by its own host's memory; the link and its `seq` start over with every
+clip either way, so one rank stopping part way through a forward, or
+reloading while its peer kept its weights, never leaves the next clip out of
+step. Before it lets go of a channel with an exchange still waiting on a
+peer, the host sets a stop that is always true, so a channel that polls
+returns; and it calls `forget` on every buffer it handed first. Expect `open`
+again once that stage's last channel is gone, and let a peer's channel going
+fail an exchange still waiting for it.
+
+MiniMax H3 is the first family to run split (shares of dense or affine
+weights, its blocks in row bands, each band's exchanges under the next band's
+work; no VDN or TaoMate yet, and MotionCache off on a rank -- each of its skips
+is judged from that rank's own sums). A rank takes the ANE tier (`ane_ffn`,
+`ane_qkv`, `ane_int8`; feature `"tensor-parallel-ane/1"`): its modules its
+share's widths, staged from its cut projections, and each band's rows split
+between the two engines -- the qkv's in the band's first pass, the
+feed-forward's straight into the band's exchange buffer -- so the bands, and
+the exchanges under them, are those of a rank without it. A rank's bands
+follow its rows and its floor alone, never its ANE, so a pair may mix a rank
+with the tier and one without (an M4 beside an M5), and a rank whose plan
+refuses the module, or that drops it for a clip, stays in step. A rank takes
+runtime adapters -- bound at the checkpoint's widths, their factors then cut as
+the weights are: B's rows of q|k|v and fc1, A's columns of the out projection
+and fc2, so the ranks' deltas sum to the whole one -- and the int8 tiers past
+accurate, its dense share converted at the group its own width takes (a width
+no group divides stays on accurate: give a rank whole groups of four heads,
+512 columns, for every tier's rotation). A transport sees none of this: the
+partials are the same shape whatever runs. A rank's memory is booked at its
+share, in the plan that refuses graphs as in the report: its share of the
+projections in the layout it holds them in (bf16, an affine pack's codes, or
+the int8 tier's on the main blocks -- the text refiner keeps its own, as the
+unsplit model's does), its adapters' factors as cut, and the AdaLN bake's
+tables (it holds no AdaLN weights) -- and the scratch of the narrower model it
+is, its exchange buffers included. A rank streams its share as the whole model
+streams the checkpoint and keeps what the box allows: booked with every block
+kept, streamable to its floor (the rest, and two blocks' shares).
+
+A rank's BANDS are about an eighth of its sequence, and no band but the last
+is under 1,024 rows -- or under the floor its share is given
+(`tensor_parallel.min_band_rows`, kept in `TpShare::extra` as
+`tp_extra::kMinBandRows`); where an eighth is shorter than the floor the rank
+takes fewer bands, each at least the floor, and a sequence under two floors
+exchanges whole blocks. Both ranks must cut the same bands, so a host states
+the floor for both, and only to a peer whose libvpipe reads it -- one listing
+`"tensor-parallel-decode/1"`, which came with it.
+
+A prompt longer than a rank's band -- a Ref2VA request's presentation of its
+references, an in-context refine's draft -- runs every block whole unless the
+share says both ranks may band it (`tensor_parallel.prompt_bands: true`, kept
+in `TpShare::extra` as `tp_extra::kPromptBands`; feature
+`"tensor-parallel-prompt-bands/1"`). Given, the rank bands such a prompt as an
+unsplit model does: its blocks banded whatever the prompt's length, its text
+refiner in bands of its own, each band's partials exchanged. It changes the
+bands the ranks cut, so a host states it alike to both, and only to a peer
+listing the feature: a rank that bands beside one that does not is out of
+step at its first exchange. A link that carries a
+band's partial in well under its compute (RDMA over several Thunderbolt
+cables) is better served by fewer, taller bands: an 832 x 480 x 73 clip's
+8,843 rows in four bands of 2,304 denoised in 8.5 s, in eight of 1,152 in
+10.4 (M5 Max and M5 Ultra, four TB5 cables). The transport sees nothing of
+it but larger partials.
+
+FLUX.3 and Qwen-Image-2.1 run split too, through generate-image's
+`tensor_parallel` (features `"tensor-parallel-flux3/1"`,
+`"tensor-parallel-qwen-image-21/1"`): ONE partial a block for FLUX.3, whose
+attention and feed-forward share a gate, TWO for Qwen-Image-2.1, each
+written straight into an exchange buffer and posted to the rank's worker as
+MiniMax H3's are. A rank streams its share and keeps it, booked as H3's is
+(its share with every block kept, streamable to the trunk and two blocks'
+shares), its share's rows alone read where a weight is cut by rows. Their
+BANDS are the host's to ask for: only a share given `min_band_rows`
+(features `"tensor-parallel-flux3/2"`, `"tensor-parallel-qwen-image-21/2"`)
+cuts a block's rows into bands -- at most eight, each at least the floor --
+for a /1 rank exchanges whole blocks, and a pair where one rank bands and the
+other does not is out of step at its first exchange. State the floor alike
+to both ranks, and only to a peer that lists /2.
+
+Krea-2 runs split the same way (feature `"tensor-parallel-krea2/1"`):
+generate-image's `tensor_parallel` on a Krea-2 DiT, TWO partials a block
+(its attention's gated residual and its feed-forward's apart), its int8 tiers
+laid out within a share, `min_band_rows` read from the start -- there is no
+unbanded /1 to keep in step with. Its attention is grouped (48 query heads
+over 12 kv heads), so a share is WHOLE GROUPS: its heads a multiple of four
+at both ends, the kv heads they read cut with them; any other share is
+refused by name. The text-fusion tower, the embeddings, the modulation and
+the final layer run whole on every rank.
+
+MOSS-Image runs split the same way (feature
+`"tensor-parallel-moss-image/1"`): TWO partials a main block -- its
+attention's out projection and its feed-forward, gated apart by the one
+modulation every block shares -- its int8 tiers laid out within a rank's
+share, `min_band_rows` read from this first version. Its fused
+`ffn_up_gate` is `[hidden | gate]`, so a rank's feed-forward rows `[f0, f1)`
+take those rows of the hidden half and the same rows of the gate half. Its
+two text blocks, the modulation, the embedders and the head run whole on
+every rank: the text blocks see the prompt's rows alone, too few to be
+worth an exchange. The negative and a skip-layer pass are forwards of
+their own on the picture's one channel, every rank running them in one
+order; a skipped block exchanges nothing on any rank. No runtime LoRA and
+no ANE tier on a rank.
+
+Z-Image and Fibo 2.0 run split the same way (features
+`"tensor-parallel-z-image/1"`, `"tensor-parallel-fibo2/1"`). Their block is
+SANDWICH-normed -- the attention's and the feed-forward's outputs are
+RMS-normed inside the residual, under a tanh gate -- so a rank completes each
+partial with the others' sum before that post-norm: TWO partials a block.
+Every block of the one shape is split, Z-Image's two refiners as its main
+stack; Fibo 2.0's injection blocks cut their cross-attention by the same heads
+(the text's keys and values each rank's own), a THIRD partial there; its
+Perceiver, a function of the text alone, runs whole on every rank. Both band
+from the first: a share given `min_band_rows` cuts every block's rows into
+bands (Fibo 2.0's injection running through each band, row by row), one
+without exchanges whole blocks -- state the floor alike to both ranks. A rank
+of either takes no runtime LoRA and no ANE tier.
+
+An image rank's EXCHANGE BUFFERS are its picture's, in all six families:
+made at the picture's first forward at its widest band, and freed -- after
+`forget` on each -- when the picture's channel goes. So a transport sees
+new buffers each picture, perhaps at addresses it saw before: register
+what it is handed after a `forget` afresh.
+
+THE CLIP'S DECODE splits the same way (feature
+`"tensor-parallel-decode/1"`): vae-decode's `tensor_parallel` --
+`{rank, ranks: 2, decode_share: [first, end], transport, params}` -- has
+MiniMax H3's video decoder decode only this rank's span of the clip's UNITS
+(each chunk's tiles, row by row) into a buffer of the whole clip, zero
+elsewhere; every tile stitch and chunk fade is a weighted sum, so each rank
+writes the terms of its own tiles, and the two buffers add to the clip
+decoded whole (to bf16 rounding where the shares fade across each other).
+The ranks first swap a header -- the clip each decoded, the units each took
+-- as the channel's exchange 0 in a 48-byte buffer pair of its own, and
+refuse a split that would not add to one clip: shares that do not tile the
+units, another tiling, another latent all cross the same bytes, so nothing
+else could tell. Then rank 1's frames alone cross, a piece at a time through
+two staging buffers of up to 32 MB (a device registers only so much), and
+rank 0 adds them in; the channel is opened before the decode, so its link is
+made while the GPU decodes. Rank 0 emits the clip; the others emit nothing. A
+still, the fast decoder, or more than two ranks decode whole, said, and every
+rank emits it.
+
+TWO CHANNELS AT ONCE. When a launch makes several clips, clip k decodes while
+generate-video denoises clip k+1, so a process holds a DiT's channel and a
+decode's at the same time -- opened in either order, and the peer's two in
+its own order. The decode's `TpShare` says what it is (`extra`:
+`tp_extra::kChannel` = `tp_extra::kChannelDecode`; no heads, no rows), and
+its `params` are vae-decode's own: pair a rank's channel with the peer's of
+the same kind -- by that key, or by params a host gives each stage apart (a
+port each) -- never by the order they open.
+
+**Optional, as model sources are.** The header is installed since feature
+`"tensor-parallel/1"`, its functions weak imports outside the host: check
+`tp_transports_available()`, or list the feature as required. It grows as the
+rest of the ABI does: `TpChannel` and `TpTransport` through
+`query_extension(id)` (null: the host keeps the older behaviour), `TpShare`
+through keys in its `extra` (`genai::tp_extra`: `kMinBandRows`, from a stage's
+bag; `kChannel`, a decode's channel).
+
 ## Extension point 6 — CoreML
 
 There is no separate CoreML plugin type: a CoreML consumer is just a
@@ -576,45 +1809,240 @@ method.
 
 ## Versioning
 
-- `VPIPE_PLUGIN_ABI_VERSION` (in `plugin/plugin-abi.h`) is the plugin
-  contract version, currently **2**. The host loads a plugin only when the
-  plugin's reported value **equals** the host's — strict equality, no
-  backward compatibility.
+vpipe versions the plugin ABI as **one integer plus feature flags**, and a
+host supports **the last two integers** at once. The contract itself is
+written down and checked by the build, not left to anyone's memory.
 
-  There is deliberately **no ledger of superseded versions**. Strict
-  equality gives the number no ordering meaning (N does not mean "N−1 and
-  more"; it is an opaque cookie), so a history of retired versions tells a
-  plugin author nothing they can act on — and it rots: the header's list
-  had drifted to describing 1 and 2 while the value read 4. vpipe is alpha
-  and no plugin has ever shipped against an earlier number, so the count
-  was reset rather than carried.
+### The version, the features, and the window
 
-- **What counts as the contract is wider than the C symbols**, and this is
-  the part that catches people. Bump the version for any change to the
-  three `extern "C"` entry points, to the `VpipePluginContext` facade —
-  *and to any interface a plugin subclasses* (`VideoModelFamily`,
-  `VaeModelFamily`, `ModelExec`, `Stage`, …). Adding a virtual to one of
-  those changes no C symbol and no facade method, yet it moves the vtable:
-  a plugin built against the older header passes every check and then calls
-  through the wrong slot. That has already happened once, which is why it
-  is written down here rather than left to judgement.
-- The `libvpipe` `SOVERSION` guards the underlying C++/ABI. It moves
-  independently; a plugin records a dependency on a compatible `libvpipe`.
+- `VPIPE_PLUGIN_ABI_VERSION` (in `plugin/plugin-abi.h`) is the ABI a plugin
+  is built for, currently **8**. A host at version N loads plugins built
+  for **N and N−1** (`VPIPE_PLUGIN_ABI_OLDEST`); keeping N−1 working is the
+  host's job. Eight is the first version under this scheme, so it stands
+  alone: nothing built for 7 or earlier loads.
+- The number changes only for a change an already-built plugin can
+  observe. Everything ADDITIVE is a **feature** instead: a string such as
+  `"stage-commands/1"`, listed by the host (`vpipe::host_features()`) and
+  queried with `VpipePluginContext::has_feature()`. A plugin that cannot
+  run without one lists it in `VpipePluginInfo::required_features`, and a
+  host that lacks it refuses the plugin at load, by name.
+- The version is read from the plugin **file** (`vpipe_plugin_abi`, emitted
+  by `VPIPE_PLUGIN_DEFINE`) before the host loads it, so a plugin outside
+  the window is refused without running any of its code. Anything a plugin
+  registers while it loads is held back until the handshake passes, and
+  withdrawn if it does not.
+
+### What the contract is
+
+The plugin ABI is exactly the **installed SDK headers**, in three tiers:
+
+- **The stable surface.** Headers that wrap their declarations in
+  `VPIPE_API_BEGIN` / `VPIPE_API_END` (`vpipe/export.h`). libvpipe is built
+  hidden by default, so these are the *only* host symbols a plugin can
+  link: stages and their specs, the runtime context, beats (`FlexData`,
+  `TensorBeat`), the session services, the family interfaces and their
+  requests, `WeightSet`, memory planning, and the Metal compute core.
+- **The toolkit** (`generative-models/shared/`). Helpers a plugin compiles
+  INTO itself: `vpipe_add_plugin` links `libvpipe_toolkit.a`. They change as
+  fast as the models do, and your plugin keeps the copy it was built and
+  tested with. `WiredPool` and `ane::Tier` are the exceptions: they own
+  host resources, so they are part of the stable surface.
+- **The kernel contract** (`apple-silicon/metal-compute/kernel-contract.h`).
+  The host Metal kernels you may dispatch by name, including the ones the
+  toolkit dispatches, with the parameter blocks and function constants
+  they depend on. A kernel that is not listed is the host's own business:
+  copy it into your plugin's metallib instead.
+
+Within the stable surface, a type is one of two kinds:
+
+- **Frozen.** Anything you hold by value, allocate, derive from, or keep in
+  a coroutine frame: its layout and vtable may not move.
+- **Opaque** (`VPIPE_ABI_OPAQUE`). A host-owned object you only reach
+  through a pointer or reference (`RuntimeContext`, `WeightSet`,
+  `MetalCompute`, the registries). Its members are the host's; its virtuals
+  and methods are still contract -- and so is the OFFSET of any member its
+  header's inline methods read (`weights()` returning `_weights`), since
+  that offset is compiled into every plugin that calls the method. The
+  snapshot records those members (`(opaque: read inline)`); within a
+  version, a new member goes after them.
+
+Four rules keep frozen types frozen without a version change:
+
+1. **Interfaces grow through `query_extension(id)`**, never through a new
+   virtual. Every interface a plugin implements has it: a newer host asks
+   for a capability by name, and your older plugin returns null, which
+   means "keep the old behaviour".
+2. **Parameter structs grow through a FlexData bag.** Every value struct
+   that crosses the boundary carrying parameters rather than bulk data --
+   requests and create-args, results, resource claims and holdings, plans,
+   catalogue entries, `ModelConfig`, memory figures -- ends in one
+   `FlexData extra` -- a bag the struct OWNS. Where the struct only
+   BORROWS one, owned by whoever lends it for the call (the args and
+   requests the host builds for a family, the chunks a VAE hands back),
+   it is `const FlexData* borrowed_extra`: the name says which, rather
+   than a plural one letter away. That is the only place a field is added
+   once the ABI is out: a new field is a KEY, lower_snake, the host's,
+   never renamed or repurposed. An absent key means the behaviour from
+   before it existed, because that is what every older binary sends -- so
+   read with a default. `common/flex-bag.h` has the readers and writers; a
+   writer there turns a null bag into an object, which a struct's
+   untouched `extra` is. A null bag costs one pointer.
+   `NamedTensor` is the worked example: its DATA FORMAT is the `dtype`
+   key in its `extra` (`genai::named_tensor`), absent meaning f32, so a
+   new element type is a new value and never a new field.
+3. **Spec structs grow through `extra` spans.** `StageSpec`, `PortSpec`,
+   `ConfigKey`, `CommandSpec`, `BufferSpec`, `ServiceReq` and `UiViewSpec`
+   live in static storage (constexpr tables, registry pointers), so they
+   cannot hold a FlexData; theirs is a span of `SpecExtra` string pairs
+   (`pipeline/spec-extra.h`), with a structured value carried as JSON text.
+   Arrays of them cannot grow at all, because the host would index them
+   with its own stride. `StageSpec` alone also carries `struct_size`, for
+   the rare TYPED addition a string cannot carry (`commands` was one);
+   the host reads such a field only when `abi_has()` says your copy has
+   it (`common/abi-struct.h`).
+4. **Compute handles keep a reserved tail** (`ComputeEncoder`,
+   `CommandStream`, `SharedBuffer`): they are on the hot path and carry no
+   parameters, so the next field takes a reserved slot instead of changing
+   the size you compiled.
+
+Structs that carry bulk data -- a tensor, a buffer, a frame (`TensorBeat`,
+`DataBuffer`, `NamedTensor`, the VAE and generation requests' latent and
+pixel pointers) -- keep their fixed layout, and grow through the FlexData
+they already point at (`borrowed_extra`, `sideband`, `report`).
+
+**Every key is a named constant in a stable header**, and the ABI snapshot
+records each one with its value in a `[keys]` section, so renaming or
+dropping a key fails `vpipe_sdk_check` like any other break. Use the
+constant, never the spelling:
+
+| vocabulary | where |
+|---|---|
+| a struct's `extra`: `NamedTensor` format, catalogue | `genai::named_tensor` (`gen-input.h`), `catalog_extra` (`stages/model-catalog.h`) |
+| the acceleration bag | `genai::accel` (`generative-models/accel-keys.h`) |
+| `HiddenStateEncoderArgs::extra` (whether the encoder's kernel tuners measure) | `genai::accel::kAutotune` (`generative-models/accel-keys.h`) |
+| scheduler / sampler specs | `genai::scheduler_spec`, `sampler_spec`, `token_sampler_spec` (`generative-models/spec-keys.h`) |
+| `LoadSpec::extra` (a separate drafter: MTP head or DFlash; weights wired as they load; the most the model may hold; its routed experts' cache) | `genai::load_spec` (`generative-models/generative-model-manager.h`) |
+| `ModelConfig::extra` (what config.json says that the struct has no field for: a YaRN / Llama-4 `rope_parameters`, a vision tower's input edge, a Qwen-VL processor's picture and clip pixel bounds, a chat template's default system message, whether that template takes a reasoning effort, the language model's whole config section as spelled) | `genai::model_config` (`generative-models/model-loader.h`) |
+| `GpuSamplerParams::extra` (the penalty seen-set's start) | `genai::gpu_sampler` (`generative-models/model-exec.h`) |
+| speculative decoding: the exec extension id, the drafter kinds | `genai::spec_decode` (`generative-models/speculative-decode.h`) |
+| the conditioning sideband | `genai::cond_sideband` (`gen-input.h`) |
+| `TpShare::extra` (a rank's band floor; which stage's channel) | `genai::tp_extra` (`generative-models/tensor-parallel.h`) |
+| what a stage tells a family it loads (`ImageModelCreateArgs` / `VideoModelCreateArgs` `borrowed_extra`: the CoreML label) | `genai::create_args` (`gen-input.h`) |
+| beats and TensorBeat sidebands | `beat`, `sideband` (`common/beat-keys.h`) |
+| `model_config` keys the host reads | `model_config::kFamilyKey` (`stages/model-config-source.h`), `genai::preview_key` (`gen-input.h`) |
+| family profiles | `genai::cond`, `quant`, `detect` (`*-profile.h`) |
+| the ANE tier, the wired pool | `genai::ane`, `genai::wired_pool` |
+| resource claims | `model_memory::kWeightsKind`, `kPhase*` (`stages/model-memory.h`) |
+| spec metadata (`SpecExtra`) | `spec_key` (`pipeline/spec-extra.h`) |
+
+Keys a family defines for itself -- its own `model_config` knobs, a
+sideband only its own stages read -- are its own business and need not
+be here.
+
+### How it is enforced
+
+- `abi/plugin-abi-<N>.txt` is the ABI written down: every frozen layout
+  (from the compiler's own record-layout dump), every virtual in vtable
+  order, and every exported symbol the stable headers declare. The target
+  **`vpipe_sdk_check`** installs the SDK to a scratch prefix and checks
+  three things:
+  - every installed header, and the toolkit's sources, compile against
+    that prefix alone;
+  - the SDK example plugin builds against it;
+  - the ABI matches the snapshot. Anything removed or changed fails;
+    additions are reported;
+  - every kernel the toolkit resolves by a literal name is in the kernel
+    contract -- the toolkit is compiled into plugins, so its kernels are
+    the host's promise too. (A name it builds at run time is beyond this
+    check; keep those listed by hand.)
+
+  Run it after any change to an installed header.
+- A failure means one of two things. Either the change was a mistake, or
+  it is a new ABI version. In that case keep the old snapshot (the host
+  still has to serve N−1), bump `VPIPE_PLUGIN_ABI_VERSION`, set
+  `VPIPE_PLUGIN_ABI_OLDEST` to N−1, add the compatibility the host needs
+  for N−1, and regenerate with **`vpipe_abi_snapshot`**. The regenerated
+  file is the diff a reviewer reads.
 - `VpipePluginInfo::schema_version` lets the info struct grow additively.
+- The `libvpipe` `SOVERSION` guards the underlying C++ library ABI
+  independently.
 
-The practical rule: **rebuild your plugin against the vpipe you deploy
-with.** A mismatch is reported and refused, not crashed.
+### Porting a plugin to ABI 8
 
-  With one trap in the way of actually doing it: `cmake --install`
-  **preserves each header's source mtime**, so a freshly installed
-  `plugin-abi.h` can look OLDER than the plugin object built minutes
-  earlier. The build then reports success, relinks, and quietly keeps the
-  stale object — the rebuild you just ran did nothing. `touch` the file
-  defining `VPIPE_PLUGIN_DEFINE` (or delete the build tree) if the loader
-  still reports the version you just moved away from. This is exactly the
-  case the strict-equality check catches; it is also why the check has to
-  exist, because the same stale object with an UNCHANGED version number
-  loads and calls through the wrong slot.
+1. Rebuild against an ABI-8 install. `vpipe_add_plugin` now also links the
+   toolkit. `cmake --install` preserves header mtimes, so `touch` the file
+   holding `VPIPE_PLUGIN_DEFINE` (or wipe the build tree) if the loader
+   still reports the old number.
+   Only the plugin module gets the toolkit automatically. A test
+   executable, or any other target that compiles code calling it, links
+   `vpipe::toolkit` itself (it brings `vpipe::vpipe` along); without it
+   the link fails on `I8GemmContext`, `MetalSageAttention`, `fp8::`,
+   `comfy::` and the like, which libvpipe no longer exports.
+2. Host kernels you dispatch by name must appear in `kernel-contract.h`.
+   Use its `SteelAttnParams` and `kAttn*` constants instead of a private
+   copy of the parameter block.
+3. Build `StageSpec` by name, not position: it begins with `struct_size`.
+   The parameter structs gained a trailing `extra` bag, which positional
+   braces leave defaulted, so they need no change.
+4. `model_memory::plan_streaming` takes a `phase` argument.
+5. If your plugin needs a feature to function, name it in
+   `required_features`.
+
+Features added within ABI 8, after it first shipped:
+`"kernel-contract/2"` (the contract's revision-2 entries; a host with it
+still serves revision 1), `"content-screen/1"`
+(`generative-models/content-screen.h`), `"video-turn/1"`
+(`generative-models/video-turn.h`) and `"ane-adapters/1"` (the ANE tier
+stages up to `ane::kMaxAdapters`, eight, runtime adapters a projection,
+`lora0` .. `lora7`; a host without it takes `lora0` and `lora1` and
+refuses the rest by name, so ask `has_feature()` before binding a third)
+and `"kernel-tuning/1"` (the session's `KernelTuningCache`, found by
+service id: the answers kernel tuners measured, kept for the session so a
+model loaded again measures nothing -- the toolkit's tuners ask for it
+through `generative-models/shared/tuned-answers.h`, and a host without it
+answers null, so never list it as required) and `"model-sources/1"`
+(`stages/model-source.h` installed, its functions weak imports outside the
+host: the sources' names and labels, the mirror table, `register_mirror_repos`
+for a family's rows; check `model_sources_available()`, or list it as
+required) and `"tensor-parallel/1"` (`generative-models/tensor-parallel.h`
+installed, its functions weak imports: `register_tp_transport`, a transport
+for a DiT split across hosts -- extension point 5b; check
+`tp_transports_available()`) and `"tensor-parallel-decode/1"` (vae-decode's
+`tensor_parallel`: a MiniMax H3 clip's decode split between the same ranks,
+through the same transport, and a rank's band floor, `min_band_rows`; a host
+asks its peer for it before handing a rank a `decode_share` or a floor) and
+`"tensor-parallel-flux3/1"` (generate-image's `tensor_parallel`: FLUX.3's DiT
+split between ranks through the same transport, one partial a block; a caller
+asks its peer for it before handing it a FLUX.3 rank) and
+`"tensor-parallel-qwen-image-21/1"` (the same for Qwen-Image-2.1's DiT: two
+partials a block, its int8 tiers laid out within a rank's share) and
+`"tensor-parallel-flux3/2"` / `"tensor-parallel-qwen-image-21/2"` (a rank of
+either reads `min_band_rows`: given, its blocks' rows are cut into bands, each
+band's partials exchanged under the next band's work; a host states the floor
+alike to both ranks, and only to a peer listing /2) and
+`"tensor-parallel-krea2/1"` (generate-image's `tensor_parallel` for Krea-2's
+DiT: two partials a block, a share whole kv groups, its int8 tiers within the
+share, `min_band_rows` read from the start; a caller asks its peer for it
+before handing it a Krea-2 rank) and
+`"tensor-parallel-moss-image/1"` (the same for MOSS-Image's DiT: two
+partials a main block, its text blocks whole, its int8 tiers within a
+share, `min_band_rows` read from the first version; a caller asks its peer
+for it before handing it a MOSS-Image rank) and
+`"tensor-parallel-z-image/1"` / `"tensor-parallel-fibo2/1"` (generate-image's
+`tensor_parallel` for Z-Image's and Fibo 2.0's DiTs: two partials a block --
+three in Fibo 2.0's injection blocks -- each completed before its sandwich
+post-norm, banded where the share carries `min_band_rows`) and
+`"tensor-parallel-ane/1"` (a MiniMax H3 rank takes the ANE tier --
+`ane_ffn`, `ane_qkv`, `ane_int8` beside `tensor_parallel` -- its feed-forward
+and qkv modules its share's widths, staged from its cut projections, each
+band's rows split between the engines, its bands those of a rank without the
+tier. A host asks a peer for it before handing it a rank under the tier; an
+older peer refuses such a rank by name) and
+`"tensor-parallel-prompt-bands/1"` (a MiniMax H3 rank reads `prompt_bands`:
+given, a prompt longer than its band is banded -- its blocks and its text
+refiner, each band's partials exchanged; unsaid, such a prompt runs every
+block whole. A host states it alike to every rank, and only to a peer listing
+it).
 
 ## Where your stages show up
 

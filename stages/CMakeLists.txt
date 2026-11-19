@@ -6,12 +6,20 @@
 # APPLE_SILICON); the gate, not the directory, decides where its sources go.
 
 set(LOCAL_SOURCES
+  # vpipe/system-monitor.h: every build (a stub off Apple Silicon).
+  system-monitor.cc
   # generic (always built)
   buffer-stage.cc
   call-stage.cc
   chrono-stage.cc
+  external-input-stage.cc
+  external-tap-stage.cc
   load-audio-stage.cc
   load-image-stage.cc
+  image-decode.cc
+  training-dataset-stage.cc
+  optimizer-select-stage.cc
+  train-lora-stage.cc
   load-text-stage.cc
   load-video-stage.cc
   lora-fuse-stage.cc
@@ -22,28 +30,41 @@ set(LOCAL_SOURCES
   save-video-stage.cc
   rgb-to-video-stage.cc
   generate-video-stage.cc
+  latent-preview.cc
   wan2-model-config-stage.cc
   minimax-h3-model-config-stage.cc
+  flashvsr-src-encoder-stage.cc
   flux2-model-config-stage.cc
-  mage-flow-model-config-stage.cc
+  flux3-model-config-stage.cc
+  fibo2-model-config-stage.cc
+  moss-image-model-config-stage.cc
   krea2-model-config-stage.cc
   boogu-image-model-config-stage.cc
+  qwen-image-21-model-config-stage.cc
+  z-image-model-config-stage.cc
   qwen-image-edit-model-config-stage.cc
+  vosr-model-config-stage.cc
+  flashvsr-model-config-stage.cc
   scheduler-select-stage.cc
   diffusion-conditioner-stage.cc
   generate-image-stage.cc
   audio-vae-decode-stage.cc
   audio-vae-encode-stage.cc
   vae-decode-stage.cc
+  wavelet-color-fix.cc
+  color-fix.cc
+  beat-tracker.cc
   vae-encode-stage.cc
   video-ref-encoder-stage.cc
   model-catalog.cc
   model-memory.cc
+  output-path.cc
   model-detect.cc
   model-fetch-stage.cc
   model-register-stage.cc
   model-remove-stage.cc
   model-registry.cc
+  model-source.cc
   passthrough-stage.cc
   qwen-asr-tokenizer.cc
   rest-client-stage.cc
@@ -52,6 +73,7 @@ set(LOCAL_SOURCES
   save-text-stage.cc
   shell-stage.cc
   text-input-stage.cc
+  tensor-buffer.cc
   text-prompt-stage.cc
   videos-db-cleanup-stage.cc
   # vision (always built)
@@ -72,6 +94,10 @@ set(LOCAL_HEADERS
   chrono-stage.h
   load-audio-stage.h
   load-image-stage.h
+  image-decode.h
+  training-dataset-stage.h
+  optimizer-select-stage.h
+  train-lora-stage.h
   load-text-stage.h
   load-video-stage.h
   model-catalog.h
@@ -79,8 +105,10 @@ set(LOCAL_HEADERS
   model-fetch-stage.h
   model-register-stage.h
   model-remove-stage.h
+  model-memory-host.h
   model-registry.h
   model-select-stage.h
+  output-path.h
   passthrough-stage.h
   qwen-asr-tokenizer.h
   rest-client-stage.h
@@ -91,13 +119,21 @@ set(LOCAL_HEADERS
   generate-video-stage.h
   wan2-model-config-stage.h
   minimax-h3-model-config-stage.h
+  latent-preview.h
+  flashvsr-src-encoder-stage.h
   flux2-model-config-stage.h
-  mage-flow-model-config-stage.h
+  flux3-model-config-stage.h
+  fibo2-model-config-stage.h
+  moss-image-model-config-stage.h
   krea2-model-config-stage.h
   boogu-image-model-config-stage.h
+  qwen-image-21-model-config-stage.h
   qwen-image-edit-model-config-stage.h
   model-config-source.h
   shell-stage.h
+  external-input-stage.h
+  external-tap-stage.h
+  tensor-buffer.h
   text-input-stage.h
   text-prompt-stage.h
   trigger-beat.h
@@ -138,6 +174,28 @@ if(VPIPE_BUILD_APPLE_SILICON)
   list(APPEND LOCAL_HEADERS audio-video/temporal-decimation-stage.h)
   list(APPEND LOCAL_SOURCES audio-video/image-resample-stage.cc)
   list(APPEND LOCAL_HEADERS audio-video/image-resample-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/image-levels-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/image-levels-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/content-aware-continuation-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/content-aware-continuation-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/alpha-mix-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/alpha-mix-stage.h)
+  list(APPEND LOCAL_SOURCES save-tensor-stage.cc)
+  list(APPEND LOCAL_HEADERS save-tensor-stage.h)
+  list(APPEND LOCAL_SOURCES load-tensor-stage.cc)
+  list(APPEND LOCAL_HEADERS load-tensor-stage.h)
+  list(APPEND LOCAL_SOURCES tensor-list-stage.cc)
+  list(APPEND LOCAL_HEADERS tensor-list-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/temporal-resample-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/temporal-resample-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/relayvsr-upscale-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/relayvsr-upscale-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/audio-temporal-resample-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/audio-temporal-resample-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/temporal-stack-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/temporal-stack-stage.h)
+  list(APPEND LOCAL_SOURCES audio-video/temporal-slice-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-video/temporal-slice-stage.h)
   # LM-driven stages (self-contained metal/no-MLX path)
   list(APPEND LOCAL_SOURCES audio-transcribe-stage.cc)
   list(APPEND LOCAL_HEADERS audio-transcribe-stage.h)
@@ -147,11 +205,25 @@ if(VPIPE_BUILD_APPLE_SILICON)
   list(APPEND LOCAL_HEADERS text-chat-stage.h)
   list(APPEND LOCAL_SOURCES text-to-speech-stage.cc)
   list(APPEND LOCAL_HEADERS text-to-speech-stage.h)
+  list(APPEND LOCAL_SOURCES generate-audio-stage.cc)
+  list(APPEND LOCAL_HEADERS generate-audio-stage.h)
+  list(APPEND LOCAL_SOURCES audio-separate-stage.cc)
+  list(APPEND LOCAL_HEADERS audio-separate-stage.h)
+  list(APPEND LOCAL_SOURCES beat-track-stage.cc)
+  list(APPEND LOCAL_HEADERS beat-track-stage.h)
+  list(APPEND LOCAL_SOURCES latent-upscale-stage.cc)
+  list(APPEND LOCAL_HEADERS latent-upscale-stage.h)
   list(APPEND LOCAL_SOURCES model-quantize-stage.cc)
   list(APPEND LOCAL_HEADERS model-quantize-stage.h)
   list(APPEND LOCAL_SOURCES model-eval-stage.cc)
   list(APPEND LOCAL_HEADERS model-eval-stage.h)
   list(APPEND LOCAL_SOURCES model-benchmark-stage.cc gpu-telemetry.mm)
+  # The status bar's readings (vpipe/system-monitor.h), once the web UI's.
+  list(APPEND LOCAL_SOURCES system-status.cc)
+  list(APPEND LOCAL_HEADERS system-status.h)
+  # The Apple-native video path (apple-silicon/media).
+  list(APPEND LOCAL_SOURCES avf-load-video-stage.cc avf-save-video-stage.cc)
+  list(APPEND LOCAL_HEADERS avf-load-video-stage.h avf-save-video-stage.h)
   list(APPEND LOCAL_HEADERS model-benchmark-stage.h gpu-telemetry.h)
   list(APPEND LOCAL_SOURCES visual-qa-stage.cc)
   list(APPEND LOCAL_HEADERS visual-qa-stage.h)

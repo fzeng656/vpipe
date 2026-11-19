@@ -4,41 +4,177 @@
 // The vpipe plugin ABI: the stable, C-linkage contract every plugin
 // .dylib must satisfy. A plugin is a C++ shared library that links the
 // host libvpipe (so it observes the same registry singletons + RTTI) and
-// exports the three `extern "C"` entry points below. All the rich
-// registration happens in C++ via VpipePluginContext (plugin-context.h);
-// this header is deliberately C-clean so the version/discovery handshake
-// never depends on C++ ABI details.
+// exports the `extern "C"` entry points below. All the rich registration
+// happens in C++ via VpipePluginContext (plugin-context.h); this header
+// is deliberately C-clean so the version/discovery handshake never
+// depends on C++ ABI details.
 //
-// See docs/PLUGINS.md for the author-facing guide.
+// See docs/PLUGINS.md, "Versioning", for the author-facing rules.
+//
+// ---- the version ----------------------------------------------------------
+//
+// ONE INTEGER, plus FEATURE FLAGS for what is added in between.
+//
+//   * The integer (VPIPE_PLUGIN_ABI_VERSION) changes for any change that an
+//     already-built plugin could observe: a field in a struct the plugin
+//     allocates, reads or is handed; a virtual in an interface it
+//     implements or calls; the signature of an exported function; the
+//     meaning of a contracted kernel. What that covers is the STABLE
+//     SURFACE -- the installed SDK headers, exported with VPIPE_API --
+//     and the layout and symbol snapshots under abi/ are what enforce
+//     it: a change to the surface fails the build until the snapshot
+//     is regenerated, which is where the number is decided. It no
+//     longer rests on someone remembering; it did not, repeatedly.
+//
+//   * A FEATURE is an addition that breaks nothing already built: a new
+//     function, a new registry, a new interface a plugin may opt into, a
+//     new command or kernel in a contract. It is a string ("name/rev"),
+//     listed by the host (vpipe::host_features()) and queried by a plugin
+//     (VpipePluginContext::has_feature). A plugin that cannot run without
+//     one names it in VpipePluginInfo::required_features, and a host without it
+//     refuses the plugin at load, by name, instead of letting it fail on
+//     a missing symbol later.
+//
+//   * THE SUPPORT WINDOW is the last TWO versions: a host at N loads
+//     plugins built for N and N-1 (VPIPE_PLUGIN_ABI_OLDEST). Keeping N-1
+//     working is the host's job -- the old layouts and entry points stay,
+//     or are translated -- so a version change is rare, batched, and
+//     never casual. Eight is the first version under this scheme, so
+//     there is no seven to keep: its OLDEST is eight.
+//
+// The version is read from the FILE before the plugin is loaded (the
+// `vpipe_plugin_abi` data symbol, see VPIPE_PLUGIN_DEFINE), so a plugin
+// outside the window is refused without running any of its code -- and
+// with a message that names both versions, not a missing-symbol error.
+// Anything a plugin registers while it loads (a TypedStage registers its
+// factory from a static initialiser) is held back until the handshake
+// passes, and withdrawn if it does not.
 
 #include <stddef.h>
 #include <stdint.h>
 
-// Bumped on ANY incompatible change to the plugin contract. The host loads
-// a plugin only when the plugin's reported version EQUALS this value
-// (strict equality -- backward compatibility is not a goal yet).
-// Independent of the dylib SOVERSION, which guards the underlying
-// C++/singleton ABI.
-//
-// NO LEDGER OF PAST VERSIONS, deliberately. Strict equality gives the
-// number no ordering meaning -- N does not mean "N-1 and more", it is an
-// opaque cookie -- so a list of superseded versions describes nothing a
-// plugin author can act on. It also rots: this comment previously
-// documented 1 and 2 while the value read 4.
-//
-// WHAT COUNTS AS THE CONTRACT is the part that is not obvious, and it is
-// wider than this file. A bump is required for any change to the three C
-// entry points below, to the VpipePluginContext facade -- and to the
-// INTERFACES A PLUGIN SUBCLASSES (VideoModelFamily, VaeModelFamily,
-// ModelExec, Stage, ...). Adding a virtual to one of those changes no C
-// symbol and no facade method, yet moves the vtable: a plugin built
-// against the older header passes every check and then calls through the
-// wrong slot. That has already happened once here.
-#define VPIPE_PLUGIN_ABI_VERSION 2u
+// The ABI this SDK builds plugins for, and the oldest one a host built
+// from it still loads.
+#define VPIPE_PLUGIN_ABI_VERSION 8u
+#define VPIPE_PLUGIN_ABI_OLDEST  8u
 
-// Layout version of VpipePluginInfo, so the struct can grow additively
-// without breaking the three-symbol contract.
-#define VPIPE_PLUGIN_INFO_SCHEMA 1u
+// Layout version of VpipePluginInfo, so the struct grows additively.
+//   1  name, version, vendor, license, description
+//   2  + required_features
+#define VPIPE_PLUGIN_INFO_SCHEMA 2u
+
+// ---- features -------------------------------------------------------------
+//
+// The features ABI 8 ships with. A later host may add more; it never
+// withdraws one while the ABI that introduced it is inside its window.
+//   stage-commands   docs/STAGE-COMMANDS.md
+//   kernel-contract  apple-silicon/metal-compute/kernel-contract.h
+//   named-outputs    generative-models/gen-input.h's input/output seams
+//   family-profiles  VpipePluginContext::register_family_profile
+//   accel-bag        generative-models/shared/accel-settings.h
+#define VPIPE_FEATURE_STAGE_COMMANDS  "stage-commands/1"
+#define VPIPE_FEATURE_KERNEL_CONTRACT "kernel-contract/1"
+#define VPIPE_FEATURE_NAMED_OUTPUTS   "named-outputs/1"
+#define VPIPE_FEATURE_FAMILY_PROFILES "family-profiles/1"
+#define VPIPE_FEATURE_ACCEL_BAG       "accel-bag/1"
+
+// Added since, inside ABI 8:
+//   kernel-contract/2  the contract's revision-2 entries (the f16
+//                      libraries' GEMM / attention / norm kernels and
+//                      the accumulate GEMM twin); revision 1 is kept
+//   content-screen     generative-models/content-screen.h: a family's
+//                      content screen, run by diffusion-conditioner
+//   video-turn         generative-models/video-turn.h: a vision-language
+//                      model a stage drives -- frames, a timed video turn
+//   perf-flops         common/perf-flops.h: the achieved-FLOP/s meter a
+//                      family credits (generative-models/shared/
+//                      dit-flops.h does it on the GPU's clock). WEAKLY
+//                      imported: a plugin using it still loads on a
+//                      host without it -- never list it as required
+//   ane-adapters       generative-models/shared/ane-tier.h: the ANE tier
+//                      stages up to ane::kMaxAdapters (8) adapters a
+//                      projection, lora0 .. lora7; a host without it
+//                      takes lora0 and lora1 and refuses the rest
+//   kernel-tuning      interfaces/session-services-intf.h: the session's
+//                      KernelTuningCache, the answers kernel tuners
+//                      measured kept for the session, found by service
+//                      id -- null on a host without it, so never list
+//                      it as required (the toolkit's tuners ask for it)
+//   model-sources      stages/model-source.h installed, WEAK imports in
+//                      a plugin (model_sources_available()): the names
+//                      and labels of the sources model-fetch reads from,
+//                      a mirror's renames and absences -- a family's rows
+//                      added by register_mirror_repos
+//   tensor-parallel    generative-models/tensor-parallel.h installed,
+//                      WEAK imports in a plugin (tp_transports_available()):
+//                      register_tp_transport, a plugin's transport carrying
+//                      a split DiT's partial sums between ranks (generate-
+//                      video's `tensor_parallel`)
+//   tensor-parallel-decode  vae-decode's `tensor_parallel`: a MiniMax H3
+//                      clip's decode split between the same ranks, each
+//                      its share of the units, the parts exchanged
+//                      through the same transport (a channel of its own,
+//                      tp_extra::kChannel) and added on rank 0; and a
+//                      rank's band floor, tp_extra::kMinBandRows
+//   tensor-parallel-flux3  generate-image's `tensor_parallel`: FLUX.3's
+//                      DiT split between ranks through the same transport,
+//                      one partial a block
+//   tensor-parallel-qwen-image-21  the same for Qwen-Image-2.1's DiT, two
+//                      partials a block, its int8 tiers within a share
+//   tensor-parallel-flux3/2, tensor-parallel-qwen-image-21/2  a rank of
+//                      either reads `min_band_rows` (tp_extra::
+//                      kMinBandRows): given, its blocks' rows are cut
+//                      into bands, each band's partials exchanged under
+//                      the next band's work; unsaid, /1's whole blocks. A
+//                      host states the floor alike to every rank, and
+//                      only to a peer listing /2
+//   tensor-parallel-krea2  generate-image's `tensor_parallel` for Krea-2's
+//                      DiT: two partials a block, a share whole kv groups,
+//                      its int8 tiers within a share, and `min_band_rows`
+//                      read from the start (banded as the /2s above)
+//   tensor-parallel-moss-image  generate-image's `tensor_parallel` for
+//                      MOSS-Image's DiT: two partials a main block, its
+//                      int8 tiers within a share, its text blocks whole;
+//                      `min_band_rows` read from this first version
+//   tensor-parallel-z-image  generate-image's `tensor_parallel` for
+//                      Z-Image's DiT: every block (the refiners' too) a
+//                      rank's share, two partials a block, each completed
+//                      before its sandwich post-norm; banded where the
+//                      share carries `min_band_rows`, from the first
+//   tensor-parallel-fibo2  the same for Fibo 2.0's DiT (its block is
+//                      Z-Image's), an injection block's cross-attention
+//                      cut by the same heads: a third partial there
+//   tensor-parallel-prompt-bands  a MiniMax H3 rank reads `prompt_bands`
+//                      (tp_extra::kPromptBands): given, a prompt longer
+//                      than its band is banded -- its blocks and its text
+//                      refiner, each band's partials exchanged; unsaid,
+//                      such a prompt runs every block whole. A host
+//                      states it alike to every rank, and only to a peer
+//                      listing this
+#define VPIPE_FEATURE_KERNEL_CONTRACT_2 "kernel-contract/2"
+#define VPIPE_FEATURE_CONTENT_SCREEN    "content-screen/1"
+#define VPIPE_FEATURE_VIDEO_TURN        "video-turn/1"
+#define VPIPE_FEATURE_PERF_FLOPS        "perf-flops/1"
+#define VPIPE_FEATURE_ANE_ADAPTERS      "ane-adapters/1"
+#define VPIPE_FEATURE_KERNEL_TUNING     "kernel-tuning/1"
+#define VPIPE_FEATURE_MODEL_SOURCES     "model-sources/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL   "tensor-parallel/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_DECODE "tensor-parallel-decode/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_FLUX3 "tensor-parallel-flux3/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_QI21 "tensor-parallel-qwen-image-21/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_FLUX3_2 "tensor-parallel-flux3/2"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_QI21_2 \
+  "tensor-parallel-qwen-image-21/2"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_KREA2 "tensor-parallel-krea2/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_MOSS_IMAGE \
+  "tensor-parallel-moss-image/1"
+// A MiniMax H3 rank takes the ANE tier (generate-video's ane_ffn /
+// ane_qkv / ane_int8 beside tensor_parallel): its modules its share's.
+#define VPIPE_FEATURE_TENSOR_PARALLEL_ANE "tensor-parallel-ane/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_Z_IMAGE "tensor-parallel-z-image/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_FIBO2 "tensor-parallel-fibo2/1"
+#define VPIPE_FEATURE_TENSOR_PARALLEL_PROMPT_BANDS \
+  "tensor-parallel-prompt-bands/1"
 
 #ifdef __cplusplus
 namespace vpipe { class VpipePluginContext; }
@@ -55,13 +191,17 @@ typedef struct VpipePluginInfo {
   const char* vendor;           // e.g. "Acme Inc."
   const char* license;          // e.g. "Commercial", "Apache-2.0"
   const char* description;      // one-line summary
+  // schema 2: the features this plugin cannot run without, as a
+  // null-terminated array of VPIPE_FEATURE_* strings; null = none.
+  const char* const* required_features;
 } VpipePluginInfo;
 
-// The host resolves these three symbols by name (unmangled) from the
-// plugin dylib. The typedefs describe the pointer types the loader casts
-// dlsym results to; the plugin DEFINES the actual functions (usually via
-// VPIPE_PLUGIN_DEFINE below).
+// The host resolves these by name (unmangled) from the plugin dylib. The
+// typedefs describe the pointer types the loader casts dlsym results to;
+// the plugin DEFINES them (via VPIPE_PLUGIN_DEFINE below).
 //
+//   const uint32_t         vpipe_plugin_abi;          (data: read from the
+//                                                      file before loading)
 //   uint32_t               vpipe_plugin_abi_version(void);
 //   const VpipePluginInfo* vpipe_plugin_info(void);
 //   void                   vpipe_plugin_register(VpipePluginContext*);
@@ -77,26 +217,33 @@ typedef void (*vpipe_plugin_register_fn)(void*);
 }  // extern "C"
 #endif
 
-// Convenience for the (C++) plugin author: emit the three exported
-// symbols. `INFO_PTR` is a pointer to a static VpipePluginInfo; `REGFN` is
-// a `void(vpipe::VpipePluginContext*)`. Place at file scope:
+// Convenience for the (C++) plugin author: emit the exported symbols.
+// `INFO_PTR` is a pointer to a static VpipePluginInfo; `REGFN` is a
+// `void(vpipe::VpipePluginContext*)`. Place at file scope:
 //
+//   static const char* const kRequires[] = {
+//       VPIPE_FEATURE_KERNEL_CONTRACT, nullptr };
 //   static const VpipePluginInfo kInfo = {
 //       VPIPE_PLUGIN_INFO_SCHEMA, "acme-codecs", "1.0.0",
-//       "Acme Inc.", "Commercial", "Acme audio codecs" };
+//       "Acme Inc.", "Commercial", "Acme audio codecs", kRequires };
 //   static void acme_register(vpipe::VpipePluginContext* c) { ... }
 //   VPIPE_PLUGIN_DEFINE(&kInfo, acme_register)
 #ifdef __cplusplus
 #define VPIPE_PLUGIN_DEFINE(INFO_PTR, REGFN)                             \
-  extern "C" uint32_t vpipe_plugin_abi_version(void)                     \
+  extern "C" __attribute__((visibility("default"), used))               \
+  const uint32_t vpipe_plugin_abi = VPIPE_PLUGIN_ABI_VERSION;            \
+  extern "C" __attribute__((visibility("default")))                     \
+  uint32_t vpipe_plugin_abi_version(void)                                \
   {                                                                      \
     return VPIPE_PLUGIN_ABI_VERSION;                                     \
   }                                                                      \
-  extern "C" const ::VpipePluginInfo* vpipe_plugin_info(void)           \
+  extern "C" __attribute__((visibility("default")))                     \
+  const ::VpipePluginInfo* vpipe_plugin_info(void)                       \
   {                                                                      \
     return (INFO_PTR);                                                   \
   }                                                                      \
-  extern "C" void vpipe_plugin_register(::vpipe::VpipePluginContext* c)  \
+  extern "C" __attribute__((visibility("default")))                     \
+  void vpipe_plugin_register(::vpipe::VpipePluginContext* c)             \
   {                                                                      \
     (REGFN)(c);                                                          \
   }

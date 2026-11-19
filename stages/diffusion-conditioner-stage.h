@@ -11,8 +11,8 @@
 // per-family conditioning tensor the generate-image (DiT) stage consumes. This
 // is the from-scratch, MLX-free metal-compute path on the
 // VPIPE_BUILD_APPLE_SILICON axis; an inert stub off it.
+#include "generative-models/content-screen.h"
 #ifdef VPIPE_BUILD_APPLE_SILICON
-#include "generative-models/mage/mage-screen.h"
 #include "generative-models/qwen-image/metal-qwen25-vision.h"
 #include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
@@ -21,7 +21,9 @@
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/shared/grounded-encode-params.h"
 #include "generative-models/tokenizer.h"
+#include "generative-models/vosr/metal-dinov2-encoder.h"
 #include "generative-models/weight-set.h"
+#include "stages/generation-input.h"
 #include "stages/model-memory.h"
 #endif
 
@@ -59,17 +61,23 @@ namespace vpipe {
 //                          (identity-edit LoRA) via Qwen3-VL. FLUX.2 ignores it.
 //                          Latched once.
 //   iport4  ref_image2     OPTIONAL SECOND reference image, same format.
-//                          Qwen-Image-Edit-2511 is a MULTI-reference edit model
-//                          and Mage-Flow-Edit's template has a per-reference
-//                          body, so on those families both pictures have to be
-//                          understood by the VLM -- the DiT's ref_latent1 only
-//                          carries the second picture's spatial detail. Each
-//                          reference gets its own vision block (the family's own
-//                          convention: "Picture N: " for Qwen-Image-Edit,
-//                          "Image N: " for Mage-Flow, bare back-to-back blocks
-//                          for Boogu), its own 2-D mROPE band and its own
+//                          Qwen-Image-Edit-2511 is a MULTI-reference edit model,
+//                          and a family whose template has a per-reference body
+//                          needs the same, so on those families both pictures
+//                          have to be understood by the VLM -- the DiT's
+//                          ref_latent1 only carries the second picture's spatial
+//                          detail. Each reference gets its own vision block (the
+//                          family's own convention: "Picture N: " for
+//                          Qwen-Image-Edit, a profile's `ref_label`, bare
+//                          back-to-back blocks for Boogu), its own 2-D mROPE
+//                          band and its own
 //                          deepstack run. Krea-2 is single-reference by design
 //                          (ComfyUI-Krea2Edit) and ignores it with a warning.
+//   iport6  ref_images     OPTIONAL reference images as ONE LIST (load-image's
+//                          `images`): as many as the graph has, each in
+//                          ref_image's format, following whatever is on
+//                          iport3 / iport4 in list order. Last, so a graph
+//                          written before it keeps its port numbers.
 //
 //   oport0  conditioning   TensorBeatPayload bf16, family-shaped:
 //                            krea2  [n_real, 12, 2560] (12-tap; the DiT fuses)
@@ -85,13 +93,13 @@ namespace vpipe {
 //                              special tokens, no padding)
 //   oport1  neg_conditioning  same shape, emitted only when a negative is set.
 //
-// MAGE-FLOW CONTENT SCREEN. On the `mage-flow` family every prompt is first
-// run through the model's own content-policy classifier (mage-screen.h) --
-// mandatory, no config key, no port to leave unwired. A refused prompt gets
-// a one-row conditioning beat tagged `content_blocked` on its sideband, which
-// generate-image turns into a skipped denoise and vae-decode into a blank
-// refusal image. With a reference image the classifier judges the SOURCE
-// PICTURE as well as the instruction. It fails CLOSED.
+// CONTENT SCREEN. A family that provides one (generative-models/
+// content-screen.h) has every prompt first judged by it, on this stage's
+// own encoder -- mandatory, no config key, no port to leave unwired. A
+// refused prompt gets a one-row conditioning beat tagged `content_blocked`
+// on its sideband, which generate-image turns into a skipped denoise and
+// vae-decode into a blank refusal image. With reference images every
+// SOURCE PICTURE is judged as well as the instruction. It fails CLOSED.
 //
 // Config (FlexData object):
 //   hf_dir     (string, OPTIONAL) -- the model dir (text_encoder/, transformer/,
@@ -138,17 +146,71 @@ public:
 
   const std::string& hf_dir() const noexcept { return _hf_dir; }
   std::uint64_t conditionings_emitted() const noexcept { return _emitted; }
-  // How many prompts the Mage-Flow content screen refused. Counted in the
+  // How many prompts the family's content screen refused. Counted in the
   // emitted total too: a refusal IS a conditioning beat (a blocked one).
   std::uint64_t blocked_by_policy() const noexcept { return _blocked; }
+  // Whether the text encoder was one kept warm, taken back (`keep_loaded`)
+  // -- a test's proof the take ran rather than a load.
+  bool encoder_taken_warm() const noexcept { return _enc_taken_warm; }
+  // How many of the encoder's layers were resident as the last prompt's
+  // encode began, where it grows a resident set (-1 where it does not):
+  // a test's proof the set was grown, kept and sized again.
+  int encoder_layers_resident_at_prompt() const noexcept
+  {
+    return _enc_resident_at_prompt;
+  }
 
 private:
   std::string _hf_dir;
+  // The text encoder's WEIGHTS -- what is opened, sized, parked and
+  // claimed -- and the directory its config.json and tokenizer come
+  // from. The same directory unless `encoder_dir` names the weights
+  // elsewhere (a Draw Things .ckpt), when the config stays the release's.
   std::string _enc_dir;
-  // krea2 | flux2 | qwen-image-edit | mage-flow | boogu-image
+  std::string _enc_cfg_dir;
+  // `encoder_dir`: VOSR's DINOv2 checkpoint (not under _hf_dir), or any
+  // other family's encoder weights. Empty until initialize() resolves it.
+  std::string _venc_dir;
+  bool        _autotune = true;   // kernel tuners measure (kAutotune)
+  // How a reference image pairs with the prompts: the `reference_mode`
+  // config key, as the mode of each reference input. "auto" is the rule
+  // every input here follows (stages/generation-input.h), which serves an
+  // edit graph and a folder of pictures alike.
+  GenerationInput::Mode _ref_mode = GenerationInput::Mode::kAuto;
+  // krea2 | flux2 | qwen-image-edit | boogu-image | ... | a registered
+  // family's tag
   std::string _family = "krea2";
+  // Within the qwen-image-edit family, WHICH of the two Qwen-Image
+  // recipes this checkpoint takes. They are one architecture published
+  // as two diffusers pipelines with two system prompts, and the weights
+  // cannot tell them apart, so this is read from the pipeline the
+  // checkpoint declares (or the model_type the registry recorded) and
+  // never from whether a reference image happens to be wired. See
+  // qwen_image_is_t2i_.
+  bool _qie_t2i = false;
+  // What the models DB recorded for this checkpoint, when a model-select
+  // source named one. Only used to ask a registered family's `claims`,
+  // which is the one probe a bare weights directory can answer.
+  std::string _model_type;
+  // True once the checkpoint has been resolved and the family is the
+  // one that will run. Before it, `_family` is a default nobody chose,
+  // and calling a config beat a mismatch against it is noise about a
+  // decision that has not been taken.
+  bool _family_settled = false;
+  // The family's conditioning profile, when a plugin registered one --
+  // an open FlexData bag of the facts that differ between checkpoints.
+  // Null for every built-in family, and null is the case the host's own
+  // per-family defaults serve. BORROWED from a process-wide registry
+  // that outlives every stage. See
+  // generative-models/conditioner-profile.h.
+  const FlexData* _profile = nullptr;
+  // The family's content screen, when it provides one through its model
+  // family's `query_extension`. Its presence is the whole decision: no
+  // key turns it off. BORROWED from the registry, which outlives every
+  // stage. See generative-models/content-screen.h.
+  genai::screen::ContentScreen* _screen = nullptr;
   std::uint64_t _emitted = 0;
-  std::uint64_t _blocked = 0;      // refused by the Mage-Flow content screen
+  std::uint64_t _blocked = 0;      // refused by the family's content screen
   // Image-aware families: always emit a grounded negative (empty prompt ok) on
   // oport1 so the DiT can run CFG>1 (Krea-2 edit deletion recipe). Config flag.
   bool _grounded_negative = false;
@@ -157,7 +219,25 @@ private:
   // since the beat only arrives after the init barrier).
   bool _model_latched  = false;
   bool _load_attempted = false;
-  bool _cfg_latched    = false;
+  // The model config: a generation input, broadcast when its source sends
+  // once -- which a config source without a trigger does.
+  GenerationInput _cfg_in;
+  // The prompt (iport0), a generation input like the rest: one prompt
+  // and a folder of reference pictures condition every picture on it.
+  GenerationInput _prompt_in;
+  std::string     _prompt;
+  // The prompt beats say they are a series (beat::kBatch): hold the
+  // encoder until end of stream. And the current one may be empty.
+  bool            _batch = false;
+  bool            _batch_checked = false;
+  // A batch on a box that holds the encoder whole loads it resident
+  // (see process()); sticky for the stage's life, like the load itself.
+  bool            _resident_for_batch = false;
+  bool            _allow_empty = false;
+  // A batch on a STREAMED encoder holds prompts back and encodes them
+  // layer-major, this many at a time (VPIPE_COND_BATCH).
+  std::vector<std::string> _pend;
+  int             _batch_max = 32;
   // The last model-config beat, held UNPARSED: which family reads it is
   // not known until the checkpoint resolves, and the two beats arrive on
   // different ports in either order.
@@ -200,23 +280,49 @@ private:
   // rather than run to its last hidden state, which is why it is its own
   // class rather than another encoder_config_*() over _encoder.
   std::unique_ptr<genai::MiniMaxH3TextEncoder>   _h3_enc;
+  // Its config, kept for the vision tower (`_vision3`), which loads at
+  // the first KEYFRAME a ref_image port brings: an FL2VA request shows
+  // each keyframe to Qwen3-VL ("<Picture i>: " + a vision block) ahead
+  // of the prompt, as both references do.
+  genai::MiniMaxH3TextEncoder::Config _h3_enc_cfg;
+  // The last H3 encode's per-row modality tags (a vision block's rows
+  // are video); empty for a prompt alone. Published on the beat.
+  mutable std::vector<int> _h3_tags;
   std::unique_ptr<genai::Tokenizer>               _tokenizer;
+  // VOSR's conditioner: a DINOv2 ViT-L/14 and nothing else. It is the
+  // WHOLE conditioning -- there is no prompt, no tokenizer and no text
+  // encoder on this path, so every text member above stays null.
+  std::unique_ptr<genai::MetalDinov2Encoder>      _dinov2;
+  int _dino_size = 448;
   metal_compute::SharedBuffer                     _embed;      // encoder embeds
   mutable std::unique_ptr<genai::MetalQwen25Vision> _vision;   // QIE, lazy
   mutable std::unique_ptr<genai::MetalQwenVisionEncoder> _vision3;  // krea2, lazy
   int _enc_hidden = 2560;
 
-  // Cached negative prompt + raw reference images, latched once like the DiT
-  // stage's negative / ref-latent inputs. kMaxRefs is the number of ref_image
-  // iports; `_n_ref` is how many actually arrived (they latch independently, so
-  // a graph may wire only the second).
-  static constexpr int kMaxRefs = 2;
+  // The negative prompt + raw reference images, each a generation input
+  // paired with the prompt the way generate-image pairs its own.
   std::string               _negative_prompt;
-  bool                      _negative_latched = false;
-  std::vector<std::uint8_t> _ref_rgb[kMaxRefs];
-  int _ref_rgb_h[kMaxRefs] = {0, 0};
-  int _ref_rgb_w[kMaxRefs] = {0, 0};
-  int _n_ref = 0;                  // contiguous count actually latched
+  GenerationInput           _negative_in;
+  // One reference picture, RGB planar U8 [3, h, w].
+  struct RefImage {
+    std::vector<std::uint8_t> rgb;
+    int h = 0, w = 0;
+    bool empty() const { return rgb.empty(); }
+  };
+  // What each reference INPUT holds: ref_image / ref_image2 (kRefPorts
+  // of them), then the ref_images list, each a generation input in
+  // `reference_mode`.
+  static constexpr int kRefPorts = 2;
+  RefImage              _ref_port[kRefPorts];
+  GenerationInput       _ref_port_in[kRefPorts];
+  std::vector<RefImage> _ref_list;
+  GenerationInput       _ref_list_in;
+  // THE REFERENCES, as the model sees them: the two ports, then the
+  // list, packed -- so "reference i" is the i-th picture the VLM sees
+  // even when only the second port is wired. No fixed count.
+  std::vector<std::vector<std::uint8_t>> _ref_rgb;
+  std::vector<int> _ref_rgb_h, _ref_rgb_w;
+  int _n_ref = 0;                  // == _ref_rgb.size()
   // Qwen3-VL deepstack features (krea2 grounded encode), bf16 [n_img, EH] each,
   // one per vision deepstack merger. Computed once in vision_tokens_, ADDED to
   // the encoder hidden states at the image rows after LM layers 0.. by encode_.
@@ -224,12 +330,35 @@ private:
   // Per-reference merged vision grid (mh, mw) and token count -- the 3-axis
   // mROPE position_ids give each reference its OWN band, so these are per
   // image, not global.
-  mutable int _img_mh[kMaxRefs] = {0, 0};
-  mutable int _img_mw[kMaxRefs] = {0, 0};
-  mutable int _img_tok[kMaxRefs] = {0, 0};
+  mutable std::vector<int> _img_mh, _img_mw, _img_tok;
+  // Reference i's merged grid, 0 past the end -- which is what a prompt
+  // with no reference reads for reference 0.
+  int
+  img_mh_(std::size_t i) const
+  {
+    return i < _img_mh.size() ? _img_mh[i] : 0;
+  }
+  int
+  img_mw_(std::size_t i) const
+  {
+    return i < _img_mw.size() ? _img_mw[i] : 0;
+  }
   mutable int _img_n = 0;          // references the tower actually encoded
 
+  // Qwen-Image-2.1's joint-sequence bookkeeping, published on the
+  // conditioning beat's sideband. Nothing downstream can recover it:
+  // an image row's embedding is a tower output, not a token id, so
+  // which rows are image slots is knowable only here.
+  mutable std::vector<std::uint8_t> _qi21_slots;
+  mutable std::vector<int> _qi21_grid_h, _qi21_grid_w;
+  mutable int _qi21_nref = 0;
+
   bool load_encoder_(metal_compute::MetalCompute* mc);
+  // The VOSR path: one picture in, one conditioning beat out, driven by
+  // the ref_image iport rather than by a prompt.
+  bool load_dinov2_(metal_compute::MetalCompute* mc,
+                    const std::string& root);
+  Job  process_vosr_(RuntimeContext& ctx);
 
   // ---- idle unload -------------------------------------------------------
   // The text encoder is the second-largest resident block in a diffusion
@@ -255,6 +384,20 @@ private:
   void release_encoder_when_idle_();
   void park_encoder_();
   void unload_encoder_();
+  // The encoder handed to the model manager to be kept warm
+  // (`keep_loaded`), where the box does not want it destroyed.
+  void keep_encoder_warm_();
+  // An encoder that streams through the raw-source slots grows a resident
+  // set by measurement, and growth is off until it is told what to leave
+  // clear. Before every prompt: the reserve (what the plan's other phases
+  // book) and the schedule (`passes` forwards this prompt -- two with a
+  // negative -- and more when the encoder outlives its beat).
+  void size_encoder_residency_(int passes);
+  double      _keep_loaded = 0.0;
+  // What it was built with, its warm hold's key; empty before.
+  std::string _enc_warm_key;
+  bool        _enc_taken_warm = false;   // see encoder_taken_warm()
+  int         _enc_resident_at_prompt = -1;
   bool reload_encoder_();
 
   // Encoder / DiT directories for this stage's model. Shared by both
@@ -266,10 +409,45 @@ private:
   // Encode `text` (+ the cached reference image, for image-aware families) into
   // the family conditioning tensor; returns the bf16 buffer + sets `n_real`.
   // `vtok`/`n_img` carry the (already-computed) vision tokens for QIE (empty
-  // for text-only). Empty buffer on failure.
+  // for text-only). `as_given`: the family's prompt rewriting skipped
+  // (Fibo 2.0's negative, which its reference encodes as written). Empty
+  // buffer on failure.
   metal_compute::SharedBuffer
   encode_(const std::string& text, const char* which, int& n_real,
-          const metal_compute::SharedBuffer& vtok, int n_img) const;
+          const metal_compute::SharedBuffer& vtok, int n_img,
+          bool as_given = false) const;
+
+  // Qwen-Image-2.1: the template's ids for `text` and how many leading
+  // ones the reference drops (the system turn).
+  bool qi21_ids_(const std::string& text, int nref,
+                 std::vector<std::int32_t>* ids, int* drop) const;
+  // The encoder's input rows for `ids`, gathered from its embedding table.
+  metal_compute::SharedBuffer
+  embed_rows_(const std::vector<std::int32_t>& ids) const;
+  // The conditioning beat's Qwen-Image-2.1 sideband: the slot mask and
+  // each reference's latent grid.
+  static FlexData qi21_sideband_(const std::vector<std::uint8_t>& slots,
+                                 int nref, const std::vector<int>& grid_h,
+                                 const std::vector<int>& grid_w);
+  // The sideband for the encode that JUST ran, `rows` rows of it; null
+  // for any other family. Take it before the next encode_, which writes
+  // its own mask over this one.
+  FlexData qi21_beat_sideband_(int rows) const;
+  // A picture is wired to ref_image / ref_image2 (a MiniMax-H3 keyframe,
+  // on that family), read off the graph before anything loads.
+  bool h3_keyframe_wired_() const;
+  // What a keyframe's vision encode is booked at: H3's widest canvas.
+  static constexpr std::int64_t kH3KeyframeBookPixels = 1920LL * 1088LL;
+  // MiniMax-H3's FL2VA presentation: every reference picture (the
+  // keyframes) through the vision tower, then "<Picture i>: " + its
+  // block per picture ahead of the prompt; tags into `_h3_tags`.
+  metal_compute::SharedBuffer
+  h3_keyframes_(const std::string& text, int* n_tokens,
+                std::string* err) const;
+  // The prompts held back from a batch on a streamed encoder, encoded in
+  // one layer-major pass and emitted in order.
+  bool batchable_() const;
+  Job flush_batch_(RuntimeContext& ctx);
 
   // Run the reference image through the family vision tower -> vision tokens,
   // sets n_img. QIE: Qwen2.5-VL, bf16 [n_img, 3584]. Krea-2 edit: Qwen3-VL,
@@ -277,13 +455,14 @@ private:
   metal_compute::SharedBuffer vision_tokens_(metal_compute::MetalCompute* mc,
                                              int& n_img) const;
 
-  // Mage-Flow's MANDATORY content screen over the encoder this stage already
-  // owns (see generative-models/mage/mage-screen.h). With a reference image
-  // the multimodal EDIT policy runs -- it judges the source picture as well
-  // as the instruction. Never throws; blocks on every failure.
-  genai::MageScreenVerdict screen_(const std::string&                 prompt,
-                                   const metal_compute::SharedBuffer& vtok,
-                                   int                                n_img)
+  // The family's MANDATORY content screen over the encoder this stage
+  // already owns (see generative-models/content-screen.h). With reference
+  // images it runs once PER REFERENCE, each pass bound to that picture,
+  // and blocks if any pass does. Never throws; blocks on every failure
+  // it can see.
+  genai::screen::Verdict screen_(const std::string&                 prompt,
+                                 const metal_compute::SharedBuffer& vtok,
+                                 int                                n_img)
       const;
 #endif
 };

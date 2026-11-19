@@ -6,6 +6,10 @@
 #include <type_traits>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace MTL {
 class Buffer;
 class CommandBuffer;
@@ -75,6 +79,14 @@ public:
 
   // Bind the function whose PSO defines the next dispatch. Must be
   // called before any dispatch().
+  //
+  // An INVALID `fn` (the name did not resolve, or its PSO did not
+  // build) binds nothing and POISONS the next dispatch: that dispatch
+  // encodes no work and latches a failure the stream's Fence::wait_ok()
+  // reports. It does not silently fall through to whatever was bound
+  // before, which is what a mis-spelt entry point used to do -- the
+  // previous op's kernel, re-run over this op's buffers, constants and
+  // grid. A later successful set_function clears it.
   void set_function(const ComputeFunction& fn);
 
   // Bind `buf` at MSL `buffer(index)`. `byte_offset` advances the
@@ -237,6 +249,13 @@ private:
     std::size_t   bytes_len = 0;
   };
 
+  // READ INLINE BY PLUGINS: CommandStream::sync_and_reopen (an inline in
+  // command-stream.h) compiles the MEANING of three fields below into
+  // every plugin that calls it -- _stream null means no stream,
+  // _scope_depth > 0 means inside a concurrent_scope, _dt is the dispatch
+  // type this encoder was opened with. The snapshot freezes their offsets
+  // (this type is held by value); changing what they mean is an ABI change
+  // too.
   MTL::ComputeCommandEncoder* _enc = nullptr;
   MTL::CommandBuffer* _cb = nullptr;   // owning command buffer (for reencode_)
   long _n_dispatch = 0;
@@ -262,6 +281,11 @@ private:
   // to wait for the next clean boundary. Silent wrong-answer bug otherwise --
   // Metal does not fault on an unbound slot.
   bool _state_dirty = false;
+  // The last set_function() was handed an INVALID ComputeFunction, so
+  // whatever pipeline state is bound belongs to some earlier op and the
+  // next dispatch must not run it. Cleared by the next successful
+  // set_function. See set_function / dispatch.
+  bool _fn_bad = false;
   // The pending op's recorded state, for replay_pending_(). Cleared (capacity
   // retained) by dispatch, so this only ever holds ONE op's bindings -- the
   // same window _state_dirty describes. State does not survive a dispatch on a
@@ -272,8 +296,14 @@ private:
   std::vector<std::uint8_t> _pending_bytes;
   MTL::ComputePipelineState* _pending_pso = nullptr;
   DispatchType _dt = DispatchType::Serial;
+  // RESERVED for the next field (plugin ABI): a plugin holds this type BY
+  // VALUE, so its size is compiled into every plugin in the support
+  // window. A new member takes a reserved slot instead of growing it.
+  std::uintptr_t _reserved[2] = {};
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

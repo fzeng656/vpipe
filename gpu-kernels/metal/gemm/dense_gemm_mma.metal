@@ -371,6 +371,148 @@ static inline void dense_gemm_mma_lora_fused_impl(
 DGVF(dense_gemm_mma_t_n128_lora_f16,     128, 128, 8)
 DGVF(dense_gemm_mma_t_n128x256_lora_f16, 128, 256, 8)
 
+// BANDED twins of the two kernels above, for a runtime LoRA that fuses
+// several separate adapters into ONE projection's output -- q, k and v
+// into MiniMax-H3's qkv_proj. Each output column belongs to exactly one
+// part and contracts only over that part's rank, so B is stored [N, R]
+// with no zeros (not the [N, parts*R] block-diagonal it would otherwise
+// be) and the tile reads the matching R-wide WINDOW of t, which is
+// [M, ldt] with the parts' ranks side by side:
+//
+//   part = (n0 / group) % parts,   t_part = t[:, part*R : part*R + R]
+//
+// `group` is how many consecutive output columns one part owns before
+// the next takes over -- a head's worth (128) where q/k/v interleave per
+// head, the whole inner width where they are three flat blocks. The tile
+// must not straddle a group (group % BN == 0), which the host checks; a
+// tile that did would contract half its columns against the wrong part.
+// The window is a strided view of t, so nothing is copied.
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_lora_band_impl(
+    const device VPIPE_ELT* t, const device VPIPE_ELT* Bf,
+    device VPIPE_ELT* y, int R, int N, int M, int ldt, int group,
+    int parts, uint3 tgid)
+{
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }
+  const int part = (n0 / group) % parts;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tT(const_cast<device VPIPE_ELT*>(t) + part * R,
+        dextents<int32_t, 2>(R, M), metal::array<int32_t, 2>{1, ldt});
+  TX tB(const_cast<device VPIPE_ELT*>(Bf), dextents<int32_t, 2>(R, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  auto mT = tT.slice(0, m0);
+  auto mB = tB.slice(0, n0);
+  auto mY = tY.slice(n0, m0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mT), decltype(mB), VPIPE_ELT>();
+  cT.load(mY);
+  op.run(mT, mB, cT);
+  cT.store(mY);
+}
+
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_lora_fused_band_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    const device VPIPE_ELT* t, const device VPIPE_ELT* Bf,
+    device VPIPE_ELT* y, int K, int N, int M, int R, int ldt, int group,
+    int parts, uint3 tgid)
+{
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }
+  const int part = (n0 / group) % parts;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x),  dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W),  dextents<int32_t, 2>(K, N));
+  TX tT(const_cast<device VPIPE_ELT*>(t) + part * R,
+        dextents<int32_t, 2>(R, M), metal::array<int32_t, 2>{1, ldt});
+  TX tB(const_cast<device VPIPE_ELT*>(Bf), dextents<int32_t, 2>(R, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+  // The same two descriptors, in the same order, as the unbanded fused
+  // tile -- see dense_gemm_mma_lora_fused_impl for why the BASE keeps the
+  // plain mode and only the delta accumulates.
+  constexpr auto desc_mul = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false);
+  constexpr auto desc_acc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc_mul, execution_simdgroups<SG>> op;
+  matmul2d<desc_acc, execution_simdgroups<SG>> op_acc;
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto mT = tT.slice(0, m0);
+  auto mB = tB.slice(0, n0);
+  auto mY = tY.slice(n0, m0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), VPIPE_ELT>();
+  op.run(mX, mW, cT);
+  op_acc.run(mT, mB, cT);
+  cT.store(mY);
+}
+
+// Buffers 0-10 as DGVF (R is the PER-PART rank); 11: ldt 12: group
+// 13: parts.
+#define DGVFB(NAME, BM, BN, SG)                                          \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      const device VPIPE_ELT* t [[buffer(8)]],                           \
+      const device VPIPE_ELT* Bf [[buffer(9)]],                          \
+      const constant int& R [[buffer(10)]],                             \
+      const constant int& ldt [[buffer(11)]],                           \
+      const constant int& group [[buffer(12)]],                         \
+      const constant int& parts [[buffer(13)]],                         \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias;                                          \
+    dense_gemm_mma_lora_fused_band_impl<BM, BN, SG>(                     \
+        x, W, t, Bf, y, K, N, M, R, ldt, group, parts, tgid);            \
+  }
+DGVFB(dense_gemm_mma_t_n128_lora_band_f16,     128, 128, 8)
+DGVFB(dense_gemm_mma_t_n128x256_lora_band_f16, 128, 256, 8)
+
+// The separate second GEMM, banded: 0: t, 1: B [N, R], 3: y, 4: R (the
+// PER-PART rank), 5: N, 6: M, 9: ldt, 10: group, 11: parts. Slots 2, 7
+// and 8 are unread, kept so the host binds it like the acc tiles.
+#define DGVLB(NAME, BM, BN, SG)                                          \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      const constant float& scale [[buffer(8)]],                        \
+      const constant int& ldt [[buffer(9)]],                            \
+      const constant int& group [[buffer(10)]],                         \
+      const constant int& parts [[buffer(11)]],                         \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias; (void)scale;                             \
+    dense_gemm_mma_lora_band_impl<BM, BN, SG>(                           \
+        x, W, y, K, N, M, ldt, group, parts, tgid);                      \
+  }
+DGVLB(dense_gemm_mma_t_n128_acc_band_f16,     128, 128, 8)
+DGVLB(dense_gemm_mma_t_n128x256_acc_band_f16, 128, 256, 8)
+
 #define DGVL(NAME, BM, BN, SG, ACC)                                      \
   kernel void NAME(                                                      \
       const device VPIPE_ELT* x [[buffer(0)]],                           \
@@ -397,6 +539,68 @@ DGVL(dense_gemm_mma_t_n128_scaled_f16, 128, 128, 8, false)
 // contraction -- and its N is the projection's full width.
 DGVL(dense_gemm_mma_t_n128_acc_f16,    128, 128, 8, true)
 DGVL(dense_gemm_mma_t_n128x256_acc_f16, 128, 256, 8, true)
+
+// THE BIAS IN THE EPILOGUE. No tile above applies a bias -- each takes the
+// slot and discards it, and a caller adds the bias in a second pass over a
+// product already rounded to the element type: TWO roundings where the
+// steel kernel folds the bias into its f32 accumulator and rounds once. In
+// f16 the second rounding is lost in the noise; in bf16 it is not -- a
+// bf16 DiT whose every projection carries a bias (RelayVSR's keyframe
+// model) measured 1.02-1.17x the reference's own bf16 error on this route
+// against 1.00x on steel. Here the destination is f32 and the bias is added
+// to it element by element, so the output rounds ONCE, as steel's does.
+//   0:x[M,K] 1:W[N,K] 2:bias[N] 3:y[M,N] 4:K 5:N 6:M 7:has_bias (unread)
+//   dispatch as dense_gemm_mma_t_n128_f16.
+template <int BM, int BN, int SG>
+static inline void dense_gemm_mma_bias_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    const device VPIPE_ELT* bias, device VPIPE_ELT* y, int K, int N, int M,
+    uint3 tgid)
+{
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }      // uniform
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), float>();
+  op.run(mX, mW, cT);
+  // Coordinates come back (col, row): x is the N extent in this file.
+  for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
+    if (!cT.is_valid_element(i)) { continue; }
+    const auto ids = cT.get_multidimensional_index(i);
+    const int gn = n0 + (int)ids[0], gm = m0 + (int)ids[1];
+    if (gm < M && gn < N) {
+      y[(int64_t)gm * (int64_t)N + gn] =
+          static_cast<VPIPE_ELT>(cT[i] + (float)bias[gn]);
+    }
+  }
+}
+
+#define DGVB(NAME, BM, BN, SG)                                           \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias;                                                      \
+    dense_gemm_mma_bias_impl<BM, BN, SG>(x, W, bias, y, K, N, M, tgid);  \
+  }
+DGVB(dense_gemm_mma_t_n128_bias_f16,     128, 128, 8)
+DGVB(dense_gemm_mma_t_n128x256_bias_f16, 128, 256, 8)
 
 // Split-K deep-reduction tile. A single-op full-K reduction underutilizes the
 // matrix units once K gets very deep (Krea2 ff-down, K=16384 runs ~0.7x the
@@ -735,6 +939,137 @@ kernel void gemm_i8i8_sc_f16_n64(
 // Same tile/dispatch contract as gemm_i8i8_sc_f16_n64; K % 512 == 0.
 #define GI8_KC 512
 
+// THE CHUNK DEPTH AS A PARAMETER, which is the question attention asks.
+//
+// A flash attention's QK product contracts over head_dim -- 128, and not
+// a number a kernel chooses -- and one threadgroup issues one such
+// product per key block, back to back into a live accumulator. That is
+// this loop's shape exactly, with KC = 128. Whether the matrix pipe
+// sustains its int8 rate at that depth, or needs a longer reduction per
+// call, is not something a standalone K=128 GEMM can answer: that one
+// pays a threadgroup's setup and store for every 128 of contraction,
+// where both this and attention pay it once for the whole loop.
+template <int KC>
+static inline void gemm_i8i8_kacc_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device half* as, const device half* ws, device half* y,
+    threadgroup int* Ys, int K, int N, int M, uint3 tgid, uint lid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4;
+  for (int e = (int)lid; e < BM * BN; e += SG * 32) { Ys[e] = 0; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  using TY = tensor<threadgroup int, dextents<int32_t, 2>, tensor_inline>;
+  TY tY(Ys, dextents<int32_t, 2>(BN, BM));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, tY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (int e = (int)lid; e < BM * BN; e += SG * 32) {
+    const int i = e / BN, j = e % BN;
+    const int gm = m0 + i, gn = n0 + j;
+    if (gm < M && gn < N) {
+      const float v = (float)Ys[e] * (float)as[gm] * (float)ws[gn];
+      y[(int64_t)gm * N + gn] = (half)v;
+    }
+  }
+}
+
+#define GI8_KACC(NAME, KC)                                               \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device half* as [[buffer(2)]],                               \
+      const device half* ws [[buffer(3)]],                               \
+      device half* y [[buffer(4)]],                                      \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ys[64 * 64];                                         \
+    gemm_i8i8_kacc_impl<KC>(xq, wq, as, ws, y, Ys, K, N, M, tgid, lid);  \
+  }
+
+GI8_KACC(gemm_i8i8_sc_f16_n64_kacc_k128, 128)
+GI8_KACC(gemm_i8i8_sc_f16_n64_kacc_k256, 256)
+// 64-deep, to carry the chunk-depth curve down to where a per-64-group
+// scale would have to live. FREE accumulation still, so what this
+// isolates is the DEPTH: the group tax is the _g64 twin below.
+GI8_KACC(gemm_i8i8_sc_f16_n64_kacc_k64, 64)
+// ...and 32, one more step down the depth curve, for the g32 question.
+GI8_KACC(gemm_i8i8_sc_f16_n64_kacc_k32, 32)
+
+// THE f16 TWIN OF THE ABOVE, so the chunk-depth sweep measures the DTYPE
+// and not the structure. Same 64x64 tile, same K chunking, same
+// multiply_accumulate mode (which carries its own per-call tax -- see
+// conv2d_mma's bias-fused note -- and both arms pay it), one store for
+// the whole loop.
+template <int KC>
+static inline void dense_gemm_mma_kacc_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    device VPIPE_ELT* y, int K, int N, int M, uint3 tgid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), VPIPE_ELT>();
+  for (auto it = cT.begin(); it != cT.end(); ++it) { *it = (VPIPE_ELT)0; }
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, cT);
+  }
+  auto mY = tY.slice(n0, m0);
+  cT.store(mY);
+}
+
+#define DGKACC(NAME, KC)                                                 \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* bias [[buffer(2)]],                        \
+      device VPIPE_ELT* y [[buffer(3)]],                                 \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& N [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      const constant int& has_bias [[buffer(7)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    (void)has_bias; (void)bias;                                          \
+    dense_gemm_mma_kacc_impl<KC>(x, W, y, K, N, M, tgid);                \
+  }
+
+DGKACC(dense_gemm_mma_kacc_k128_f16, 128)
+DGKACC(dense_gemm_mma_kacc_k512_f16, 512)
+
 kernel void gemm_i8i8_sc_f16_n64_kacc(
     const device int8_t* xq [[buffer(0)]],
     const device int8_t* wq [[buffer(1)]],
@@ -786,20 +1121,138 @@ kernel void gemm_i8i8_sc_f16_n64_kacc(
 // bf16 DiT loads this from the _bf16 metallib so it reads its bf16 scales and
 // stores a bf16 result (the int8 tensors are format-independent). The int32
 // tile accumulation + f32 per-group scaling are unchanged.
-kernel void gemm_i8i8_sc_f16_n64_g512(
+// PER-GROUP SCALING, TEMPLATED ON THE GROUP WIDTH.
+//
+// The width is the chunk depth: one matmul2d per group, drained and
+// scaled before the next. So "group size" and "how deep each matmul2d
+// call is" are the same number here, and making the groups finer makes
+// the calls shallower -- which is why the two costs cannot be separated
+// on this kernel and why the kacc twins above exist to separate them.
+template <int KC>
+static inline void gemm_i8i8_gk_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device VPIPE_ELT* as, const device VPIPE_ELT* ws,
+    device VPIPE_ELT* y, threadgroup int* Ys, int K, int N, int M,
+    const device VPIPE_ELT* bias, int has_bias,
+    uint3 tgid, uint lid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4;
+  constexpr int EPT = (BM * BN) / (SG * 32);
+
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  using TY = tensor<threadgroup int, dextents<int32_t, 2>, tensor_inline>;
+  TY tY(Ys, dextents<int32_t, 2>(BN, BM));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G = K / KC;
+
+  float facc[EPT] = {0.0f};
+  for (int g = 0; g < G; ++g) {
+    auto mX = tX.slice(g * KC, m0);
+    auto mW = tW.slice(g * KC, n0);
+    op.run(mX, mW, tY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int t = 0; t < EPT; ++t) {
+      const int e = (int)lid + t * (SG * 32);
+      const int i = e / BN, j = e % BN;
+      const int gm = m0 + i, gn = n0 + j;
+      if (gm < M && gn < N) {
+        facc[t] += (float)Ys[e] * (float)as[(int64_t)gm * G + g] *
+                   (float)ws[(int64_t)gn * G + g];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  for (int t = 0; t < EPT; ++t) {
+    const int e = (int)lid + t * (SG * 32);
+    const int i = e / BN, j = e % BN;
+    const int gm = m0 + i, gn = n0 + j;
+    if (gm < M && gn < N) {
+      const float bv = has_bias != 0 ? (float)bias[gn] : 0.0f;
+      y[(int64_t)gm * N + gn] = (VPIPE_ELT)(facc[t] + bv);
+    }
+  }
+}
+
+#define GI8_GK(NAME, KC)                                                 \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ys[64 * 64];                                         \
+    gemm_i8i8_gk_impl<KC>(xq, wq, as, ws, y, Ys, K, N, M, bias,          \
+                          has_bias, tgid, lid);                          \
+  }
+
+GI8_GK(gemm_i8i8_sc_f16_n64_g512, 512)
+// Finer groups, for the group-size sweep (gemm_i8.group_size). Not
+// wired: what they are for is measuring what a finer group COSTS.
+GI8_GK(gemm_i8i8_sc_f16_n64_g128, 128)
+GI8_GK(gemm_i8i8_sc_f16_n64_g64, 64)
+GI8_GK(gemm_i8i8_sc_f16_n64_g32, 32)
+
+// SPLIT-K twin of _g512: the same per-512-group accumulation, cut across
+// grid.z planes and left in f32 for splitk_fold_f32_f16 to sum.
+//
+// WHY IT IS THIS EASY, and why the deep-K case wanted it. _g512 already
+// walks K as a sequence of independent 512-groups, each scaled by its own
+// pair before it joins a float accumulator -- so a plane is nothing but a
+// contiguous RANGE of that loop, and the fold is the rest of the sum. The
+// float term for group g is computed identically whichever plane owns it,
+// so the only difference from the single-op kernel is the ORDER of the G
+// float adds: a reassociation, exactly the argument mma-splitk.h makes for
+// the dense f32 planes, and a weaker requirement than that one because
+// here the summands themselves are bit-identical either way.
+//
+// The split is by GROUP INDEX, not by K, which is what keeps every plane
+// boundary on a 512 multiple for free -- a chunk width in elements would
+// have had to be constrained to one.
+//
+// What it buys is what split-K always buys: a single-op reduction over a
+// deep K leaves only (M/BM)*(N/BN) threadgroups walking one long serial
+// contraction, and the matrix units stall with nothing else in flight.
+// The int8 pipe is not exempt -- the prototype measured the ff-down at
+// K=12288 running 18.5 TOPS against 22.5-23.6 at K=4096, the same deep-K
+// cliff the f16 path has and the reason this twin was flagged as the
+// obvious follow-up when i8 shipped.
+//
+// NO BIAS HERE, deliberately: a split writes S partial planes and the
+// bias must be added ONCE. splitk_fold_bias_f32_f16 does it in the fold.
+//   0:xq 1:wq 2:as 3:ws 4:planes (float [S, M, N]) 5:K 6:N 7:M 8:gpp
+// grid (N/BN, M/BM, S) THREADGROUPS. `gpp` is groups per plane; the last
+// plane takes the remainder, so S need not divide G.
+kernel void gemm_i8i8_sc_f16_n64_g512_sk(
     const device int8_t*    xq [[buffer(0)]],
     const device int8_t*    wq [[buffer(1)]],
-    const device VPIPE_ELT* as [[buffer(2)]],   // [M, K/512] per-token-group
-    const device VPIPE_ELT* ws [[buffer(3)]],   // [N, K/512] per-chan-group
-    device VPIPE_ELT*       y  [[buffer(4)]],
-    const constant int& K [[buffer(5)]],
-    const constant int& N [[buffer(6)]],
-    const constant int& M [[buffer(7)]],
+    const device VPIPE_ELT* as [[buffer(2)]],
+    const device VPIPE_ELT* ws [[buffer(3)]],
+    device float*           planes [[buffer(4)]],
+    const constant int& K   [[buffer(5)]],
+    const constant int& N   [[buffer(6)]],
+    const constant int& M   [[buffer(7)]],
+    const constant int& gpp [[buffer(8)]],
     uint3 tgid [[threadgroup_position_in_grid]],
     uint  lid  [[thread_index_in_threadgroup]])
 {
   constexpr int BM = 64, BN = 64, SG = 4;
-  constexpr int EPT = (BM * BN) / (SG * 32);  // elements per thread (32)
+  constexpr int EPT = (BM * BN) / (SG * 32);
   threadgroup int Ys[BM * BN];
 
   using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
@@ -815,13 +1268,16 @@ kernel void gemm_i8i8_sc_f16_n64_g512(
 
   const int m0 = (int)tgid.y * BM;
   const int n0 = (int)tgid.x * BN;
-  const int G = K / GI8_KC;
+  const int G  = K / GI8_KC;
+  const int p  = (int)tgid.z;
+  const int g0 = p * gpp;
+  const int g1 = min(G, g0 + gpp);
 
   float facc[EPT] = {0.0f};
-  for (int g = 0; g < G; ++g) {
+  for (int g = g0; g < g1; ++g) {
     auto mX = tX.slice(g * GI8_KC, m0);
     auto mW = tW.slice(g * GI8_KC, n0);
-    op.run(mX, mW, tY);                       // chunk partial (overwrite)
+    op.run(mX, mW, tY);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int t = 0; t < EPT; ++t) {
       const int e = (int)lid + t * (SG * 32);
@@ -832,13 +1288,18 @@ kernel void gemm_i8i8_sc_f16_n64_g512(
                    (float)ws[(int64_t)gn * G + g];
       }
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);   // before overwrite
+    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  // A plane whose range is empty still writes: the fold sums S planes
+  // unconditionally, and leaving one uninitialised is the kind of bug
+  // that only shows up when S stops dividing G.
   for (int t = 0; t < EPT; ++t) {
     const int e = (int)lid + t * (SG * 32);
     const int i = e / BN, j = e % BN;
     const int gm = m0 + i, gn = n0 + j;
-    if (gm < M && gn < N) { y[(int64_t)gm * N + gn] = (VPIPE_ELT)facc[t]; }
+    if (gm < M && gn < N) {
+      planes[((int64_t)p * M + gm) * N + gn] = facc[t];
+    }
   }
 }
 
@@ -863,7 +1324,10 @@ kernel void gemm_i8i8_sc_f16_n64_g512(
 // 1.05e-2 float-g512 / 1.11e-2 single-op) because pow2 scales on BOTH
 // operands each give up ~0.6 bit vs amax. Kept as the measurement record
 // + for hardware without fast float pipes or for cross-device bit-exact
-// reproducibility requirements.
+// reproducibility requirements. The register-resident twins below
+// (gemm_i8i8_gkrs_impl) are where a shift accumulate DOES pay: with the
+// drain gone and the scales staged, the fixed-exponent form runs at the
+// float twin's rate.
 kernel void gemm_i8i8_sc_f16_n64_g512i(
     const device int8_t* xq [[buffer(0)]],
     const device int8_t* wq [[buffer(1)]],
@@ -941,6 +1405,2046 @@ kernel void gemm_i8i8_sc_f16_n64_g512i(
   }
 }
 
+
+// REGISTER-RESIDENT PER-GROUP ACCUMULATION.
+//
+// The _g twins above pay their group tax in the DRAIN, not in the
+// arithmetic: matmul2d writes each group's i32 partial to a threadgroup
+// tile, a barrier, every thread reads its elements back and scales
+// them, and a second barrier frees the tile for the next group. At
+// KC=64 that round-trip runs eight times per 512 of contraction, and
+// MEASURED (gemm_i8.group_size) g64 at 6.4 TOP/s against kacc-64's 18.3
+// for the same matrix work -- below the f16 dense kernel.
+//
+// This twin never drains. The partial lands in a COOPERATIVE tensor --
+// the i32 result of each element in the registers of the thread that
+// owns it -- and is folded into a per-thread register accumulator
+// right there, so between groups there is no threadgroup traffic and
+// no barrier. The element -> (row, col) map is the layout's own
+// (get_multidimensional_index), resolved once before the loop.
+//
+// SHIFT=true is the block-floating-point accumulate of _g512i: pow2
+// scales carried as int8 EXPONENTS, an i32 accumulator with a tracked
+// exponent, rounded right-shifts to align, one ldexp at the end.
+// SHIFT=false is the float accumulate of _g512: f16 amax scales, one
+// fma per element per group. Buffers as _g512i / _g512 respectively
+// (0:xq 1:wq 2:sa[M,K/KC] 3:sw[N,K/KC] 4:y 5:K 6:N 7:M), no bias.
+//
+// MEASURED (gemm_i8.group_size, M5, TOP/s at 4096x12288x4096 /
+// 4096x4096x12288): g64r 7.8 / 7.4 and g64ri 5.2 / 5.4 against the
+// drained g64's 6.4 / 6.1 -- removing the drain bought almost nothing,
+// and g512r (17.4) is SLOWER than the drained g512 (19.3). The cost
+// had moved, not gone: two DEVICE scale loads per element per group
+// are 64 loads per thread per group, and with ~160 live registers
+// there is no occupancy to hide them behind. The staged twins below
+// (gemm_i8i8_gkrs_impl) are the fix; this one is the measurement
+// record of why they stage.
+template <int KC, bool SHIFT, typename ST>
+static inline void gemm_i8i8_gkr_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device ST* sa, const device ST* sw,
+    device VPIPE_ELT* y, int K, int N, int M, uint3 tgid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4;
+  // Elements per thread of a 64x64 i32 destination over 4 simdgroups.
+  // The layout is the runtime's; gemm_i8.g64_register_acc probes that
+  // it is exactly this (32 valid elements per thread, covering the
+  // tile once) before anything trusts the kernel.
+  constexpr int CAP = 32;
+
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G = K / KC;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+
+  // Per-element scale rows, resolved once: sa[oa + g], sw[ow + g].
+  // Coordinates come back (col, row) -- x is the N extent everywhere
+  // in this file.
+  int oa[CAP], ow[CAP];
+  uint okm = 0u;
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const auto ids = cP.get_multidimensional_index((uint16_t)i);
+    const int gn = n0 + (int)ids[0], gm = m0 + (int)ids[1];
+    const bool ok = cP.is_valid_element((uint16_t)i) && gm < M && gn < N;
+    okm |= ok ? (1u << i) : 0u;
+    oa[i] = gm * G;
+    ow[i] = gn * G;
+  }
+
+  int acc[CAP];
+  short ae[CAP];
+  float facc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { acc[i] = 0; ae[i] = -1000; facc[i] = 0.0f; }
+
+  for (int g = 0; g < G; ++g) {
+    auto mX = tX.slice(g * KC, m0);
+    auto mW = tW.slice(g * KC, n0);
+    op.run(mX, mW, cP);
+#pragma clang loop unroll(full)
+    for (int i = 0; i < CAP; ++i) {
+      if ((okm >> i) & 1u) {
+        int p = cP[(uint16_t)i];
+        if constexpr (SHIFT) {
+          const int eg = (int)sa[oa[i] + g] + (int)sw[ow[i] + g];
+          const int d = eg - (int)ae[i];
+          if (d > 0) {
+            acc[i] = (d >= 31) ? 0 : ((acc[i] + (1 << (d - 1))) >> d);
+            acc[i] += p;
+            ae[i] = (short)eg;
+          } else if (d < 0) {
+            const int dd = -d;
+            p = (dd >= 31) ? 0 : ((p + (1 << (dd - 1))) >> dd);
+            acc[i] += p;
+          } else {
+            acc[i] += p;
+          }
+        } else {
+          facc[i] += (float)p * (float)sa[oa[i] + g] * (float)sw[ow[i] + g];
+        }
+      }
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    if ((okm >> i) & 1u) {
+      const auto ids = cP.get_multidimensional_index((uint16_t)i);
+      const int gn = n0 + (int)ids[0], gm = m0 + (int)ids[1];
+      float v;
+      if constexpr (SHIFT) {
+        v = ldexp((float)acc[i], (int)ae[i]);
+      } else {
+        v = facc[i];
+      }
+      y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+    }
+  }
+}
+
+#define GI8_GKR(NAME, KC, SHIFT, ST)                                     \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device ST* sa [[buffer(2)]],                                 \
+      const device ST* sw [[buffer(3)]],                                 \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    gemm_i8i8_gkr_impl<KC, SHIFT, ST>(xq, wq, sa, sw, y, K, N, M, tgid); \
+  }
+
+// _r: float accumulate in registers (f16 scales); _ri: shift-aligned
+// i32 accumulate in registers (int8 exponents).
+GI8_GKR(gemm_i8i8_sc_f16_n64_g64r, 64, false, VPIPE_ELT)
+GI8_GKR(gemm_i8i8_sc_f16_n64_g64ri, 64, true, char)
+GI8_GKR(gemm_i8i8_sc_f16_n64_g128r, 128, false, VPIPE_ELT)
+GI8_GKR(gemm_i8i8_sc_f16_n64_g128ri, 128, true, char)
+GI8_GKR(gemm_i8i8_sc_f16_n64_g512r, 512, false, VPIPE_ELT)
+GI8_GKR(gemm_i8i8_sc_f16_n64_g512ri, 512, true, char)
+
+// THE COOPERATIVE-DESTINATION CEILING: the kacc loop (raw i32
+// multiply_accumulate, one scale at the end) with the accumulator in a
+// cooperative tensor instead of the threadgroup tile. No per-group work
+// at all, so the gap to kacc at the same KC is what the register
+// destination itself costs, and whatever a register twin below adds on
+// top of THIS is its epilogue.
+//
+// MEASURED (gemm_i8.group_size, M5): kaccr-64 20.4 / 18.5 TOP/s against
+// kacc-64's 18.4 / 17.6, kaccr-512 20.8 / 18.8 against 22.9 / 19.4. The
+// register destination is not a cost at all at 64 -- it is CHEAPER than
+// the tile, which pays a tgmem store per op -- and within 3-9% at 512.
+template <int KC>
+static inline void gemm_i8i8_kaccr_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device half* as, const device half* ws, device half* y,
+    int K, int N, int M, uint3 tgid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4, CAP = 32;
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { cP[(uint16_t)i] = 0; }
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, cP);
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const auto ids = cP.get_multidimensional_index((uint16_t)i);
+    const int gn = n0 + (int)ids[0], gm = m0 + (int)ids[1];
+    if (cP.is_valid_element((uint16_t)i) && gm < M && gn < N) {
+      const float v = (float)cP[(uint16_t)i] * (float)as[gm] * (float)ws[gn];
+      y[(int64_t)gm * N + gn] = (half)v;
+    }
+  }
+}
+
+#define GI8_KACCR(NAME, KC)                                              \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device half* as [[buffer(2)]],                               \
+      const device half* ws [[buffer(3)]],                               \
+      device half* y [[buffer(4)]],                                      \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    gemm_i8i8_kaccr_impl<KC>(xq, wq, as, ws, y, K, N, M, tgid);          \
+  }
+
+GI8_KACCR(gemm_i8i8_sc_f16_n64_kaccr_k64, 64)
+GI8_KACCR(gemm_i8i8_sc_f16_n64_kaccr_k512, 512)
+GI8_KACCR(gemm_i8i8_sc_f16_n64_kaccr_k32, 32)
+GI8_KACCR(gemm_i8i8_sc_f16_n64_kaccr_k128, 128)
+
+// STAGED-SCALE register twins. The naive register twin above reads two
+// device scales per element per group -- 64 loads per thread per group
+// -- and MEASURED no better than the drain it replaced. This one stages
+// a STRIP of groups' scales into threadgroup memory first (8 groups x
+// (64 rows + 64 cols): one load per thread per group, one barrier per
+// strip) and indexes them by the element's tile-local (row, col), which
+// the probe shows is all 32 elements valid, so the per-element guard
+// goes too: out-of-range rows and cols stage a zero scale and are never
+// stored.
+//
+// AROW=true is the second half of the design: the ACTIVATION quantized
+// per ROW (one scale per token over all of K, quant_f16_i8_row) and only
+// the WEIGHT per (channel, group) -- which is what "int8-g64 weights"
+// asks for, and halves the per-element work again: one staged scale, one
+// fma. The row scale is applied once, at the store. Buffer 2 is then
+// as[M] (or int8 exponents ea[M]).
+//
+// MEASURED (gemm_i8.group_size, M5, TOP/s at 4096x12288x4096 /
+// 4096x4096x12288; the drained g64 is 6.4 / 6.1, kacc-64 18.4 / 17.6,
+// and the f16 kacc twin at the same tile 11.2 / 4.4):
+//
+//   g64rs   17.4 / 16.9   float, both grouped      (2.7x the drain)
+//   g64rsi   9.4 /  9.5   running shift, both grouped
+//   w64rs   19.0 / 17.6   float, activation per row
+//   w64rsi  10.1 / 10.2   running shift, activation per row
+//   w64rsf  17.7 / 17.6   FIXED-exponent shift, activation per row
+//   g512rs  21.3 / 19.3   float, both grouped -- above the drained
+//                         g512's 19.3 / 14.7 that ships today
+//   g32rs   14.0 / 13.6   one step finer: the depth-32 matmul is free
+//                         (kaccr-32 19.9 / 18.5) and the epilogue,
+//                         run twice as often, is the whole 20%
+//   g128rs  19.3 / 18.5   one step coarser, 4% under its ceiling
+//
+// So a 64-wide group is viable once nothing drains: the float twins
+// sit at 0.95-1.03x of the chunk-depth ceiling. The RUNNING shift is
+// the slow half of the design -- its branchless align is ~12 integer
+// ops per element where the float path is a convert and an fma -- and
+// the fixed-exponent form (one pre-staged shift per element) is what
+// closes that gap. All four shift twins are bit-exact against a CPU
+// replica (gemm_i8.g64_register_acc); f32 quality at 256x512x1024 is
+// 8.4e-3 for the amax float twins and 1.29-1.35e-2 for the pow2 shift
+// twins, the ~0.6 bit per pow2 operand that _g512i's note predicts.
+//
+// FIXED=true (SHIFT && AROW only) is the cheaper alignment that the
+// per-row activation makes possible: a column's exponent schedule is a
+// pure function of ITS weight exponents, all known before the loop, so
+// the accumulator sits at the column's FINAL exponent from the start
+// and every partial takes one right-shift by a pre-staged amount --
+// no tracked exponent, no accumulator shift, no max. Numerically it is
+// the running scheme's end state reached directly: the running scheme
+// shifts the accumulator down to the same exponent as soon as the
+// largest group arrives, and the fixed one rounds each partial there
+// instead of the running sum.
+//
+// SPLIT=true is the split-K twin: grid.z planes, each owning `gpp`
+// consecutive groups (the last takes the remainder), left in f32 for
+// splitk_fold_f32_f16 -- the same by-group-index split the drained
+// _g512_sk makes, for the same reason (a plane is a contiguous range of
+// this loop). No bias on that path: the fold adds it once.
+template <int KC, bool SHIFT, bool AROW, bool FIXED, bool SPLIT,
+          typename ST>
+static inline void gemm_i8i8_gkrs_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device ST* sa, const device ST* sw,
+    device VPIPE_ELT* y, const device VPIPE_ELT* bias, int has_bias,
+    device float* planes, int gpp,
+    threadgroup int* Ss, threadgroup int* Ecol,
+    int K, int N, int M, uint3 tgid, uint lid)
+{
+  static_assert(!FIXED || (SHIFT && AROW),
+                "FIXED is the per-row-activation shift scheme");
+  static_assert(!SPLIT || !SHIFT, "the split twin is the float one");
+  constexpr int BM = 64, BN = 64, SG = 4, CAP = 32;
+  constexpr int STRIP = 8;
+  // Per-group staged values: the rows' scales, then the cols'; AROW
+  // stages only the cols'.
+  constexpr int SR = AROW ? 0 : BM;
+  constexpr int SW = SR + BN;
+
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G = K / KC;
+  int gbeg = 0, gend = G;
+  if constexpr (SPLIT) {
+    gbeg = (int)tgid.z * gpp;
+    gend = min(G, gbeg + gpp);
+  }
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+
+  uchar lr[CAP], lc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const auto ids = cP.get_multidimensional_index((uint16_t)i);
+    lc[i] = (uchar)ids[0];
+    lr[i] = (uchar)ids[1];
+  }
+  int acc[CAP];
+  int ae[CAP];
+  float facc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { acc[i] = 0; ae[i] = -1000; facc[i] = 0.0f; }
+
+  if constexpr (FIXED) {
+    // Each column's max exponent over ALL its groups: two threads per
+    // column, one per group parity, then the pair's max.
+    const int c = (int)lid & 63, par = (int)lid >> 6;
+    const int gn = n0 + c;
+    int em = -1000;
+    if (gn < N) {
+      for (int g = par; g < G; g += 2) {
+        em = max(em, (int)sw[(int64_t)gn * G + g]);
+      }
+    }
+    Ecol[(int)lid] = em;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 64) { Ecol[lid] = max(Ecol[lid], Ecol[lid + 64]); }
+  }
+
+  for (int g0 = gbeg; g0 < gend; g0 += STRIP) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = (int)lid; e < STRIP * SW; e += SG * 32) {
+      const int s = e / SW, r = e - s * SW;
+      const int g = g0 + s;
+      float fv = 0.0f;
+      int iv = 0;
+      if (g < gend) {
+        if (r < SR) {
+          const int gm = m0 + r;
+          if (gm < M) {
+            if constexpr (SHIFT) { iv = (int)sa[(int64_t)gm * G + g]; }
+            else { fv = (float)sa[(int64_t)gm * G + g]; }
+          }
+        } else {
+          const int gn = n0 + r - SR;
+          if (gn < N) {
+            if constexpr (FIXED) {
+              // The pre-staged shift: down from this group's exponent
+              // to the column's final one.
+              iv = clamp(Ecol[r - SR] - (int)sw[(int64_t)gn * G + g],
+                         0, 31);
+            } else if constexpr (SHIFT) {
+              iv = (int)sw[(int64_t)gn * G + g];
+            } else {
+              fv = (float)sw[(int64_t)gn * G + g];
+            }
+          }
+        }
+      }
+      if constexpr (SHIFT) { Ss[e] = iv; } else { Ss[e] = as_type<int>(fv); }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int s = 0; s < STRIP; ++s) {
+      const int g = g0 + s;
+      if (g >= gend) { break; }
+      auto mX = tX.slice(g * KC, m0);
+      auto mW = tW.slice(g * KC, n0);
+      op.run(mX, mW, cP);
+      const threadgroup int* sr = Ss + s * SW;
+      const threadgroup int* sc = sr + SR;
+#pragma clang loop unroll(full)
+      for (int i = 0; i < CAP; ++i) {
+        const int p = cP[(uint16_t)i];
+        if constexpr (FIXED) {
+          const int s2 = sc[lc[i]];
+          acc[i] += (p + (int)((1u << s2) >> 1)) >> s2;
+        } else if constexpr (SHIFT) {
+          // Branchless align: shift whichever side is finer down to the
+          // coarser exponent, rounding half up. |acc| < 2^30 and |p| <
+          // 2^21, so a clamped 31-bit shift is the "drop it" case.
+          int eg = sc[lc[i]];
+          if constexpr (!AROW) { eg += sr[lr[i]]; }
+          const int d = eg - ae[i];
+          const int s1 = clamp(d, 0, 31), s2 = clamp(-d, 0, 31);
+          acc[i] = ((acc[i] + (int)((1u << s1) >> 1)) >> s1) +
+                   ((p + (int)((1u << s2) >> 1)) >> s2);
+          ae[i] = max(ae[i], eg);
+        } else {
+          float sv = as_type<float>(sc[lc[i]]);
+          if constexpr (!AROW) { sv *= as_type<float>(sr[lr[i]]); }
+          facc[i] += (float)p * sv;
+        }
+      }
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const int gn = n0 + (int)lc[i], gm = m0 + (int)lr[i];
+    if (gm < M && gn < N) {
+      float v;
+      if constexpr (FIXED) {
+        v = ldexp((float)acc[i], Ecol[lc[i]] + (int)sa[gm]);
+      } else if constexpr (SHIFT) {
+        int e = ae[i];
+        if constexpr (AROW) { e += (int)sa[gm]; }
+        v = ldexp((float)acc[i], e);
+      } else {
+        v = facc[i];
+        if constexpr (AROW) { v *= (float)sa[gm]; }
+      }
+      if constexpr (SPLIT) {
+        // A plane whose range is empty still writes: the fold sums S
+        // planes unconditionally.
+        planes[((int64_t)tgid.z * M + gm) * N + gn] = v;
+      } else {
+        if (has_bias != 0) { v += (float)bias[gn]; }
+        y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+      }
+    }
+  }
+}
+
+// Same buffer contract as _g512 (bias at 8/9, zero = not added), so
+// I8GemmContext binds either family the same way.
+#define GI8_GKRS(NAME, KC, SHIFT, AROW, FIXED, ST)                       \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device ST* sa [[buffer(2)]],                                 \
+      const device ST* sw [[buffer(3)]],                                 \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * 128];                                         \
+    threadgroup int Ecol[128];                                           \
+    gemm_i8i8_gkrs_impl<KC, SHIFT, AROW, FIXED, false, ST>(              \
+        xq, wq, sa, sw, y, bias, has_bias, nullptr, 0, Ss, Ecol, K, N,   \
+        M, tgid, lid);                                                   \
+  }
+
+// Same contract as _g512_sk: 4:planes (float [S, M, N]), 8:gpp, grid
+// (N/64, M/64, S) threadgroups.
+#define GI8_GKRS_SK(NAME, KC)                                            \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device VPIPE_ELT* sa [[buffer(2)]],                          \
+      const device VPIPE_ELT* sw [[buffer(3)]],                          \
+      device float* planes [[buffer(4)]],                                \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const constant int& gpp [[buffer(8)]],                            \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * 128];                                         \
+    threadgroup int Ecol[128];                                           \
+    gemm_i8i8_gkrs_impl<KC, false, false, false, true, VPIPE_ELT>(       \
+        xq, wq, sa, sw, nullptr, nullptr, 0, planes, gpp, Ss, Ecol, K,   \
+        N, M, tgid, lid);                                                \
+  }
+
+// _rs: float, both operands grouped; _rsi: shift-aligned, both grouped;
+// _w64rs / _w64rsi: weights grouped, activation per row; _w64rsf: the
+// same with the fixed column exponent.
+GI8_GKRS(gemm_i8i8_sc_f16_n64_g64rs, 64, false, false, false, VPIPE_ELT)
+GI8_GKRS(gemm_i8i8_sc_f16_n64_g64rsi, 64, true, false, false, char)
+GI8_GKRS(gemm_i8i8_sc_f16_n64_g512rs, 512, false, false, false, VPIPE_ELT)
+GI8_GKRS(gemm_i8i8_sc_f16_n64_g512rsi, 512, true, false, false, char)
+GI8_GKRS(gemm_i8i8_sc_f16_n64_w64rs, 64, false, true, false, VPIPE_ELT)
+GI8_GKRS(gemm_i8i8_sc_f16_n64_w64rsi, 64, true, true, false, char)
+GI8_GKRS(gemm_i8i8_sc_f16_n64_w64rsf, 64, true, true, true, char)
+// THE SHIPPED PAIR: g64rs and its split-K twin are what I8GemmContext
+// runs at its default group of 64.
+GI8_GKRS_SK(gemm_i8i8_sc_f16_n64_g64rs_sk, 64)
+// GROUP 32, the same design one step finer (VPIPE_I8_GROUP=32): each
+// matmul2d is 32 deep and the epilogue runs twice as often per K.
+GI8_GKRS(gemm_i8i8_sc_f16_n64_g32rs, 32, false, false, false, VPIPE_ELT)
+GI8_GKRS_SK(gemm_i8i8_sc_f16_n64_g32rs_sk, 32)
+// GROUP 128, one step coarser (VPIPE_I8_GROUP=128), completing the set
+// 32 / 64 / 128 / 512 on one design.
+GI8_GKRS(gemm_i8i8_sc_f16_n64_g128rs, 128, false, false, false, VPIPE_ELT)
+GI8_GKRS_SK(gemm_i8i8_sc_f16_n64_g128rs_sk, 128)
+
+// NATIVE AFFINE-WEIGHT INT8 GEMM: the activation's int8 code against the
+// checkpoint's OWN codes -- w8 bytes or w4 nibbles, group 64, the MLX
+// affine form w = s*q + b with q unsigned -- with the scale and the zero
+// point folded into the register epilogue EXACTLY. No dequant scratch,
+// no requant pass, and no second quantization of the weight.
+//
+// The matrix units have no int8 x uint8 form (uint8 x uint8 and uint8 x
+// uint4 are what exist for unsigned codes), so the activation goes in
+// as xq + 128 and the epilogue takes the offset back out:
+//
+//   P'[m,n,g] = sum_k (xq + 128) * q            the MMA, exact in i32
+//   P         = P' - 128 * Q[n,g],  Q = sum_k q  affine_group_sums_*
+//   y[m,n]    = sum_g  a[m,g] * s[n,g] * P  +  u[m,g] * b[n,g]
+//               u = a * X,  X = sum_k xq       the quantizer's row sums
+//
+// P' and 128*Q are both under 2^23, so the subtraction is exact in
+// int32 and what reaches the fma is the true code product. The u*b term
+// is the zero point's contribution and it is summed per group in f32
+// with the rest; deferring it to an f16 accumulate after the store
+// would round a term as large as the output itself.
+//
+// MEASURED on the M5 at 4096x12288x4096, TOP/s, kernel only
+// (gemm_i8.native_affine_kernel_arms):
+//
+//   ceilings, no epilogue:  i8xi8 22.2   u8xu8 19.8   u8xu4 17.6   i8xi4 18.8
+//   g64rs (the requant kernel)         17.3
+//   native w8:  per-group form (v1) 12.6, matmul form cm0 15.3, cm1 16.2
+//   native w4:  v1 10.6, cm0 12.5, cm1 13.1
+//   a signed code format would give: w8 16.9, w4 15.0
+//
+// Three things moved it from v1 to cm1: the zero-point term as one
+// matmul instead of two loads and an fma per element per group;
+// staging only what the mode reads (the unread u and b columns cost
+// 15% on their own); and adding that matmul in registers on the
+// strength of the layout probe, no tile. What remains is the matrix
+// pipe: unsigned costs 11% against int8 x int8 and the 4-bit operand
+// another 11%, and no epilogue gets that back.
+//   0:xu[M,K] u8  1:codes  2:as[M,G]  3:xs[M,G] i16  4:ws[N,G]  5:wb[N,G]
+//   6:wsum[N,G] i16  7:y (f32 planes for _sk)  8:K 9:N 10:M
+//   11:bias 12:has_bias  (_sk: 11:gpp)  13:u[M,G]  14:c_hi 15:c_lo
+//   grid as the g64rs kernels.
+//
+// UB_MMA=true moves the zero-point term out of the group loop. It is
+// sum_g u[m,g] * b[n,g] -- a rank-G product, i.e. one 64x64xG matmul
+// per threadgroup over U[M,G] (the quantizer's a*X, in the element
+// type) and the checkpoint's OWN qbias tensor [N,G], run once after the
+// loop into an f32 cooperative tensor and folded into facc. That leaves
+// the per-group epilogue with three loads, an int add, a convert, a
+// multiply and one fma. The -128*Q term cannot go the same way: it
+// cancels the +128*Q that rides inside P', and an f16/bf16 operand
+// would carry that cancellation at 11 (8) bits.
+//
+// CMODE=1 folds the -128*Q term into that matmul too, as sum_g a[m,g] *
+// c[n,g] with c = -128*s*Q carried as an f16 hi/lo PAIR (c_hi = f16(c),
+// c_lo = f16(c - c_hi), ~22 bits between them) so the cancellation
+// against the +128*Q inside P' survives; the per-group epilogue is then
+// exactly g64rs's: two loads, a multiply, a convert and an fma.
+// Staged words per group for a mode: [a | u] rows, [s | b | c] cols in
+// the per-group form; the matmul forms read a, s (and c under CMODE 0).
+template <bool UB, int CM>
+constexpr int gemm_u8q_sw()
+{
+  return (UB ? 1 : 2) * 64 + (UB ? (CM == 1 ? 1 : 2) : 3) * 64;
+}
+
+template <int BITS, bool SPLIT, int STRIP = 8, bool UB_MMA = true,
+          int CMODE = 0>
+static inline void gemm_u8q_impl(
+    const device uint8_t* xu, const device uchar* codes,
+    const device VPIPE_ELT* as, const device short* xs,
+    const device VPIPE_ELT* ws, const device VPIPE_ELT* wb,
+    const device short* wsum, const device VPIPE_ELT* uf,
+    const device VPIPE_ELT* c_hi, const device VPIPE_ELT* c_lo,
+    device VPIPE_ELT* y, const device VPIPE_ELT* bias, int has_bias,
+    device float* planes, int gpp,
+    threadgroup int* Ss, int K, int N, int M, uint3 tgid, uint lid)
+{
+  static_assert(CMODE == 0 || UB_MMA, "CMODE 1 rides the post-loop matmul");
+  constexpr int BM = 64, BN = 64, SG = 4, CAP = 32, KC = 64;
+  // Staged per group: [a | u] rows then [s | b | c] cols in the per-group
+  // form; the matmul forms read only a, s (and c under CMODE 0).
+  constexpr int NR = UB_MMA ? 1 : 2;
+  constexpr int NC = UB_MMA ? (CMODE == 1 ? 1 : 2) : 3;
+  constexpr int SW = gemm_u8q_sw<UB_MMA, CMODE>();
+  static_assert(SW == NR * BM + NC * BN, "staging layout");
+  using TX = tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline>;
+  using WE = conditional_t<BITS == 4, uint4b_format, uint8_t>;
+  using TW = tensor<device WE, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device uint8_t*>(xu), dextents<int32_t, 2>(K, M));
+  // A 4-bit tensor's handle is a byte pointer and its extents count
+  // ELEMENTS, so the packed row of K nibbles is K wide here.
+  TW tW(const_cast<device uchar*>(codes), dextents<int32_t, 2>(K, N));
+
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G = K / KC;
+  int gbeg = 0, gend = G;
+  if constexpr (SPLIT) {
+    gbeg = (int)tgid.z * gpp;
+    gend = min(G, gbeg + gpp);
+  }
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+
+  uchar lr[CAP], lc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const auto ids = cP.get_multidimensional_index((uint16_t)i);
+    lc[i] = (uchar)ids[0];
+    lr[i] = (uchar)ids[1];
+  }
+  float facc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { facc[i] = 0.0f; }
+
+  for (int g0 = gbeg; g0 < gend; g0 += STRIP) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = (int)lid; e < STRIP * SW; e += SG * 32) {
+      const int sidx = e / SW, r = e - sidx * SW;
+      const int g = g0 + sidx;
+      int v = 0;
+      if (g < gend) {
+        if (r < NR * BM) {
+          const int gm = m0 + (r < BM ? r : r - BM);
+          if (gm < M) {
+            const float a = (float)as[(int64_t)gm * G + g];
+            v = as_type<int>(r < BM
+                ? a : a * (float)xs[(int64_t)gm * G + g]);
+          }
+        } else {
+          const int rc = r - NR * BM;
+          const int which = rc / BN;          // 0: s, 1: b or c, 2: c
+          const int gn = n0 + (rc - which * BN);
+          if (gn < N) {
+            if (which == 0) {
+              v = as_type<int>((float)ws[(int64_t)gn * G + g]);
+            } else if (which == 1 && !UB_MMA) {
+              v = as_type<int>((float)wb[(int64_t)gn * G + g]);
+            } else {
+              v = -128 * (int)wsum[(int64_t)gn * G + g];
+            }
+          }
+        }
+      }
+      Ss[e] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int sidx = 0; sidx < STRIP; ++sidx) {
+      const int g = g0 + sidx;
+      if (g >= gend) { break; }
+      auto mX = tX.slice(g * KC, m0);
+      auto mW = tW.slice(g * KC, n0);
+      op.run(mX, mW, cP);
+      const threadgroup int* sa = Ss + sidx * SW;
+      const threadgroup int* su = sa + BM;             // per-group form
+      const threadgroup int* ss = sa + NR * BM;
+      const threadgroup int* sb = ss + BN;             // per-group form
+      const threadgroup int* sc = ss + (NC - 1) * BN;  // last column set
+#pragma clang loop unroll(full)
+      for (int i = 0; i < CAP; ++i) {
+        const int p = CMODE == 1 ? cP[(uint16_t)i]
+                                 : cP[(uint16_t)i] + sc[lc[i]];
+        const float a = as_type<float>(sa[lr[i]]);
+        if constexpr (UB_MMA) {
+          facc[i] += a * as_type<float>(ss[lc[i]]) * (float)p;
+        } else {
+          const float u = as_type<float>(su[lr[i]]);
+          facc[i] += a * as_type<float>(ss[lc[i]]) * (float)p +
+                     u * as_type<float>(sb[lc[i]]);
+        }
+      }
+    }
+  }
+
+  if constexpr (UB_MMA) {
+    // The zero-point term as one matmul over ALL G groups, accumulated
+    // into a cooperative f32 tensor and added in REGISTERS: the f16 ->
+    // f32 destination of this tile has the int8 destination's element
+    // layout (probed by gemm_i8.g64_register_acc, which fails if that
+    // ever changes), so element i of both is the same (row, col). Under
+    // a split the whole term belongs to plane 0 -- the fold is a plain
+    // sum of the planes, and a slice from gbeg would contract to the
+    // tensor's END, not to gend, which is how the first version
+    // double-counted.
+    if (!SPLIT || tgid.z == 0) {
+      using TU = tensor<device VPIPE_ELT, dextents<int32_t, 2>,
+                        tensor_inline>;
+      TU tU(const_cast<device VPIPE_ELT*>(uf), dextents<int32_t, 2>(G, M));
+      TU tB(const_cast<device VPIPE_ELT*>(wb), dextents<int32_t, 2>(G, N));
+      constexpr auto descA = matmul2d_descriptor(
+          BM, BN, static_cast<int>(dynamic_extent),
+          /*transpose_left=*/false, /*transpose_right=*/true,
+          /*relaxed_precision=*/false,
+          matmul2d_descriptor::mode::multiply_accumulate);
+      matmul2d<descA, execution_simdgroups<SG>> opA;
+      auto mU = tU.slice(0, m0);
+      auto mB = tB.slice(0, n0);
+      auto cF = opA.template get_destination_cooperative_tensor<
+          decltype(mU), decltype(mB), float>();
+#pragma clang loop unroll(full)
+      for (int i = 0; i < CAP; ++i) { cF[(uint16_t)i] = 0.0f; }
+      opA.run(mU, mB, cF);
+      if constexpr (CMODE == 1) {
+        TU tA(const_cast<device VPIPE_ELT*>(as), dextents<int32_t, 2>(G, M));
+        TU tH(const_cast<device VPIPE_ELT*>(c_hi),
+              dextents<int32_t, 2>(G, N));
+        TU tL(const_cast<device VPIPE_ELT*>(c_lo),
+              dextents<int32_t, 2>(G, N));
+        auto mA = tA.slice(0, m0);
+        auto mH = tH.slice(0, n0);
+        auto mL = tL.slice(0, n0);
+        opA.run(mA, mH, cF);
+        opA.run(mA, mL, cF);
+      }
+#pragma clang loop unroll(full)
+      for (int i = 0; i < CAP; ++i) { facc[i] += cF[(uint16_t)i]; }
+    }
+  }
+
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const int gn = n0 + (int)lc[i], gm = m0 + (int)lr[i];
+    if (gm < M && gn < N) {
+      float v = facc[i];
+      if constexpr (SPLIT) {
+        planes[((int64_t)tgid.z * M + gm) * N + gn] = v;
+      } else {
+        if (has_bias != 0) { v += (float)bias[gn]; }
+        y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+      }
+    }
+  }
+}
+
+#define GI8_U8Q_ENTRY(NAME, BITS, STRIP, UB, CM)                         \
+  kernel void NAME(                                                      \
+      const device uint8_t* xu [[buffer(0)]],                            \
+      const device uchar* codes [[buffer(1)]],                           \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device short* xs [[buffer(3)]],                              \
+      const device VPIPE_ELT* ws [[buffer(4)]],                          \
+      const device VPIPE_ELT* wb [[buffer(5)]],                          \
+      const device short* wsum [[buffer(6)]],                            \
+      device VPIPE_ELT* y [[buffer(7)]],                                 \
+      const constant int& K [[buffer(8)]],                              \
+      const constant int& N [[buffer(9)]],                              \
+      const constant int& M [[buffer(10)]],                             \
+      const device VPIPE_ELT* bias [[buffer(11)]],                       \
+      const constant int& has_bias [[buffer(12)]],                      \
+      const device VPIPE_ELT* uf [[buffer(13)]],                         \
+      const device VPIPE_ELT* c_hi [[buffer(14)]],                       \
+      const device VPIPE_ELT* c_lo [[buffer(15)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[STRIP * gemm_u8q_sw<UB, CM>()];                   \
+    gemm_u8q_impl<BITS, false, STRIP, UB, CM>(                           \
+        xu, codes, as, xs, ws, wb, wsum, uf, c_hi, c_lo, y, bias,        \
+        has_bias, nullptr, 0, Ss, K, N, M, tgid, lid);                   \
+  }
+
+#define GI8_U8Q_SK(NAME, BITS, CM)                                       \
+  kernel void NAME(                                                      \
+      const device uint8_t* xu [[buffer(0)]],                            \
+      const device uchar* codes [[buffer(1)]],                           \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device short* xs [[buffer(3)]],                              \
+      const device VPIPE_ELT* ws [[buffer(4)]],                          \
+      const device VPIPE_ELT* wb [[buffer(5)]],                          \
+      const device short* wsum [[buffer(6)]],                            \
+      device float* planes [[buffer(7)]],                                \
+      const constant int& K [[buffer(8)]],                              \
+      const constant int& N [[buffer(9)]],                              \
+      const constant int& M [[buffer(10)]],                             \
+      const constant int& gpp [[buffer(11)]],                           \
+      const device VPIPE_ELT* uf [[buffer(13)]],                         \
+      const device VPIPE_ELT* c_hi [[buffer(14)]],                       \
+      const device VPIPE_ELT* c_lo [[buffer(15)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * gemm_u8q_sw<true, CM>()];                     \
+    gemm_u8q_impl<BITS, true, 8, true, CM>(                              \
+        xu, codes, as, xs, ws, wb, wsum, uf, c_hi, c_lo, nullptr,        \
+        nullptr, 0, planes, gpp, Ss, K, N, M, tgid, lid);                \
+  }
+
+// The two forms the context can select (VPIPE_I8_NATIVE_CMODE): the
+// -128*Q term per group in integer (cm0), or folded into the post-loop
+// matmul as an f16 hi/lo pair (cm1); each with its split-K twin.
+GI8_U8Q_ENTRY(gemm_u8q_w8g64, 8, 8, true, 0)
+GI8_U8Q_ENTRY(gemm_u8q_w4g64, 4, 8, true, 0)
+GI8_U8Q_SK(gemm_u8q_w8g64_sk, 8, 0)
+GI8_U8Q_SK(gemm_u8q_w4g64_sk, 4, 0)
+GI8_U8Q_ENTRY(gemm_u8q_w8g64_cm, 8, 8, true, 1)
+GI8_U8Q_ENTRY(gemm_u8q_w4g64_cm, 4, 8, true, 1)
+GI8_U8Q_SK(gemm_u8q_w8g64_cm_sk, 8, 1)
+GI8_U8Q_SK(gemm_u8q_w4g64_cm_sk, 4, 1)
+// The per-group form of the zero-point term, and the smaller strips,
+// for the A/B record.
+GI8_U8Q_ENTRY(gemm_u8q_w8g64_v1, 8, 8, false, 0)
+GI8_U8Q_ENTRY(gemm_u8q_w4g64_v1, 4, 8, false, 0)
+GI8_U8Q_ENTRY(gemm_u8q_w4g64_s4, 4, 4, false, 0)
+GI8_U8Q_ENTRY(gemm_u8q_w4g64_s2, 4, 2, false, 0)
+GI8_U8Q_ENTRY(gemm_u8q_w8g64_s4, 8, 4, false, 0)
+GI8_U8Q_ENTRY(gemm_u8q_w8g64_s2, 8, 2, false, 0)
+
+// (c) THE SIGNED-CODE LAYOUT (affine_to_signed_* in affine_dequant):
+// the same kernel over int8 x int8 / int8 x int4b with NO offset --
+// codes stored as q ^ 0x80 (bytes) or q ^ 0x8 (nibbles), which two's
+// complement reads as q - 128 / q - 8, and the zero point moved to b' =
+// b + 128*s / 8*s. No -128*Q term, no u8 offset, the fastest MMA; the
+// only work past g64rs's is the zero-point matmul sum_g u[m,g] * b'[n,g]
+// (u = a * sum(xq), quant_f16_i8s_row_g64). MEASURED on the M5 Pro, the
+// whole route a caller pays (gemm_i8.w8_against_bf16_routes, 4096 rows,
+// FLUX.2 / Z-Image / FLUX.3 projection shapes, splits off): w8 1.03-
+// 1.06x of a bf16 weight under i8 (requant + g64rs), where the unsigned
+// native route ran 0.95-1.00x.
+//   0:xq[M,K] i8  1:codes  2:as[M,G]  3:ws[N,G]  4:zb[N,G] (b')
+//   5:u[M,G]  6:y (f32 planes for _sk)  7:K 8:N 9:M  10:bias
+//   11:has_bias (_sk: 10:gpp)   grid as the g64rs kernels.
+template <int BITS, bool UB_MMA, bool SPLIT = false>
+static inline void gemm_i8q_impl(
+    const device int8_t* xq, const device uchar* codes,
+    const device VPIPE_ELT* as, const device VPIPE_ELT* ws,
+    const device VPIPE_ELT* wb, const device VPIPE_ELT* uf,
+    device VPIPE_ELT* y, threadgroup int* Ss, int K, int N, int M,
+    uint3 tgid, uint lid, const device VPIPE_ELT* bias = nullptr,
+    int has_bias = 0, device float* planes = nullptr, int gpp = 0)
+{
+  constexpr int BM = 64, BN = 64, SG = 4, CAP = 32, KC = 64, STRIP = 8;
+  constexpr int NR = UB_MMA ? 1 : 2, NC = UB_MMA ? 1 : 2;
+  constexpr int SW = NR * BM + NC * BN;
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  using WE = conditional_t<BITS == 4, int4b_format, int8_t>;
+  // A packed format's handle is a byte pointer; int8's is its own.
+  using WH = conditional_t<BITS == 4, uchar, int8_t>;
+  using TW = tensor<device WE, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TW tW(reinterpret_cast<device WH*>(const_cast<device uchar*>(codes)),
+        dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G = K / KC;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+  uchar lr[CAP], lc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const auto ids = cP.get_multidimensional_index((uint16_t)i);
+    lc[i] = (uchar)ids[0];
+    lr[i] = (uchar)ids[1];
+  }
+  float facc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { facc[i] = 0.0f; }
+  int gbeg = 0, gend = G;
+  if constexpr (SPLIT) {
+    gbeg = (int)tgid.z * gpp;
+    gend = min(G, gbeg + gpp);
+  }
+  for (int g0 = gbeg; g0 < gend; g0 += STRIP) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int e = (int)lid; e < STRIP * SW; e += SG * 32) {
+      const int sidx = e / SW, r = e - sidx * SW;
+      const int g = g0 + sidx;
+      float v = 0.0f;
+      if (g < gend) {
+        if (r < NR * BM) {
+          const int gm = m0 + (r < BM ? r : r - BM);
+          if (gm < M) {
+            v = r < BM ? (float)as[(int64_t)gm * G + g]
+                       : (float)uf[(int64_t)gm * G + g];
+          }
+        } else {
+          const int rc = r - NR * BM;
+          const int gn = n0 + (rc < BN ? rc : rc - BN);
+          if (gn < N) {
+            v = rc < BN ? (float)ws[(int64_t)gn * G + g]
+                        : (float)wb[(int64_t)gn * G + g];
+          }
+        }
+      }
+      Ss[e] = as_type<int>(v);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int sidx = 0; sidx < STRIP; ++sidx) {
+      const int g = g0 + sidx;
+      if (g >= gend) { break; }
+      auto mX = tX.slice(g * KC, m0);
+      auto mW = tW.slice(g * KC, n0);
+      op.run(mX, mW, cP);
+      const threadgroup int* sa = Ss + sidx * SW;
+      const threadgroup int* su = sa + BM;
+      const threadgroup int* ss = sa + NR * BM;
+      const threadgroup int* sb = ss + BN;
+#pragma clang loop unroll(full)
+      for (int i = 0; i < CAP; ++i) {
+        const float a = as_type<float>(sa[lr[i]]);
+        facc[i] += a * as_type<float>(ss[lc[i]]) * (float)cP[(uint16_t)i];
+        if constexpr (!UB_MMA) {
+          facc[i] += as_type<float>(su[lr[i]]) * as_type<float>(sb[lc[i]]);
+        }
+      }
+    }
+  }
+  // The zero-point term over ALL groups, so under a split it belongs to
+  // plane 0 alone (the fold is a plain sum of the planes).
+  if (UB_MMA && (!SPLIT || tgid.z == 0)) {
+    using TU = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+    TU tU(const_cast<device VPIPE_ELT*>(uf), dextents<int32_t, 2>(G, M));
+    TU tB(const_cast<device VPIPE_ELT*>(wb), dextents<int32_t, 2>(G, N));
+    constexpr auto descA = matmul2d_descriptor(
+        BM, BN, static_cast<int>(dynamic_extent),
+        /*transpose_left=*/false, /*transpose_right=*/true,
+        /*relaxed_precision=*/false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<descA, execution_simdgroups<SG>> opA;
+    auto mU = tU.slice(0, m0);
+    auto mB = tB.slice(0, n0);
+    auto cF = opA.template get_destination_cooperative_tensor<
+        decltype(mU), decltype(mB), float>();
+#pragma clang loop unroll(full)
+    for (int i = 0; i < CAP; ++i) { cF[(uint16_t)i] = 0.0f; }
+    opA.run(mU, mB, cF);
+#pragma clang loop unroll(full)
+    for (int i = 0; i < CAP; ++i) { facc[i] += cF[(uint16_t)i]; }
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const int gn = n0 + (int)lc[i], gm = m0 + (int)lr[i];
+    if (gm < M && gn < N) {
+      float v = facc[i];
+      if constexpr (SPLIT) {
+        planes[((int64_t)tgid.z * M + gm) * N + gn] = v;
+      } else {
+        if (has_bias != 0) { v += (float)bias[gn]; }
+        y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+      }
+    }
+  }
+}
+
+#define GI8_I8Q_ENTRY(NAME, BITS, UB)                                    \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device uchar* codes [[buffer(1)]],                           \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      const device VPIPE_ELT* wb [[buffer(4)]],                          \
+      const device VPIPE_ELT* uf [[buffer(5)]],                          \
+      device VPIPE_ELT* y [[buffer(6)]],                                 \
+      const constant int& K [[buffer(7)]],                              \
+      const constant int& N [[buffer(8)]],                              \
+      const constant int& M [[buffer(9)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * (UB ? 128 : 256)];                            \
+    gemm_i8q_impl<BITS, UB>(xq, codes, as, ws, wb, uf, y, Ss, K, N, M,   \
+                            tgid, lid);                                  \
+  }
+GI8_I8Q_ENTRY(gemm_i8q_w8g64s, 8, true)
+GI8_I8Q_ENTRY(gemm_i8q_w4g64s, 4, true)
+
+// The production entries I8GemmContext::gemm_signed binds: + a per-column
+// bias, and the split-K twins (planes folded by splitk_fold_*).
+#define GI8_I8S_ENTRY(NAME, BITS)                                        \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device uchar* codes [[buffer(1)]],                           \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      const device VPIPE_ELT* zb [[buffer(4)]],                          \
+      const device VPIPE_ELT* uf [[buffer(5)]],                          \
+      device VPIPE_ELT* y [[buffer(6)]],                                 \
+      const constant int& K [[buffer(7)]],                              \
+      const constant int& N [[buffer(8)]],                              \
+      const constant int& M [[buffer(9)]],                              \
+      const device VPIPE_ELT* bias [[buffer(10)]],                       \
+      const constant int& has_bias [[buffer(11)]],                      \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * 128];                                         \
+    gemm_i8q_impl<BITS, true>(xq, codes, as, ws, zb, uf, y, Ss, K, N, M, \
+                              tgid, lid, bias, has_bias);                \
+  }
+
+#define GI8_I8S_SK(NAME, BITS)                                           \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device uchar* codes [[buffer(1)]],                           \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      const device VPIPE_ELT* zb [[buffer(4)]],                          \
+      const device VPIPE_ELT* uf [[buffer(5)]],                          \
+      device float* planes [[buffer(6)]],                                \
+      const constant int& K [[buffer(7)]],                              \
+      const constant int& N [[buffer(8)]],                              \
+      const constant int& M [[buffer(9)]],                              \
+      const constant int& gpp [[buffer(10)]],                           \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    threadgroup int Ss[8 * 128];                                         \
+    gemm_i8q_impl<BITS, true, true>(xq, codes, as, ws, zb, uf, nullptr,  \
+                                    Ss, K, N, M, tgid, lid, nullptr, 0,  \
+                                    planes, gpp);                        \
+  }
+
+GI8_I8S_ENTRY(gemm_i8s_w8g64, 8)
+GI8_I8S_ENTRY(gemm_i8s_w4g64, 4)
+GI8_I8S_SK(gemm_i8s_w8g64_sk, 8)
+GI8_I8S_SK(gemm_i8s_w4g64_sk, 4)
+
+// (d) THE COARSE TIER (I8GemmContext's "fast" tier): symmetric int8 x int8
+// at a group of GC along K for BOTH operands -- per (row, group) and per
+// (column, group) scales, no zero point -- so the fold runs once per GC
+// rather than once per 64, and a group's whole contraction is ONE matmul
+// into the i32 destination. The weight is held in this layout (converted
+// once from a g64 pack or a bf16 checkpoint, affine_to_i8c_* /
+// quant_i8_row_gc*), so no per-call weight pass. The trade is
+// precision: a group's scale follows its largest element over GC.
+//
+// A thread's destination elements are the outer product of 4 rows and
+// 4*NCB columns (gemm_i8.coarse_tier's probe; NCB 2 is the 32-element
+// layout of 64x64/4, 64x128/8 and 128x64/8, NCB 4 the 64-element one of
+// 128x128/8):
+//   element i -> row slot ((i >> 2) & 1) | ((i >> (3 + log2 NCB)) << 1)
+//                col slot (i & 3) | (((i >> 3) & (NCB - 1)) << 2)
+//   0:xq[M,K] i8 1:wq[N,K] i8 2:as[M,K/GC] 3:ws[N,K/GC] 4:y 5:K 6:N 7:M
+//   8:bias 9:has_bias   grid {ceil(N/BN)*32*SG, ceil(M/BM), 1} threads,
+//   tg {32*SG, 1, 1}.
+template <int GC, int BM, int BN, int SG, int NCB>
+static inline void gemm_i8c_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device VPIPE_ELT* as, const device VPIPE_ELT* ws,
+    device VPIPE_ELT* y, const device VPIPE_ELT* bias, int has_bias,
+    int K, int N, int M, uint3 tgid)
+{
+  constexpr int CAP = 16 * NCB;
+  constexpr int LN = NCB == 2 ? 1 : 2;
+  static_assert(NCB == 2 || NCB == 4, "4x8 or 4x16 per thread");
+  static_assert(BM * BN / (32 * SG) == CAP, "CAP mismatch");
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, GC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  const int G = K / GC;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+  int rr[4], cc[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)(((k & 1) << 2) | ((k >> 1) << (3 + LN))));
+    rr[k] = m0 + (int)ids[1];
+  }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)((j & 3) | ((j >> 2) << 3)));
+    cc[j] = n0 + (int)ids[0];
+  }
+  // Clamped row/column for the scale loads: a tile past M or N reads a
+  // real row's scale and its output is never stored.
+  int ra[4], ca[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) { ra[k] = min(rr[k], M - 1) * G; }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) { ca[j] = min(cc[j], N - 1) * G; }
+  float facc[CAP];
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { facc[i] = 0.0f; }
+  for (int g = 0; g < G; ++g) {
+    auto mX = tX.slice(g * GC, m0);
+    auto mW = tW.slice(g * GC, n0);
+    op.run(mX, mW, cP);
+    float a[4], sc[4 * NCB];
+#pragma clang loop unroll(full)
+    for (int k = 0; k < 4; ++k) { a[k] = (float)as[ra[k] + g]; }
+#pragma clang loop unroll(full)
+    for (int j = 0; j < 4 * NCB; ++j) { sc[j] = (float)ws[ca[j] + g]; }
+#pragma clang loop unroll(full)
+    for (int i = 0; i < CAP; ++i) {
+      const int ri = ((i >> 2) & 1) | ((i >> (3 + LN)) << 1);
+      const int ci = (i & 3) | (((i >> 3) & (NCB - 1)) << 2);
+      facc[i] = fma((float)cP[(uint16_t)i] * sc[ci], a[ri], facc[i]);
+    }
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const int ri = ((i >> 2) & 1) | ((i >> (3 + LN)) << 1);
+    const int ci = (i & 3) | (((i >> 3) & (NCB - 1)) << 2);
+    const int gn = cc[ci], gm = rr[ri];
+    if (gm < M && gn < N) {
+      float v = facc[i];
+      if (has_bias != 0) { v += (float)bias[gn]; }
+      y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+    }
+  }
+}
+
+#define GI8_I8C_ENTRY(NAME, GC, BM, BN, SG, NCB)                         \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device VPIPE_ELT* as [[buffer(2)]],                          \
+      const device VPIPE_ELT* ws [[buffer(3)]],                          \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    gemm_i8c_impl<GC, BM, BN, SG, NCB>(xq, wq, as, ws, y, bias,          \
+                                       has_bias, K, N, M, tgid);         \
+  }
+// The study set (gemm_i8.coarse_tier): three groups at four tiles.
+GI8_I8C_ENTRY(gemm_i8c_g256_t64x64, 256, 64, 64, 4, 2)
+GI8_I8C_ENTRY(gemm_i8c_g512_t64x64, 512, 64, 64, 4, 2)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t64x64, 1024, 64, 64, 4, 2)
+GI8_I8C_ENTRY(gemm_i8c_g256_t64x128, 256, 64, 128, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g512_t64x128, 512, 64, 128, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t64x128, 1024, 64, 128, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g256_t128x64, 256, 128, 64, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g512_t128x64, 512, 128, 64, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t128x64, 1024, 128, 64, 8, 2)
+GI8_I8C_ENTRY(gemm_i8c_g256_t128x128, 256, 128, 128, 8, 4)
+GI8_I8C_ENTRY(gemm_i8c_g512_t128x128, 512, 128, 128, 8, 4)
+GI8_I8C_ENTRY(gemm_i8c_g1024_t128x128, 1024, 128, 128, 8, 4)
+
+// THE PER-TOKEN TIER (gemm_i8pt_*): the i8x layout. Weights int8 per
+// output CHANNEL over all of K (one scale a row, as Draw Things stores
+// them), activations int8 per TOKEN over all of K. Nothing varies along
+// K, so the whole reduction is ONE int32 accumulation and the scales
+// are applied once, at the store: y = acc * as[m] * ws[n] (+ bias).
+// |acc| <= 127^2 K, inside int32 for K < 133144.
+//   0:xq[M,K] i8  1:wq[N,K] i8  2:as[M] f32  3:ws[N] f32  4:y[M,N]
+//   5:K 6:N 7:M 8:bias[N] 9:has_bias.  K % BK == 0 (K % 64 for _p/_d).
+//
+// _t<BM>x<BN>_k<BK>: one matmul2d over execution_simdgroups<SG>,
+// stepping K by BK into a cooperative i32 destination; the compact
+// epilogue of gemm_i8c_impl.
+//   dispatch {ceil(N/BN) * 32 * SG, ceil(M/BM)}, tg {32 * SG}
+template <int BM, int BN, int SG, int NCB, int BK>
+static inline void gemm_i8pt_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device float* as, const device float* ws,
+    device VPIPE_ELT* y, const device VPIPE_ELT* bias, int has_bias,
+    int K, int N, int M, uint3 tgid)
+{
+  constexpr int CAP = 16 * NCB;
+  constexpr int LN = NCB == 2 ? 1 : 2;
+  static_assert(NCB == 2 || NCB == 4, "4x8 or 4x16 per thread");
+  static_assert(BM * BN / (32 * SG) == CAP, "CAP mismatch");
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device int8_t*>(wq), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, BK, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { cP[(uint16_t)i] = 0; }
+  for (int k0 = 0; k0 < K; k0 += BK) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, cP);
+  }
+  int rr[4], cc[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)(((k & 1) << 2) | ((k >> 1) << (3 + LN))));
+    rr[k] = m0 + (int)ids[1];
+  }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) {
+    const auto ids = cP.get_multidimensional_index(
+        (uint16_t)((j & 3) | ((j >> 2) << 3)));
+    cc[j] = n0 + (int)ids[0];
+  }
+  float a[4], sc[4 * NCB], bv[4 * NCB];
+#pragma clang loop unroll(full)
+  for (int k = 0; k < 4; ++k) { a[k] = as[min(rr[k], M - 1)]; }
+#pragma clang loop unroll(full)
+  for (int j = 0; j < 4 * NCB; ++j) {
+    const int n = min(cc[j], N - 1);
+    sc[j] = ws[n];
+    bv[j] = has_bias != 0 ? (float)bias[n] : 0.0f;
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const int ri = ((i >> 2) & 1) | ((i >> (3 + LN)) << 1);
+    const int ci = (i & 3) | (((i >> 3) & (NCB - 1)) << 2);
+    const int gn = cc[ci], gm = rr[ri];
+    if (gm < M && gn < N) {
+      const float v = fma((float)cP[(uint16_t)i] * a[ri], sc[ci], bv[ci]);
+      y[(int64_t)gm * N + gn] = (VPIPE_ELT)v;
+    }
+  }
+}
+
+#define GI8_PT_ENTRY(NAME, BM, BN, SG, NCB, BK)                          \
+  kernel void NAME(                                                      \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device float* as [[buffer(2)]],                              \
+      const device float* ws [[buffer(3)]],                              \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    gemm_i8pt_impl<BM, BN, SG, NCB, BK>(xq, wq, as, ws, y, bias,         \
+                                        has_bias, K, N, M, tgid);        \
+  }
+GI8_PT_ENTRY(gemm_i8pt_t64x64_k128, 64, 64, 4, 2, 128)
+GI8_PT_ENTRY(gemm_i8pt_t64x128_k128, 64, 128, 8, 2, 128)
+GI8_PT_ENTRY(gemm_i8pt_t128x64_k128, 128, 64, 8, 2, 128)
+GI8_PT_ENTRY(gemm_i8pt_t128x128_k128, 128, 128, 8, 4, 128)
+GI8_PT_ENTRY(gemm_i8pt_t128x64_k64, 128, 64, 8, 2, 64)
+GI8_PT_ENTRY(gemm_i8pt_t128x64_k256, 128, 64, 8, 2, 256)
+GI8_PT_ENTRY(gemm_i8pt_t128x128_k64, 128, 128, 8, 4, 64)
+GI8_PT_ENTRY(gemm_i8pt_t128x128_k256, 128, 128, 8, 4, 256)
+
+// The lane's coordinate in a 16x16 matmul2d register fragment: eight
+// values, four adjacent columns in each of two rows eight apart. This is
+// the hardware's cooperative-tensor layout as MLX's steel NAX tiles
+// spell it (BaseNAXFrag::get_coord, vendored MIT under
+// gpu-kernels/metal/vendored/mlx/.../steel/attn/nax.h).
+static inline short2 i8pt_frag_coord(ushort lane) {
+  const short qid = (short)(lane >> 2);
+  return short2((short)(((qid & 2) | (lane & 1)) * 4),
+                (short)((qid & 4) | ((lane >> 1) & 3)));
+}
+
+// gemm_i8pt_m<BM>x<BN>: the token tier's register kernel. Each
+// simdgroup owns SM x SN = 32 x 32 of the output as TM x TN 16x16 int32
+// fragments and loads its own operands straight from device memory, WM x
+// WN simdgroups a tile; the K loop is MLX's NAX GEMM loop (gemm_loop in
+// mlx/backend/metal/kernels/steel/gemm/gemm_nax.h, MIT): 512-deep
+// blocks, one threadgroup barrier each to keep the simdgroups that share
+// a row or column of the tile in step, the steps inside not unrolled,
+// and MLX's (32, WN, WM) threadgroups. What is this kernel's own is the operand path: int8 x
+// int8 into one int32 accumulation with the two scales applied at the
+// store, and K PERMUTED inside each 64-deep step. An int8 dot product
+// does not care which order its K terms come in, only that both operands
+// use the same one, so the logical column (kk, 4q + j) of fragment kk --
+// what a lane at o.x = 4q holds -- is read from physical column 16q + 4kk
+// + j. A lane's four fragments' values for one row are then 16
+// CONTIGUOUS bytes, one int4 load where a plain fragment load issues
+// four.
+//   dispatch {ceil(N/BN) * 32, ceil(M/BM) * WN, WM}, tg {32, WN, WM}
+//   K % 64 == 0, N % 4 == 0
+template <int TM, bool FULL>
+static inline void i8pt_load_p(thread int4 (&f)[TM][2],
+                               const device int8_t* src, int K, int rows,
+                               short2 o)
+{
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < 2; ++r) {
+      const int row = m * 16 + r * 8 + o.y;
+      f[m][r] = int4(0);
+      if (FULL || row < rows) {
+        f[m][r] = *reinterpret_cast<const device int4*>(
+            src + (int64_t)row * K + o.x * 4);
+      }
+    }
+  }
+}
+
+// One 64-deep step of the permuted K: each of the four 16-deep fragments
+// of the step, every (m, n pair) of the simdgroup's block, one 16x32x16
+// op (the fragment layout is MLX's, see i8pt_frag_coord).
+template <int TM, int TN, class Op>
+static inline void i8pt_p_step(thread vec<int32_t, 8> (&acc)[TM][TN],
+                               thread const int4 (&a)[TM][2],
+                               thread const int4 (&b)[TN][2], thread Op& op)
+{
+#pragma clang loop unroll(full)
+  for (int kk = 0; kk < 4; ++kk) {
+#pragma clang loop unroll(full)
+    for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+      for (int n = 0; n < TN; n += 2) {
+        auto aT = op.template get_left_input_cooperative_tensor<
+            int8_t, int8_t, int32_t>();
+        auto bT = op.template get_right_input_cooperative_tensor<
+            int8_t, int8_t, int32_t>();
+        auto cT = op.template get_destination_cooperative_tensor<
+            metal::remove_addrspace_t<decltype(aT)>,
+            metal::remove_addrspace_t<decltype(bT)>, int32_t>();
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+          const int r = i >> 2, j = i & 3;
+          aT[i] = as_type<char4>(a[m][r][kk])[j];
+          bT[i] = as_type<char4>(b[n][r][kk])[j];
+          bT[8 + i] = as_type<char4>(b[n + 1][r][kk])[j];
+          cT[i] = acc[m][n][i];
+          cT[8 + i] = acc[m][n + 1][i];
+        }
+        op.run(aT, bT, cT);
+#pragma clang loop unroll(full)
+        for (int i = 0; i < 8; ++i) {
+          acc[m][n][i] = cT[i];
+          acc[m][n + 1][i] = cT[8 + i];
+        }
+      }
+    }
+  }
+}
+
+// DB (gemm_i8pt_d<BM>x<BN>, the A/B arm): the K loop DOUBLE-BUFFERED in
+// registers with no barrier -- the next 64-deep step's operands loaded
+// before this step's ops are issued. MEASURED slower than the blocked
+// loop in the Qwen-Image-2.1 forward (M5 Ultra 0.965-0.986x, base M5
+// 0.945x): with nothing re-aligning them, the simdgroups sharing a
+// tile's rows drift apart along K and stop meeting each other's lines in
+// cache, and re-aligning every 256-1024 of K cost more than it gave
+// (0.88-0.90x).
+template <int TM, int TN, bool FM, bool FN, bool DB>
+static inline void gemm_i8pt_p_body(
+    const device int8_t* A, const device int8_t* B,
+    const device float* as, const device float* ws, device VPIPE_ELT* y,
+    const device VPIPE_ELT* bias, int has_bias, int K, int N, int rows,
+    int cols, ushort lane)
+{
+  static_assert(TN % 2 == 0, "pairs of n fragments a matmul");
+  const short2 o = i8pt_frag_coord(lane);
+  vec<int32_t, 8> acc[TM][TN];
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int n = 0; n < TN; ++n) { acc[m][n] = vec<int32_t, 8>(0); }
+  }
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, true, true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  const bool live = rows > 0 && cols > 0;
+  if constexpr (DB) {
+    if (!live) { return; }
+    int4 a0[TM][2], b0[TN][2], a1[TM][2], b1[TN][2];
+    i8pt_load_p<TM, FM>(a0, A, K, rows, o);
+    i8pt_load_p<TN, FN>(b0, B, K, cols, o);
+#pragma clang loop unroll(disable)
+    for (int k = 0; k < K; k += 128) {
+      const bool two = k + 64 < K;
+      if (two) {
+        i8pt_load_p<TM, FM>(a1, A + k + 64, K, rows, o);
+        i8pt_load_p<TN, FN>(b1, B + k + 64, K, cols, o);
+      }
+      i8pt_p_step<TM, TN>(acc, a0, b0, op);
+      if (!two) { break; }
+      if (k + 128 < K) {
+        i8pt_load_p<TM, FM>(a0, A + k + 128, K, rows, o);
+        i8pt_load_p<TN, FN>(b0, B + k + 128, K, cols, o);
+      }
+      i8pt_p_step<TM, TN>(acc, a1, b1, op);
+    }
+  } else {
+#pragma clang loop unroll(disable)
+    for (int kb = 0; kb < K; kb += 512) {
+      threadgroup_barrier(mem_flags::mem_none);
+      if ((!FM || !FN) && !live) { continue; }
+      const int ke = min(K - kb, 512);
+#pragma clang loop unroll(disable)
+      for (int k = 0; k < ke; k += 64) {
+        int4 a[TM][2], b[TN][2];
+        i8pt_load_p<TM, FM>(a, A + kb + k, K, rows, o);
+        i8pt_load_p<TN, FN>(b, B + kb + k, K, cols, o);
+        i8pt_p_step<TM, TN>(acc, a, b, op);
+      }
+    }
+  }
+  if (!live) { return; }
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < 2; ++r) {
+      const int row = m * 16 + r * 8 + o.y;
+      if (!FM && row >= rows) { continue; }
+      const float ar = as[row];
+      device VPIPE_ELT* yr = y + (int64_t)row * N;
+#pragma clang loop unroll(full)
+      for (int n = 0; n < TN; ++n) {
+        const int c0 = n * 16 + o.x;
+        if (FN || c0 + 3 < cols) {
+          const float4 w4 = *reinterpret_cast<const device float4*>(ws + c0);
+          float4 b4 = float4(0.0f);
+          if (has_bias != 0) {
+            b4 = float4(*reinterpret_cast<const device vec<VPIPE_ELT, 4>*>(
+                bias + c0));
+          }
+          const float4 v = fma(float4(acc[m][n][r * 4 + 0],
+                                      acc[m][n][r * 4 + 1],
+                                      acc[m][n][r * 4 + 2],
+                                      acc[m][n][r * 4 + 3]) * ar,
+                               w4, b4);
+          *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(yr + c0) =
+              vec<VPIPE_ELT, 4>(v);
+        } else {
+#pragma clang loop unroll(full)
+          for (int c = 0; c < 4; ++c) {
+            if (c0 + c < cols) {
+              const float b = has_bias != 0 ? (float)bias[c0 + c] : 0.0f;
+              yr[c0 + c] = (VPIPE_ELT)fma(
+                  (float)acc[m][n][r * 4 + c] * ar, ws[c0 + c], b);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+template <int WM, int WN, int TM, int TN, bool DB>
+static inline void gemm_i8pt_p_impl(
+    const device int8_t* xq, const device int8_t* wq,
+    const device float* as, const device float* ws, device VPIPE_ELT* y,
+    const device VPIPE_ELT* bias, int has_bias, int K, int N, int M,
+    uint3 tgid, ushort sgid, ushort lane)
+{
+  constexpr int SM = 16 * TM, SN = 16 * TN;
+  constexpr int BM = SM * WM, BN = SN * WN;
+  const int row = (int)tgid.y * BM + (int)(sgid / WN) * SM;
+  const int col = (int)tgid.x * BN + (int)(sgid % WN) * SN;
+  const int rows = min(SM, M - row), cols = min(SN, N - col);
+  const device int8_t* A = xq + (int64_t)max(row, 0) * K;
+  const device int8_t* B = wq + (int64_t)max(col, 0) * K;
+  device VPIPE_ELT* Y = y + (int64_t)row * N + col;
+  const bool fm = (M % BM) == 0 || ((int)tgid.y + 1) * BM <= M;
+  const bool fn = (N % BN) == 0 || ((int)tgid.x + 1) * BN <= N;
+  const device float* AS = as + row;
+  const device float* WS = ws + col;
+  const device VPIPE_ELT* BI = bias + (has_bias != 0 ? col : 0);
+  if (fm) {
+    if (fn) {
+      gemm_i8pt_p_body<TM, TN, true, true, DB>(A, B, AS, WS, Y, BI,
+                                               has_bias, K, N, rows, cols,
+                                               lane);
+    } else {
+      gemm_i8pt_p_body<TM, TN, true, false, DB>(A, B, AS, WS, Y, BI,
+                                                has_bias, K, N, rows, cols,
+                                                lane);
+    }
+  } else {
+    if (fn) {
+      gemm_i8pt_p_body<TM, TN, false, true, DB>(A, B, AS, WS, Y, BI,
+                                                has_bias, K, N, rows, cols,
+                                                lane);
+    } else {
+      gemm_i8pt_p_body<TM, TN, false, false, DB>(A, B, AS, WS, Y, BI,
+                                                 has_bias, K, N, rows,
+                                                 cols, lane);
+    }
+  }
+}
+
+#define GI8_PT_P_ENTRY(NAME, WM, WN, TM, TN, DB)                         \
+  [[kernel, max_total_threads_per_threadgroup(32 * WM * WN)]]            \
+  void NAME(                                                             \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device int8_t* wq [[buffer(1)]],                             \
+      const device float* as [[buffer(2)]],                              \
+      const device float* ws [[buffer(3)]],                              \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* bias [[buffer(8)]],                        \
+      const constant int& has_bias [[buffer(9)]],                       \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      ushort sgid [[simdgroup_index_in_threadgroup]],                    \
+      ushort lane [[thread_index_in_simdgroup]]) {                       \
+    gemm_i8pt_p_impl<WM, WN, TM, TN, DB>(xq, wq, as, ws, y, bias,        \
+                                         has_bias, K, N, M, tgid, sgid,  \
+                                         lane);                          \
+  }
+// 32x32 a simdgroup. m128x64 is the tier's (VPIPE_I8_TOKEN_TILE=64x128
+// the other); the d entries are the double-buffered A/B
+// (VPIPE_I8_TOKEN_KERNEL=d128x64).
+GI8_PT_P_ENTRY(gemm_i8pt_m128x64, 4, 2, 2, 2, false)
+GI8_PT_P_ENTRY(gemm_i8pt_m64x128, 2, 4, 2, 2, false)
+GI8_PT_P_ENTRY(gemm_i8pt_d128x64, 4, 2, 2, 2, true)
+GI8_PT_P_ENTRY(gemm_i8pt_d64x128, 2, 4, 2, 2, true)
+
+// THE W4 UNPACK STUDY (gemm_i8.w4_unpack_cost): what it costs the token
+// tier's GEMM to read a 4-bit weight and widen it to int8 ITSELF, against
+// reading the int8 layout it holds. The m128x64 tile, full tiles only
+// (M % 128, N % 64, K % 128 == 0); dispatched by no model.
+//   WF 0: int8 [N, K], the layout as held.
+//   WF 1: int4 per row in offset binary (u = q + 8), [N, K/2]: each
+//         32-bit word holds 8 elements, byte i = e_i | e_{i+4} << 4, so a
+//         word widens with two masks, an add and an xor per half.
+//   WF 2: the w4 g64 AFFINE pack as stored (byte b = k 2b low, 2b + 1
+//         high) with its bf16 scales and biases, requantized per element
+//         to the token_plain code against the row's 127 / amax (`inv`):
+//         the held conversion (affine_to_i8pt_w4) done inside the GEMM.
+//   ST false: each simdgroup widens its own fragments in registers.
+//   ST true: the threadgroup widens a 64 x 128 block of the weight into
+//         threadgroup memory once a 128-deep chunk (two barriers), and
+//         every simdgroup reads its fragments from there.
+//   0:xq[M,K] i8 1:w 2:as[M] f32 3:ws[N] f32 4:y[M,N] 5:K 6:N 7:M
+//   8:scales[N,K/64] 9:biases[N,K/64] 10:inv[N] f32 (WF 2)
+//   dispatch {N/64 * 32, M/128 * 2, 4}, tg {32, 2, 4}
+static inline uint i8pt_w4_widen(uint w)
+{
+  return ((w & 0x0F0F0F0Fu) + 0x78787878u) ^ 0x80808080u;
+}
+
+// Four consecutive elements of an affine g64 pack from two bytes, as the
+// held conversion computes them: the pack's element-type dequant, then
+// the row's code.
+static inline int i8pt_affine4(uint p, float s, float b, float inv)
+{
+  const float4 c = float4(p & 0xfu, (p >> 4) & 0xfu, (p >> 8) & 0xfu,
+                          (p >> 12) & 0xfu);
+  const float4 v = float4(vec<VPIPE_ELT, 4>(c * s + b));
+  return as_type<int>(char4(clamp(int4(rint(v * inv)), int4(-127),
+                                  int4(127))));
+}
+
+// 16 elements of weight row `row` from element k (a multiple of 16).
+template <int WF>
+static inline int4 i8pt_wx_row16(const device uchar* w,
+                                 const device VPIPE_ELT* sc,
+                                 const device VPIPE_ELT* bi,
+                                 const device float* inv, int row, int k,
+                                 int K)
+{
+  if constexpr (WF == 0) {
+    return *reinterpret_cast<const device int4*>(w + (int64_t)row * K + k);
+  } else {
+    const uint2 p = *reinterpret_cast<const device uint2*>(
+        w + (int64_t)row * (K / 2) + k / 2);
+    if constexpr (WF == 1) {
+      return int4(as_type<int>(i8pt_w4_widen(p.x)),
+                  as_type<int>(i8pt_w4_widen(p.x >> 4)),
+                  as_type<int>(i8pt_w4_widen(p.y)),
+                  as_type<int>(i8pt_w4_widen(p.y >> 4)));
+    } else {
+      const int64_t g = (int64_t)row * (K / 64) + k / 64;
+      const float s = (float)sc[g], b = (float)bi[g], iv = inv[row];
+      return int4(i8pt_affine4(p.x & 0xffffu, s, b, iv),
+                  i8pt_affine4(p.x >> 16, s, b, iv),
+                  i8pt_affine4(p.y & 0xffffu, s, b, iv),
+                  i8pt_affine4(p.y >> 16, s, b, iv));
+    }
+  }
+}
+
+template <int WF, bool ST>
+static inline void gemm_i8pt_wx_impl(
+    const device int8_t* xq, const device uchar* w, const device float* as,
+    const device float* ws, device VPIPE_ELT* y, int K, int N,
+    const device VPIPE_ELT* sc, const device VPIPE_ELT* bi,
+    const device float* inv, threadgroup int8_t* tgw, uint3 tgid,
+    ushort sgid, ushort lane)
+{
+  constexpr int TM = 2, TN = 2, WN = 2, CH = 128, STR = CH + 16;
+  const short2 o = i8pt_frag_coord(lane);
+  const int row0 = (int)tgid.y * 128 + (int)(sgid / WN) * 32;
+  const int tcol = (int)tgid.x * 64;
+  const int scol = (int)(sgid % WN) * 32;   // within the tile
+  const device int8_t* A = xq + (int64_t)row0 * K;
+  vec<int32_t, 8> acc[TM][TN];
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int n = 0; n < TN; ++n) { acc[m][n] = vec<int32_t, 8>(0); }
+  }
+  constexpr auto desc = matmul2d_descriptor(
+      16, 32, 16, false, true, true,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroup> op;
+  if constexpr (ST) {
+    const int tid = (int)sgid * 32 + (int)lane;
+    const int fr = tid >> 2, fs = (tid & 3) * 32;   // row, 32 elements
+#pragma clang loop unroll(disable)
+    for (int kc = 0; kc < K; kc += CH) {
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      threadgroup int8_t* dst = tgw + fr * STR + fs;
+      const int4 lo = i8pt_wx_row16<WF>(w, sc, bi, inv, tcol + fr,
+                                        kc + fs, K);
+      const int4 hi = i8pt_wx_row16<WF>(w, sc, bi, inv, tcol + fr,
+                                        kc + fs + 16, K);
+      *reinterpret_cast<threadgroup int4*>(dst) = lo;
+      *reinterpret_cast<threadgroup int4*>(dst + 16) = hi;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+#pragma clang loop unroll(full)
+      for (int k = 0; k < CH; k += 64) {
+        int4 a[TM][2], b[TN][2];
+        i8pt_load_p<TM, true>(a, A + kc + k, K, 32, o);
+#pragma clang loop unroll(full)
+        for (int n = 0; n < TN; ++n) {
+#pragma clang loop unroll(full)
+          for (int r = 0; r < 2; ++r) {
+            const int row = scol + n * 16 + r * 8 + o.y;
+            b[n][r] = *reinterpret_cast<const threadgroup int4*>(
+                tgw + row * STR + k + o.x * 4);
+          }
+        }
+        i8pt_p_step<TM, TN>(acc, a, b, op);
+      }
+    }
+  } else {
+#pragma clang loop unroll(disable)
+    for (int kb = 0; kb < K; kb += 512) {
+      threadgroup_barrier(mem_flags::mem_none);
+      const int ke = min(K - kb, 512);
+#pragma clang loop unroll(disable)
+      for (int k = 0; k < ke; k += 64) {
+        int4 a[TM][2], b[TN][2];
+        i8pt_load_p<TM, true>(a, A + kb + k, K, 32, o);
+        // DESCENDING, and only because ascending MEASURED wrong for WF 2
+        // on the M5's compiler: the first fragment widened (8 of every 32
+        // output columns) came out different from the threadgroup form of
+        // the same helper, while WF 0 / 1 were exact either way. No
+        // undefined behaviour found; reversing the order is exact.
+#pragma clang loop unroll(full)
+        for (int n = TN - 1; n >= 0; --n) {
+#pragma clang loop unroll(full)
+          for (int r = 1; r >= 0; --r) {
+            const int row = tcol + scol + n * 16 + r * 8 + o.y;
+            b[n][r] = i8pt_wx_row16<WF>(w, sc, bi, inv, row,
+                                        kb + k + o.x * 4, K);
+          }
+        }
+        i8pt_p_step<TM, TN>(acc, a, b, op);
+      }
+    }
+  }
+#pragma clang loop unroll(full)
+  for (int m = 0; m < TM; ++m) {
+#pragma clang loop unroll(full)
+    for (int r = 0; r < 2; ++r) {
+      const int row = row0 + m * 16 + r * 8 + o.y;
+      const float ar = as[row];
+      device VPIPE_ELT* yr = y + (int64_t)row * N + tcol + scol;
+#pragma clang loop unroll(full)
+      for (int n = 0; n < TN; ++n) {
+        const int c0 = n * 16 + o.x;
+        const float4 w4 = *reinterpret_cast<const device float4*>(
+            ws + tcol + scol + c0);
+        const float4 v = fma(float4(acc[m][n][r * 4 + 0],
+                                    acc[m][n][r * 4 + 1],
+                                    acc[m][n][r * 4 + 2],
+                                    acc[m][n][r * 4 + 3]) * ar,
+                             w4, float4(0.0f));
+        *reinterpret_cast<device vec<VPIPE_ELT, 4>*>(yr + c0) =
+            vec<VPIPE_ELT, 4>(v);
+      }
+    }
+  }
+}
+
+#define GI8_PT_WX_ENTRY(NAME, WF, ST)                                    \
+  [[kernel, max_total_threads_per_threadgroup(256)]]                     \
+  void NAME(                                                             \
+      const device int8_t* xq [[buffer(0)]],                             \
+      const device uchar* w [[buffer(1)]],                               \
+      const device float* as [[buffer(2)]],                              \
+      const device float* ws [[buffer(3)]],                              \
+      device VPIPE_ELT* y [[buffer(4)]],                                 \
+      const constant int& K [[buffer(5)]],                              \
+      const constant int& N [[buffer(6)]],                              \
+      const constant int& M [[buffer(7)]],                              \
+      const device VPIPE_ELT* sc [[buffer(8)]],                          \
+      const device VPIPE_ELT* bi [[buffer(9)]],                          \
+      const device float* inv [[buffer(10)]],                            \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      ushort sgid [[simdgroup_index_in_threadgroup]],                    \
+      ushort lane [[thread_index_in_simdgroup]]) {                       \
+    threadgroup int8_t tgw[ST ? 64 * 144 : 16];                          \
+    (void)M;                                                             \
+    gemm_i8pt_wx_impl<WF, ST>(xq, w, as, ws, y, K, N, sc, bi, inv, tgw,  \
+                              tgid, sgid, lane);                         \
+  }
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_i8_reg, 0, false)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_i8_tg, 0, true)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_w4_reg, 1, false)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_w4_tg, 1, true)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_aff_reg, 2, false)
+GI8_PT_WX_ENTRY(gemm_i8pt_wx_aff_tg, 2, true)
+
+// THE UNSIGNED MMA CEILINGS: the kaccr loop over uint8 x uint8 and
+// uint8 x uint4, raw multiply_accumulate into a cooperative i32 tensor
+// with no scales at all, so the gap between them is what the 4-bit
+// operand costs the matrix pipe and the gap to kaccr-64 (int8 x int8)
+// is what unsigned costs, if anything.
+template <int BITS>
+static inline void gemm_u8q_kaccr_impl(
+    const device uint8_t* xu, const device uchar* codes, device half* y,
+    int K, int N, int M, uint3 tgid)
+{
+  constexpr int BM = 64, BN = 64, SG = 4, CAP = 32, KC = 64;
+  using TX = tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline>;
+  using WE = conditional_t<BITS == 4, uint4b_format, uint8_t>;
+  using TW = tensor<device WE, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device uint8_t*>(xu), dextents<int32_t, 2>(K, M));
+  TW tW(const_cast<device uchar*>(codes), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { cP[(uint16_t)i] = 0; }
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, cP);
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const auto ids = cP.get_multidimensional_index((uint16_t)i);
+    const int gn = n0 + (int)ids[0], gm = m0 + (int)ids[1];
+    if (cP.is_valid_element((uint16_t)i) && gm < M && gn < N) {
+      y[(int64_t)gm * N + gn] = (half)((float)cP[(uint16_t)i] * 1e-6f);
+    }
+  }
+}
+
+#define GI8_U8Q_KACCR(NAME, BITS)                                        \
+  kernel void NAME(                                                      \
+      const device uint8_t* xu [[buffer(0)]],                            \
+      const device uchar* codes [[buffer(1)]],                           \
+      device half* y [[buffer(2)]],                                      \
+      const constant int& K [[buffer(3)]],                              \
+      const constant int& N [[buffer(4)]],                              \
+      const constant int& M [[buffer(5)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    gemm_u8q_kaccr_impl<BITS>(xu, codes, y, K, N, M, tgid);              \
+  }
+GI8_U8Q_KACCR(gemm_u8u8_kaccr_k64, 8)
+GI8_U8Q_KACCR(gemm_u8u4_kaccr_k64, 4)
+
+// ...and int8 x int4b, the signed 4-bit form's ceiling.
+kernel void gemm_i8i4_kaccr_k64(
+    const device int8_t* xq [[buffer(0)]],
+    const device uchar* codes [[buffer(1)]],
+    device half* y [[buffer(2)]],
+    const constant int& K [[buffer(3)]],
+    const constant int& N [[buffer(4)]],
+    const constant int& M [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]])
+{
+  constexpr int BM = 64, BN = 64, SG = 4, CAP = 32, KC = 64;
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  using TW = tensor<device int4b_format, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device int8_t*>(xq), dextents<int32_t, 2>(K, M));
+  TW tW(const_cast<device uchar*>(codes), dextents<int32_t, 2>(K, N));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false,
+      matmul2d_descriptor::mode::multiply_accumulate);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM;
+  const int n0 = (int)tgid.x * BN;
+  auto mX0 = tX.slice(0, m0);
+  auto mW0 = tW.slice(0, n0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mW0), int32_t>();
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) { cP[(uint16_t)i] = 0; }
+  for (int k0 = 0; k0 < K; k0 += KC) {
+    auto mX = tX.slice(k0, m0);
+    auto mW = tW.slice(k0, n0);
+    op.run(mX, mW, cP);
+  }
+#pragma clang loop unroll(full)
+  for (int i = 0; i < CAP; ++i) {
+    const auto ids = cP.get_multidimensional_index((uint16_t)i);
+    const int gn = n0 + (int)ids[0], gm = m0 + (int)ids[1];
+    if (cP.is_valid_element((uint16_t)i) && gm < M && gn < N) {
+      y[(int64_t)gm * N + gn] = (half)((float)cP[(uint16_t)i] * 1e-6f);
+    }
+  }
+}
+
+// The layout probe behind the register twins' CAP: one threadgroup of
+// the same op writes its cooperative destination's capacity and, per
+// thread and element, (valid, col, row). Never runs the matmul.
+//   0:out[1 + 128*64*3] int; dispatch {128,1,1}, tg {128,1,1}
+kernel void gemm_i8i8_coop_probe(
+    device int* out [[buffer(0)]],
+    uint lid [[thread_index_in_threadgroup]])
+{
+  constexpr int BM = 64, BN = 64, SG = 4, KC = 64;
+  using TX = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(reinterpret_cast<device int8_t*>(out), dextents<int32_t, 2>(KC, BM));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, KC, /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  auto mX0 = tX.slice(0, 0);
+  auto cP = op.template get_destination_cooperative_tensor<
+      decltype(mX0), decltype(mX0), int32_t>();
+  const int cap = (int)cP.get_capacity();
+  if (lid == 0) { out[0] = cap; }
+  for (int i = 0; i < 64; ++i) {
+    int v = -1, c0 = -1, c1 = -1;
+    if (i < cap) {
+      v = cP.is_valid_element((uint16_t)i) ? 1 : 0;
+      const auto ids = cP.get_multidimensional_index((uint16_t)i);
+      c0 = (int)ids[0];
+      c1 = (int)ids[1];
+    }
+    device int* o = out + 1 + ((int)lid * 64 + i) * 3;
+    o[0] = v; o[1] = c0; o[2] = c1;
+  }
+  // And the layout of a half x half -> float destination of the same
+  // tile, dynamic K: if it is the int8 one's, a second product can be
+  // added in registers without a tile. Region 2 starts at 1 + 128*64*3.
+  using TH = tensor<device half, dextents<int32_t, 2>, tensor_inline>;
+  TH tH(reinterpret_cast<device half*>(out), dextents<int32_t, 2>(64, BM));
+  constexpr auto descF = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent),
+      /*transpose_left=*/false, /*transpose_right=*/true,
+      /*relaxed_precision=*/false, matmul2d_descriptor::mode::multiply);
+  matmul2d<descF, execution_simdgroups<SG>> opF;
+  auto mH0 = tH.slice(0, 0);
+  auto cF = opF.template get_destination_cooperative_tensor<
+      decltype(mH0), decltype(mH0), float>();
+  const int capf = (int)cF.get_capacity();
+  device int* out2 = out + 1 + 128 * 64 * 3;
+  if (lid == 0) { out2[0] = capf; }
+  for (int i = 0; i < 64; ++i) {
+    int v = -1, c0 = -1, c1 = -1;
+    if (i < capf) {
+      v = cF.is_valid_element((uint16_t)i) ? 1 : 0;
+      const auto ids = cF.get_multidimensional_index((uint16_t)i);
+      c0 = (int)ids[0];
+      c1 = (int)ids[1];
+    }
+    device int* o = out2 + 1 + ((int)lid * 64 + i) * 3;
+    o[0] = v; o[1] = c0; o[2] = c1;
+  }
+}
+
+
+// ---- Qwen3.8-Flash-Next's hyper-connection GEMMs, their elementwise
+// passes in the store (a prefill's rows; qwen4_hc.metal holds the model) --
+//
+// DOWN: d [M, R] = silu(elt(hcn [M, SH] @ Wd [R, SH]^T) / S) -- the
+// reference rounds the projection, then divides by the stream count
+// (exact: a power of two) and applies silu, rounded again: hc_act_f16's
+// arithmetic, in the register tile. Tiles BN wide: R = 320 is five of 64,
+// where the deep-K 128 x 256 tile computed 512 columns in 106 threadgroups.
+// The threadgroups of the first column tile also finish the injection
+// weights from hc_group_rms8_pre_f16's partials: inj[m, j] =
+// 2 sigmoid(elt(sum_s part[m, s, j]) / S), hc_act_f16's rounding.
+template <int BM, int BN, int SG>
+static inline void hc_down_silu_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    device VPIPE_ELT* y, int K, int N, int M, int S,
+    const device float* part, device float* inj, int with_inject,
+    uint3 tgid, uint lid)
+{
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, N));
+  TX tY(y, dextents<int32_t, 2>(N, M));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM, n0 = (int)tgid.x * BN;
+  if (m0 >= M || n0 >= N) { return; }
+  if (with_inject != 0 && tgid.x == 0) {
+    for (int e = (int)lid; e < BM * S; e += SG * 32) {
+      const int m = m0 + e / S, j = e % S;
+      if (m >= M) { continue; }
+      float acc = 0.0f;
+      for (int sp = 0; sp < S; ++sp) {
+        acc += part[((ulong)m * S + sp) * S + j];
+      }
+      const float v = (float)(VPIPE_ELT)acc / (float)S;
+      inj[(ulong)m * S + j] =
+          (float)(VPIPE_ELT)(2.0f / (1.0f + metal::exp(-v)));
+    }
+  }
+  auto mX = tX.slice(0, m0);
+  auto mW = tW.slice(0, n0);
+  auto cT = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(mW), VPIPE_ELT>();
+  op.run(mX, mW, cT);
+  for (auto it = cT.begin(); it != cT.end(); ++it) {
+    if (!it.is_valid_element()) { continue; }
+    const float v = (float)*it / (float)S;
+    *it = (VPIPE_ELT)(v / (1.0f + metal::exp(-v)));
+  }
+  cT.store(tY.slice(n0, m0));
+}
+
+// UP + MIX: out [M, H] = (1/S) sum_s elt(sigmoid(u_s)) * n_s, u_s =
+// elt(d [M, R] @ Wu[s H .. s H + H)^T) -- the four streams' up rows of one
+// BN-wide hidden tile as four products into four register tiles of one
+// layout, so a lane's element i is the same (row, hidden) in each, and the
+// mix runs in the store: [M, S * H] of up output is never written and
+// re-read (hc_mix_f16's arithmetic, stream order and roundings).
+// S == 4 (the model's hc_count).
+template <int BM, int BN, int SG>
+static inline void hc_up_mix_impl(
+    const device VPIPE_ELT* x, const device VPIPE_ELT* W,
+    const device VPIPE_ELT* hn, device VPIPE_ELT* out, int K, int H, int M,
+    uint3 tgid)
+{
+  constexpr int S = 4;
+  using TX = tensor<device VPIPE_ELT, dextents<int32_t, 2>, tensor_inline>;
+  TX tX(const_cast<device VPIPE_ELT*>(x), dextents<int32_t, 2>(K, M));
+  TX tW(const_cast<device VPIPE_ELT*>(W), dextents<int32_t, 2>(K, S * H));
+  TX tO(out, dextents<int32_t, 2>(H, M));
+  constexpr auto desc = matmul2d_descriptor(
+      BM, BN, static_cast<int>(dynamic_extent), false, true, false);
+  matmul2d<desc, execution_simdgroups<SG>> op;
+  const int m0 = (int)tgid.y * BM, h0 = (int)tgid.x * BN;
+  if (m0 >= M || h0 >= H) { return; }
+  auto mX = tX.slice(0, m0);
+  auto w0 = tW.slice(0, 0 * H + h0);
+  auto w1 = tW.slice(0, 1 * H + h0);
+  auto w2 = tW.slice(0, 2 * H + h0);
+  auto w3 = tW.slice(0, 3 * H + h0);
+  auto c0 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w0), VPIPE_ELT>();
+  auto c1 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w1), VPIPE_ELT>();
+  auto c2 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w2), VPIPE_ELT>();
+  auto c3 = op.template get_destination_cooperative_tensor<
+      decltype(mX), decltype(w3), VPIPE_ELT>();
+  op.run(mX, w0, c0);
+  op.run(mX, w1, c1);
+  op.run(mX, w2, c2);
+  op.run(mX, w3, c3);
+  const ulong SH = (ulong)S * (ulong)H;
+  auto i1 = c1.begin(), i2 = c2.begin(), i3 = c3.begin();
+  for (auto i0 = c0.begin(); i0 != c0.end(); ++i0, ++i1, ++i2, ++i3) {
+    if (!i0.is_valid_element()) { continue; }
+    const auto ij = i0.get_multidimensional_index();
+    const ulong h = (ulong)(h0 + (int)ij[0]);
+    const device VPIPE_ELT* nr = hn + (ulong)(m0 + (int)ij[1]) * SH + h;
+    const VPIPE_ELT u[S] = {*i0, *i1, *i2, *i3};
+    float acc = 0.0f;
+    for (int st = 0; st < S; ++st) {
+      const float mw =
+          (float)(VPIPE_ELT)(1.0f / (1.0f + metal::exp(-(float)u[st])));
+      acc += (float)(VPIPE_ELT)(mw * (float)nr[(ulong)st * H]);
+    }
+    *i0 = (VPIPE_ELT)(acc / (float)S);
+  }
+  c0.store(tO.slice(h0, m0));
+}
+
+#define HC_DOWN(NAME, BM, BN, SG)                                        \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      device VPIPE_ELT* y [[buffer(2)]],                                 \
+      const constant int& K [[buffer(3)]],                              \
+      const constant int& N [[buffer(4)]],                              \
+      const constant int& M [[buffer(5)]],                              \
+      const constant int& S [[buffer(6)]],                              \
+      const device float* part [[buffer(7)]],                            \
+      device float* inj [[buffer(8)]],                                   \
+      const constant int& with_inject [[buffer(9)]],                    \
+      uint3 tgid [[threadgroup_position_in_grid]],                       \
+      uint lid [[thread_index_in_threadgroup]]) {                        \
+    hc_down_silu_impl<BM, BN, SG>(x, W, y, K, N, M, S, part, inj,        \
+                                  with_inject, tgid, lid);               \
+  }
+#define HC_UP(NAME, BM, BN, SG)                                          \
+  kernel void NAME(                                                      \
+      const device VPIPE_ELT* x [[buffer(0)]],                           \
+      const device VPIPE_ELT* W [[buffer(1)]],                           \
+      const device VPIPE_ELT* hn [[buffer(2)]],                          \
+      device VPIPE_ELT* out [[buffer(3)]],                               \
+      const constant int& K [[buffer(4)]],                              \
+      const constant int& H [[buffer(5)]],                              \
+      const constant int& M [[buffer(6)]],                              \
+      uint3 tgid [[threadgroup_position_in_grid]]) {                     \
+    hc_up_mix_impl<BM, BN, SG>(x, W, hn, out, K, H, M, tgid);            \
+  }
+// MEASURED on the M5 Ultra, a block at 6667 rows (H 2560, R 320, w8 g64;
+// qwen4_exp_kernels.hc_prefill_fusion_agrees, VPIPE_HC_FUSE_BENCH): the
+// seven passes 3.06 ms; these with the fused norm 1.92 (1.59x). Down 64 x 64
+// tiles 2.03, up 128-row tiles 1.96, 32-wide 2.00.
+HC_DOWN(hc_down_silu_mma_m128_f16, 128, 64, 8)
+HC_UP(hc_up_mix_mma_m64_f16, 64, 64, 4)
+#undef HC_DOWN
+#undef HC_UP
+
 #else
 // Tensor ops unavailable for this target: emit stubs so the metallib
 // still builds. The loader never binds these on a non-tensor GPU.
@@ -954,6 +3458,85 @@ DGV_STUB(gemm_i8i8_sc_f16_n64)
 DGV_STUB(gemm_i8i8_sc_f16_n64_kacc)
 DGV_STUB(gemm_i8i8_sc_f16_n64_g512)
 DGV_STUB(gemm_i8i8_sc_f16_n64_g512i)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g64r)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g64ri)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g128r)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g128ri)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g512r)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g512ri)
+DGV_STUB(gemm_i8i8_coop_probe)
+DGV_STUB(gemm_i8i8_sc_f16_n64_kaccr_k64)
+DGV_STUB(gemm_i8i8_sc_f16_n64_kaccr_k512)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g64rs)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g64rsi)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g512rs)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g512rsi)
+DGV_STUB(gemm_i8i8_sc_f16_n64_w64rs)
+DGV_STUB(gemm_i8i8_sc_f16_n64_w64rsi)
+DGV_STUB(gemm_i8i8_sc_f16_n64_w64rsf)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g64rs_sk)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g32rs)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g32rs_sk)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g128rs)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g128rs_sk)
+DGV_STUB(gemm_i8i8_sc_f16_n64_kaccr_k128)
+DGV_STUB(gemm_i8i8_sc_f16_n64_kacc_k32)
+DGV_STUB(gemm_i8i8_sc_f16_n64_kaccr_k32)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g32)
+DGV_STUB(gemm_i8i8_sc_f16_n64_g512_sk)
+DGV_STUB(gemm_u8q_w8g64)
+DGV_STUB(gemm_u8q_w4g64)
+DGV_STUB(gemm_u8q_w8g64_sk)
+DGV_STUB(gemm_u8q_w4g64_sk)
+DGV_STUB(gemm_u8q_w8g64_v1)
+DGV_STUB(gemm_u8q_w4g64_v1)
+DGV_STUB(gemm_u8q_w8g64_cm)
+DGV_STUB(gemm_u8q_w4g64_cm)
+DGV_STUB(gemm_u8q_w8g64_cm_sk)
+DGV_STUB(gemm_u8q_w4g64_cm_sk)
+DGV_STUB(gemm_i8q_w8g64s)
+DGV_STUB(gemm_i8q_w4g64s)
+DGV_STUB(gemm_i8s_w8g64)
+DGV_STUB(gemm_i8s_w4g64)
+DGV_STUB(gemm_i8s_w8g64_sk)
+DGV_STUB(gemm_i8s_w4g64_sk)
+DGV_STUB(gemm_i8c_g256_t64x64)
+DGV_STUB(gemm_i8c_g256_t64x128)
+DGV_STUB(gemm_i8c_g256_t128x64)
+DGV_STUB(gemm_i8c_g256_t128x128)
+DGV_STUB(gemm_i8c_g512_t64x64)
+DGV_STUB(gemm_i8c_g512_t64x128)
+DGV_STUB(gemm_i8c_g512_t128x64)
+DGV_STUB(gemm_i8c_g512_t128x128)
+DGV_STUB(gemm_i8c_g1024_t64x64)
+DGV_STUB(gemm_i8c_g1024_t64x128)
+DGV_STUB(gemm_i8c_g1024_t128x64)
+DGV_STUB(gemm_i8c_g1024_t128x128)
+DGV_STUB(gemm_i8pt_t64x64_k128)
+DGV_STUB(gemm_i8pt_t64x128_k128)
+DGV_STUB(gemm_i8pt_t128x64_k128)
+DGV_STUB(gemm_i8pt_t128x128_k128)
+DGV_STUB(gemm_i8pt_t128x64_k64)
+DGV_STUB(gemm_i8pt_t128x64_k256)
+DGV_STUB(gemm_i8pt_t128x128_k64)
+DGV_STUB(gemm_i8pt_t128x128_k256)
+DGV_STUB(gemm_i8pt_m128x64)
+DGV_STUB(gemm_i8pt_m64x128)
+DGV_STUB(gemm_i8pt_d128x64)
+DGV_STUB(gemm_i8pt_d64x128)
+DGV_STUB(gemm_i8pt_wx_i8_reg)
+DGV_STUB(gemm_i8pt_wx_i8_tg)
+DGV_STUB(gemm_i8pt_wx_w4_reg)
+DGV_STUB(gemm_i8pt_wx_w4_tg)
+DGV_STUB(gemm_i8pt_wx_aff_reg)
+DGV_STUB(gemm_i8pt_wx_aff_tg)
+DGV_STUB(gemm_u8q_w4g64_s4)
+DGV_STUB(gemm_u8q_w4g64_s2)
+DGV_STUB(gemm_u8q_w8g64_s4)
+DGV_STUB(gemm_u8q_w8g64_s2)
+DGV_STUB(gemm_u8u8_kaccr_k64)
+DGV_STUB(gemm_u8u4_kaccr_k64)
+DGV_STUB(gemm_i8i4_kaccr_k64)
 DGV_STUB(dense_gemm_mma_t_n128_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_f16)
 DGV_STUB(dense_gemm_mma_t_n128_rp_f16)
@@ -961,10 +3544,16 @@ DGV_STUB(dense_gemm_mma_t_n128x256_rp_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_tn2_f16)
 DGV_STUB(dense_gemm_mma_t_scaled_f16)
 DGV_STUB(dense_gemm_mma_t_n128_scaled_f16)
+DGV_STUB(dense_gemm_mma_t_n128_bias_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_bias_f16)
 DGV_STUB(dense_gemm_mma_t_n128_acc_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_acc_f16)
 DGV_STUB(dense_gemm_mma_t_n128_lora_f16)
 DGV_STUB(dense_gemm_mma_t_n128x256_lora_f16)
+DGV_STUB(dense_gemm_mma_t_n128_lora_band_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_lora_band_f16)
+DGV_STUB(dense_gemm_mma_t_n128_acc_band_f16)
+DGV_STUB(dense_gemm_mma_t_n128x256_acc_band_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k8192_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k6784_f16)
 DGV_STUB(dense_gemm_mma_splitk_n128x256_k3392_f16)
@@ -974,4 +3563,6 @@ DGV_STUB(dense_gemm_mma_splitk32_n128x256_k4352_f16)
 DGV_STUB(dense_gemm_mma_splitk32_n128x256_k5376_f16)
 DGV_STUB(dense_gemm_mma_splitk32_n128x256_k2304_f16)
 DGV_STUB(dense_gemm_mma_t_qkcausal_n128_f16)
+DGV_STUB(hc_down_silu_mma_m128_f16)
+DGV_STUB(hc_up_mix_mma_m64_f16)
 #endif

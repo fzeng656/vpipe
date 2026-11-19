@@ -1,5 +1,8 @@
+#include "generative-models/shared/accel-settings.h"
 #include "stages/audio-vae-decode-stage.h"
+#include "common/beat-keys.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/weight-set.h"
 
 #include "apple-silicon/tensor-beat.h"
@@ -27,17 +30,46 @@ namespace {
 // The model iport, appended after the primary `latent` input.
 [[maybe_unused]] constexpr unsigned kModelPort = 1;
 
+// What THIS stage implements: a two-way decision (destroy or keep, else
+// resolve from the box). "park" would land in the `auto` branch and mean
+// something other than what it says, so it is not offered. The legacy
+// "always" / "never" stay accepted and show as unlisted.
+constexpr SpecExtra kUnloadChoices[] = {
+  {spec_key::kChoices, "auto,destroy,keep"},
+};
 const ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
    .doc = "model dir carrying an audio VAE (read from <hf_dir>/audio_vae). "
           "OPTIONAL: a model-select source on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "minimax-h3-fl2va"},
+   .suggest_db_type = "minimax-h3-fl2va,yue2-vae,minimax-music3",
+   .model_channel = "diffusion-model"},
+  {.key = "vae_dir", .type = ConfigType::String, .required = false,
+   .doc = "the audio VAE's WEIGHTS, when they are not hf_dir's own: a "
+          "directory, a registry key, or a single file -- a Draw Things "
+          ".ckpt (MiniMax-H3's, which carries the video VAE beside it), "
+          "read under the release's names. The config (latent statistics) "
+          "still comes from hf_dir's audio VAE",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the VAE weights after each beat and reload on the next one. "
           "\"auto\" (default) decides from physical RAM vs the pipeline's "
-          "weight bytes; \"always\" / \"never\" force it",
-   .def_str = "auto"},
+          "weight bytes; \"destroy\" / \"keep\" force it (legacy spellings: "
+          "\"always\" / \"never\"). \"park\" is NOT implemented here and "
+          "resolves as \"auto\": parking is the manager's to do and needs "
+          "this stage's borrow to end first -- only diffusion-conditioner "
+          "does that today",
+   .def_str = "auto", .extra = kUnloadChoices},
+  {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the codec's big "
+          "matmuls. OFF BY DEFAULT AND FOR A QUALITY REASON, not because it "
+          "is unimplemented: a codec is the last thing between a latent and "
+          "the pixels a person looks at, so an approximation in it has "
+          "nowhere to be absorbed -- where the same trade inside a DiT is "
+          "followed by dozens of blocks and a decode. It is settable so the "
+          "trade can be MEASURED. Only a REGISTERED family reads it; the "
+          "built-in codecs ignore it. Env VPIPE_I8_GEMM overrides",
+   .def_bool = false},
 };
 const PortSpec kIports[] = {
   {.name = "latent",
@@ -71,10 +103,13 @@ const StageSpec kSpec = {
 // Detect the family from the audio VAE's config.json `_class_name`.
 // Empty when the directory holds no audio VAE at all, which is the
 // common misconfiguration (an hf_dir pointing at a model that generates
-// no soundtrack) and deserves a different message than a bad one.
+// no soundtrack) and deserves a different message than a bad one -- and
+// empty with `*unknown_class` set when a config NAMES a class nothing
+// here decodes, which is a third thing again and is refused by name.
 std::string
-audio_vae_family_(const std::string& vae_dir)
+audio_vae_family_(const std::string& vae_dir, std::string* unknown_class)
 {
+  unknown_class->clear();
   // A Comfy-Org repack has no config.json anywhere: resolve_vae_dir hands
   // back the .safetensors itself and the architecture is named by that
   // file's `__metadata__` key. Checking it first is what keeps this stage
@@ -95,8 +130,15 @@ audio_vae_family_(const std::string& vae_dir)
   if (!fd.is_object()) { return {}; }
   auto obj = fd.as_object();
   if (!obj.contains("_class_name")) { return {}; }
-  const std::string cls(obj.at("_class_name").as_string(""));
-  if (cls == "MiniMaxH3AudioVAE") { return "minimax-h3"; }
+  const FlexData c = obj.at("_class_name");   // a VIEW: bind it
+  const std::string cls(c.as_string(""));
+  // Released, and the diffusers pipeline's copy of the same codec (the
+  // same tensors, the same names; minimax-h3-diffusers-layout.h).
+  if (cls == "MiniMaxH3AudioVAE" ||
+      cls == genai::minimax_h3::kDiffusersAudioVaeClass) {
+    return "minimax-h3";
+  }
+  *unknown_class = cls;
   return {};
 }
 #endif
@@ -114,6 +156,16 @@ AudioVaeDecodeStage::AudioVaeDecodeStage(const SessionContextIntf* s,
   // edited before hf_dir exists. The "no model at all" case is reported
   // at initialize()/process(), when iport connectivity is known.
   _hf_dir = attr_str("hf_dir");
+  _vae_weights = attr_str("vae_dir");
+  // THE ACCELERATION BAG, built once and handed to a registered family
+  // whole. Written whether the tier is on or off, and with the SETTLED
+  // value, so no family repeats this stage's reading or reaches a
+  // different answer than the log line did. The built-in codecs never
+  // see it: they are compiled with this stage and take their kernels
+  // from their own configs.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm,
+                         attr_bool("i8_gemm"));
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -179,7 +231,7 @@ AudioVaeDecodeStage::declare_resources() const
     // twice, in two phases, and the audio VAE not at all. Asking by
     // ROLE is what tells them apart.
     const std::string a =
-        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+        f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
     if (!a.empty()) { return model_memory::weight_claims({a}); }
     // No separate audio file: the family's single answer is the right
     // one, which is what a checkpoint with one VAE for both means.
@@ -195,8 +247,9 @@ AudioVaeDecodeStage::declare_resources() const
   // The arena and the PCM are declared by generate-video, not here:
   // the soundtrack's length comes from that stage's frames/fps, and
   // this one has no way to know it at plan time. Same reason the video
-  // decode arena is declared there.
-  return model_memory::weight_claims({vae_dir});
+  // decode arena is declared there. Weights named apart (`vae_dir`) are
+  // what loads, so they are what is claimed.
+  return model_memory::weight_claims({vae_dir_for_release_()});
 }
 
 // Pass TWO: WHEN those weights are resident.
@@ -228,7 +281,7 @@ AudioVaeDecodeStage::declare_memory() const
           genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root),
           resolve_model(session(), _hf_dir).model_type)) {
     m.holdings = f->declare_holdings(root,
-                                     genai::VaeModelFamily::Role::kAudio);
+                                     genai::VaeModelFamily::kRoleAudio);
     if (!m.holdings.empty()) {
       for (StageHolding& h : m.holdings) { h.releases = true; }
       return m;
@@ -249,13 +302,19 @@ std::string
 AudioVaeDecodeStage::vae_dir_for_release_() const
 {
   if (_hf_dir.empty()) { return {}; }
+  // Weights named apart from the model (`vae_dir`) are what loads, so
+  // they are what is claimed and released.
+  if (!_vae_weights.empty()) {
+    const std::string w = resolve_model_dir(session(), _vae_weights);
+    if (!w.empty()) { return w; }
+  }
   const std::string root = resolve_model_dir(session(), _hf_dir);
   const std::string h3 = genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
   if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
           session(), root, h3,
           resolve_model(session(), _hf_dir).model_type)) {
     const std::string a =
-        f->vae_path(root, genai::VaeModelFamily::Role::kAudio);
+        f->vae_path(root, genai::VaeModelFamily::kRoleAudio);
     if (!a.empty()) { return a; }
   }
   return h3;
@@ -273,16 +332,20 @@ AudioVaeDecodeStage::unload_vae_()
   }
 
   if (!_h3_vae) { return; }
-  // TO THE POOL when the policy is `auto`, and BEFORE the reset:
-  // pool_weights() finds the set through a WEAK reference, so there is
-  // nothing left to pool once this model drops its last strong one.
-  if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
-    if (auto* mgr = session()->services()->generative_model_manager()) {
-      mgr->pool_weights(vae_dir_for_release_());
-    }
-  }
   _h3_vae.reset();
   _plugin_dec.reset();
+  // SETTLE IT NOW that the borrow has ended. The manager owns the
+  // checkpoint, so the resets above only ended this stage's; `destroy`
+  // is the caller asking for the bytes back, which parking does not do,
+  // and anything else keeps it purgeable for the next clip.
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    const std::string vdir = vae_dir_for_release_();
+    if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+      mgr->drop_weights(vdir);
+    } else {
+      mgr->pool_weights(vdir);
+    }
+  }
   _unloaded = true;
   session()->log_debug(fmt(
       "AudioVaeDecodeStage('{}'): audio VAE unloaded (idle)", this->id()));
@@ -365,7 +428,16 @@ AudioVaeDecodeStage::ensure_loaded_()
     return;                        // NOT the built-in chain below
   }
 
-  _family = audio_vae_family_(vae_dir);
+  std::string unknown_class;
+  _family = audio_vae_family_(vae_dir, &unknown_class);
+  if (_family.empty() && !unknown_class.empty()) {
+    session()->error(fmt(
+        "AudioVaeDecodeStage('{}'): '{}' names the audio VAE class '{}', "
+        "which nothing built in reads (MiniMaxH3AudioVAE, {}) and no "
+        "registered family claims; inert", this->id(), vae_dir,
+        unknown_class, genai::minimax_h3::kDiffusersAudioVaeClass));
+    return;
+  }
   if (_family.empty()) {
     session()->error(fmt(
         "AudioVaeDecodeStage('{}'): '{}' holds no audio VAE this stage "
@@ -425,8 +497,17 @@ AudioVaeDecodeStage::ensure_loaded_()
   // that path gets a checkpoint nothing can account for, share, park or
   // pool: MEASURED, this stage unloaded its VAE and pool_weights() found
   // no such set to pool, silently, because the key was never registered.
+  // The weights from `vae_dir` when it names them (a Draw Things .ckpt),
+  // the config above from the model's own audio VAE either way.
+  std::string ws_dir = vae_dir;
+  if (!_vae_weights.empty()) {
+    ws_dir = resolve_model_dir(session(), _vae_weights);
+    session()->info(fmt(
+        "AudioVaeDecodeStage('{}'): the audio VAE's weights from '{}', its "
+        "config from '{}'", this->id(), ws_dir, vae_dir));
+  }
   _h3_vae = genai::MetalMiniMaxH3AudioVae::load(
-      genai::open_weight_set(vae_dir, session()), mc, cfg);
+      genai::open_weight_set(ws_dir, session()), mc, cfg);
   if (!_h3_vae) {
     // Naming the likely cause, because the config parsed a moment ago and
     // "could not load" alone points at the path -- which by here is known
@@ -505,6 +586,13 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
       co_return;
     }
     genai::AudioVaeDecodeRequest areq;
+    areq.accel = &_accel;
+    // ALWAYS INSTALLED, even though nothing is named yet: a
+    // family that had to guard every lookup would eventually
+    // forget one, and calling an empty std::function throws.
+    areq.input =
+        [](std::string_view, genai::NamedTensor*) { return false; };
+
     areq.latent = atb->as_f32();
     areq.shape.reserve(atb->shape.size());
     for (std::int64_t d : atb->shape) { areq.shape.push_back((int)d); }
@@ -512,8 +600,9 @@ AudioVaeDecodeStage::process(RuntimeContext& ctx)
     if (atb->sideband.is_object()) {
       FlexData sb = atb->sideband;          // as_object() is a view
       auto o = sb.as_object();
-      if (o.contains("latents_per_second")) {
-        areq.latents_per_second = o.at("latents_per_second").as_real(0.0);
+      if (o.contains(sideband::kLatentsPerSecond)) {
+        areq.latents_per_second =
+            o.at(sideband::kLatentsPerSecond).as_real(0.0);
       }
     }
     // The same lazy bar the video twin opens, and for the same reason:

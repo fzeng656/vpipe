@@ -14,6 +14,67 @@ constant bool align_K [[function_constant(201)]];
 constant bool has_mask [[function_constant(300)]];
 constant bool do_causal [[function_constant(301)]];
 constant bool has_sinks [[function_constant(302)]];
+// vpipe: BLOCK-SPARSE attention. The host supplies, per query block, the
+// key blocks it may attend to; everything else is never loaded. Gated on
+// a function constant so every existing instantiation compiles to
+// exactly the code it did before -- the specialisation is resolved
+// before codegen, so the branches below cost the dense kernels nothing.
+// OPTIONAL BY CONSTRUCTION. Every other caller of this entry point in
+// the tree -- eleven of them, across six DiTs, two encoders and an LM --
+// sets 300..302 and stops there, so a new slot they do not know about
+// must not be able to change what they get. Reading it through
+// is_function_constant_defined makes "unset" mean false explicitly
+// rather than relying on what an unset constant does, and leaves those
+// call sites correct without being touched, which is a stronger
+// statement than having audited them.
+constant bool has_spans_set [[function_constant(303)]];
+constant bool has_spans =
+    is_function_constant_defined(has_spans_set) ? has_spans_set : false;
+
+// vpipe: export this pass's online-softmax statistics, so a SECOND
+// partial attention over a disjoint key set can be merged with it.
+//
+// Sol-Attn needs exactly that: the exact blocks run here at full steel
+// throughput while the approximate ones are summarised elsewhere, and
+// the two halves combine only if both report their running maximum and
+// denominator. O is stored ALREADY divided by sum_score, so the merge
+// multiplies it back -- nothing about the store changes.
+//
+// Read through is_function_constant_defined, like has_spans: every
+// existing caller sets 200/201/301..303 and stops there, and unset must
+// mean false EXPLICITLY rather than by luck.
+constant bool export_ml_set [[function_constant(304)]];
+constant bool export_ml =
+    is_function_constant_defined(export_ml_set) ? export_ml_set : false;
+
+// vpipe: a per-(query block, KEY) byte mask, which is what lets this
+// kernel also run Sol-Attn's APPROXIMATE half.
+//
+// That half is an attention over the summary sequence -- one key per
+// routing block -- from which the blocks the routing kept exact must be
+// excluded, or they would be counted twice. The exclusion is decided
+// per query block and per key, which is exactly the routing's own flag
+// array, so nothing is materialised: `block_mask` IS that array, read
+// as [H][params->NQ][params->kL] with a nonzero byte meaning EXCLUDE.
+//
+// A per-element mask (has_mask) would be [qL, kL] -- 50 million bytes a
+// head at video geometry against the flag array's 100 thousand -- and a
+// span list cannot say it at all, the CSR's unit being 16 keys where
+// this decision is per key.
+//
+// A ROW WITH EVERY KEY EXCLUDED IS LEGITIMATE (tau low enough keeps
+// every block) and produces max_score == finite_min, since that is both
+// the initial value and what the mask writes. The caller reads that
+// sentinel and drops the half; see sol_merge_ml_mma.
+//
+// The matrix-core kernel beside this one has carried the same constant
+// at the same number since the Sol port; this is that path on the boxes
+// without matrix cores, and the two are deliberately spelled the same
+// so one driver drives both.
+constant bool has_block_mask_set [[function_constant(305)]];
+constant bool has_block_mask =
+    is_function_constant_defined(has_block_mask_set) ? has_block_mask_set
+                                                     : false;
 
 struct MaxOp {
   template <typename T>
@@ -76,6 +137,22 @@ template <
     const constant AttnMaskParams* mask_params [[buffer(5), function_constant(has_mask)]],
     const device MaskType* mask [[buffer(6), function_constant(has_mask)]],
     const device T* sinks [[buffer(7), function_constant(has_sinks)]],
+    // vpipe block-sparse: qb_off[NQ + 1] indexes qb_blocks, which lists
+    // the key BLOCK indices each query block visits, ascending.
+    const device int* qb_off [[buffer(8), function_constant(has_spans)]],
+    const device int* qb_blocks [[buffer(9), function_constant(has_spans)]],
+    const constant AttnSpanParams* span_params
+        [[buffer(10), function_constant(has_spans)]],
+    // [num_frames] window bounds, inclusive, UNCLAMPED -- lo < 0 and
+    // hi >= num_frames are how "nothing outside on that side" is said.
+    const device int2* span_bounds
+        [[buffer(11), function_constant(has_spans)]],
+    // vpipe: [B, H, qL] each, this pass's per-row max and denominator.
+    device float* ml_max [[buffer(12), function_constant(export_ml)]],
+    device float* ml_sum [[buffer(13), function_constant(export_ml)]],
+    // vpipe: [H, params->NQ, params->kL] bytes; nonzero EXCLUDES.
+    const device uchar* block_mask
+        [[buffer(14), function_constant(has_block_mask)]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]],
     uint3 tid [[threadgroup_position_in_grid]],
@@ -246,8 +323,33 @@ template <
     kb_min_causal = (q_min / BK);
   }
 
+  // vpipe block-sparse: walk the query block's OWN list of key blocks
+  // instead of all of them. `nvis` is how many it visits and `kb` is
+  // which, so every position computed from `kb` below stays the real
+  // column and the length/causal masking is untouched.
+  int nvis = kb_lim;
+  int vis_base = 0;
+  int kb_prev = 0;
+  if (has_spans) {
+    // qb_stride == 0 is one list shared by every head; anything else
+    // lays qb_off out as [H][NQ + 1]. See AttnSpanParams.
+    const int qbi = int(tid.y) * span_params->qb_stride + int(tid.x);
+    vis_base = qb_off[qbi];
+    nvis = qb_off[qbi + 1] - vis_base;
+  }
+
   // Loop over KV seq length
-  for (int kb = 0; kb < kb_lim; kb++) {
+  for (int vi = 0; vi < nvis; vi++) {
+    const int kb = has_spans ? qb_blocks[vis_base + vi] : vi;
+    if (has_spans) {
+      // The loaders start at block 0 and only ever move forward, so the
+      // step is the gap since the last visited block -- kb itself on the
+      // first iteration, which is how a query block whose window starts
+      // late skips straight to it.
+      loader_k.jump(kb - kb_prev);
+      loader_v.jump(kb - kb_prev);
+      kb_prev = kb;
+    }
     // Load K block and apply scale
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!align_K && kb == (params->NK_aligned)) {
@@ -318,6 +420,84 @@ template <
           STEEL_PRAGMA_UNROLL
           for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
             if (row_pos < (col_pos + jj)) {
+              Stile.frag_at(i, j)[jj] = neg_inf;
+            }
+          }
+        }
+      }
+    }
+
+    // vpipe block-sparse: the block list is rounded OUTWARD to whole
+    // key blocks, so a block at a span's edge carries keys the mask
+    // forbids. This is WindowMask::allows, element by element and in
+    // closed form -- nothing is read but the frame's own [lo, hi].
+    if (has_spans) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+
+      const int vs = span_params->video_start;
+      const int tpf = span_params->tokens_per_frame;
+      const int nf = span_params->num_frames;
+      const int anc = span_params->anchors;
+      const int ve = vs + nf * tpf;
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        const int row_pos =
+            tid.x * BQ + params->qL_off + tm + sm + (i * stile_t::kFragRows);
+        const bool q_video = row_pos >= vs && row_pos < ve && tpf > 0;
+        // A query row outside the video block is dense both ways, and so
+        // is every row past the sequence -- those are already -inf from
+        // the length mask and must not be revived here.
+        if (!q_video) { continue; }
+        int qf = (row_pos - vs) / tpf;
+        qf = qf < 0 ? 0 : (qf > nf - 1 ? nf - 1 : qf);
+        const int2 b = span_bounds[qf];
+        const bool q_anchor = (qf == 0) || (qf == nf - 1);
+        // Anchor ROWS see everything, so the whole row is already right.
+        if (((anc & 2) != 0) && q_anchor) { continue; }
+
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            const int c = col_pos + jj;
+            if (c < vs || c >= ve) { continue; }   // a global key: dense
+            const int kf = (c - vs) / tpf;
+            bool ok = (kf >= b.x && kf <= b.y);
+            if (!ok && ((anc & 1) != 0)) {
+              ok = (kf == 0) || (kf == nf - 1);
+            }
+            if (!ok) { Stile.frag_at(i, j)[jj] = neg_inf; }
+          }
+        }
+      }
+    }
+
+    // vpipe: the routing's own exclusion, per query block and per key.
+    // Column-only -- every row of this query block obeys the same flag
+    // row -- so the row index never enters it, and the length mask
+    // above is repeated here because a key past kL has no flag byte.
+    if (has_block_mask) {
+      using stile_t = decltype(Stile);
+      using selem_t = typename stile_t::elem_type;
+      constexpr auto neg_inf = Limits<selem_t>::finite_min;
+
+      const device uchar* brow =
+          block_mask + (size_t(tid.y) * size_t(params->NQ) + size_t(tid.x)) *
+                           size_t(params->kL);
+
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < stile_t::kTileRows; i++) {
+        STEEL_PRAGMA_UNROLL
+        for (short j = 0; j < stile_t::kTileCols; j++) {
+          const int col_pos = kb * BK + sn + (j * stile_t::kFragCols);
+          STEEL_PRAGMA_UNROLL
+          for (short jj = 0; jj < stile_t::MMAFrag_t::kElemCols; jj++) {
+            const int c = col_pos + jj;
+            if (c >= params->kL || brow[c] != 0) {
               Stile.frag_at(i, j)[jj] = neg_inf;
             }
           }
@@ -428,7 +608,7 @@ template <
       for (short id = 0; id < TD; id++) {
         STEEL_PRAGMA_UNROLL
         for (short ik = 0; ik < TK; ik++) {
-          if constexpr (BD == 128) {
+          if constexpr (BD >= 128) {
             simdgroup_barrier(mem_flags::mem_none);
           }
 
@@ -438,7 +618,7 @@ template <
           Vtile.template load<T, 1, 1, LDV_tgp, 1>(
               &Vs[Vs_offset + kk * LDV_tgp + dd]);
 
-          if constexpr (BD == 128) {
+          if constexpr (BD >= 128) {
             simdgroup_barrier(mem_flags::mem_none);
           }
 
@@ -451,13 +631,50 @@ template <
       }
     }
 
-    // Prepare for next iteration
-    loader_k.next();
-    loader_v.next();
+    // Prepare for next iteration. The sparse path jumps at the TOP
+    // instead, because the gap is a property of the block it is about to
+    // read and not of the one it has just finished.
+    if (!has_spans) {
+      loader_k.next();
+      loader_v.next();
+    }
   }
 
-  // Normalize output
-  Otile.template row_bin_op<DivOp>(sum_score);
+  // vpipe: the statistics, BEFORE the normalize consumes them.
+  //
+  // Four lanes share a row after row_reduce and all four hold the same
+  // reduced value, so one of them writes: sn is the fragment COLUMN and
+  // is 0 for exactly one lane of each row.
+  if (export_ml) {
+    if (sn == 0) {
+      STEEL_PRAGMA_UNROLL
+      for (short i = 0; i < kRowsPT; ++i) {
+        const int row = int(tid.x) * BQ + tm + sm + i * kFragSize;
+        if (row < params->qL) {
+          const size_t o =
+              (size_t(tid.z) * params->H + size_t(tid.y)) * params->qL + row;
+          ml_max[o] = float(max_score[i]);
+          ml_sum[o] = float(sum_score[i]);
+        }
+      }
+    }
+  }
+
+  // Normalize output.
+  //
+  // vpipe: A ROW THAT ATTENDED NOTHING IS ZERO, exactly as in the NAX
+  // kernel -- see the note there. Dividing by infinity rather than by the
+  // untouched 0 makes that row 0 whatever the tile holds (nothing, on a
+  // span list; the masked keys' average, on the per-key mask).
+  AccumType divisor[kRowsPT];
+  STEEL_PRAGMA_UNROLL
+  for (short i = 0; i < kRowsPT; ++i) {
+    const bool empty =
+        sum_score[i] == 0 ||
+        (has_block_mask && max_score[i] == Limits<AccumType>::finite_min);
+    divisor[i] = empty ? Limits<AccumType>::max : sum_score[i];
+  }
+  Otile.template row_bin_op<DivOp>(divisor);
   threadgroup_barrier(mem_flags::mem_none);
 
   // Store results

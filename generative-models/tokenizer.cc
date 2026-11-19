@@ -6,6 +6,8 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
+#include <CoreFoundation/CoreFoundation.h>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -13,6 +15,7 @@
 #include <fstream>
 #include <limits>
 #include <regex>
+#include <span>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -180,7 +183,8 @@ is_ws_(unsigned char c)
 // length of the matched chunk, or 0 if no alternative matched
 // (caller advances by one codepoint to make progress).
 size_t
-llama3_match_one_(const char* data, size_t len, size_t pos)
+llama3_match_one_(const char* data, size_t len, size_t pos,
+                  int max_digits)
 {
   // --- Alt 1: contractions (case-insensitive ASCII) -----------------
   if (pos < len && data[pos] == '\'') {
@@ -235,11 +239,11 @@ llama3_match_one_(const char* data, size_t len, size_t pos)
     if (w > 0) { return w; }
   }
 
-  // --- Alt 3: \p{N}{1,3} --------------------------------------------
+  // --- Alt 3: \p{N}{1,3} (Llama-3), or \p{N} (Qwen) ---------------
   {
     size_t end = pos;
     int count = 0;
-    while (count < 3 && end < len) {
+    while (count < max_digits && end < len) {
       size_t cl;
       uint32_t cp = utf8_next_(data, len, end, &cl);
       if (!is_digit_cp_(cp)) { break; }
@@ -336,6 +340,430 @@ llama3_match_one_(const char* data, size_t len, size_t pos)
     return cl;
   }
   return 0;
+}
+
+// ---------------------------------------------------------------------
+// Tekken pre-tokenizer scanner (Mistral: Ministral 3, Pixtral, Mistral
+// Small 3.x). The Split pattern is GPT-4o's minus the contractions, with
+// single digits and a trailing [\r\n/]*:
+//
+//     [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*
+//                       [\p{Ll}\p{Lm}\p{Lo}\p{M}]+
+//   | [^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+
+//                       [\p{Ll}\p{Lm}\p{Lo}\p{M}]*
+//   | \p{N}
+//   |  ?[^\s\p{L}\p{N}]+[\r\n/]*
+//   | \s*[\r\n]+
+//   | \s+(?!\S)
+//   | \s+
+//
+// It splits letter runs on CASE ("HelloWorld" -> "Hello" "World"), so
+// the coarse is_letter_cp_ above cannot serve it. The classes come from
+// CoreFoundation's Unicode tables, plus the Nl/No numbers (superscripts,
+// fractions, roman numerals...) it has no set for.
+// ---------------------------------------------------------------------
+
+enum class UCls : uint8_t {
+  Other,         // punctuation, symbols, controls
+  Upper,         // Lu, Lt
+  Lower,         // Ll
+  LetterOther,   // Lm, Lo -- in BOTH case classes of the pattern
+  Mark,          // M* -- in both case classes, but NOT \p{L}
+  Number,        // N*
+  Space,         // White_Space
+};
+
+// General category Nl + No (Unicode 16), which CoreFoundation's
+// decimal-digit set (Nd only) leaves out.
+constexpr uint32_t kNumberLetterOther[][2] = {
+  {0x00B2, 0x00B3}, {0x00B9, 0x00B9}, {0x00BC, 0x00BE}, {0x09F4, 0x09F9},
+  {0x0B72, 0x0B77}, {0x0BF0, 0x0BF2}, {0x0C78, 0x0C7E}, {0x0D58, 0x0D5E},
+  {0x0D70, 0x0D78}, {0x0F2A, 0x0F33}, {0x1369, 0x137C}, {0x16EE, 0x16F0},
+  {0x17F0, 0x17F9}, {0x19DA, 0x19DA}, {0x2070, 0x2070}, {0x2074, 0x2079},
+  {0x2080, 0x2089}, {0x2150, 0x2182}, {0x2185, 0x2189}, {0x2460, 0x249B},
+  {0x24EA, 0x24FF}, {0x2776, 0x2793}, {0x2CFD, 0x2CFD}, {0x3007, 0x3007},
+  {0x3021, 0x3029}, {0x3038, 0x303A}, {0x3192, 0x3195}, {0x3220, 0x3229},
+  {0x3248, 0x324F}, {0x3251, 0x325F}, {0x3280, 0x3289}, {0x32B1, 0x32BF},
+  {0xA6E6, 0xA6EF}, {0xA830, 0xA835}, {0x10107, 0x10133},
+  {0x10140, 0x10178}, {0x1018A, 0x1018B}, {0x102E1, 0x102FB},
+  {0x10320, 0x10323}, {0x10341, 0x10341}, {0x1034A, 0x1034A},
+  {0x103D1, 0x103D5}, {0x10858, 0x1085F}, {0x10879, 0x1087F},
+  {0x108A7, 0x108AF}, {0x108FB, 0x108FF}, {0x10916, 0x1091B},
+  {0x109BC, 0x109BD}, {0x109C0, 0x109CF}, {0x109D2, 0x109FF},
+  {0x10A40, 0x10A48}, {0x10A7D, 0x10A7E}, {0x10A9D, 0x10A9F},
+  {0x10AEB, 0x10AEF}, {0x10B58, 0x10B5F}, {0x10B78, 0x10B7F},
+  {0x10BA9, 0x10BAF}, {0x10CFA, 0x10CFF}, {0x10E60, 0x10E7E},
+  {0x10F1D, 0x10F26}, {0x10F51, 0x10F54}, {0x10FC5, 0x10FCB},
+  {0x11052, 0x11065}, {0x111E1, 0x111F4}, {0x1173A, 0x1173B},
+  {0x118EA, 0x118F2}, {0x11C5A, 0x11C6C}, {0x11FC0, 0x11FD4},
+  {0x12400, 0x1246E}, {0x16B5B, 0x16B61}, {0x16E80, 0x16E96},
+  {0x1D2C0, 0x1D2D3}, {0x1D2E0, 0x1D2F3}, {0x1D360, 0x1D378},
+  {0x1E8C7, 0x1E8CF}, {0x1EC71, 0x1ECAB}, {0x1ECAD, 0x1ECAF},
+  {0x1ECB1, 0x1ECB4}, {0x1ED01, 0x1ED2D}, {0x1ED2F, 0x1ED3D},
+  {0x1F100, 0x1F10C},
+};
+
+UCls
+uni_class_(uint32_t cp)
+{
+  if (cp < 0x80) {
+    if (cp >= 'a' && cp <= 'z') { return UCls::Lower; }
+    if (cp >= 'A' && cp <= 'Z') { return UCls::Upper; }
+    if (cp >= '0' && cp <= '9') { return UCls::Number; }
+    if (cp == ' ' || (cp >= 0x09 && cp <= 0x0D)) { return UCls::Space; }
+    return UCls::Other;
+  }
+  // The predefined sets are immutable singletons owned by CF.
+  static const CFCharacterSetRef ws =
+      CFCharacterSetGetPredefined(kCFCharacterSetWhitespaceAndNewline);
+  static const CFCharacterSetRef upper =
+      CFCharacterSetGetPredefined(kCFCharacterSetUppercaseLetter);
+  static const CFCharacterSetRef lower =
+      CFCharacterSetGetPredefined(kCFCharacterSetLowercaseLetter);
+  static const CFCharacterSetRef letter =
+      CFCharacterSetGetPredefined(kCFCharacterSetLetter);   // L* + M*
+  static const CFCharacterSetRef mark =
+      CFCharacterSetGetPredefined(kCFCharacterSetNonBase);  // M*
+  static const CFCharacterSetRef digit =
+      CFCharacterSetGetPredefined(kCFCharacterSetDecimalDigit);
+  const auto c = static_cast<UTF32Char>(cp);
+  if (CFCharacterSetIsLongCharacterMember(ws, c))     { return UCls::Space; }
+  if (CFCharacterSetIsLongCharacterMember(upper, c))  { return UCls::Upper; }
+  if (CFCharacterSetIsLongCharacterMember(lower, c))  { return UCls::Lower; }
+  if (CFCharacterSetIsLongCharacterMember(mark, c))   { return UCls::Mark; }
+  if (CFCharacterSetIsLongCharacterMember(letter, c)) {
+    return UCls::LetterOther;
+  }
+  if (CFCharacterSetIsLongCharacterMember(digit, c))  { return UCls::Number; }
+  for (const auto& r : kNumberLetterOther) {
+    if (cp < r[0]) { break; }
+    if (cp <= r[1]) { return UCls::Number; }
+  }
+  return UCls::Other;
+}
+
+// One leftmost-alternative match of the Tekken pattern at `pos`; the
+// byte length of the chunk, never 0 while pos < len.
+size_t
+tekken_match_one_(const char* data, size_t len, size_t pos)
+{
+  auto cls_at = [&](size_t p, size_t* cl) {
+    const uint32_t cp = utf8_next_(data, len, p, cl);
+    return std::make_pair(cp, uni_class_(cp));
+  };
+  auto in_u = [](UCls c) {
+    return c == UCls::Upper || c == UCls::LetterOther || c == UCls::Mark;
+  };
+  auto in_l = [](UCls c) {
+    return c == UCls::Lower || c == UCls::LetterOther || c == UCls::Mark;
+  };
+  auto is_l = [](UCls c) {   // \p{L}
+    return c == UCls::Upper || c == UCls::Lower || c == UCls::LetterOther;
+  };
+  // End of the maximal run of `pred` codepoints from `p`.
+  auto run = [&](size_t p, auto pred) {
+    while (p < len) {
+      size_t cl;
+      if (!pred(cls_at(p, &cl).second)) { break; }
+      p += cl;
+    }
+    return p;
+  };
+
+  // Optional lead [^\r\n\p{L}\p{N}] (greedy: tried consumed first).
+  size_t lead = 0;
+  {
+    size_t cl;
+    const auto [cp, c] = cls_at(pos, &cl);
+    if (cp != '\r' && cp != '\n' && !is_l(c) && c != UCls::Number) {
+      lead = cl;
+    }
+  }
+
+  // --- Alt 1: lead? U* L+ -------------------------------------------
+  // U* is greedy and gives codepoints back until L+ can start; only a
+  // codepoint in both classes (Lm/Lo/M) can start it inside the U run.
+  auto alt1 = [&](size_t s) -> size_t {
+    const size_t u_end = run(s, in_u);
+    size_t k = u_end;
+    while (true) {
+      const size_t l_end = run(k, in_l);
+      if (l_end > k) { return l_end; }
+      if (k == s) { return 0; }
+      // Step back one codepoint (to the start of the previous one).
+      do { --k; } while (k > s && (data[k] & 0xC0) == 0x80);
+    }
+  };
+  // --- Alt 2: lead? U+ L* -------------------------------------------
+  auto alt2 = [&](size_t s) -> size_t {
+    const size_t u_end = run(s, in_u);
+    return u_end > s ? run(u_end, in_l) : 0;
+  };
+  if (lead > 0) {
+    if (size_t e = alt1(pos + lead)) { return e - pos; }
+  }
+  if (size_t e = alt1(pos)) { return e - pos; }
+  if (lead > 0) {
+    if (size_t e = alt2(pos + lead)) { return e - pos; }
+  }
+  if (size_t e = alt2(pos)) { return e - pos; }
+
+  // --- Alt 3: \p{N} (one codepoint) ----------------------------------
+  {
+    size_t cl;
+    if (cls_at(pos, &cl).second == UCls::Number) { return cl; }
+  }
+
+  // --- Alt 4:  ?[^\s\p{L}\p{N}]+[\r\n/]* ------------------------------
+  {
+    auto punct = [&](UCls c) {
+      return c != UCls::Space && !is_l(c) && c != UCls::Number;
+    };
+    auto tail = [&](size_t e) {
+      while (e < len && (data[e] == '\r' || data[e] == '\n'
+                         || data[e] == '/')) {
+        ++e;
+      }
+      return e;
+    };
+    const size_t sp = (data[pos] == ' ') ? 1 : 0;
+    size_t e = run(pos + sp, punct);
+    if (e > pos + sp) { return tail(e) - pos; }
+    if (sp > 0) {
+      e = run(pos, punct);
+      if (e > pos) { return tail(e) - pos; }
+    }
+  }
+
+  // Whitespace run from pos (codepoints, Unicode White_Space).
+  const size_t wp = run(pos, [](UCls c) { return c == UCls::Space; });
+  if (wp > pos) {
+    // --- Alt 5: \s*[\r\n]+ -- up to the LAST newline in the run.
+    // ASCII bytes never occur inside a multi-byte sequence, so a byte
+    // scan backwards finds it.
+    for (size_t m = wp; m > pos; --m) {
+      if (data[m - 1] == '\r' || data[m - 1] == '\n') { return m - pos; }
+    }
+    // --- Alt 6: \s+(?!\S) -- all of it at the end of the text, else
+    // all but the last codepoint (which then precedes the \S).
+    if (wp >= len) { return wp - pos; }
+    size_t last = wp - 1;
+    while (last > pos && (data[last] & 0xC0) == 0x80) { --last; }
+    if (last > pos) { return last - pos; }
+    // --- Alt 7: \s+
+    return wp - pos;
+  }
+
+  // No alternative matched: advance one codepoint to make progress.
+  size_t cl;
+  (void)utf8_next_(data, len, pos, &cl);
+  return cl;
+}
+
+// ---------------------------------------------------------------------
+// DeepSeek-V3 / V4 pre-tokenizer: a Sequence of three Isolated splits,
+// each applied to every piece the one before produced (a piece's
+// unmatched gaps are pieces too):
+//
+//   1. \p{N}{1,3}                         numbers, three at a time
+//   2. [一-龥぀-ゟ゠-ヿ]+   CJK / kana runs
+//   3. [!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+
+//    | [^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+
+//    |  ?[\p{P}\p{S}]+[\r\n]*
+//    | \s*[\r\n]+
+//    | \s+(?!\S)
+//    | \s+
+//
+// then ByteLevel without its own regex. Stage 3 is matched leftmost-
+// first as the reference's (onig) regex does, against the end of its
+// PIECE, not the text.
+// ---------------------------------------------------------------------
+
+bool
+is_punct_sym_(uint32_t cp)
+{
+  if (cp < 0x80) {
+    return (cp >= 0x21 && cp <= 0x2F) || (cp >= 0x3A && cp <= 0x40) ||
+           (cp >= 0x5B && cp <= 0x60) || (cp >= 0x7B && cp <= 0x7E);
+  }
+  static const CFCharacterSetRef punct =
+      CFCharacterSetGetPredefined(kCFCharacterSetPunctuation);
+  static const CFCharacterSetRef sym =
+      CFCharacterSetGetPredefined(kCFCharacterSetSymbol);
+  const auto c = static_cast<UTF32Char>(cp);
+  return CFCharacterSetIsLongCharacterMember(punct, c) ||
+         CFCharacterSetIsLongCharacterMember(sym, c);
+}
+
+bool
+ds_cjk_(uint32_t cp)
+{
+  return (cp >= 0x4E00 && cp <= 0x9FA5) || (cp >= 0x3040 && cp <= 0x309F) ||
+         (cp >= 0x30A0 && cp <= 0x30FF);
+}
+
+// Stage 3's match at `pos` of the piece [0, len): its byte length, 0 if
+// no alternative matches there.
+size_t
+deepseek_match_one_(const char* data, size_t len, size_t pos)
+{
+  auto at = [&](size_t p, size_t* cl) { return utf8_next_(data, len, p, cl); };
+  auto is_l = [](UCls c) {
+    return c == UCls::Upper || c == UCls::Lower || c == UCls::LetterOther;
+  };
+  auto is_lm = [&](uint32_t cp) {
+    const UCls c = uni_class_(cp);
+    return is_l(c) || c == UCls::Mark;
+  };
+  auto is_ws = [](uint32_t cp) { return uni_class_(cp) == UCls::Space; };
+  // the end of the maximal run of `pred` from p
+  auto run = [&](size_t p, auto pred) {
+    while (p < len) {
+      size_t cl;
+      if (!pred(at(p, &cl))) { break; }
+      p += cl;
+    }
+    return p;
+  };
+  size_t cl0;
+  const uint32_t c0 = at(pos, &cl0);
+  // A1: an ASCII punctuation mark, then ASCII letters
+  if (c0 < 0x80 && is_punct_sym_(c0)) {
+    const size_t e = run(pos + cl0, [](uint32_t c) {
+      return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    });
+    if (e > pos + cl0) { return e - pos; }
+  }
+  // A2: an optional lead (not CR / LF / L / P / S), then L / M
+  {
+    const UCls k0 = uni_class_(c0);
+    const bool lead = c0 != '\r' && c0 != '\n' && !is_l(k0) &&
+                      !is_punct_sym_(c0);
+    if (lead) {
+      const size_t e = run(pos + cl0, is_lm);
+      if (e > pos + cl0) { return e - pos; }
+    }
+    if (is_lm(c0)) { return run(pos, is_lm) - pos; }
+  }
+  // A3: an optional space, punctuation / symbols, then CR / LF
+  {
+    size_t p = pos;
+    if (c0 == ' ' && pos + 1 < len) {
+      size_t cl;
+      if (is_punct_sym_(at(pos + 1, &cl))) { p = pos + 1; }
+    }
+    const size_t e = run(p, [](uint32_t c) { return is_punct_sym_(c); });
+    if (e > p) {
+      return run(e, [](uint32_t c) { return c == '\r' || c == '\n'; }) -
+             pos;
+    }
+  }
+  if (!is_ws(c0)) { return 0; }
+  const size_t e = run(pos, is_ws);
+  // A4: whitespace through its last CR / LF
+  {
+    size_t last = std::string::npos;
+    for (size_t p = pos; p < e;) {
+      size_t cl;
+      const uint32_t c = at(p, &cl);
+      if (c == '\r' || c == '\n') { last = p + cl; }
+      p += cl;
+    }
+    if (last != std::string::npos) { return last - pos; }
+  }
+  // A5: whitespace not followed by a non-space: all of it at the piece's
+  // end, else all but its last character (if that leaves any)
+  if (e == len) { return e - pos; }
+  {
+    size_t prev = pos, p = pos;
+    while (p < e) {
+      size_t cl;
+      (void)at(p, &cl);
+      prev = p;
+      p += cl;
+    }
+    if (prev > pos) { return prev - pos; }
+  }
+  // A6
+  return e - pos;
+}
+
+vector<string>
+deepseek_pre_split_(string_view text)
+{
+  auto cps = [](string_view t, auto&& f) {
+    size_t p = 0;
+    while (p < t.size()) {
+      size_t cl;
+      const uint32_t c = utf8_next_(t.data(), t.size(), p, &cl);
+      f(p, cl, c);
+      p += cl;
+    }
+  };
+  // 1. numbers, isolated in runs of at most three
+  vector<string> s1;
+  {
+    string gap, num;
+    int nnum = 0;
+    cps(text, [&](size_t p, size_t cl, uint32_t c) {
+      if (uni_class_(c) == UCls::Number) {
+        if (!gap.empty()) { s1.push_back(std::move(gap)); gap.clear(); }
+        num.append(text.data() + p, cl);
+        if (++nnum == 3) {
+          s1.push_back(std::move(num));
+          num.clear();
+          nnum = 0;
+        }
+      } else {
+        if (!num.empty()) {
+          s1.push_back(std::move(num));
+          num.clear();
+          nnum = 0;
+        }
+        gap.append(text.data() + p, cl);
+      }
+    });
+    if (!gap.empty()) { s1.push_back(std::move(gap)); }
+    if (!num.empty()) { s1.push_back(std::move(num)); }
+  }
+  // 2. CJK / kana runs, isolated
+  vector<string> s2;
+  for (const string& piece : s1) {
+    string cur;
+    int kind = -1;                  // 1 inside a run, 0 outside
+    cps(piece, [&](size_t p, size_t cl, uint32_t c) {
+      const int k = ds_cjk_(c) ? 1 : 0;
+      if (k != kind && !cur.empty()) {
+        s2.push_back(std::move(cur));
+        cur.clear();
+      }
+      kind = k;
+      cur.append(piece.data() + p, cl);
+    });
+    if (!cur.empty()) { s2.push_back(std::move(cur)); }
+  }
+  // 3. the main split, matched per piece, gaps kept
+  vector<string> out;
+  for (const string& piece : s2) {
+    const char* d = piece.data();
+    const size_t n = piece.size();
+    size_t pos = 0, gap = 0;
+    while (pos < n) {
+      const size_t m = deepseek_match_one_(d, n, pos);
+      if (m == 0) {
+        size_t cl;
+        (void)utf8_next_(d, n, pos, &cl);
+        pos += cl;
+        continue;
+      }
+      if (pos > gap) { out.emplace_back(d + gap, pos - gap); }
+      out.emplace_back(d + pos, m);
+      pos += m;
+      gap = pos;
+    }
+    if (n > gap) { out.emplace_back(d + gap, n - gap); }
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -451,6 +879,9 @@ public:
   bool parse(const FlexData& root, string_view tag,
              const SessionContextIntf* session);
   bool load_gguf(const GgufFile& g, const SessionContextIntf* session);
+  bool load_tiktoken(string_view path,
+                     span<const string> specials,
+                     const SessionContextIntf* session);
 
   vector<int32_t> encode(string_view text) const;
   string          decode(span<const int32_t> ids) const;
@@ -459,7 +890,9 @@ public:
 
   int32_t     vocab_size() const noexcept { return _vocab_size; }
   bool        has_pre_tokenizer() const noexcept
-  { return _use_llama3_pre || !_pre_regexes.empty(); }
+  {
+    return _use_llama3_pre || _use_deepseek_pre || !_pre_regexes.empty();
+  }
   size_t      merge_count() const noexcept { return _merge_priority.size(); }
   size_t      special_count() const noexcept { return _special_by_name.size(); }
 
@@ -486,6 +919,28 @@ private:
   // that walks the seven alternatives of that regex directly, with
   // best-effort Unicode property classification.
   bool                                                      _use_llama3_pre = false;
+  // Mistral's Tekken split pattern (case-aware letter runs, single
+  // digits, no contractions); pre_tokenize_ hands it to
+  // tekken_match_one_. Takes precedence over _use_llama3_pre.
+  bool                                                      _use_tekken_pre = false;
+  // DeepSeek-V3 / V4's three-stage split (deepseek_pre_split_).
+  bool _use_deepseek_pre = false;
+  // BPE `ignore_merges` (Tekken sets it): a pre-token whose byte-level
+  // spelling is itself a vocab entry is emitted as that one token,
+  // without running the merges -- which need not reach it.
+  bool                                                      _ignore_merges = false;
+  // Longest digit run the scanner keeps in one pre-token: the Llama-3
+  // pattern spells \p{N}{1,3}, Qwen's spells a bare \p{N}. Left at 3
+  // for tokenizer.json (whose Qwen vocabularies carry no digit merges,
+  // so the two spellings agree there); a tiktoken rank file sets 1.
+  int                                                       _pre_digit_run = 3;
+  // tiktoken rank-file BPE (qwen.tiktoken): there is no merges list.
+  // The pair to merge is the adjacent pair whose CONCATENATION has the
+  // lowest rank, and a token's rank is its id -- so the priority is a
+  // vocab lookup and no merges table is built. Ids at or above
+  // `_n_ordinary` are specials and never take part.
+  bool                                                      _rank_merges = false;
+  int32_t                                                   _n_ordinary = 0;
   int32_t                                                   _vocab_size = 0;
 
   // SentencePiece-style metaspace mode (Gemma): a `Replace " " -> "▁"`
@@ -645,6 +1100,9 @@ Tokenizer::Impl::parse(const FlexData&            root,
     return false;
   }
   _unigram = (model_type == "Unigram");
+  if (model.contains("ignore_merges")) {
+    _ignore_merges = model.at("ignore_merges").as_bool(false);
+  }
 
   if (!model.contains("vocab")) {
     if (session) {
@@ -939,7 +1397,22 @@ Tokenizer::Impl::parse(const FlexData&            root,
     auto pre = rootobj.at("pre_tokenizer");
     vector<string> patterns;
     collect_split_regexes_(pre, &patterns);
+    // DeepSeek-V3 / V4: digits, then CJK runs, then the punctuation /
+    // symbol aware split -- the three as one hand-coded scanner.
+    if (patterns.size() == 3 && patterns[0] == "\\p{N}{1,3}" &&
+        patterns[1].rfind("[\u4e00-\u9fa5", 0) == 0 &&
+        patterns[2].find("[\\p{P}\\p{S}]") != string::npos) {
+      _use_deepseek_pre = true;
+      patterns.clear();
+    }
     for (const auto& p : patterns) {
+      // Mistral Tekken: the only pattern here that names the letter
+      // CASE classes (see tekken_match_one_).
+      if (p.find("\\p{Lu}") != string::npos
+          && p.find("\\p{Ll}") != string::npos) {
+        _use_tekken_pre = true;
+        continue;
+      }
       // Llama-3 / Qwen-2.5 family: \p{L}/\p{N} are not in
       // std::regex. Detect the pattern and hand the input to a
       // hand-coded scanner (see llama3_match_one_).
@@ -1039,6 +1512,68 @@ Tokenizer::Impl::load_gguf(const GgufFile& g,
   return !_vocab.empty();
 }
 
+bool
+Tokenizer::Impl::load_tiktoken(string_view path, span<const string> specials,
+                               const SessionContextIntf* session)
+{
+  const string path_str(path);
+  ifstream in(path_str, ios::binary);
+  if (!in) {
+    if (session) {
+      session->warn(fmt("Tokenizer::from_tiktoken('{}'): cannot open",
+                        path_str));
+    }
+    return false;
+  }
+  // One "<base64 bytes> <rank>" per line. The vocab is keyed in the
+  // byte-level alphabet like every other BPE here, so encode_chunk_ and
+  // the decoder need no tiktoken arm of their own.
+  string line;
+  int32_t max_rank = -1;
+  while (getline(in, line)) {
+    if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+    if (line.empty()) { continue; }
+    const auto sp = line.find(' ');
+    if (sp == string::npos) { return false; }
+    auto bytes = media_line::base64_decode(string_view(line).substr(0, sp));
+    if (!bytes) { return false; }
+    int32_t rank = -1;
+    try {
+      rank = static_cast<int32_t>(stol(line.substr(sp + 1)));
+    } catch (const exception&) {
+      return false;
+    }
+    if (rank < 0) { return false; }
+    const string tok = bytes_to_byte_level_(
+        string_view(reinterpret_cast<const char*>(bytes->data()),
+                    bytes->size()));
+    _vocab.emplace(tok, rank);
+    _inv_vocab.emplace(rank, tok);
+    max_rank = std::max(max_rank, rank);
+  }
+  if (max_rank < 0 || (size_t)(max_rank + 1) != _vocab.size()) {
+    if (session) {
+      session->warn(fmt(
+          "Tokenizer::from_tiktoken('{}'): {} ranks are not dense in "
+          "[0, {})", path_str, _vocab.size(), max_rank + 1));
+    }
+    return false;
+  }
+  _n_ordinary = max_rank + 1;
+  _vocab_size = _n_ordinary;
+  // Specials follow the ordinary ranks, in the order given.
+  for (const auto& name : specials) {
+    const int32_t id = _vocab_size++;
+    _special_by_name.emplace(name, id);
+    _special_by_id.emplace(id, name);
+  }
+  _rank_merges = true;
+  _use_llama3_pre = true;
+  _pre_digit_run = 1;
+  detect_thinking_markers_();
+  return true;
+}
+
 void
 Tokenizer::Impl::detect_thinking_markers_()
 {
@@ -1064,9 +1599,20 @@ Tokenizer::Impl::bpe_(vector<string>* pieces) const
     size_t best_idx = numeric_limits<size_t>::max();
     int32_t best_prio = numeric_limits<int32_t>::max();
     for (size_t i = 0; i + 1 < pieces->size(); ++i) {
-      auto it = _merge_priority.find({(*pieces)[i], (*pieces)[i + 1]});
-      if (it != _merge_priority.end() && it->second < best_prio) {
-        best_prio = it->second;
+      int32_t prio = numeric_limits<int32_t>::max();
+      if (_rank_merges) {
+        auto it = _vocab.find((*pieces)[i] + (*pieces)[i + 1]);
+        if (it != _vocab.end() && it->second < _n_ordinary) {
+          prio = it->second;
+        }
+      } else {
+        auto it = _merge_priority.find({(*pieces)[i], (*pieces)[i + 1]});
+        if (it != _merge_priority.end()) { prio = it->second; }
+      }
+      // Strictly less: the LEFTMOST of equal priorities merges first,
+      // which is also what tiktoken does.
+      if (prio < best_prio) {
+        best_prio = prio;
         best_idx  = i;
       }
     }
@@ -1197,6 +1743,13 @@ void
 Tokenizer::Impl::encode_chunk_(string_view chunk, vector<int32_t>* out) const
 {
   if (chunk.empty()) { return; }
+  if (_ignore_merges && !_metaspace) {
+    const auto it = _vocab.find(bytes_to_byte_level_(chunk));
+    if (it != _vocab.end()) {
+      out->push_back(it->second);
+      return;
+    }
+  }
   // Metaspace (Gemma): BPE on the raw UTF-8 (marker already substituted
   // for spaces); Llama/Qwen: GPT-2 byte-level encode first.
   auto pieces = _metaspace
@@ -1275,6 +1828,20 @@ Tokenizer::Impl::metaspace_decode_(const string& s) const
 vector<string>
 Tokenizer::Impl::pre_tokenize_(string_view text) const
 {
+  if (_use_deepseek_pre) { return deepseek_pre_split_(text); }
+  if (_use_tekken_pre) {
+    vector<string> out;
+    const char* data = text.data();
+    const size_t len = text.size();
+    size_t pos = 0;
+    while (pos < len) {
+      size_t n = tekken_match_one_(data, len, pos);
+      if (n == 0) { break; }
+      out.emplace_back(data + pos, n);
+      pos += n;
+    }
+    return out;
+  }
   if (_use_llama3_pre) {
     // Hand-coded scanner for the Llama-3 / Qwen-2.5 pre-tokenizer
     // regex. Walks the seven alternatives at each position; emits
@@ -1284,7 +1851,7 @@ Tokenizer::Impl::pre_tokenize_(string_view text) const
     const size_t len = text.size();
     size_t pos = 0;
     while (pos < len) {
-      size_t n = llama3_match_one_(data, len, pos);
+      size_t n = llama3_match_one_(data, len, pos, _pre_digit_run);
       if (n == 0) { break; }
       out.emplace_back(data + pos, n);
       pos += n;
@@ -1481,6 +2048,17 @@ Tokenizer::from_gguf(const GgufFile& gguf, const SessionContextIntf* session)
 {
   unique_ptr<Tokenizer> tok(new Tokenizer);
   if (!tok->_impl->load_gguf(gguf, session)) {
+    return nullptr;
+  }
+  return tok;
+}
+
+unique_ptr<Tokenizer>
+Tokenizer::from_tiktoken(string_view path, span<const string> specials,
+                         const SessionContextIntf* session)
+{
+  unique_ptr<Tokenizer> tok(new Tokenizer);
+  if (!tok->_impl->load_tiktoken(path, specials, session)) {
     return nullptr;
   }
   return tok;

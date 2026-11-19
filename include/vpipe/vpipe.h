@@ -7,7 +7,20 @@
 //   * SessionIntf     (vpipe/session-intf.h)
 //   * PipelineHandle, StageHandle, StagePortHandle
 //                     (vpipe/pipeline-handle.h)
+//   * CommandHandle, DataBuffer, BufferLayout -- commands to a running
+//     stage, with data in and out by reference
+//                     (vpipe/stage-command.h)
 //   * Status          (vpipe/status.h)
+//   * the live progress reports a host draws its own bars from
+//                     (SessionIntf::progress, as /api/io/progress)
+//   * SystemMonitor   the machine's load and GPU thermal verdict, as the
+//                     web UI's status bar and `vpipe --gpu-thermal` read
+//                     them (vpipe/system-monitor.h; included on its own:
+//                     it needs no session)
+//
+// Specs, configs and command arguments go in as JSON text, or -- for a
+// host that builds them in code -- as FlexData documents
+// (common/flex-data.h, from the SDK), with no text written or parsed.
 //
 // Everything else (the implementation classes, the Stage type tree,
 // internal helpers) lives under non-installed headers and is reached
@@ -22,6 +35,10 @@
 #define VPIPE_H
 
 #include "vpipe/session-manager.h"
+
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -41,5 +58,7 @@ const char* vpipe_version_number();
 const char* vpipe_build_hash();
 
 }
+
+VPIPE_API_END
 
 #endif

@@ -1,9 +1,15 @@
 #ifndef STAGES_MODEL_REGISTRY_H
 #define STAGES_MODEL_REGISTRY_H
 
+#include "common/flex-data.h"
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -16,6 +22,30 @@ class FlexData;
 // about where a model reference resolves. The leading underscores keep it
 // out of the way of the user-named sub-dbs (cameras, videos, ...).
 inline constexpr std::string_view kModelRegistryDb = "__vpipe_model_registry";
+
+// The directory the session's databases live in: where its LmdbEnv
+// actually opened, made absolute.
+//
+// NOT always the process CWD. A CLI run started inside the web-ui's
+// `sandbox` directory adopts the database beside it, one level up, so
+// that a pipeline authored in the web-ui resolves the same models from
+// either (see Session::lmdb_env). Anything anchored to the DATABASE --
+// the default parent for model directories, a registry record that
+// stored a relative path -- must be measured from here rather than from
+// the CWD, or a CLI run one directory down disagrees with the web-ui
+// about where the same name points.
+//
+// Opens the env if it is not open yet (that is what says where it is).
+// Falls back to the CWD when the session has none.
+std::filesystem::path
+session_db_dir(const SessionContextIntf* session);
+
+// `<session_db_dir>/models`: the default parent directory for model
+// directories this process WRITES -- model-fetch's downloads,
+// model-quantize's and lora-fuse's outputs. One spelling, so a fetch and
+// the quantize that reads it cannot land in different trees.
+std::filesystem::path
+default_models_dir(const SessionContextIntf* session);
 
 // Resolve a model reference to a directory. If `ref` is a key in the
 // model registry (kModelRegistryDb, the sub-db model-fetch writes, keyed
@@ -51,6 +81,9 @@ struct ResolvedModel {
   // cannot answer, and answers WRONGLY rather than loudly.
   std::vector<std::string> files;
   bool from_registry = false;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Resolve `ref` to a directory AND whatever the registry says about it.
@@ -62,6 +95,27 @@ resolve_model(const SessionContextIntf* session, const std::string& ref);
 std::string
 resolve_model_dir(const SessionContextIntf* session,
                   const std::string&        ref);
+
+// The directory the record's pinned files actually live in.
+//
+// `dir` is where the repo was downloaded, and a record may pin a SUBTREE
+// of it rather than the whole thing. VDN-H3's two stages are published
+// from one repo as `stage-b-step-2000/...` and `stage-dmd-step-250/...`,
+// so both keys resolve to the same root and only the pinned paths say
+// which subtree was meant -- a consumer handed the root finds neither
+// stage's config and reports the repo as malformed.
+//
+// Returns `dir` joined with the common DIRECTORY prefix of the pinned
+// paths, and `dir` unchanged when they share none: a whole-repo fetch, a
+// plain filesystem path, and every record whose files sit at the top all
+// answer the same as before.
+//
+// OPT-IN, not folded into resolve_model_dir(), because "the directory
+// the files are in" is not always "the directory the consumer wants" --
+// a record pinning only `transformer/*.safetensors` of a multi-component
+// repo pins a subtree whose consumer still wants the root next to it.
+std::string
+resolved_subtree_dir(const ResolvedModel& rm);
 
 // True when `ref` resolves (via resolve_model_dir) to a path that exists
 // on disk -- i.e. the model is actually present, not just a registry key
@@ -77,7 +131,9 @@ model_dir_available(const SessionContextIntf* session,
 // Resolve a reference to ONE `.safetensors` -- an adapter, which is a
 // file where every other model reference here is a directory.
 //
-// Three shapes, in order: a direct path to a file; a registry key, whose
+// Three shapes, in order: a direct path to a file (under the web-ui's
+// file sandbox, a path in the sandbox's own "/"-rooted tree is tried
+// first -- it is what that UI's file browser writes); a registry key, whose
 // record NAMES its file (the only thing that disambiguates two records
 // over one directory -- both MiniMax-H3 Turbo checkpoints are published
 // from one repo and land side by side); and a bare directory, scanned
@@ -103,5 +159,7 @@ apply_model_select_beat(const FlexData& beat,
                         std::string&    hf_dir);
 
 }
+
+VPIPE_API_END
 
 #endif

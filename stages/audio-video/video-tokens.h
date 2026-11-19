@@ -41,6 +41,21 @@ struct VideoStreamParams {
   int        pix_fmt    = AV_PIX_FMT_NONE;   // AVPixelFormat as int
   AVRational time_base  = {0, 1};
   AVRational frame_rate = {0, 1};
+  // WHAT THE YUV MEANS, carried so the sink can TAG the file instead of
+  // leaving a reader to guess. An untagged stream is read by convention
+  // -- limited range, and the matrix picked from the frame height --
+  // and a producer that disagrees with that convention is invisible
+  // until something decodes its output and gets flat, hue-tilted RGB.
+  int        color_range = AVCOL_RANGE_UNSPECIFIED;
+  int        colorspace  = AVCOL_SPC_UNSPECIFIED;
+  // The other two thirds of the colour description. A wrong matrix
+  // tilts hue outright; these decide how a colour-managed player maps
+  // the result onto its display, so leaving them unspecified is the
+  // smaller error of the same kind -- the reader falls back on
+  // convention, and for an untagged HD file that convention is BT.709
+  // whatever the matrix actually was.
+  int        color_primaries = AVCOL_PRI_UNSPECIFIED;
+  int        color_trc       = AVCOL_TRC_UNSPECIFIED;
 };
 
 struct AudioStreamParams {

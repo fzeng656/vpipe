@@ -2,12 +2,14 @@
 #include "apple-silicon/metal-compute/buffer-view.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "apple-silicon/metal-compute/wire-on-alloc.h"
 #include "common/session.h"
 
 #include <Metal/Metal.hpp>
 
 #include <cstdint>
 #include <cstring>
+#include <thread>
 #include <utility>
 
 using namespace vpipe;
@@ -371,4 +373,76 @@ TEST(metal_compute_shared_buffer, parked_state_survives_a_move) {
   EXPECT_TRUE(assigned.is_inactive());
   EXPECT_TRUE(assigned.reactivate());
   EXPECT_FALSE(assigned.is_inactive());
+}
+
+// WireOnAlloc counts what ITS thread's scope wired and still holds -- the
+// figure the model manager charges to the wired pool: a buffer kept counts,
+// a temporary freed inside the scope does not, and neither does anything
+// another thread wires meanwhile (a concurrently initializing peer, by its
+// own scope or by hand). A process-wide wired delta took all three in.
+TEST(metal_compute_shared_buffer, wire_on_alloc_counts_its_own_live_buffers) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+  constexpr std::size_t kMB = std::size_t{1} << 20;
+  WireOnAlloc scope;
+  SharedBuffer kept = mc->make_shared_buffer(8 * kMB);
+  ASSERT_TRUE(!kept.empty());
+  if (!kept.is_wired()) { return; }   // mlock refused here: nothing to count
+  {
+    SharedBuffer tmp = mc->make_shared_buffer(4 * kMB);
+    EXPECT_TRUE(tmp.is_wired());
+  }
+  SharedBuffer peer_scoped, peer_manual;
+  std::thread([&] {
+    WireOnAlloc theirs;
+    peer_scoped = mc->make_shared_buffer(16 * kMB);
+    peer_manual = mc->make_shared_buffer(16 * kMB);
+    (void)peer_manual.set_wired(true);
+  }).join();
+  EXPECT_TRUE(peer_scoped.is_wired());
+  // Under kMinBytes it is a heap slice or not worth a syscall: unwired.
+  SharedBuffer small = mc->make_shared_buffer(16 * 1024);
+  EXPECT_TRUE(!small.is_wired());
+  EXPECT_TRUE(scope.wired_bytes() == 12 * kMB);   // the temporary included
+  EXPECT_TRUE(scope.live_bytes() == 8 * kMB);     // only what it kept
+  // Freed while the scope is still open: no longer the scope's.
+  kept = SharedBuffer{};
+  EXPECT_TRUE(scope.live_bytes() == 0);
+}
+
+// A scope's ROOM -- the wired pool's, for a language model's load: a buffer
+// that would take what the scope holds wired past it is left unwired and
+// counted as held back; one freed gives its room back; an inner scope's
+// smaller room is the one in force, the outer's again after it.
+TEST(metal_compute_shared_buffer, wire_on_alloc_wires_within_its_room) {
+  Session s;
+  MetalCompute* mc = get_mc_(s);
+  if (mc == nullptr) { return; }
+  constexpr std::size_t kMB = std::size_t{1} << 20;
+  WireOnAlloc scope(12 * kMB);
+  SharedBuffer a = mc->make_shared_buffer(8 * kMB);
+  ASSERT_TRUE(!a.empty());
+  if (!a.is_wired()) { return; }   // mlock refused here: nothing to count
+  SharedBuffer over = mc->make_shared_buffer(8 * kMB);
+  EXPECT_TRUE(!over.empty());
+  EXPECT_TRUE(!over.is_wired());
+  SharedBuffer fits = mc->make_shared_buffer(4 * kMB);
+  EXPECT_TRUE(fits.is_wired());
+  EXPECT_TRUE(scope.live_bytes() == 12 * kMB);
+  EXPECT_TRUE(WireOnAlloc::live_now() == 12 * kMB);
+  EXPECT_TRUE(scope.held_back_bytes() == 8 * kMB);
+  a = SharedBuffer{};
+  SharedBuffer again = mc->make_shared_buffer(8 * kMB);
+  EXPECT_TRUE(again.is_wired());
+  {
+    WireOnAlloc inner(0);
+    SharedBuffer none = mc->make_shared_buffer(kMB);
+    EXPECT_TRUE(!none.is_wired());
+    EXPECT_TRUE(inner.held_back_bytes() == kMB);
+  }
+  fits = SharedBuffer{};
+  SharedBuffer after = mc->make_shared_buffer(4 * kMB);
+  EXPECT_TRUE(after.is_wired());
+  EXPECT_TRUE(scope.held_back_bytes() == 9 * kMB);
 }

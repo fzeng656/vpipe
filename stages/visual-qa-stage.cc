@@ -7,6 +7,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -16,6 +17,8 @@
 #if defined(VPIPE_BUILD_APPLE_SILICON)
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/tokenizer.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/tensor-beat-bridge.h"
@@ -184,6 +187,14 @@ VisualQaStage::VisualQaStage(const SessionContextIntf* s,
 }
 
 namespace {
+// A question's turn beside its answer (max_new_tokens), in tokens: the
+// rendered user turn and the generation prompt, for what a branch adds.
+constexpr std::int64_t kQuestionTurnTokens = 256;
+// The compute precisions the LM loader accepts, for the editor's
+// dropdown; the loader stays the authority.
+constexpr SpecExtra kComputeDtypeChoices[] = {
+  {spec_key::kChoices, "bf16,f16,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "VLM model: a models-DB key (registered by model-fetch) or an "
@@ -195,7 +206,8 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "CoreML compute units (0=CPU,1=+GPU,2=All,3=+ANE)",
    .def_int = 2},
   {.key = "compute_dtype", .type = ConfigType::String,
-   .doc = "bf16 | f16 | f32", .def_str = "bf16"},
+   .doc = "bf16 | f16 | f32", .def_str = "bf16",
+   .extra = kComputeDtypeChoices},
   {.key = "page_tokens", .type = ConfigType::Int,
    .doc = "ContextManager K/V page size", .def_int = 512},
   {.key = "max_pages", .type = ConfigType::Int,
@@ -260,6 +272,20 @@ VisualQaStage::spec() const noexcept
 
 VisualQaStage::~VisualQaStage() = default;
 
+#if defined(VPIPE_BUILD_APPLE_SILICON)
+const char*
+VisualQaStage::tower_name_() const
+{
+  if (_m_coreml) { return "coreml"; }
+  if (_mgvis)    { return "metal-gemma4"; }
+  if (_mpix)     { return "metal-pixtral"; }
+  if (_mlfm)     { return "metal-lfm3"; }
+  if (_mguni)    { return "gemma4-unified"; }
+  if (_mvis)     { return "metal-tower"; }
+  return "none";
+}
+#endif
+
 std::vector<ServiceReq>
 VisualQaStage::declare_services() const
 {
@@ -294,8 +320,19 @@ std::vector<ResourceClaim>
 VisualQaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return model_memory::weight_claims(
-      {resolve_model_dir(session(), _hf_dir)});
+  // The LM (streamable when it is a Mixture of Experts), what it runs in
+  // -- the picture's context in the page pool and a branch of it per
+  // question, its turn and answer -- and its vision tower at the largest
+  // picture the checkpoint admits.
+  genai::LmRunShape run;
+  run.page_tokens = _page_tokens;
+  run.max_pages = _max_pages;
+  run.kv_tokens = (std::int64_t)_page_tokens * (std::int64_t)_max_pages;
+  run.contexts = 1 + (int)_questions.size();
+  run.branch_tokens = (std::int64_t)_max_new_tokens + kQuestionTurnTokens;
+  run.i8_prefill = _i8_prefill;
+  return model_memory::lm_claims(
+      session(), resolve_model_dir(session(), _hf_dir), id(), run);
 }
 
 Job
@@ -330,10 +367,11 @@ VisualQaStage::initialize(RuntimeContext& ctx)
     co_return;
   }
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs. No-op
-  // on backends without the route; env VPIPE_I8_GEMM overrides.
-  if (_i8_prefill) { _lm->set_i8_prefill(true); }
+  // on backends without the route; env VPIPE_I8_GEMM overrides. Asked off
+  // too: a warm model comes as the last stage left it (text-chat's note).
+  _lm->request_i8_prefill(_i8_prefill, mgr->launch_epoch());
   _chat_tpl = genai::make_chat_template(
-      _lm->config().architecture, _lm->tokenizer(), _disable_thinking);
+      _lm->config(), _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
     session()->warn(fmt(
         "VisualQaStage('{}'): [metal] no chat template for '{}'; "
@@ -341,9 +379,11 @@ VisualQaStage::initialize(RuntimeContext& ctx)
   }
   _mvis  = _lm->metal_vision_encoder();
   _mgvis = _lm->metal_gemma4_vision_encoder();
+  _mpix  = _lm->metal_pixtral_vision_encoder();
+  _mlfm  = _lm->metal_lfm3_vision();
   _mguni = _lm->gemma4_unified_embedder();
   if (_mguni && !_mguni->has_vision()) { _mguni = nullptr; }
-  if (!_mvis && !_mgvis && !_mguni) {
+  if (!_mvis && !_mgvis && !_mpix && !_mlfm && !_mguni) {
     session()->warn(fmt(
         "VisualQaStage('{}'): [metal] no metal vision tower (model has "
         "no vision config?); every round will drop", this->id()));
@@ -379,10 +419,7 @@ VisualQaStage::initialize(RuntimeContext& ctx)
       "VisualQaStage('{}'): [metal/no-MLX] model ready ({} layers, "
       "vocab={}, vision={})", this->id(), _lm->config().n_layers,
       _lm->config().vocab_size,
-      _m_coreml ? "coreml"
-                : (_mvis ? "metal-tower"
-                         : (_mgvis ? "metal-gemma4"
-                                   : (_mguni ? "gemma4-unified" : "none")))));
+      tower_name_()));
 #else
   session()->error(fmt(
       "VisualQaStage('{}'): this build was compiled without "
@@ -433,7 +470,7 @@ VisualQaStage::process(RuntimeContext& ctx)
   }
   const int H = static_cast<int>(tbp->shape[1]);
   const int W = static_cast<int>(tbp->shape[2]);
-  if (_m_coreml || _mvis || _mgvis || _mguni) {
+  if (_m_coreml || _mvis || _mgvis || _mpix || _mlfm || _mguni) {
     if (_video_enabled && !_m_video_warned) {
       session()->warn(fmt(
           "VisualQaStage('{}'): [metal] video 2:1 temporal merge is not "
@@ -485,6 +522,21 @@ VisualQaStage::process(RuntimeContext& ctx)
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h;
       m.mw         = r.grid_w;
+    } else if (_mlfm) {
+      // LFM3-VL: one row an <|image|> placeholder, 1-D positions.
+      auto r = _mlfm->encode(rgb, H, W);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
+    } else if (_mpix) {
+      // Pixtral: the rows include the image's [IMG_BREAK] / [IMG_END]
+      // rows, one placeholder each; 1-D RoPE (the grid is informational).
+      auto r = _mpix->encode(rgb, H, W);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
     } else if (_mguni) {
       // Gemma-4-12B "unified": encoder-less shallow embedder. Host-f32 rows
       // ([n_tokens, H]) routed through the TokenRef embeddings_host splice.
@@ -508,10 +560,7 @@ VisualQaStage::process(RuntimeContext& ctx)
     session()->info(fmt(
         "VisualQaStage('{}'): [metal] vision encode ({}) {}x{} -> {} tok "
         "in {:.3f} s", this->id(),
-        _m_coreml ? "coreml"
-                  : (_mgvis ? "metal-gemma4"
-                            : (_mguni ? "gemma4-unified" : "metal-tower")),
-        W, H, m.n_tokens, ve_s));
+        tower_name_(), W, H, m.n_tokens, ve_s));
     if (m.n_tokens > 0 &&
         (!m.embeddings.empty() || !m.embeddings_host.empty())) {
       _m_imgs.push_back(std::move(m));
@@ -597,12 +646,9 @@ VisualQaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
   // pdecode loop (greedy) or decode_pipelined (sampling -- the verify samples
   // each position). rope is anchored on ctx (post-image mROPE after a
   // multimodal prefill, or sequential after the per-question text prefill)
-  // exactly as pdecode_begin reads it. Greedy OR penalty-free sampling -- the
-  // verify applies no repetition/presence penalty, so a penalised sampler stays
-  // on the loops below.
-  const bool mtp_ok = cur >= 0 && _lm->mtp_available()
-      && (genai::Sampler(sp).is_argmax()
-          || (sp.repetition_penalty == 1.0f && sp.presence_penalty == 0.0f));
+  // exactly as pdecode_begin reads it. Penalties apply as pdecode's do, its
+  // seen-set primed from the first token alone (no text prompt) here too.
+  const bool mtp_ok = cur >= 0 && _lm->mtp_available();
   if (mtp_ok) {
     auto is_stop = [tpl](std::int32_t id) {
       return tpl && tpl->is_stop_token(id);
@@ -740,6 +786,7 @@ VisualQaStage::m_run_round_()
       genai::TokenRef r;
       if (id == image_pad && img_idx < _m_imgs.size()) {
         r.kind = genai::TokenRef::Kind::ImageTokens;
+        r.text_id = id;
         // gemma4_unified: host-f32 rows; else native-f16 SharedBuffer.
         if (!_m_imgs[img_idx].embeddings_host.empty()) {
           r.embeddings_host = &_m_imgs[img_idx].embeddings_host;

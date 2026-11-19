@@ -39,6 +39,12 @@ namespace vpipe {
 // / `end_utc` / `duration_us` describe the GOP's wall-clock window;
 // `path` is the parent segment's mp4 path (consumers can also look
 // it up via `db_key`).
+// Metadata key under which a container vpipe wrote records the TRUE
+// (unpadded) audio sample count. Reverse-DNS, because mp4 carries an
+// arbitrary key only in the QuickTime `mdta` form.
+inline constexpr const char* kAudioSamplesMetaKey =
+    "com.tgo.vpipe.audio_samples";
+
 struct EncodedSegment {
   enum class Kind { Video, Audio };
 
@@ -67,6 +73,77 @@ struct EncodedSegment {
   unsigned    fps_den     = 0;            // video only
   unsigned    sample_rate = 0;            // audio only
   unsigned    channels    = 0;            // audio only
+
+  // AUDIO GAPLESS BOOKKEEPING, in samples at `sample_rate`.
+  //
+  // A block codec cannot encode an arbitrary length. AAC emits whole
+  // 1024-sample frames and primes its decoder with a frame of silence,
+  // so a decoded stream carries padding at BOTH ends: `skip_head`
+  // samples of encoder priming before the first real sample, and
+  // whatever it took to round the tail up to a whole frame after the
+  // last one. Played alone that is inaudible; CONCATENATED it is a gap
+  // at every join, which is what a multi-part video hears.
+  //
+  // The container knows the priming (`initial_padding`) but NOT the
+  // true length -- an mp4's audio duration is the PADDED count. So the
+  // writer records the true count and the reader trims to it. 0 means
+  // "not known", and nothing is trimmed at that end.
+  // Which JOINED part this packet came from, 0 when there is only one.
+  // `skip_head` / `total_samples` describe THAT part, so a consumer
+  // counting samples has to restart its count when this changes.
+  unsigned     part_index   = 0;
+  std::int64_t skip_head    = 0;          // audio only, encoder priming
+  std::int64_t total_samples = 0;         // audio only, true length
+
+  // Whether this packet can START a decode, i.e. the container's
+  // AV_PKT_FLAG_KEY. Video only.
+  //
+  // For H.264 the consumer does NOT read this -- it scans the access
+  // unit for an IDR NAL instead, because the live source (rtsp-capture)
+  // has no container to ask and delivers SPS/PPS/IDR in-band. For every
+  // OTHER codec that scan is meaningless: FFV1 has no NAL framing at
+  // all, so a gate written against H.264's returns false forever and
+  // the decoder never starts. See video-to-rgb's sync gate.
+  //
+  // DEFAULTS TRUE, and the default is the safe direction: a producer
+  // that does not know must not be able to stall a decoder for the
+  // length of a stream. The cost of guessing true on a long-GOP codec
+  // is a few bad frames until the next real keyframe; the cost of
+  // guessing false is silence.
+  bool       key_frame = true;
+
+  // WHAT THE CONTAINER SAYS THE YUV MEANS, video only, as AVCOL_* ints.
+  //
+  // Carried because the bitstream is not the only place it lives and a
+  // decoder built from `extradata` alone can only ever see the other
+  // one. H.264 may put a colour description in the SPS VUI, and when it
+  // does that wins -- but plenty of files tag only the container (mp4's
+  // `colr` box, matroska's colour elements), and for those the VUI is
+  // silent and this is the whole of the answer. ffmpeg's own decode
+  // seeds the codec context from the container and lets the VUI
+  // overwrite it, which is the behaviour these fields exist to
+  // reproduce.
+  //
+  // UNSPECIFIED is the honest default and what every producer that does
+  // not know writes: the reader then falls back on convention, which is
+  // where a wrong answer becomes a hue tilt nothing reports.
+  int color_range     = 0;   // AVCOL_RANGE_UNSPECIFIED
+  int colorspace      = 2;   // AVCOL_SPC_UNSPECIFIED
+  int color_primaries = 2;   // AVCOL_PRI_UNSPECIFIED
+  int color_trc       = 2;   // AVCOL_TRC_UNSPECIFIED
+
+  // HOW FAR THE STREAM REORDERS, video only: frames a decoder must hold
+  // before its first output (AVCodecParameters::video_delay), as the
+  // demuxer measured it. 0 = not known.
+  //
+  // Carried for the same reason as the colour above. An H.264 SPS
+  // without VUI bitstream_restriction -- VideoToolbox writes none --
+  // leaves the decoder guessing a delay of 1, and on a deeper B-pyramid
+  // it discovers its mistake one frame late and DROPS the picture that
+  // came out of order. MEASURED: an h264_videotoolbox file with bf=2
+  // lost frame 1 of 33 through video-to-rgb (both slots) while ffmpeg,
+  // whose decoder is seeded from the stream, decoded all 33.
+  int video_delay = 0;
 
   std::vector<uint8_t> extradata;
   std::vector<uint8_t> data;

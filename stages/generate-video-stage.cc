@@ -1,13 +1,22 @@
+#include "stages/minimax-h3-image-host.h"
 #include "stages/generate-video-stage.h"
+#include "generative-models/shared/torch-randn.h"
+#include "generative-models/gen-input.h"
+#include "generative-models/tensor-parallel.h"
+#include "common/host-report.h"
+#include "common/beat-keys.h"
+#include "common/flex-bag.h"
 
 #include "apple-silicon/tensor-beat.h"
 #include "common/beat-payload-intf.h"
 #include "common/flex-data.h"
+#include "common/oport-policy.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-config-source.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/denoise-progress.h"
 #include "stages/model-provenance.h"
@@ -17,11 +26,18 @@
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "generative-models/generative-model-manager.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-audio-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
+#include "generative-models/minimax-h3/minimax-h3-scheduler.h"
+#include "generative-models/minimax-h3/minimax-h3-taomate.h"
+#include "generative-models/shared/motion-cache.h"
 #include "generative-models/wan/metal-wan-vae.h"
 #include "generative-models/weight-set.h"
+#include "generative-models/llama3/metal-llama-weights.h"
 #endif
 
 #include <algorithm>
+#include <exception>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -35,22 +51,111 @@
 #include <vector>
 
 namespace vpipe {
+namespace {
+
+// The warm hold's kind for MiniMax-H3's DiT (keep_model_warm).
+constexpr const char* kWarmH3 = "minimax-h3-dit";
+
+}  // namespace
 
 namespace {
 
+// The margin kept on reclaimable RAM. The WORKING-SET margin is
+// deliberately NOT here: over-allocating wired Metal memory is the failure
+// that takes the machine down rather than slowing it, so that cushion stays
+// where it is.
+//
+// How much memory the clip may plan to displace into swap is the session's
+// `swap_allowance_mb`, read from the manager at the gate -- a setting an
+// operator can change from the CLI or the Settings panel, not a file-static
+// here. See GenerativeModelManager::set_swap_allowance_bytes.
+double video_phys_margin_()
+{
+  static const double v = [] {
+    const char* e = std::getenv("VPIPE_VIDEO_PHYS_MARGIN_PCT");
+    const double pct = e != nullptr ? std::atof(e) : 5.0;
+    return pct >= 0.0 && pct < 50.0 ? pct / 100.0 : 0.05;
+  }();
+  return v;
+}
+
+// How many MiniMax-H3 runtime-LoRA slots this stage carries beats for:
+// the stages' one count (stages/lora-slots.h), which this file's slot
+// bookkeeping can see outside the Apple-Silicon guard. It must equal
+// MetalMiniMaxH3Transformer::kMaxLoraSlots, asserted where that header
+// exists: fewer leaves slots unreachable, more names adapters the DiT
+// warns about and drops.
+constexpr int kH3LoraSlots = lora_slots::kSlots;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+static_assert(kH3LoraSlots ==
+                  genai::MetalMiniMaxH3Transformer::kMaxLoraSlots,
+              "stages/lora-slots.h and the H3 DiT disagree on the slots");
+#endif
+
+// The most VDN's softmax half may reach, in chunks either side
+// (`vdn_range`, `vdn_range_steps`): the DiT's cap, where its window
+// bounds stay inside an int and already cover any clip. Asserted where
+// that header exists, as the slot count above is.
+constexpr int kVdnMaxRange = 1024;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+static_assert(kVdnMaxRange ==
+                  genai::MetalMiniMaxH3Transformer::kVdnMaxRadius,
+              "generate-video and the H3 DiT disagree on VDN's reach");
+#endif
+
+// What THIS stage implements: a two-way decision (destroy or keep, else
+// resolve from the box). "park" would land in the `auto` branch and mean
+// something other than what it says, so it is not offered. The legacy
+// "always" / "never" stay accepted and show as unlisted.
+constexpr SpecExtra kUnloadChoices[] = {
+  {spec_key::kChoices, "auto,destroy,keep"},
+};
+constexpr SpecExtra kSolThreshChoices[] = {
+  {spec_key::kChoices, "diag,exact"},
+};
+constexpr SpecExtra kI8TierChoices[] = {
+  {spec_key::kChoices, "accurate,fast,token,token_plain"},
+};
+constexpr SpecExtra kAneInt8TierChoices[] = {
+  {spec_key::kChoices, "token,token_plain"},
+};
+constexpr SpecExtra kSeedSequenceExtra[] = {
+  {spec_key::kChoices, kSeedSequenceChoices},
+};
 const ConfigKey kAttrs[] = {
+  {.key = "autotune", .type = ConfigType::Bool,
+   .doc = "whether the models' kernel tuners MEASURE (int8 split-K, GEMM "
+          "routes and tiles, a VAE's conv route and mid-attention, a "
+          "backbone's attention sets): false takes the choice believed "
+          "fastest on this GPU, timing nothing and reading no kept answer, "
+          "so a run repeats (accel-keys.h kAutotune). Default true",
+   .def_bool = true},
   {.key = "hf_dir", .type = ConfigType::String, .required = false,
-   .doc = "video model root -- Wan (transformer/, transformer_2/, vae/, "
-          "text_encoder/) or a MiniMax-H3 repack (diffusion_models/, vae/, "
-          "audio_vae/, text_encoders/). OPTIONAL: a model-select source on "
-          "the model iport overrides it",
+   .doc = "video model root. The layout is the resident family's own -- an "
+          "upstream tree of per-component directories, or a repack that "
+          "names them differently -- and each registered family claims the "
+          "roots it recognises, so this takes the checkpoint root and the "
+          "family that claims it decides. OPTIONAL: a model-select source "
+          "on the model iport overrides it",
    .suggest_db = kModelRegistryDb,
-   .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va"},
+   .suggest_db_type = "wan-i2v,wan-t2v,minimax-h3-fl2va,minimax-h3-ref2va,"
+                      "minimax-h3-image",
+   .model_channel = "diffusion-model"},
+  {.key = "dit_dir", .type = ConfigType::String, .required = false,
+   .doc = "MiniMax-H3 only: a DiT checkpoint to run in place of the one "
+          "under hf_dir, whose text encoder and VAEs are still used -- a "
+          "single .safetensors (a Comfy-Org repack, or the diffusers "
+          "naming, e.g. lightx2v's FP8 turbo DiT, read as it is with FP8 "
+          "kept FP8), a Draw Things .ckpt (its i8x codes run as stored on "
+          "i8_gemm_tier token_plain) or a transformer directory. Empty: "
+          "the one hf_dir holds",
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "minimax-h3-dit,minimax-h3-fl2va,minimax-h3-ref2va",
+   .is_path = true, .path_filter = "*.safetensors,*.ckpt"},
   {.key = "height", .type = ConfigType::Int, .required = false,
-   .doc = "video height in pixels. ROUNDED UP to the family's VAE stride "
-          "times its DiT patch -- 16 for wan (8x VAE, 2x patch), 32 for "
-          "minimax-h3 (16x VAE, 2x patch) -- so any positive value is "
-          "accepted and the stage logs what it used",
+   .doc = "video height in pixels. ROUNDED UP to the resident family's VAE "
+          "stride times its DiT patch, which differs per family, so any "
+          "positive value is accepted and the stage logs what it used",
    .def_int = 480},
   {.key = "width", .type = ConfigType::Int, .required = false,
    .doc = "video width in pixels; same multiple as height", .def_int = 832},
@@ -60,78 +165,489 @@ const ConfigKey kAttrs[] = {
           "number is accepted here", .def_int = 81},
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate stamped on the emitted latent, for the decoder and the "
-          "encoder downstream of it", .def_real = 16.0},
+          "encoder downstream of it. This stage does not resample: the value "
+          "describes the clip the family generated, so a family conditioned "
+          "at another rate wants it set",
+   .def_real = 24.0},
   {.key = "steps", .type = ConfigType::Int, .required = false,
-   .doc = "denoising steps", .def_int = 40},
+   .doc = "denoising steps, each one forward of the model (two under "
+          "classifier-free guidance) -- counted the way diffusers' "
+          "num_inference_steps and ComfyUI's steps count them. A family "
+          "that ships its own grid runs that instead: a flow-map adapter, "
+          "or an adapter whose manifest states a sampling contract (Pika "
+          "H3 Flex's six steps)",
+   .def_int = 40},
   {.key = "seed", .type = ConfigType::Int, .required = false,
-   .doc = "initial-noise RNG seed (default 0)"},
+   .doc = "initial-noise RNG seed (default 0). The run's FIRST clip uses "
+          "it; `seed_sequence` decides what later ones use"},
+  {.key = "seed_sequence", .type = ConfigType::String, .required = false,
+   .doc = "the seed of each clip when a run makes several -- a prompt per "
+          "beat, a folder of first frames. \"increment\" (default): "
+          "`seed`, then `seed`+1, `seed`+2, ... in generation order, so any "
+          "one of them can be re-run alone by setting its number. "
+          "\"randomize\": ignore `seed` and draw each from the clock; "
+          "every seed used is logged, and fits the `seed` field for a "
+          "re-run. \"keep\": `seed` for every clip, which compares prompts "
+          "on the same noise",
+   .def_str = "increment", .extra = kSeedSequenceExtra},
+  {.key = "i8_gemm_tier", .type = ConfigType::String, .required = false,
+   .doc = "which int8 GEMM i8_gemm runs: 'accurate' (default; groups "
+          "of 64 on both operands, Hadamard-rotated where a bf16 weight is "
+          "quantized per call), "
+          "'fast' (the block weights held as rotated int8 at a coarse "
+          "group), 'token' (int8 per weight row x per token after a "
+          "256-wide Hadamard rotation: the fastest) or 'token_plain' (the "
+          "same unrotated, which reads a Draw Things i8x checkpoint's "
+          "codes as stored). Taken by minimax-h3; others run accurate. "
+          "Env VPIPE_I8_TIER overrides",
+   .def_str = "accurate", .extra = kI8TierChoices},
+  {.key = "tensor_parallel", .type = ConfigType::Object, .required = false,
+   .doc = "this stage as one RANK of a MiniMax H3 DiT split across hosts "
+          "(generative-models/tensor-parallel.h): {rank, ranks, heads: "
+          "[first, end], ffn: [first, end] -- unsaid, an even split -- "
+          "transport: the name a plugin registered its transport under, "
+          "params: that transport's own, passed through; min_band_rows: "
+          "the fewest rows a band takes, stated alike to every rank; "
+          "prompt_bands: true bands a prompt longer than a band (unsaid, "
+          "its blocks run whole), stated alike to every rank and only to "
+          "peers listing tensor-parallel-prompt-bands/1}. The "
+          "rank holds its share of every block's projections -- streamed, "
+          "then kept as the box allows -- and adds the other ranks' "
+          "partial sums through the transport twice a block, a long "
+          "sequence's band by band under the next band's work. Dense or "
+          "affine weights; adapters, the int8 tiers and the ANE tier take "
+          "the share's widths (the ANE splitting each band's rows with the "
+          "GPU, its bands a rank's without it); no VDN or TaoMate"},
   {.key = "i8_gemm", .type = ConfigType::Bool, .required = false,
    .doc = "accelerated mode (LOSSY): dynamic-int8 GEMMs for the DiT's big "
-          "block matmuls instead of bf16, at int8 quality. Taken only by a "
+          "block matmuls instead of bf16, at int8 quality. Independent of "
+          "`sol_attn` below and settable with it -- this chooses how the "
+          "GEMMs are computed, that one how the attention between them "
+          "is.  Taken only by a "
           "family whose forward materializes a dense weight for the matrix "
-          "cores -- minimax-h3 today; wan is steel-only and IGNORES it, as "
-          "does any box without NAX matmul2d. It also self-gates on ROWS "
+          "cores; a steel-only family IGNORES it, as does any box without "
+          "NAX matmul2d. It also self-gates on ROWS "
           "(>= 1024), so a short clip keeps the bf16 tiles either way, and "
           "on how much a projection would have to be zero-padded to reach a "
           "whole int8 chunk (refused past 10% extra MACs). "
           "MEASURED on minimax-h3, 2 blocks at production geometry: 2.02-2.11 "
           "s/step -> 1.52-1.55 s (1.35x), with the step's velocity rms moving "
-          "0.11%. Default false; env VPIPE_I8_GEMM overrides",
+          "0.11%. "
+          "WITH A VDN `linear_branch` ATTACHED this reaches it twice, which "
+          "a separately-fetched checkpoint does not obviously imply. Its "
+          "output projection is run by the DiT's own GEMM at the o_proj's "
+          "exact shape, so it takes the same route; and the branch reads the "
+          "DiT's q/k/v, which are themselves int8 by then. What the branch "
+          "computes INSIDE itself is not affected -- its statistics, solve "
+          "and readout have no int8 arm. Its per-frame A stays invertible "
+          "regardless, being a Gram matrix whatever noise its input carries. "
+          "Default false; env VPIPE_I8_GEMM overrides",
    .def_bool = false},
+  // ---- SageAttention (thu-ml, arXiv:2410.02367) ---------------------
+  {.key = "ane_ffn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated FFN (LOSSY, fp16): run the block feed-forward on "
+          "the Apple Neural Engine, which on an M4 is the only unused "
+          "compute on the die -- the GPU's f16 GEMM already sits at "
+          "84-92% of roofline and its integer MAD is a QUARTER of the "
+          "f16 rate, so there is no int8 lever there. The rows are split "
+          "between the two engines and run concurrently. The ANE runs "
+          "ONE shared module whose weights are runtime inputs, staged "
+          "per block into IOSurface buffers: its memory is fixed "
+          "(~1.2-1.5 GB for MiniMax-H3 depending on clip length, however "
+          "many blocks use it), it compiles once per shape and is cached "
+          "after. The resource plan decides whether the module fits. A "
+          "4/8-bit affine checkpoint is dequantized into those buffers "
+          "per block, and a runtime LoRA on the feed-forward is merged "
+          "into them. Implemented by MiniMax-H3; other families ignore "
+          "it"},
+  {.key = "ane_int8", .type = ConfigType::Bool, .required = false,
+   .doc = "the ANE's modules in ROTATED INT8 (LOSSY, W8A8) rather than "
+          "fp16: each staged weight row Walsh-Hadamard rotated and "
+          "quantized to int8, each projection's input rotated and "
+          "quantized per token inside the module -- the arithmetic of "
+          "i8_gemm_tier `token`, on the ANE's rows. On MiniMax-H3's "
+          "feed-forward the ANE runs ~1.5x faster (M4 Pro), and its rows "
+          "come out 2.5-9x further from exact than fp16's (0.6-2.1e-2 "
+          "against 2.2-2.5e-3 on real blocks, the GPU token tier's "
+          "figure). Needs macOS 26; where the module cannot run it, the "
+          "tier keeps fp16 and says so. REQUIRES ane_ffn. Implemented by "
+          "MiniMax-H3, and handed to a registered family in its accel "
+          "settings (ane_int8_tier says which int8); VPIPE_ANE_INT8 (0 | 1 | "
+          "plain) overrides it",
+   .def_bool = false},
+  {.key = "ane_int8_tier", .type = ConfigType::String, .required = false,
+   .doc = "which int8 ane_int8 runs, named as i8_gemm_tier names the "
+          "GPU's: 'token' (default; each weight row and each "
+          "projection's input Walsh-Hadamard rotated per 256 and "
+          "quantized per row / per token) or 'token_plain' (the same "
+          "unrotated: ~3x token's error on a block's output, ~1.7x on "
+          "MiniMax-H3's video, at token's speed -- the arithmetic of the "
+          "GPU's token_plain, which reads a Draw Things i8x checkpoint's "
+          "codes as stored). On a Mac with "
+          "no GPU matrix cores (the M4 series), where i8_gemm does not "
+          "run, these are the int8 flavours there are. Needs ane_int8; "
+          "VPIPE_ANE_INT8=plain forces token_plain",
+   .def_str = "token", .extra = kAneInt8TierChoices},
+  {.key = "ane_qkv", .type = ConfigType::Bool, .required = false,
+   .doc = "the fused q|k|v projection on the ANE too, as a SECOND module "
+          "beside the feed-forward's, split the same way and sharing the "
+          "one ANE worker. REQUIRES ane_ffn: the plan books both modules "
+          "as one unit and grants them together. It costs its own weight "
+          "slots and staging on top of the feed-forward's, so the plan "
+          "may decline the pair where it would have granted the "
+          "feed-forward alone. Implemented by MiniMax-H3; "
+          "VPIPE_H3_ANE_QKV=1 also turns it on"},
+  {.key = "ane_rows", .type = ConfigType::Real, .required = false,
+   .doc = "share of the FFN's ROWS given to the ANE, the GPU taking the "
+          "rest CONCURRENTLY (rows are independent in a feed-forward, so "
+          "the split is exact -- no partial sums, no seam). 0 (default) "
+          "lets the family balance from the two engines' measured rates; "
+          "~12.6 TOPS ANE against ~7 TFLOP/s GPU puts it near 0.64. 1 "
+          "gives the whole FFN to the ANE and idles the GPU for its "
+          "duration. The crossing itself is free: measured at -0.3 to "
+          "-1.0 ms against a GPU-only control with the same commit "
+          "count, i.e. the ANE phase overlaps the GPU's commit/wait "
+          "rather than serialising behind it"},
+  {.key = "ane_templates", .type = ConfigType::String, .required = false,
+   .doc = "directory of precompiled ANE module templates. Unused by the "
+          "runtime-weight feed-forward, which emits its own graph; "
+          "accepted so existing graphs keep loading"},
+  {.key = "ane_layers", .type = ConfigType::Int, .required = false,
+   .doc = "cap on how many blocks use the ANE feed-forward; 0 (default) "
+          "means every dense block. Not a memory setting -- the blocks "
+          "share one module whose cost is fixed -- so set it only to "
+          "cover fewer blocks on purpose, e.g. for a benchmark"},
+  {.key = "sage_attn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated attention (LOSSY): SageAttention runs the QK^T "
+          "product of the flash kernel in INT8, with one scale per "
+          "attention block -- per query block for Q, per key block for K, "
+          "which is the granularity the kernel already tiles at, so "
+          "dequantizing a score tile is a single scalar. P*V stays in the "
+          "tensor dtype: P is a probability, already well-conditioned, and "
+          "quantizing it buys the same again for a much worse error. K is "
+          "quantized as K - mean(K) over tokens, which is EXACT rather "
+          "than approximate -- a per-channel shift moves every score in a "
+          "row equally and softmax does not see it. MEASURED on an M5, 8 "
+          "heads x 20036 rows x 128: 156.6 -> 130.6 ms including the "
+          "quantization prologue (1.20x), at cosine 0.99992 against a "
+          "double-precision reference where the f16 kernel is also "
+          "0.99992. MATRIX CORES ONLY -- the int8 fragment MMA is an M5 "
+          "instruction and there is no ALU fallback, so a box without them "
+          "says so once and runs dense rather than refusing. INDEPENDENT "
+          "of i8_gemm and of sol_attn and settable with either: i8_gemm "
+          "chooses how the block's GEMMs are computed, sol_attn which key "
+          "blocks are attended, and this one how the attended ones are "
+          "multiplied. Off by default -- it is an approximation, and which "
+          "clips it is safe on is a judgement about the model",
+   .def_bool = false},
+  {.key = "sage_dense_layers", .type = ConfigType::Int, .required = false,
+   .doc = "leading transformer blocks left in the tensor dtype, untouched "
+          "by SageAttention. 0 -- the default -- quantizes every block. "
+          "Zero rather than sol_dense_layers' one because the two "
+          "approximate differently: Sol DROPS keys, so an early block's "
+          "less redundant residual stream is an argument for leaving it "
+          "alone, while Sage computes every key and every query and only "
+          "computes them in int8. No published profile needs a dense "
+          "prefix here; the key exists so a measurement can act on one",
+   .def_int = 0},
+  {.key = "sage_pv8", .type = ConfigType::Bool, .required = false,
+   .doc = "with sage_attn: the P*V product in INT8 TOO (LOSSY, more so "
+          "than sage_attn alone). The flash kernel holds the product in "
+          "int32 across key blocks with no f32 output tile -- P as uint8 "
+          "against the row's running max, V with one scale per channel "
+          "over the sequence, offset by 128 -- and rescales the held sum "
+          "only when a row's max grows; Q goes per token. The prompt's and "
+          "the soundtrack's query rows keep sage_attn alone unless "
+          "sage_pv8_all_rows. MEASURED on an M5 Ultra, MiniMax-H3 at "
+          "1344x768 x 362 frames (109k rows, 16 steps): the attention 2.46 "
+          "s against sage_attn's 2.90, the denoise 1927 s against 2110. "
+          "MiniMax-H3 only; matrix cores only, as sage_attn",
+   .def_bool = false},
+  {.key = "sage_pv8_from_step", .type = ConfigType::Int, .required = false,
+   .doc = "the first sampling step sage_pv8 runs at; the steps before "
+          "keep sage_attn alone. -1 -- the default -- is the family's: "
+          "MiniMax-H3 runs the first quarter of its steps without, the "
+          "steps that settle a clip's layout",
+   .def_int = -1},
+  {.key = "sage_pv8_all_rows", .type = ConfigType::Bool, .required = false,
+   .doc = "sage_pv8 on every query row. Off -- the default -- the "
+          "prompt's and the soundtrack's rows, which lead MiniMax-H3's "
+          "sequence (under 1% of it), keep sage_attn alone in a dispatch "
+          "of their own, and the video's run in int8",
+   .def_bool = false},
+  // ---- Sol-Attn (NVlabs, arXiv:2607.24027) --------------------------
+  // Family-agnostic like `i8_gemm` beside it, and here for the same
+  // reason: it approximates ATTENTION, which every DiT in this tree has,
+  // rather than anything one family does. A family that has not taken it
+  // ignores these keys.
+  {.key = "sol_attn", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated attention (LOSSY): Sol-Attn routes whole 64-key "
+          "blocks during the online softmax, attending the ones a proxy "
+          "score keeps and standing in for the rest with each block's key "
+          "centroid and value sum. Cost falls with the fraction of blocks "
+          "kept, which is a property of the DATA and is reported per run. "
+          "Taken by minimax-h3; other families ignore it. NOT combinable "
+          "with a VDN linear branch -- VDN's windowed softmax and its "
+          "linear complement partition the keys between them, so "
+          "approximating one half would drop what the other assumed it "
+          "covered; Sol turns itself off for those blocks and says so. "
+          "The blocks the routing KEEPS are run by the same matrix-core "
+          "steel flash kernel the dense path uses, walking only the "
+          "listed blocks; only the summaries, the routing and the "
+          "approximate half are Sol's own code. MEASURED IN THE MODEL on "
+          "an M4 Pro, minimax-h3 at 20036 rows: a routed block's "
+          "attention goes 3480 -> 1348 ms (2.58x) keeping 26.1% of key "
+          "blocks, which projects to ~2.1x on the whole DiT once every "
+          "block but the first is routed. INDEPENDENT OF i8_gemm and "
+          "settable with it: that one chooses how the block's GEMMs are "
+          "computed and this one how the attention between them is, and "
+          "neither reads the other. Still OFF by default -- it is an "
+          "approximation, and which clips it is safe on is a judgement "
+          "about the model, not about the kernel",
+   .def_bool = false},
+  {.key = "sol_tau", .type = ConfigType::Real, .required = false,
+   .doc = "Sol-Attn routing threshold, in STANDARD DEVIATIONS of a query "
+          "block's own proxy-score distribution -- which is what lets one "
+          "number serve every head, layer and clip length where a fixed "
+          "block count would not. HIGHER keeps fewer blocks: quality falls "
+          "and speed rises, monotonically in both. The published profile "
+          "runs 1.0 / 1.25 / 1.5 over its three steps; 1.0 is the default "
+          "here because a single value has to be the conservative one",
+   .def_real = 1.0},
+  {.key = "sol_dense_layers", .type = ConfigType::Int, .required = false,
+   .doc = "leading transformer blocks left DENSE, untouched by Sol-Attn. "
+          "The first blocks are where the residual stream is least "
+          "redundant; the published profile keeps 1 of 48. 0 routes every "
+          "block",
+   .def_int = 1},
+  {.key = "sol_dense_steps", .type = ConfigType::Int, .required = false,
+   .doc = "leading DENOISING STEPS left dense, untouched by Sol-Attn -- "
+          "the time-axis twin of sol_dense_layers. The first steps decide "
+          "a clip's coarse structure, and they are where a routing "
+          "approximation costs most. 0 (default) routes every step. "
+          "HyperFlow's published Sol recipe for its 8-step grid is 2 "
+          "here with sol_dense_layers 2 and sol_tau 1.0. minimax-h3 only",
+   .def_int = 0},
+  {.key = "sol_tau_steps", .type = ConfigType::String, .required = false,
+   .doc = "Sol-Attn's tau STEP BY STEP, comma-separated (\"1.0,1.5,2.0\"): "
+          "entry i for denoising step i, the last for every step past the "
+          "list; sol_tau when empty (default). The time-axis twin of "
+          "sol_tau as sol_dense_steps is of sol_dense_layers: a step's "
+          "error under the same tau falls as the noise does, so later "
+          "steps can keep fewer blocks. MEASURED on Open-H3-Regenerate-2K's "
+          "3-step refine (2K x 39 frames, the velocity against the dense "
+          "forward's on the same input): diag tau 1.0 cost 0.176 / 0.107 / "
+          "0.074 over the three steps. A step sol_dense_steps leaves dense "
+          "stays dense. minimax-h3 only",
+   .def_str = ""},
+  {.key = "sol_key_block", .type = ConfigType::Int, .required = false,
+   .doc = "keys summarised by one centroid, and the unit the routing "
+          "decides on. 32 or 64 only; 0 (default) takes 64, which is the "
+          "published value. THE TWO TRADE AGAINST EACH OTHER RATHER THAN "
+          "ONE DOMINATING, which is why both are offered. MEASURED on an "
+          "M4 Pro, 56 heads x 20036 rows against dense steel: 64 keeps "
+          "19.1% of key blocks and runs 3.54x, 32 keeps 22.9-26.0% and "
+          "runs 2.79x -- so 32 does MORE exact work and is slower, and is "
+          "also the more accurate of the two (rel-L2 0.0070-0.0077 "
+          "against 0.0082-0.0091 over three sequence lengths), because a "
+          "centroid over 32 keys stands in for them better. 64 is the "
+          "speed choice, 32 the fidelity one. Larger blocks were measured "
+          "and are worse on both counts (128 -> 3.33x, 256 -> 2.47x, both "
+          "keeping more), so they are not offered",
+   .def_int = 0},
+  {.key = "sol_threshold", .type = ConfigType::String, .required = false,
+   .doc = "how Sol-Attn's routing estimates the spread of a query block's "
+          "proxy scores, which sol_tau counts in: 'diag' (default) from "
+          "the key centroids' per-channel variance, 'exact' from their "
+          "full covariance -- the published Sol-Attn's two forms. The two "
+          "keep different fractions of the key blocks at one tau, so a "
+          "tau chosen for one does not carry over to the other. "
+          "Open-H3-Regenerate-2K's own engine runs its refine on 'exact'",
+   .def_str = "diag", .extra = kSolThreshChoices},
+  {.key = "sol_local_radius", .type = ConfigType::Int, .required = false,
+   .doc = "key blocks either side of a query's own block that are always "
+          "exact, never routed. A block centroid is least representative "
+          "exactly where a query discriminates most, so the near diagonal "
+          "is not put to the vote. -1 routes even the query's own block, "
+          "which is an ablation rather than a setting",
+   .def_int = 1},
+  // ---- VDN's window (OpenVDN, with a `linear_branch` attached) -----
+  {.key = "vdn_range", .type = ConfigType::Int, .required = false,
+   .doc = "MiniMax-H3 with a VDN `linear_branch` only: how far the "
+          "hybrid's SOFTMAX half reaches -- the query frame's chunk (5 "
+          "latent frames) and this many whole chunks either side -- the "
+          "LINEAR half carrying every frame beyond. The softmax/linear "
+          "split: wider is more of the original attention, exact and "
+          "slower (a window over the whole clip turns the linear half "
+          "off); narrower hands more to the delta rule. The halves still "
+          "partition the keys at any value, but the branch and its gate "
+          "were trained at the checkpoint's `softmax_attention.radius` "
+          "(1), so another value is a tuning outside it. -1 (the "
+          "default): the checkpoint's; at most 1024, which covers any "
+          "clip (more reads as 1024). Per request -- no reload -- and "
+          "ignored without a branch",
+   .def_int = -1},
+  {.key = "vdn_range_steps", .type = ConfigType::String, .required = false,
+   .doc = "vdn_range STEP BY STEP, comma-separated (\"2,1,1\"): entry i "
+          "for denoising step i, the last for every step past the list, "
+          "-1 to 1024, -1 the checkpoint's; vdn_range when empty "
+          "(default). The time-axis twin of vdn_range as sol_tau_steps is "
+          "of sol_tau: the early, structure-deciding steps may keep more "
+          "of the original attention, the later ones hand more to the "
+          "linear half. The "
+          "memory preflight books the narrowest step's window (the most "
+          "left to the linear half). MiniMax-H3 with a VDN branch only",
+   .def_str = ""},
+  // ---- MotionCache (MAC-AutoML, arXiv:2605.01725) -------------------
+  // A SAMPLING-LOOP tier rather than a transformer one: it decides per
+  // step whether to run the forward at all, so it composes with every
+  // tier above, each of which makes a forward cheaper.
+  {.key = "motion_cache", .type = ConfigType::Bool, .required = false,
+   .doc = "accelerated sampling (LOSSY): MotionCache skips whole denoising "
+          "FORWARDS. After a warm-up, each step predicts how far the "
+          "model's output has moved since the last forward that ran -- a "
+          "gain measured between the last two computed forwards, times how "
+          "far the input has moved since, over the output's size -- with "
+          "every latent position weighted by how much the clip is MOVING "
+          "there, read from the frame-to-frame difference of the model's "
+          "own clean estimate. While that prediction, summed over "
+          "consecutive skips, stays under motion_cache_threshold, the step "
+          "reuses the last forward's residual (output minus input, carried "
+          "to the new input) instead of running one. It saves forwards "
+          "rather than making one cheaper, so it composes with i8_gemm, "
+          "sage_attn, sol_attn and ane_ffn; the decision is host work on "
+          "a subsample of the latent, milliseconds a step. A few-step "
+          "schedule (a Turbo LoRA, HyperFlow) has little left to skip once "
+          "the warm-up has run. Taken by minimax-h3; other families ignore "
+          "it. Off by default -- it is an approximation, and faces, hands, "
+          "fast motion and lip sync are where it shows first",
+   .def_bool = false},
+  {.key = "motion_cache_threshold", .type = ConfigType::Real,
+   .required = false,
+   .doc = "MotionCache's budget: the accumulated predicted relative change "
+          "of the output under which a step reuses instead of running. "
+          "HIGHER skips more and drifts more. 0.15 is the reference "
+          "node's default; the example workflow it ships runs 0.2. Lower "
+          "it if faces, hands, fast motion, lip sync or sound effects go "
+          "unstable",
+   .def_real = 0.15},
+  {.key = "motion_cache_strength", .type = ConfigType::Real,
+   .required = false,
+   .doc = "how much MOTION weighs in MotionCache's change measures: a "
+          "latent position counts 1 + strength x its frame-to-frame motion "
+          "(normalised to mean 1), so a drift where the clip moves costs "
+          "more than the same drift over a still background. 0 weighs "
+          "every position alike",
+   .def_real = 1.0},
+  {.key = "motion_cache_warmup", .type = ConfigType::Int, .required = false,
+   .doc = "leading forwards MotionCache always runs -- the early steps "
+          "decide the clip's coarse structure. The first two run whatever "
+          "this says: the gain a prediction needs is measured between two "
+          "computed forwards",
+   .def_int = 4},
+  {.key = "motion_cache_max_skips", .type = ConfigType::Int,
+   .required = false,
+   .doc = "most steps MotionCache reuses in a row before it forces a "
+          "forward, which bounds how stale a residual can get. At least 1",
+   .def_int = 2},
+  {.key = "motion_cache_start", .type = ConfigType::Real, .required = false,
+   .doc = "where in the schedule MotionCache starts being consulted, as a "
+          "fraction of the sampling range: 0 is pure noise, 1 is clean. "
+          "Mapped to a sigma through the family's own VIDEO shift, the way "
+          "the reference maps it -- so at minimax-h3's shift of 12, 0.15 "
+          "is sigma 0.986. Steps outside the window always run",
+   .def_real = 0.15},
+  {.key = "motion_cache_end", .type = ConfigType::Real, .required = false,
+   .doc = "where MotionCache stops being consulted, on the same scale as "
+          "motion_cache_start and above it. The last steps are the fine "
+          "detail, so 0.95 leaves them dense",
+   .def_real = 0.95},
+  {.key = "motion_cache_subsample", .type = ConfigType::Int,
+   .required = false,
+   .doc = "stride, in latent rows and columns (and audio latent steps), of "
+          "the samples MotionCache DECIDES from. A reused step still "
+          "reuses every element; only the estimate is subsampled. 1 reads "
+          "everything",
+   .def_int = 8},
+  {.key = "keep_loaded", .type = ConfigType::Real, .required = false,
+   .doc = "seconds to keep MiniMax-H3's DiT BUILT after this stage lets it "
+          "go (a clip's end under unload_when_idle, or the graph's), on a "
+          "box with room for it beside the decode -- every block resident "
+          "(its blocks stream on the first forward and are kept as the box "
+          "allows): the next graph asking for the same checkpoint and "
+          "build -- a rank's share, adapters, int8 tier, attention -- is "
+          "handed it resident, nothing read again. Released sooner when a "
+          "launch that does not use it needs the room. 0 (the default) "
+          "lets it go. Not on a box whose blocks stream for want of room, "
+          "nor with a VDN branch, TaoMate or MiniMax-H3-Image",
+   .def_real = 0.0},
   {.key = "unload_when_idle", .type = ConfigType::String, .required = false,
    .doc = "drop the resident model's weights after each clip and reload on "
           "the next one. \"auto\" (default) decides from physical RAM vs the "
-          "pipeline's weight bytes; \"always\" / \"never\" force it",
-   .def_str = "auto"},
+          "pipeline's weight bytes; \"destroy\" / \"keep\" force it (legacy "
+          "spellings: \"always\" / \"never\"). \"park\" is NOT implemented "
+          "here and resolves as \"auto\": parking is the manager's to do and "
+          "needs this stage's borrow to end first -- only "
+          "diffusion-conditioner does that today",
+   .def_str = "auto", .extra = kUnloadChoices},
 };
 const PortSpec kIports[] = {
   {.name = "conditioning",
    .doc = "text hidden states from a diffusion-conditioner: bf16 [text_seq, "
-          "dim] at the resident family's own encoder width -- 4096 for wan "
-          "(umT5-XXL), 5120 for minimax-h3 (the Qwen3-VL tap)",
+          "dim] at the resident family's own encoder width. The conditioner "
+          "resolves the same checkpoint this stage does, so the width "
+          "matches by construction rather than by configuration",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
   {.name = "neg_conditioning",
    .doc = "OPTIONAL negative conditioning (the conditioner's oport1) for "
-          "classifier-free guidance, for the families that take it: wan is "
-          "not distilled, so without this its guidance is forced to 1. "
-          "Ignored by a guidance-distilled family (minimax-h3), which runs "
-          "one forward per step",
+          "classifier-free guidance. A family that is NOT guidance-distilled "
+          "needs it: without one its guidance is forced to 1. A "
+          "guidance-distilled family runs a single forward per step and "
+          "ignores it",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
   {.name = "model", .doc = "OPTIONAL shared model reference from a model-select "
                            "source; overrides the hf_dir config",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "sampler",
-   .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select). Read by "
-          "the families that sample from a spec (wan, defaulting to the UniPC "
-          "multistep it ships); inert for a family that carries its own "
-          "sampler (minimax-h3 runs rectified-flow Euler over two shifted "
-          "schedules -- see video_shift / audio_shift)",
+   .doc = "OPTIONAL sampler spec FlexData (diffusion-sampler-select). Read "
+          "by a family that samples from a spec, in place of the sampler it "
+          "ships. minimax-h3 carries its own sampler and maps the spec's "
+          "method onto it: euler (its default), dmd (x0 at each sigma, "
+          "then fresh noise to the next) and res_multistep, one forward a "
+          "step each; any other method is warned about and its default "
+          "runs. Its grid is not the spec's but its model-config "
+          "source's (`sigmas`, or `steps` and the shifts)",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "scheduler",
-   .doc = "OPTIONAL scheduler spec FlexData (scheduler-select). Inert for the "
-          "same families the sampler port is inert for",
+   .doc = "OPTIONAL scheduler spec FlexData (scheduler-select), for a "
+          "family that samples from a spec. Inert for minimax-h3, whose "
+          "grid is its model-config source's `sigmas` (the video's, as "
+          "run) or `steps` and the two shifts",
    .type = &typeid(FlexDataPayload), .clock_group = 0},
   {.name = "ref_latent0",
-   .doc = "OPTIONAL image-to-video conditioning latent from vae-encode: f32 "
-          "[16, T, H/8, W/8] for wan (the conditioning image followed by "
-          "blank frames), f32 [24, 1, H/16, W/16] for minimax-h3 (the "
-          "FIRST-frame keyframe anchor). Present => image-to-video",
+   .doc = "OPTIONAL image-to-video conditioning latent from vae-encode, in "
+          "the resident family's own latent geometry. Which SHAPE depends on "
+          "how the family conditions: a clip-shaped tensor (the conditioning "
+          "image followed by blank frames) or a single FIRST-frame keyframe "
+          "anchor. Present => image-to-video",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_latent1",
-   .doc = "OPTIONAL LAST-frame keyframe anchor from a second vae-encode "
-          "(minimax-h3 only; wan's i2v latent is one clip-shaped tensor). "
-          "With ref_latent0 this is the FL2VA first-and-last mode",
+   .doc = "OPTIONAL LAST-frame keyframe anchor from a second vae-encode, "
+          "for a family that anchors on keyframes rather than on one "
+          "clip-shaped latent. With ref_latent0 this is the first-and-last "
+          "mode; alone, the clip is generated up to this frame "
+          "(last-frame-to-video)",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_video_rows",
    .doc = "OPTIONAL reference VIDEO rows from a video-ref-encoder: f32 "
-          "[rows, 96], MiniMax-H3's Ref2VA partition. Already packed into "
-          "DiT rows and concatenated in reference order, because every "
-          "reference is encoded at a resolution of its own and rows are the "
-          "only shape they share. Wiring it is what makes this stage a "
-          "Ref2VA denoiser; the geometry it belongs to rides on the "
-          "conditioning beat's sideband",
+          "[rows, 96], for a family with a reference-conditioned partition. "
+          "Already packed into DiT rows and concatenated in reference "
+          "order, because every reference is encoded at a resolution of its "
+          "own and rows are the only shape they share. Wiring it is what "
+          "puts this stage in its reference-conditioned mode; the geometry "
+          "the rows belong to rides on the conditioning beat's sideband",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "ref_audio_rows",
    .doc = "OPTIONAL reference AUDIO rows from the same video-ref-encoder: "
@@ -139,27 +655,69 @@ const PortSpec kIports[] = {
           "a clean timestep and is never denoised",
    .type = &typeid(TensorBeatPayload), .clock_group = 0},
   {.name = "model_config",
-   .doc = "OPTIONAL model-specific parameters from the resident family's own "
-          "config source -- wan2-model-config (guidance, expert boundary) or "
-          "minimax-h3-model-config (sigma shifts, condition timesteps, audio "
-          "duration). Passed to that family's GenerationParams UNREAD, so "
-          "this stage carries none of the knobs. Unwired, the family runs "
-          "its documented defaults",
+   .doc = "OPTIONAL model-specific parameters from the resident family's "
+          "own config source -- each family ships one, carrying whatever it "
+          "alone has to say (guidance and expert boundaries, sigma shifts, "
+          "condition timesteps, audio duration). Passed to that family's "
+          "GenerationParams UNREAD, so this stage carries none of the knobs. "
+          "Unwired, the family runs its documented defaults",
    .type = &typeid(FlexDataPayload),
    .tags = "model-config", .clock_group = 0},
   {.name = "audio_conditioning",
    .doc = "OPTIONAL second-modality conditioning for a family that "
-          "generates a soundtrack from its own projection of the caption "
-          "-- LTX-2.5's 2048-wide audio context, beside the 4096-wide "
-          "video one on iport0. A separate port because it is a different "
-          "WIDTH from a different projection, so packing both into one "
-          "beat would make the split a convention rather than a type. "
-          "Unwired, such a family generates VIDEO ONLY and says so; it "
-          "must not invent a zero context, which would be conditioning "
-          "that says silence rather than nothing. Ignored by wan and "
-          "minimax-h3, which take no second context",
+          "generates a soundtrack from its own projection of the caption: "
+          "an AUDIO context beside the video one on iport0, at a width of "
+          "its own. A separate port because it is a different WIDTH from a "
+          "different projection, so packing both into one beat would make "
+          "the split a convention rather than a type. Unwired, such a "
+          "family generates VIDEO ONLY and says so; it must not invent a "
+          "zero context, which would be conditioning that says silence "
+          "rather than nothing. Ignored by a family that takes no second "
+          "context",
    .type = &typeid(TensorBeatPayload),
    .tags = "conditioning", .clock_group = 0},
+  {.name = "init_latent",
+   .doc = "OPTIONAL clip to REFINE rather than generate from noise "
+          "(MiniMax-H3: Open-H3-Regenerate-2K): f32 [z, T, H/16, W/16], "
+          "whitened -- a vae-encode of a draft, or a latent-upscale of "
+          "one. The clip is put back to the refine's first sigma and "
+          "denoised again over its own geometry (the latent's, not this "
+          "stage's width / height), conditioned on the prompt and on an "
+          "encoded silence; keyframe inputs are ignored. REFERENCES are "
+          "kept, held clean ahead of it -- an in-context refine "
+          "(Open-H3-Regenerate-2K-IC: the draft as <Video 1> on the "
+          "Ref2VA weights). The schedule is the model config's "
+          "`refine_start_sigma` / `refine_shift` over this stage's `steps` "
+          "-- 3 is the release's -- or, under a flow-map adapter "
+          "(HyperFlow), the last `steps` of its own grid. Wire the "
+          "release's adapters on the model config",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "latent", .clock_group = 0},
+  {.name = "guide_latent",
+   .doc = "OPTIONAL (MiniMax-H3, keyframe layout) a GUIDE: video latent "
+          "frames f32 [z, n, H/16, W/16], whitened -- this stage's own "
+          "`latent` oport, cut by a load-tensor -- pinned where they lie in "
+          "the clip, from pixel frame `frame` of the beat's sideband on "
+          "(default 0; negative from the end), each latent frame at its "
+          "own rotary time. The keyframe anchor generalized: a "
+          "continuation is the last 7 latent frames (22 pixel frames) of "
+          "a clip at frame 0, the new clip generated THROUGH them -- its "
+          "first 22 frames redo the tail, the rest go on. Conditioning "
+          "rows at the keyframe level, never stepped. Ignored beside "
+          "references (the reference layout has no slot), a refine and "
+          "TaoMate-H3",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "latent", .clock_group = 0},
+  {.name = "guide_audio_latent",
+   .doc = "OPTIONAL the guide's SOUNDTRACK: audio latents f32 [2, 32, m] "
+          "as this stage's `audio_latent` oport writes them, pinned from "
+          "the same pixel frame (the beat's own `frame`, else the video "
+          "guide's, else 0) on the shared clock -- 5/3 latents a frame -- "
+          "and cut where the generated soundtrack ends. Conditioning rows "
+          "at the reference soundtrack's level (`condition_audio_"
+          "timestep`); may come without a video guide",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "latent", .clock_group = 0},
 };
 [[maybe_unused]] constexpr unsigned kModelPort   = 2;
 [[maybe_unused]] constexpr unsigned kSamplerPort = 3;
@@ -170,6 +728,9 @@ const PortSpec kIports[] = {
 [[maybe_unused]] constexpr unsigned kRefAudioRowsPort = 8;
 [[maybe_unused]] constexpr unsigned kModelCfgPort     = 9;
 [[maybe_unused]] constexpr unsigned kAudioCondPort    = 10;
+[[maybe_unused]] constexpr unsigned kInitPort         = 11;
+[[maybe_unused]] constexpr unsigned kGuidePort        = 12;
+[[maybe_unused]] constexpr unsigned kGuideAudioPort   = 13;
 
 // The keys that MOVED to the per-family config stages. Named here so a
 // pipeline written against the old union says what to do instead of
@@ -190,23 +751,43 @@ constexpr MovedKey kMovedKeys[] = {
 const PortSpec kOports[] = {
   {.name = "latent",
    .doc = "f32 latent VIDEO [z, T, H/r, W/r] (whitened), sideband "
-          "{fps, frames}. z/r are the family's VAE geometry: 16/8 for wan, "
-          "24/16 for minimax-h3",
+          "{fps, frames}. z/r are the resident family's VAE geometry",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
   {.name = "audio_latent",
-   .doc = "f32 latent AUDIO [audio_channels, audio_latents], minimax-h3 "
-          "only -- the families that generate no audio never write it",
+   .doc = "f32 latent AUDIO [audio_channels, audio_latents] from a family "
+          "that generates a soundtrack -- the families that do not never "
+          "write it",
    .type = &typeid(TensorBeatPayload),
    .tags = "latent", .clock_group = 0},
+  // Its OWN clock: previews come several per clip, at the step rate, and
+  // a consumer of them is not on the latent's clock.
+  {.name = "preview",
+   .doc = "OPTIONAL live preview of the clip while it denoises: planar U8 "
+          "RGB [F, 3, H, W], one beat per rendered step, decoded by the "
+          "tiny autoencoder the family's config source names "
+          "(`preview_vae`). Feed a `preview` stage, which loops each clip "
+          "until the next. Push-style (DropOldest, one consumer): a preview "
+          "nobody reads is dropped, never waited for. Unwired, nothing is "
+          "decoded",
+   .type = &typeid(TensorBeatPayload),
+   .tags = "rgb-clip", .clock_group = 1},
 };
+[[maybe_unused]] constexpr unsigned kPreviewPort = 2;
+// Deep enough that the preview stage's tick can pick one up, shallow
+// enough that a clip-sized beat nobody reads is not hoarded.
+constexpr unsigned kPreviewDepth = 2;
 const StageSpec kSpec = {
   .type_name = "generate-video",
   .doc       = "Video DiT denoiser: conditioning (+ optional keyframe or "
                "reference latents) -> the resident family's sampler over its "
                "transformer -> a latent VIDEO, and a latent SOUNDTRACK from "
                "the families that generate one, on the metal-compute backend. "
-               "Feed vae-decode (and audio-vae-decode).",
+               "Feed vae-decode (and audio-vae-decode). A run makes one clip "
+               "per generation: an input whose source sends one beat and "
+               "ends serves every clip, one that keeps sending is consumed a "
+               "beat per clip, and the run ends when a consumed input does. "
+               "`seed_sequence` sets each clip's seed.",
   .display_name = "Generate Video",
   .category  = StageCategory::Generative,
   .iports    = kIports,
@@ -224,13 +805,287 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
                                    std::move(config))
 {
   _hf_dir = attr_str("hf_dir");
+  _dit_dir = attr_str("dit_dir");
+  _h3_lora_model_slot.fill(-1);
   _height = (int)attr_int("height");
   _width  = (int)attr_int("width");
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // Named by the GRAPH, not defaulted: the spec's 832 x 480 is what an
+  // unset key reads as.
+  _size_set = this->config().is_object() &&
+              (this->config().as_object().contains("height") ||
+               this->config().as_object().contains("width"));
+#endif
   _frames = (int)attr_int("frames");
   _fps    = attr_real("fps");
+  _keep_loaded = std::max(0.0, attr_real("keep_loaded"));
   _steps  = (int)attr_int("steps");
   _i8_gemm = attr_bool("i8_gemm");
-  _seed   = (std::uint64_t)attr_int("seed");
+  _tp_cfg = {};
+  if (this->config().is_object() &&
+      this->config().as_object().contains("tensor_parallel")) {
+    _tp_cfg = this->config().as_object().at("tensor_parallel");
+  }
+  _sage.enabled      = attr_bool("sage_attn");
+  _sage.dense_layers = (int)attr_int("sage_dense_layers");
+  _sage.pv8          = attr_bool("sage_pv8");
+  _sage.pv8_from_step = (int)attr_int("sage_pv8_from_step");
+  _sage.pv8_all_rows = attr_bool("sage_pv8_all_rows");
+  _sol.enabled      = attr_bool("sol_attn");
+  _sol.tau          = (float)attr_real("sol_tau");
+  _sol.dense_layers = (int)attr_int("sol_dense_layers");
+  _sol.local_radius = (int)attr_int("sol_local_radius");
+  // Clamped in 64 bits, before the int: a reach past kVdnMaxRange reads
+  // as it (the window already covers any clip there), and a huge value
+  // is what a graph types to mean "the whole clip".
+  _vdn_range = (int)std::clamp<std::int64_t>(attr_int("vdn_range"), -1,
+                                             kVdnMaxRange);
+  _vdn_range_steps.clear();
+  {
+    const std::string t = attr_str("vdn_range_steps");
+    std::size_t p0 = 0;
+    while (p0 < t.size()) {
+      std::size_t p1 = t.find(',', p0);
+      if (p1 == std::string::npos) { p1 = t.size(); }
+      const std::string tok = t.substr(p0, p1 - p0);
+      char* end = nullptr;
+      const long v = std::strtol(tok.c_str(), &end, 10);
+      while (end != nullptr && *end == ' ') { ++end; }
+      if (tok.empty() || end == tok.c_str() || *end != '\0' || v < -1 ||
+          v > kVdnMaxRange) {
+        fail_config(fmt("GenerateVideoStage('{}'): vdn_range_steps must be "
+                        "comma-separated whole numbers from -1 to {} (got "
+                        "'{}')", this->id(), kVdnMaxRange, t));
+        _vdn_range_steps.clear();
+        break;
+      }
+      _vdn_range_steps.push_back((int)v);
+      p0 = p1 + 1;
+    }
+  }
+  _sol_dense_steps  = std::max(0, (int)attr_int("sol_dense_steps"));
+  _sol_tau_steps.clear();
+  {
+    const std::string t = attr_str("sol_tau_steps");
+    std::size_t p0 = 0;
+    while (p0 < t.size()) {
+      std::size_t p1 = t.find(',', p0);
+      if (p1 == std::string::npos) { p1 = t.size(); }
+      const std::string tok = t.substr(p0, p1 - p0);
+      char* end = nullptr;
+      const float v = std::strtof(tok.c_str(), &end);
+      if (tok.empty() || end == tok.c_str() || !std::isfinite(v)) {
+        fail_config(fmt("GenerateVideoStage('{}'): sol_tau_steps must be "
+                        "comma-separated numbers (got '{}')", this->id(), t));
+        _sol_tau_steps.clear();
+        break;
+      }
+      _sol_tau_steps.push_back(v);
+      p0 = p1 + 1;
+    }
+  }
+  // 32 or 64, and 0 means the default. WARN AND FALL BACK rather than
+  // refuse the stage, which is what `unload_when_idle` beside it does
+  // for the same class of key: a perf knob spelled wrong should not take
+  // a graph down. Named in the warning, because silently running a
+  // different block size than was asked for is how a benchmark comes to
+  // report the wrong number.
+  {
+    const std::int64_t kb = attr_int("sol_key_block");
+    if (kb == 0 || kb == 32 || kb == 64) {
+      _sol.key_block = (int)kb;
+    } else {
+      _sol.key_block = 0;
+      // The message distinguishes the two rejects, because they are not
+      // the same fact: 128 and 256 RUN and are simply worse on both
+      // speed and accuracy, so declining them is a policy; anything not
+      // a multiple of the steel kernel's 16-key block cannot run at all.
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): sol_key_block {} is not 32 or 64; "
+          "using 64. {}", this->id(), (long long)kb,
+          kb > 64
+              ? "Larger blocks were measured and are slower AND less "
+                "accurate, so they are not offered"
+              : "The routing block is also the unit the exact half walks, "
+                "so it cannot be smaller than 32"));
+    }
+  }
+  // THE BAG, and the typed views are read BACK OUT OF IT rather than
+  // kept beside it. Two spellings of one decision drift; one spelling
+  // with two readers cannot. The in-tree models still take a typed
+  // Config -- they are compiled with this stage and have no ABI to
+  // protect -- and a plugin family gets the bag itself.
+  //
+  // Written whether the tier is on or off, and with the SETTLED value:
+  // `sol_key_block` here is what the check above fell back to, not what
+  // the graph said, so no family has to repeat that validation or can
+  // reach a different answer than the log line did.
+  _accel = FlexData::make_object();
+  genai::accel::set_flag(&_accel, genai::accel::kI8Gemm, _i8_gemm);
+  {
+    const std::string t = attr_str("i8_gemm_tier");
+    const bool known = t == genai::accel::kI8TierFast ||
+                       t == genai::accel::kI8TierToken ||
+                       t == genai::accel::kI8TierTokenPlain;
+    if (!t.empty() && !known && t != genai::accel::kI8TierAccurate) {
+      fail_config(fmt("GenerateVideoStage('{}'): i8_gemm_tier must be "
+                      "'accurate', 'fast', 'token' or 'token_plain' (got "
+                      "'{}')", this->id(), t));
+    }
+    genai::accel::set_text(&_accel, genai::accel::kI8GemmTier,
+                           known ? t
+                                 : std::string(genai::accel::kI8TierAccurate));
+  }
+  genai::accel::set_flag(&_accel, genai::accel::kSageAttn, _sage.enabled);
+  genai::accel::set_integer(&_accel, genai::accel::kSageDenseLayers,
+                            _sage.dense_layers);
+  genai::accel::set_flag(&_accel, genai::accel::kSagePv8, _sage.pv8);
+  genai::accel::set_integer(&_accel, genai::accel::kSagePv8FromStep,
+                            _sage.pv8_from_step);
+  genai::accel::set_flag(&_accel, genai::accel::kSagePv8AllRows,
+                         _sage.pv8_all_rows);
+  genai::accel::set_flag(&_accel, genai::accel::kSolAttn, _sol.enabled);
+  genai::accel::set_real(&_accel, genai::accel::kSolTau, (double)_sol.tau);
+  genai::accel::set_integer(&_accel, genai::accel::kSolKeyBlock,
+                            _sol.key_block);
+  genai::accel::set_integer(&_accel, genai::accel::kSolDenseLayers,
+                            _sol.dense_layers);
+  genai::accel::set_integer(&_accel, genai::accel::kSolLocalRadius,
+                            _sol.local_radius);
+  {
+    const std::string t = attr_str("sol_threshold");
+    genai::sol::Threshold th = genai::sol::Threshold::kDiag;
+    if (!t.empty() && !genai::sol::parse_threshold(t, &th)) {
+      fail_config(fmt("GenerateVideoStage('{}'): sol_threshold must be 'diag' or "
+                      "'exact' (got '{}')", this->id(), t));
+    }
+    genai::accel::set_text(&_accel, genai::accel::kSolThreshold,
+                           genai::sol::threshold_name(th));
+  }
+  // MotionCache, settled the way sol_key_block is above: a value that
+  // would make the estimate meaningless WARNS and falls back to the
+  // shipped one rather than refusing the stage, and the bag carries what
+  // was settled on.
+  {
+    namespace a = genai::accel;
+    const genai::motion_cache::Config dflt;
+    auto bad = [&](const char* key, const std::string& said,
+                   const std::string& used) {
+      session()->warn(fmt("GenerateVideoStage('{}'): {} {} is out of "
+                          "range; using {}", this->id(), key, said, used));
+    };
+    double thr = attr_real("motion_cache_threshold");
+    if (!(thr >= 0.0) || !std::isfinite(thr)) {
+      bad("motion_cache_threshold", fmt("{}", thr)(),
+          fmt("{}", dflt.threshold)());
+      thr = dflt.threshold;
+    }
+    double strength = attr_real("motion_cache_strength");
+    if (!(strength >= 0.0) || !std::isfinite(strength)) {
+      bad("motion_cache_strength", fmt("{}", strength)(),
+          fmt("{}", dflt.motion_strength)());
+      strength = dflt.motion_strength;
+    }
+    long long warm = attr_int("motion_cache_warmup");
+    if (warm < 0) {
+      bad("motion_cache_warmup", std::to_string(warm),
+          std::to_string(dflt.warmup_steps));
+      warm = dflt.warmup_steps;
+    }
+    long long skips = attr_int("motion_cache_max_skips");
+    if (skips < 1) {
+      bad("motion_cache_max_skips", std::to_string(skips), "1");
+      skips = 1;
+    }
+    double start = attr_real("motion_cache_start");
+    double end   = attr_real("motion_cache_end");
+    if (!(start >= 0.0 && start < end && end <= 1.0)) {
+      bad("motion_cache_start/_end", fmt("{}/{}", start, end)(),
+          fmt("{}/{}", dflt.start, dflt.end)());
+      start = dflt.start;
+      end   = dflt.end;
+    }
+    long long sub = attr_int("motion_cache_subsample");
+    if (sub < 1) {
+      bad("motion_cache_subsample", std::to_string(sub),
+          std::to_string(dflt.subsample));
+      sub = dflt.subsample;
+    }
+    a::set_flag(&_accel, a::kMotionCache, attr_bool("motion_cache"));
+    a::set_real(&_accel, a::kMotionCacheThreshold, thr);
+    a::set_real(&_accel, a::kMotionCacheStrength, strength);
+    a::set_integer(&_accel, a::kMotionCacheWarmup, warm);
+    a::set_integer(&_accel, a::kMotionCacheMaxSkips, skips);
+    a::set_real(&_accel, a::kMotionCacheStart, start);
+    a::set_real(&_accel, a::kMotionCacheEnd, end);
+    a::set_integer(&_accel, a::kMotionCacheSubsample, sub);
+  }
+  // The ANE tier. An empty `ane_templates` does NOT disable it: a family
+  // that can emit its own graph needs no template, and only the family
+  // knows whether it can. `ane_layers` caps the blocks that use it; no
+  // video family implements the tier yet, so here the keys
+  // are carried to a plugin family and no further.
+  {
+    const std::string tdir = attr_str("ane_templates");
+    const bool on = attr_bool("ane_ffn");
+    double rows = attr_real("ane_rows");
+    if (!(rows >= 0.0) || rows > 1.0) { rows = 0.0; }
+    long long layers = attr_int("ane_layers");
+    if (layers < 0) { layers = 0; }
+    genai::accel::set_flag(&_accel, genai::accel::kAneFfn, on);
+    // Only with the feed-forward: the two modules are one booking.
+    genai::accel::set_flag(&_accel, genai::accel::kAneQkv,
+                           on && attr_bool("ane_qkv"));
+    genai::accel::set_flag(&_accel, genai::accel::kAneInt8,
+                           on && attr_bool("ane_int8"));
+    {
+      namespace a = genai::accel;
+      const std::string t = attr_str("ane_int8_tier");
+      const bool plain = t == a::kI8TierTokenPlain;
+      if (!t.empty() && !plain && t != a::kI8TierToken) {
+        fail_config(fmt("GenerateVideoStage('{}'): ane_int8_tier must be "
+                        "'token' or 'token_plain' (got '{}')", this->id(),
+                        t));
+      }
+      a::set_text(&_accel, a::kAneInt8Tier,
+                  std::string(plain ? a::kI8TierTokenPlain
+                                    : a::kI8TierToken));
+    }
+    genai::accel::set_real(&_accel, genai::accel::kAneRows, rows);
+    genai::accel::set_text(&_accel, genai::accel::kAneTemplates, tdir);
+    genai::accel::set_integer(&_accel, genai::accel::kAneLayers, layers);
+  }
+  // ...and back out, which is the half that makes it one decision. If a
+  // key is ever written under one name and read under another, this is
+  // where it stops being true rather than three plugins away.
+  _sol  = genai::sol::config_from_flex(&_accel);
+  _sage = genai::sage::config_from_flex(&_accel);
+  // The kernel tuners (kAutotune): into the accel the families read,
+  // and back out below for the Configs this stage fills itself.
+  genai::accel::set_flag(&_accel, genai::accel::kAutotune,
+                         attr_bool("autotune"));
+  _i8_gemm = genai::accel::flag(&_accel, genai::accel::kI8Gemm);
+  _autotune = genai::accel::flag(&_accel, genai::accel::kAutotune, true);
+  {
+    const std::string t =
+        genai::accel::text(&_accel, genai::accel::kI8GemmTier);
+    _i8_tier = t == genai::accel::kI8TierTokenPlain ? 3
+               : t == genai::accel::kI8TierToken    ? 2
+               : t == genai::accel::kI8TierFast     ? 1
+                                                    : 0;
+  }
+
+  _seed_base = (std::uint64_t)attr_int("seed");
+  _seed      = _seed_base;
+  {
+    const std::string sq = attr_str("seed_sequence");
+    if (!sq.empty() && !parse_seed_sequence(sq, &_seed_seq)) {
+      // Deferred-validated config: warn and take the default.
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): seed_sequence '{}' is not "
+          "increment|randomize|keep; using increment", this->id(), sq));
+    }
+  }
   // The family-specific keys are gone from this stage; a pipeline still
   // carrying one gets told where it went. Warning rather than failing
   // because the key is now inert, not wrong -- the graph runs, it just
@@ -251,32 +1106,34 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   if (_width  <= 0) { _width  = 832; }
   if (_frames <= 0) { _frames = 81; }
   if (_steps  <= 0) { _steps  = 40; }
-  if (!(_fps > 0.0)) { _fps = 16.0; }
+  if (!(_fps > 0.0)) { _fps = 24.0; }
   if (_height <= 0) { _height = 480; }
   if (_width  <= 0) { _width  = 832; }
   // The frame SIZE is not validated here either, and for exactly the
   // reason the frame COUNT is not (see below): the legal grid is the
-  // family's VAE stride times its DiT patch -- 16 for wan, 32 for
-  // MiniMax-H3 -- and the family is not known until the checkpoint is
-  // read. resolve_config_ rounds UP to the resident family's grid.
+  // family's VAE stride times its DiT patch, which differs per family,
+  // and the family is not known until the checkpoint is read.
+  // resolve_config_ rounds UP to the resident family's grid.
   //
   // This used to refuse anything that was not a multiple of 16, which was
-  // both too strict (a caller should not have to know) and too loose (it
-  // passed H3 sizes that are illegal, e.g. 1360, whose latent width 85 is
-  // odd and cannot be patched).
+  // both too strict (a caller should not have to know) and too loose: on
+  // a coarser grid it passed sizes that cannot be patched at all, e.g.
+  // 1360, whose latent width at stride 16 is 85 -- odd, and so not
+  // divisible by the patch.
   // The frame count is NOT validated here, deliberately. A count the VAE
   // cannot chunk has no latent representation -- but the rule is PER
-  // FAMILY (wan compresses in 4-frame chunks after a 1-frame first chunk,
-  // 4k+1; MiniMax-H3 takes 17-frame clips keeping 5 latents, 17n+5) and
-  // the family is only known once the checkpoint is read, which happens
-  // after this constructor. So resolve_config_ rounds UP to the resident
-  // family's rule instead, and any positive count is accepted.
+  // FAMILY, and the shapes are unrelated to each other: one family
+  // compresses in 4-frame chunks after a 1-frame first chunk (4k+1),
+  // another takes 17-frame clips keeping 5 latents (17n+5). The family
+  // is only known once the checkpoint is read, which happens after this
+  // constructor, so resolve_config_ rounds UP to the resident family's
+  // rule instead and any positive count is accepted.
   //
-  // Rounding rather than rejecting because the two rules share almost no
-  // legal counts -- 81 is fine for wan and impossible for H3, 56 the
-  // reverse -- so a graph that names one family's number could not change
-  // checkpoints without also being re-authored, which is exactly what
-  // being family-generic is supposed to buy.
+  // Rounding rather than rejecting because such rules share almost no
+  // legal counts -- 81 is legal under 4k+1 and impossible under 17n+5;
+  // 56 is the reverse -- so a graph carrying one family's number could
+  // not change checkpoints without being re-authored, which is exactly
+  // what being family-generic is supposed to buy.
 #ifdef VPIPE_BUILD_APPLE_SILICON
   {
     bool bad = false;
@@ -289,8 +1146,10 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
           attr_str("unload_when_idle")));
     }
   }
-  // UniPC multistep on the checkpoint's flow schedule -- the sampler every
-  // Wan checkpoint ships with. A sampler-select source overrides it.
+  // UniPC multistep on the checkpoint's flow schedule: the spec this
+  // stage starts from for a family that samples from one. A family
+  // carrying its own sampler ignores it, and a sampler-select source on
+  // the sampler iport overrides it.
   _sampler_spec.method = "unipc";
   _sampler_spec.order = 2;
   _sampler_spec.solver_bh2 = true;
@@ -300,14 +1159,209 @@ GenerateVideoStage::GenerateVideoStage(const SessionContextIntf* s,
   _scheduler_spec.num_train = 1000;
 #endif
   allocate_oports(spec().oports.size());
+  set_oport_policy(kPreviewPort, {kPreviewDepth, OverrunPolicy::DropOldest});
 }
 
-GenerateVideoStage::~GenerateVideoStage() = default;
+GenerateVideoStage::~GenerateVideoStage()
+{
+  (void)keep_h3_warm_();
+}
+
+// MiniMax-H3's DiT handed to the manager's warm hold (keep_loaded) as the
+// stage lets it go -- the same rule the picture stages keep: a build on a
+// box that is not tight (_h3_may_keep: its blocks did not stream for want
+// of room) and, streamed then retained, with EVERY block resident -- the
+// stack a next graph takes back then reads nothing -- and only where the
+// box holds it beside the rest of THIS graph and what else is warm: what
+// the manager books in the decode phase still to come (its weights, its
+// declared scratch -- else the decode's working set), the live language
+// models' K/V, every other warm hold, this one, the headroom -- within
+// the RAM, as release_warm_unless_it_fits_ asks of the next launch. The
+// plan let this DiT's bytes go at the decode only under `destroy` (its
+// phase claim); otherwise its claim is counted there already and is left
+// out once, so the hold is weighed at what the model holds (held_bytes,
+// its adapters' factors with it). A rank's share is small beside its
+// checkpoint, so a rank on a box that streams the whole model keeps it.
+// A rank's generation is ended first: the link is a clip's, never kept.
+// Its wired bytes are noted with the hold (note_warm_wired): they stay
+// charged to the pool.
+bool
+GenerateVideoStage::keep_h3_warm_()
+{
+  if (!_h3_dit || !_h3_may_keep || _h3_warm_key.empty() ||
+      session() == nullptr) {
+    return false;
+  }
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return false; }
+  if (_h3_dit->streaming()) {
+    (void)_h3_dit->release_idle_slots();
+    const int kept = _h3_dit->resident_block_count();
+    if (kept < _h3_cfg.n_layers) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): the MiniMax-H3 DiT is not kept warm -- "
+          "residency held {} of its {} blocks, so the next graph would "
+          "stream it again", this->id(), kept, _h3_cfg.n_layers));
+      return false;
+    }
+  }
+  // Its forward's scratch goes first: a warm hold keeps weights.
+  const std::size_t freed = _h3_dit->release_forward_scratch();
+  if (freed > 0) {
+    session()->log_debug(fmt(
+        "GenerateVideoStage('{}'): {} MB of the DiT's forward scratch let "
+        "go before it is kept warm", this->id(), freed >> 20));
+  }
+  const std::size_t held = _h3_dit->held_bytes() + _h3_dit->lora_bytes();
+  const std::string decode_phase(model_memory::kPhaseDecode);
+  std::size_t decode = mgr->scratch_bytes(decode_phase);
+  if (decode == 0) {
+    decode = model_memory::video_vae_working_bytes(_root, _width, _height);
+  }
+  std::size_t others = mgr->phase_footprint(decode_phase) +
+                       mgr->resident_kv_bytes();
+  // Its own claims -- the DiT's and its adapters' -- unless `destroy`
+  // phased them to the denoise (decide_resources): counted in the decode
+  // phase's figure already, where `held` counts them again.
+  if (_unload_cfg != model_memory::UnloadPolicy::kDestroy) {
+    std::size_t own = mgr->planned_weight_bytes(h3_warm_dir_());
+    for (const std::string& f : h3_plan_lora_files_()) {
+      own += mgr->planned_weight_bytes(f);
+    }
+    others -= std::min(others, own);
+  }
+  for (const auto& w : mgr->warm_report()) {
+    others += w.bytes + w.kv_bytes;
+  }
+  const std::size_t ram = model_memory::phys_ram();
+  if (ram == 0 || others + held + decode + model_memory::kHeadroom > ram) {
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): the MiniMax-H3 DiT is not kept warm -- "
+        "{} MB beside {} MB held or booked and the decode's {} MB is more "
+        "than this {} MB box keeps", this->id(), held >> 20, others >> 20,
+        decode >> 20, ram >> 20));
+    return false;
+  }
+  _h3_dit->end_tp_generation();
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): the MiniMax-H3 DiT{} kept warm for {:.0f} s "
+      "({} MB)", this->id(),
+      _h3_cfg.tp.active() ? fmt(" (rank {}'s share)", _h3_cfg.tp.rank)()
+                          : std::string(),
+      _keep_loaded, held >> 20));
+  const std::size_t wired = _h3_dit->wired_bytes();
+  mgr->keep_model_warm(kWarmH3, h3_warm_dir_(), _h3_warm_key,
+                       std::move(_h3_dit), held, _keep_loaded);
+  // Its blocks stay wired while it is warm: the pool test of the next
+  // launch beside it counts them (release_warm_unless_it_fits_).
+  mgr->note_warm_wired(kWarmH3, h3_warm_dir_(), _h3_warm_key, wired);
+  _h3_dit.reset();
+  return true;
+}
 
 const StageSpec&
 GenerateVideoStage::spec() const noexcept
 {
   return kSpec;
+}
+
+// See the declaration. Deliberately outside the Apple-Silicon guard: the
+// rule is a property of the two PARTITIONS, not of the backend that runs
+// them, and a test for it should not need a GPU.
+int
+GenerateVideoStage::h3_anchor_count(bool have_references, bool have_keyframe,
+                                    int ref_frames, bool* ignored)
+{
+  if (ignored != nullptr) { *ignored = false; }
+  if (!have_keyframe || ref_frames <= 0) { return 0; }
+  // A request WITH REFERENCES takes no anchors, and the reason is
+  // structural: build_ref2va_packed_sequence() has no keyframe
+  // parameter, because its layout is [text | reference blocks | target
+  // audio | target video] where the keyframe one is [text | keyframe
+  // conditions | ...]. There is nowhere to put one. Reported rather than
+  // dropped quietly -- the symptom otherwise is a clip whose subject and
+  // wardrobe transferred while its opening frame did not, which reads as
+  // disobedience rather than as a mode that does not exist.
+  //
+  // The test is the REQUEST, not the partition, and that is load-bearing
+  // since Ref2VA-like put references on FL2VA weights: the two layouts
+  // remain mutually exclusive on a checkpoint that can build either.
+  if (have_references) {
+    if (ignored != nullptr) { *ignored = true; }
+    return 0;
+  }
+  // One anchor is first-frame image-to-video; two is the first AND last
+  // the FL2VA partition is named for. A LAST frame with no first is one
+  // anchor too, and h3_anchor_ends says which end it pins.
+  return ref_frames >= 2 ? 2 : 1;
+}
+
+// See the declaration. Outside the Apple-Silicon guard for the same
+// reason as h3_anchor_count.
+std::vector<GenerateVideoStage::H3AnchorEnd>
+GenerateVideoStage::h3_anchor_ends(bool have_references, int ref_frames,
+                                   bool last_only, bool* ignored)
+{
+  const int n = h3_anchor_count(have_references, ref_frames > 0,
+                                ref_frames, ignored);
+  if (n == 0) { return {}; }
+  // l2va: the clip generated UP TO a frame. Both references pack it as
+  // a single block at the last frame's rotary time -- the time the last
+  // anchor of a first-and-last request takes -- with nothing at the
+  // first.
+  if (last_only) { return {H3AnchorEnd::kLast}; }
+  if (n == 1) { return {H3AnchorEnd::kFirst}; }
+  return {H3AnchorEnd::kFirst, H3AnchorEnd::kLast};
+}
+
+// See the declaration. Outside the Apple-Silicon guard for the same
+// reason as h3_anchor_count.
+GenerateVideoStage::H3Route
+GenerateVideoStage::h3_reference_route(bool said, int num_references,
+                                       const std::string& partition)
+{
+  if (num_references > 0) { return H3Route::kReference; }
+  if (partition == "ref2va") {
+    return said ? H3Route::kReference : H3Route::kRefuse;
+  }
+  return H3Route::kKeyframe;
+}
+
+// See the declaration. Neither question names the text encoder or a VAE:
+// a peer that holds one has declared it (every model-holding stage
+// does), and the manager counts that declaration in its phase. Named
+// here as well, it was counted AGAIN at its size on disk whenever
+// nothing in the launch held it -- a graph handed its conditioning,
+// with no conditioning stage in it.
+model_memory::StreamPlan
+GenerateVideoStage::h3_stream_plan(const SessionContextIntf* session,
+                                   const std::string&        dit_dir,
+                                   std::size_t               dit_retires)
+{
+  return model_memory::plan_streaming(session, dit_dir, std::string(),
+                                      model_memory::kStreamHeadroom,
+                                      dit_retires);
+}
+
+bool
+GenerateVideoStage::h3_box_bounded(const SessionContextIntf* session)
+{
+  return model_memory::bounded(session, {}, model_memory::kHeadroom);
+}
+
+// See the declaration. Outside the Apple-Silicon guard for the same
+// reason as h3_anchor_count: it is a property of the port contract.
+int
+GenerateVideoStage::h3_reference_rows(const TensorBeatPayload* t,
+                                      int want_elems, const float** data)
+{
+  *data = nullptr;
+  if (t == nullptr || t->shape.size() != 2 || t->shape[0] <= 0) {
+    return 0;
+  }
+  if ((int)t->shape[1] != want_elems) { return -1; }
+  *data = t->as_f32();
+  return (int)t->shape[0];
 }
 
 int
@@ -362,6 +1416,22 @@ GenerateVideoStage::apply_constant(unsigned iport, const FlexData& beat)
   // beat and the same parse, early enough that declare_resources()
   // sees the model. Bookkeeping only -- nothing loads here; the
   // pipeline is not assembled yet (see Stage::apply_constant).
+  if (iport == kModelCfgPort) {
+    // The family's own knobs, latched early for the one of them that a
+    // LATER DECISION depends on: VDN's linear branch is a second 4.28 GB
+    // checkpoint, and declare_resources() runs before any driver, so a
+    // branch first seen at run time is one every peer sized the box
+    // without. Stored RAW and re-parsed by the runtime latch, which
+    // stays in place -- apply_model_config_() needs a resolved family
+    // and there is none yet.
+    //
+    // Kept twice: `_model_cfg` for declare_resources(), which runs next,
+    // and `_model_cfg_launch` for reset_run_state(), which runs after
+    // that and must not lose it (see there).
+    _model_cfg = beat;
+    _model_cfg_launch = beat;
+    return;
+  }
   if (iport != kModelPort) { return; }
   apply_model_select_beat(beat, _hf_dir);
 }
@@ -379,7 +1449,7 @@ GenerateVideoStage::apply_constant(unsigned iport, const FlexData& beat)
 //
 // The same rules resolve_config_ applies, from the same sources. Each
 // arm is a cheap query by construction: a registered family answers
-// without loading, and both built-ins read one JSON (or, for a
+// without loading, and the built-in arms read one JSON (or, for a
 // Comfy-Org repack, the safetensors __metadata__ that stands in for it).
 //
 // RETURNING FALSE MATTERS AS MUCH AS THE ROUNDING. A source none of
@@ -424,8 +1494,36 @@ GenerateVideoStage::planned_geometry_(const std::string& root, int* out_w,
     const std::string part =
         genai::MetalMiniMaxH3Transformer::partition_of_model_type(
             resolve_model(session(), _hf_dir).model_type);
-    if (genai::MetalMiniMaxH3Transformer::config_from_json(root, h3, &err,
-                                                           part)) {
+    if (genai::h3i::is_root(root)) {
+      // MiniMax-H3-Image (initialize()'s rule): one frame, the size
+      // named or 2048^2, generated at least at `min_generation_area`.
+      frames = 1;
+      if (!_size_set) {
+        h = genai::h3i::kDefaultSide;
+        w = genai::h3i::kDefaultSide;
+      }
+      const auto p =
+          genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
+              _model_cfg);
+      genai::h3i::canvas_size(h, w,
+                              p.min_generation_area > 0
+                                  ? p.min_generation_area
+                                  : genai::h3i::kDefaultMinArea,
+                              genai::h3i::kCanvasMultiple, &h, &w);
+      known = true;
+    } else if (genai::ph3::is_root(root)) {
+      // P-H3-Image (resolve_config_'s rule): one frame, the canvas named
+      // or 8 MP, rounded to the nearest 32. An edit's canvas is its
+      // picture's, at most the manifest's 8 MP -- which this covers.
+      frames = 1;
+      if (!_size_set) {
+        h = genai::ph3::kDefaultSide;
+        w = genai::ph3::kDefaultSide;
+      }
+      genai::ph3::round_canvas(h, w, genai::ph3::kCanvasMultiple, &h, &w);
+      known = true;
+    } else if (genai::MetalMiniMaxH3Transformer::config_from_json(
+                   root, h3, &err, part)) {
       // 17-frame chunks keeping 5 latents each, so only 17n+5 has a
       // latent form -- 9 becomes 22, which is the whole of the 2.4x.
       frames = genai::minimax_h3::align_num_frames(frames, 17, 5);
@@ -448,6 +1546,461 @@ GenerateVideoStage::planned_geometry_(const std::string& root, int* out_w,
   if (out_frames != nullptr) { *out_frames = frames; }
   return known;
 }
+
+std::string
+GenerateVideoStage::vdn_dir_() const
+{
+  if (!_model_cfg.is_object()) { return {}; }
+  auto o = _model_cfg.as_object();
+  if (!o.contains("linear_branch")) { return {}; }
+  return std::string(o.at("linear_branch").as_string(""));
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+std::vector<ResourceClaim>
+GenerateVideoStage::preview_claims_(int w, int h, int frames) const
+{
+  // Only a family that can render previews books them: MiniMax-H3, and a
+  // registered family, which hands its clean estimate back through the
+  // request's output seam. A preview VAE on a Wan config would be claimed
+  // and never loaded.
+  const std::string fam = model_config::family_of(_model_cfg);
+  if (fam != "minimax-h3" &&
+      genai::VideoModelRegistry::get().find(fam) == nullptr) {
+    return {};
+  }
+  return latent_preview_claims(
+      session(), this->id(), LatentPreviewSpec::from_model_config(_model_cfg),
+      fam == "minimax-h3" ? genai::MetalTaeDecoder::Trim::kH3Chunks
+                          : genai::MetalTaeDecoder::Trim::kLeading,
+      w, h, frames);
+}
+#endif
+
+std::string
+GenerateVideoStage::ane_claim_label_() const
+{
+  return "ane-ffn/" + std::string(this->id());
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// What the MiniMax-H3 ANE tier books: its fixed module plus host buffers
+// for the ANE's rows of the PLANNED clip -- the packed sequence of the
+// planned geometry, with room for two conditioning latent frames and the
+// longest text. The same geometry answers the claim and the grant, so the
+// two cannot book different numbers.
+int
+GenerateVideoStage::h3_plan_seq_(int* text) const
+{
+  int w = _width, h = _height, f = _frames;
+  const std::string root = resolve_model_dir(session(), _hf_dir);
+  (void)planned_geometry_(root, &w, &h, &f);
+  const genai::MetalMiniMaxH3VideoVae::Config vc;
+  const genai::MetalMiniMaxH3Transformer::Config tc;
+  constexpr int kCondFrames = 2, kTextRows = 512;
+  // P-H3-Image: the picture, its two audio latents a channel, and -- an
+  // edit, its references wired -- the picture to edit at the canvas and
+  // its vision block in the presentation (the tower reads a ~1 MP copy:
+  // ~1000 tokens; 1061 rows MEASURED with a short instruction). More
+  // pictures are the runtime preflight's to book, at their size.
+  //
+  // THE PICTURE IS NOT ALWAYS AT THE CANVAS: video-ref-encoder holds the
+  // one edited at least at the manifest's canvas floor (4 MP) whatever
+  // canvas generate-video names -- it cannot see it -- so a smaller
+  // named canvas still carries a 4 MP picture's rows. MEASURED: a 1024^2
+  // canvas edit ran 6185 rows where the canvas alone booked 2,1xx.
+  // MiniMax-H3-Image: the picture, and -- an edit -- a picture the
+  // release keeps at its own size between 1024 and 2048 short edges
+  // (booked at the canvas, at least 2048^2's rows) with the tower's copy
+  // at a 1024 short edge beside it in the presentation. No audio rows.
+  if (genai::h3i::is_root(root)) {
+    const int gh = std::max(1, h / genai::h3i::kCanvasMultiple);
+    const int gw = std::max(1, w / genai::h3i::kCanvasMultiple);
+    const bool edit = iport_edges().size() > kRefVideoRowsPort &&
+                      iport_edges()[kRefVideoRowsPort].v != nullptr;
+    const int cell = genai::h3i::kCanvasMultiple * genai::h3i::kCanvasMultiple;
+    const int picture = std::max(gh * gw, (int)(4096LL * 4096LL / 4 / cell));
+    const int vision = (int)((std::int64_t)genai::h3i::kVisionShortEdge *
+                             genai::h3i::kVisionShortEdge / cell) + 16;
+    if (text != nullptr) { *text = kTextRows + (edit ? vision : 0); }
+    return gh * gw + (edit ? picture + vision : 0) + kTextRows;
+  }
+  if (genai::ph3::is_root(root)) {
+    constexpr int kPictureTokens = 1024;
+    const int gh = std::max(1, h / genai::ph3::kCanvasMultiple);
+    const int gw = std::max(1, w / genai::ph3::kCanvasMultiple);
+    const bool edit = iport_edges().size() > kRefVideoRowsPort &&
+                      iport_edges()[kRefVideoRowsPort].v != nullptr;
+    genai::ph3::Manifest man;
+    (void)genai::ph3::read_manifest(root, &man, nullptr);
+    const int cell = genai::ph3::kCanvasMultiple * genai::ph3::kCanvasMultiple;
+    const int picture =
+        std::max(gh * gw, (int)(man.canvas_min_pixels / cell));
+    if (text != nullptr) {
+      *text = kTextRows + (edit ? kPictureTokens : 0);
+    }
+    return gh * gw + (edit ? picture + kPictureTokens : 0) +
+           genai::minimax_h3::kAudioChannels * genai::ph3::kAudioLatents +
+           kTextRows;
+  }
+  const int lf = genai::MetalMiniMaxH3VideoVae::video_latent_frames_for(
+      vc, std::max(1, f));
+  const int gh = std::max(1, (h + vc.patch - 1) / vc.patch / tc.patch_h);
+  const int gw = std::max(1, (w + vc.patch - 1) / vc.patch / tc.patch_w);
+  const int audio =
+      _fps > 0.0
+          ? genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
+                (double)std::max(1, f) / _fps)
+          : 0;
+  // A GUIDE wired books the continuation recipe's: 7 latent frames (22
+  // pixel frames) and their soundtrack. A longer one is the runtime
+  // preflight's to check, at its real geometry.
+  const bool guided =
+      (iport_edges().size() > kGuidePort &&
+       iport_edges()[kGuidePort].v != nullptr) ||
+      (iport_edges().size() > kGuideAudioPort &&
+       iport_edges()[kGuideAudioPort].v != nullptr);
+  constexpr int kGuideFrames = 7, kGuideAudio = 37;
+  // A REFINE takes no keyframe frames. IN CONTEXT -- references wired
+  // beside its init latent, Open-H3-Regenerate-2K-IC -- it books that
+  // recipe's reference: the draft as a clip at 768P (1344 x 768, the
+  // release's draft canvas and video-ref-encoder's clip cap) over the
+  // clip's latent frames, and its presentation: the clip sampled at
+  // 2 fps, merged in pairs, a 1344 x 768 cell of 1008 tokens a pair.
+  // Another draft is the runtime preflight's to book at its geometry.
+  // 2K x 22 books 33,813 rows for the 33,420 a forward ran (the prompt's
+  // 512 are generous); the release's 2K x 124 ~177k, where the canvas
+  // and two anchors alone had booked ~141k.
+  const bool refine = refines_();
+  const bool in_context = refine &&
+                          iport_edges().size() > kRefVideoRowsPort &&
+                          iport_edges()[kRefVideoRowsPort].v != nullptr;
+  // The presentation's tokens are the PROMPT's rows: the text refiner's,
+  // banded with the prompt where it passes a band.
+  int draft = 0, present = 0;
+  if (in_context) {
+    constexpr int kDraftW = 1344, kDraftH = 768;
+    const int dgh = kDraftH / vc.patch / tc.patch_h;
+    const int dgw = kDraftW / vc.patch / tc.patch_w;
+    draft = std::max(0, lf) * dgh * dgw;
+    std::vector<int> idx;
+    std::vector<float> secs;
+    if (genai::minimax_h3::condition_frame_indices(
+            std::max(1, f), genai::minimax_h3::kFps, 2.0, 2, &idx, &secs)) {
+      present = ((int)idx.size() + 1) / 2 * (kDraftW / 32) * (kDraftH / 32);
+    }
+  }
+  if (text != nullptr) { *text = kTextRows + present; }
+  return (std::max(0, lf) + (refine ? 0 : kCondFrames) +
+          (guided ? kGuideFrames : 0)) *
+             gh * gw +
+         draft + present + audio + (guided ? 2 * kGuideAudio : 0) +
+         kTextRows;
+}
+
+std::size_t
+GenerateVideoStage::h3_ane_bytes_() const
+{
+  genai::MetalMiniMaxH3Transformer::Config tc;
+  // The CLAIM has to cover every tier the graph asked for. It did not
+  // cover the qkv module while the preflight already charged for it, so
+  // the gate refused against a number the plan had never granted.
+  tc.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  // A RANK (`tensor_parallel`): its modules are its share's.
+  tc.tp = h3_tp_share_(tc);
+  return genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(tc,
+                                                             h3_plan_seq_());
+}
+
+// What a RANK of a split H3 holds (`tensor_parallel`): the transformer's
+// own figure, the one held_bytes() then measures -- its share of every
+// block's four projections in the layout the load leaves (bf16, an
+// affine pack's codes, a main block's int8 tier layout where it engages
+// -- not under an ANE tier asked, the larger figure whether or not it is
+// granted), the trunk and the refiner's norms whole, no AdaLN (the bake
+// reads it from the checkpoint and retires it, the final layer's too),
+// and the bake's tables for four rows a step of the most steps it can
+// run. 0 when not split.
+//
+// The load's transient -- a column cut's projection read whole,
+// uncached, then cut (tp_linear_; a row cut reads its share's rows
+// alone): the out projection's 77 MB, fc2's 154 at most -- is not held:
+// the forward's scratch, booked beside this, is not allocated until the
+// first forward, after the load.
+std::size_t
+GenerateVideoStage::h3_tp_held_bytes_(const std::string& dit,
+                                      bool hold_w4,
+                                      std::size_t* floor) const
+{
+  if (floor != nullptr) { *floor = 0; }
+  using T = genai::MetalMiniMaxH3Transformer;
+  T::Config tc;
+  if (!_tp_cfg.is_object() || !T::config_from_json(dit, tc, nullptr)) {
+    return 0;
+  }
+  tc.tp = h3_tp_share_(tc);
+  if (!tc.tp.active()) { return 0; }
+  tc.i8_gemm = _i8_gemm;
+  tc.i8_tier = _i8_tier;
+  tc.i8_hold_w4 = hold_w4;
+  tc.autotune = _autotune;
+  tc.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  auto* mc = session() != nullptr ? session()->services()->metal_compute()
+                                  : nullptr;
+  // The bake's rows: four a step, at the most steps the clip can run --
+  // the request's, or a flow-map adapter's grid, or an adapter's sampling
+  // contract, as the load bounds them.
+  int steps = h3_steps_();
+  for (const std::string& f : h3_plan_lora_files_()) {
+    steps = std::max(steps, T::flow_map_steps(f));
+    T::SamplingContract sc;
+    std::string cerr;
+    if (T::sampling_contract_of(f, &sc, &cerr)) {
+      steps = std::max(steps, (int)sc.sigmas.size() - 1);
+    }
+  }
+  return T::tp_held_bytes(dit, tc, 4 * steps, mc, floor);
+}
+
+genai::TpShare
+GenerateVideoStage::h3_tp_share_(
+    const genai::MetalMiniMaxH3Transformer::Config& c) const
+{
+  genai::TpShare sh;
+  if (!_tp_cfg.is_object() ||
+      !genai::TpShare::from_flex(_tp_cfg, c.n_heads, c.ffn, &sh, nullptr)) {
+    return genai::TpShare{};
+  }
+  return sh;
+}
+
+// THE DENOISE'S ACTIVATIONS, which the plan never booked: only the
+// runtime preflight (preflight_h3_scratch_) knew them, so the one ledger
+// that can refuse a graph carried weights alone through the phase where a
+// video forward holds ~200 KB a row (1.9 GB at 9382 rows, 3.9 at 19k). The
+// forward's scratch at the planned sequence, the dequant scratch where
+// matrix cores may take it (a quantized or FP8 checkpoint, or an int8
+// layout's declined bands), and the int8 context's bound. Sol's and
+// Sage's are mostly lent from the attention arena and stay the
+// preflight's, which still checks the real geometry.
+std::size_t
+GenerateVideoStage::h3_forward_scratch_bytes_(const std::string& dit) const
+{
+  using T = genai::MetalMiniMaxH3Transformer;
+  T::Config c;
+  if (!T::config_from_json(dit, c, nullptr)) { return 0; }
+  auto* mc = session() != nullptr ? session()->services()->metal_compute()
+                                  : nullptr;
+  const bool mx = mc != nullptr && mc->supports_matrix_cores();
+  int text = 0;
+  const int seq = h3_plan_seq_(&text);
+  // THE BANDED FORWARD, as the DiT will decide it (band_for): the tiers
+  // the graph asked for keep the whole sequence, and so do VDN's branch
+  // and TaoMate-H3's streaming attention.
+  c.ane_ffn = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+  c.ane_qkv = genai::accel::flag(&_accel, genai::accel::kAneQkv);
+  c.sol = _sol;
+  c.sage = _sage;
+  // A RANK of a split DiT (`tensor_parallel`): its share's widths, and
+  // the banding a rank takes -- every scratch below is the narrower
+  // model's, its exchange buffers counted by scratch_bytes.
+  {
+    genai::TpShare sh;
+    if (_tp_cfg.is_object() &&
+        genai::TpShare::from_flex(_tp_cfg, c.n_heads, c.ffn, &sh, nullptr) &&
+        sh.active()) {
+      c.tp = sh;
+      c = T::rank_config(c);
+    }
+  }
+  const std::vector<std::string> loras = h3_plan_lora_files_();
+  bool whole = !vdn_dir_().empty();
+  for (const std::string& f : loras) {
+    whole = whole || genai::minimax_h3::taomate::is_adapter(f);
+  }
+  const int band = whole ? 0 : T::band_for(c, seq, text);
+  const int rows = band > 0 ? band : seq;
+  // An FP8 / int8 / W4A8 file widens its projections into the dequant
+  // scratch on every GPU (fp8_widen_bytes), the matrix cores' tiles
+  // aside. The prompt at the rows the plan put in the sequence: an
+  // in-context refine's presentation is thousands of them, a long
+  // draft's past a band.
+  std::size_t n = T::scratch_bytes(c, seq, text, T::kTimestepSlots, mx,
+                                   /*narrow_ff=*/false, 0, band,
+                                   T::fp8_widen_bytes(dit, c));
+  if (mx && _i8_gemm) {
+    n += genai::I8GemmContext::forward_bytes_bound(rows, c.ffn, 2 * c.ffn,
+                                                   c.hidden, _i8_tier == 0);
+  }
+  // Sage's and Sol's own scratch, which a banded forward does not lend
+  // them (run whole, they borrow the dead attention windows and stay the
+  // preflight's): Sage's keys and V for every row and one band's
+  // queries, Sol's calls per band size.
+  if (band > 0) {
+    const int H = c.n_heads, HD = c.head_dim;
+    if (mx && _sage.enabled && _sage.dense_layers < c.n_layers) {
+      n += genai::MetalSageAttention::private_bytes(
+          H, H, band, seq, HD, genai::MetalSageAttention::nax_query_block(),
+          genai::MetalSageAttention::nax_key_block(), 0, 0, _sage.pv8);
+    }
+    if (_sol.enabled && _sol.dense_layers < c.n_layers) {
+      const std::size_t lend = (std::size_t)band * 3 * c.inner() * 2;
+      n += genai::MetalSolAttention::band_private_bytes(
+          H, H, band, seq, HD, _sol.key_block, mx, lend, 0);
+      if (seq % band != 0) {
+        n += genai::MetalSolAttention::band_private_bytes(
+            H, H, seq % band, seq, HD, _sol.key_block, mx, lend, 0);
+      }
+      // The layer's keys, summarised once for every band's call.
+      n += genai::MetalSolAttention::prepared_keys_bytes(H, seq, HD,
+                                                         _sol.key_block);
+    }
+  }
+  // The adapters' [rows, rank] intermediate, every slot's region: 149 MB
+  // for Open-H3-Regenerate-2K's merge (q|k|v at rank 1728) at a 2K refine
+  // run whole, a band's 28 MB banded.
+  int rank = 0;
+  for (const std::string& f : loras) {
+    rank += T::lora_footprint(f, c.n_layers, c.pruned() ? &c : nullptr).rank;
+  }
+  n += (std::size_t)rows * (std::size_t)rank * 2;
+  return n;
+}
+
+std::vector<std::string>
+GenerateVideoStage::h3_plan_lora_files_() const
+{
+  std::vector<std::string> out;
+  if (!_model_cfg.is_object()) { return out; }
+  const auto o = _model_cfg.as_object();
+  for (int i = 0; i < kH3LoraSlots; ++i) {
+    const std::string_view kp = lora_slots::kPath[i];
+    if (!o.contains(kp)) { continue; }
+    const std::string p(o.at(kp).as_string(""));
+    if (p.empty()) { continue; }
+    std::string ignored;
+    const std::string f = resolve_adapter_file(session(), p, &ignored);
+    if (!f.empty()) { out.push_back(f); }
+  }
+  return out;
+}
+
+int
+GenerateVideoStage::h3_steps_() const
+{
+  if (_h3i) { return _h3i_manifest.steps(); }
+  const auto p =
+      genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
+          _model_cfg);
+  return p.sigmas.size() >= 2 ? (int)p.sigmas.size() - 1 : _steps;
+}
+
+void
+GenerateVideoStage::h3i_canvas_()
+{
+  // The size RETURNED: the graph's, or the release's default -- read
+  // from the config every time, since _height / _width are overwritten
+  // with the canvas below and the canvas is not idempotent.
+  _h3i_out_h = _size_set ? std::max(1, (int)attr_int("height"))
+                         : genai::h3i::kDefaultSide;
+  _h3i_out_w = _size_set ? std::max(1, (int)attr_int("width"))
+                         : genai::h3i::kDefaultSide;
+  _h3i_min_area = _h3_params.min_generation_area > 0
+                      ? _h3_params.min_generation_area
+                      : genai::h3i::kDefaultMinArea;
+  int h = 0, w = 0;
+  genai::h3i::canvas_size(_h3i_out_h, _h3i_out_w, _h3i_min_area,
+                          genai::h3i::kCanvasMultiple, &h, &w);
+  _height = h;
+  _width  = w;
+}
+
+bool
+GenerateVideoStage::refines_() const
+{
+  return iport_edges().size() > kInitPort &&
+         iport_edges()[kInitPort].v != nullptr;
+}
+
+// Carry the settled ANE tier out of the accel bag and onto _h3_cfg.
+// WHETHER it runs is the plan's call: the module is one fixed unit, and
+// without the grant the config stays off, which is how the DiT is told to
+// keep its GPU feed-forward. Read here rather than at claim time because
+// the grant is not computed until every stage has claimed.
+void
+GenerateVideoStage::apply_h3_ane_()
+{
+  namespace a = genai::accel;
+  _h3_cfg.ane_ffn  = false;
+  _h3_cfg.ane_qkv  = false;
+  _h3_cfg.ane_int8 = false;
+  _h3_cfg.ane_int8_plain = false;
+  if (!a::flag(&_accel, a::kAneFfn)) { return; }
+  const std::size_t bytes = h3_ane_bytes_();
+  if (model_memory::coreml_grant(session(), ane_claim_label_(), bytes, 1) <=
+      0) {
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): the ANE feed-forward was requested but "
+        "the plan left no room for its module ({} MB); keeping the GPU "
+        "feed-forward", this->id(), bytes >> 20));
+    return;
+  }
+  _h3_cfg.ane_ffn    = true;
+  // Granted as one unit with the feed-forward, so it rides the same
+  // grant rather than asking again.
+  _h3_cfg.ane_qkv    = a::flag(&_accel, a::kAneQkv);
+  _h3_cfg.ane_int8   = a::flag(&_accel, a::kAneInt8);
+  _h3_cfg.ane_int8_plain =
+      _h3_cfg.ane_int8 &&
+      a::text(&_accel, a::kAneInt8Tier) == a::kI8TierTokenPlain;
+  _h3_cfg.ane_rows   = (float)a::real(&_accel, a::kAneRows, 0.0);
+  _h3_cfg.ane_layers =
+      (int)std::max<long long>(0, a::integer(&_accel, a::kAneLayers, 0));
+}
+#else
+std::size_t GenerateVideoStage::h3_ane_bytes_() const { return 0; }
+int GenerateVideoStage::h3_plan_seq_(int*) const { return 0; }
+std::size_t
+GenerateVideoStage::h3_forward_scratch_bytes_(const std::string&) const
+{
+  return 0;
+}
+void GenerateVideoStage::apply_h3_ane_() {}
+#endif
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+namespace {
+
+// What a STREAMED dense H3 checkpoint's slot pair adds on the int8 tiers:
+// each slot keeps its bf16 source as the refill target AND the layout
+// quantized from it (Linear::ds), so a slot is ~1.5 blocks. Block 0's
+// four projections at int8 with the finest group's scales, twice. Zero for
+// a pack (its codes convert in place) and where the tiers do not engage.
+std::size_t
+h3_int8_slot_bytes_(const SessionContextIntf* session,
+                    const std::string& dit, bool i8, int tier)
+{
+  if (!i8 || tier <= 0 || session == nullptr) { return 0; }
+  auto* mc = session->services()->metal_compute();
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return 0; }
+  auto w = genai::MetalLlamaWeights::open_model(dit);
+  if (!w.has_value()) { return 0; }
+  std::size_t n = 0;
+  for (const char* p : {"attn.qkv_proj", "attn.out_proj", "mlp.fc1",
+                        "mlp.fc2"}) {
+    const std::string nm = std::string("blocks.0.") + p;
+    if (w->info(nm + ".scales") != nullptr) { return 0; }
+    const auto* ti = w->info(nm + ".weight");
+    if (ti == nullptr || ti->shape.size() != 2) { continue; }
+    const std::size_t N = (std::size_t)ti->shape[0];
+    const std::size_t K = (std::size_t)ti->shape[1];
+    n += N * K + std::max(N * (K / 256) * 2, N * 4);
+  }
+  return 2 * n;
+}
+
+}  // namespace
+#endif
 
 std::vector<ResourceClaim>
 GenerateVideoStage::declare_resources() const
@@ -480,7 +2033,12 @@ GenerateVideoStage::declare_resources() const
   int aw = _width, ah = _height, af = _frames;
   std::size_t arena_bytes = model_memory::kUnknownArena;
   if (planned_geometry_(root, &aw, &ah, &af)) {
-    arena_bytes = model_memory::video_decode_scratch_bytes(aw, ah, af);
+    // The clip, and what the VAE holds to make it -- which for the Wan
+    // VAE at FlashVSR's 1920x1152 is several times the clip. Booked as
+    // the clip alone, that decode read as 530 MB and ran into 9.5 GB of
+    // swap.
+    arena_bytes = model_memory::video_decode_scratch_bytes(aw, ah, af) +
+                  model_memory::video_vae_working_bytes(root, aw, ah);
   } else {
     session()->log_debug(fmt(
         "GenerateVideoStage('{}'): no rounding rule for '{}', so the decode "
@@ -490,6 +2048,23 @@ GenerateVideoStage::declare_resources() const
   // No geometry to size from: a presence marker, so the per-beat figure
   // has an entry to revise. See model_memory::kUnknownArena.
   if (arena_bytes == 0) { arena_bytes = model_memory::kUnknownArena; }
+  // MiniMax-H3's released decoder works BESIDE its clip: one chunk's tile
+  // decodes kept until stitched, the stitch, its ViT scratch
+  // (decode_working_bytes) -- 1.4 GB at 2K that the arena never carried.
+  // A registered family states its own.
+  if (arena_bytes != model_memory::kUnknownArena &&
+      genai::VideoModelRegistry::get().claim_for(
+          session(), root, resolve_model(session(), _hf_dir).model_type) ==
+          nullptr) {
+    genai::MetalMiniMaxH3VideoVae::Config vc;
+    if (genai::MetalMiniMaxH3VideoVae::config_from_json(
+            genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root), vc,
+            nullptr)) {
+      arena_bytes += genai::MetalMiniMaxH3VideoVae::decode_working_bytes(
+          vc, genai::MetalMiniMaxH3VideoVae::video_latent_frames_for(vc, af),
+          ah / vc.patch, aw / vc.patch);
+    }
+  }
   std::vector<ResourceClaim> arena = model_memory::scratch_claims(
       "vae-decode", arena_bytes, model_memory::kPhaseDecode);
   // The LATENT this stage emits, alive from the denoise that writes it
@@ -525,6 +2100,21 @@ GenerateVideoStage::declare_resources() const
         arena.push_back(std::move(c));
       }
     }
+    // What the DENOISE allocates beyond its weights: a family's activation
+    // scratch and its per-clip caches. The latent above is what LEAVES the
+    // stage; this is what the stage holds while making it, and for a
+    // family like FlashVSR it is the larger of the two by far.
+    if (fam != nullptr) {
+      const std::size_t den = fam->denoise_scratch_bytes(
+          root, aw, ah, af, _model_cfg.is_object() ? &_model_cfg : nullptr);
+      if (den > 0) {
+        for (auto& c : model_memory::scratch_claims(
+                 fmt("{}-denoise", this->id())(), den,
+                 model_memory::kPhaseDenoise)) {
+          arena.push_back(std::move(c));
+        }
+      }
+    }
     // The SOUNDTRACK, on the same principle: its length comes from this
     // stage's frames/fps, so the audio decode downstream cannot size
     // itself and this is the only place that can. Plan-time seconds are
@@ -534,7 +2124,11 @@ GenerateVideoStage::declare_resources() const
     // guessing.
     std::size_t alat = 0, pcm = 0, aarena = 0;
     bool has_audio = false;
-    if (_fps > 0.0) {
+    // A MiniMax-H3 refine writes no soundtrack: it is held at the
+    // silence it was conditioned on, and nothing decodes one.
+    if (_fps > 0.0 &&
+        !(fam == nullptr && (refines_() || genai::ph3::is_root(root) ||
+                             genai::h3i::is_root(root)))) {
       if (fam != nullptr) {
         has_audio = fam->audio_cost(root, af, _fps, &alat, &pcm, &aarena);
       } else {
@@ -558,10 +2152,32 @@ GenerateVideoStage::declare_resources() const
         arena.push_back(std::move(c));
       }
     }
+    for (auto& c : preview_claims_(aw, ah, af)) {
+      arena.push_back(std::move(c));
+    }
   }
 
   if (fam != nullptr) {
-    std::vector<ResourceClaim> out = fam->declare_resources(root);
+    // A family's CoreML claim -- the ANE module a family that implements
+    // `ane_ffn` holds -- is booked only when the graph asked for the tier,
+    // and under THIS stage's label: the family cannot know the stage's id,
+    // and two stages sharing a label would share one grant. The grant is
+    // read back at load; see the plugin branch of load.
+    const bool ane = genai::accel::flag(&_accel, genai::accel::kAneFfn);
+    std::vector<ResourceClaim> out;
+    for (auto& c : fam->declare_resources(root)) {
+      std::size_t ub = 0;
+      int un = 0;
+      if (model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
+        if (!ane) { continue; }
+        for (auto& r : model_memory::coreml_claims(ane_claim_label_(), ub,
+                                                   un, c.phase)) {
+          out.push_back(std::move(r));
+        }
+        continue;
+      }
+      out.push_back(std::move(c));
+    }
     for (auto& c : arena) { out.push_back(std::move(c)); }
     return out;
   }
@@ -582,14 +2198,152 @@ GenerateVideoStage::declare_resources() const
   const std::string part =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  const std::string dit = h3_dit_(root, part);
   // BOTH numbers: what this DiT weighs, and the floor it can be reduced
   // to by streaming its blocks. A graph that does not fit the first and
   // does fit the second is not one to refuse -- it is one to stream.
-  std::vector<ResourceClaim> out{model_memory::weight_claim_streamable(
-      dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit))};
+  //
+  // A RANK of a split DiT (`tensor_parallel`) streams its SHARE as the
+  // whole model streams the checkpoint: booked at the share every block
+  // kept (held), streamable to the rank's floor -- its trunk, refiner and
+  // tables, and two blocks' shares -- as declare_memory() reports it.
+  // Claimed as the whole checkpoint, the ledger that refuses graphs and
+  // every peer sizing against it read 66.3 GB for a rank that holds 8.0
+  // (11 of 56 heads).
+  std::vector<ResourceClaim> out;
+  std::size_t tp_floor = 0;
+  if (std::size_t tp = h3_tp_held_bytes_(dit, false, &tp_floor);
+      tp > 0) {
+    // ...and the w4 layouts' growth on its share where its load held
+    // them preloaded (the VPIPE_PRELOAD A/B; 0 until a load decides).
+    tp += _h3_tp_hold_growth_;
+    ResourceClaim c = model_memory::weight_claim_streamable(dit, tp_floor);
+    bag::set_integer(c.extra, model_memory::kClaimHeldBytes,
+                     (std::int64_t)tp);
+    out.push_back(std::move(c));
+  } else {
+    out.push_back(model_memory::weight_claim_streamable(
+        dit, genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
+                 h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier)));
+  }
+  // THE FORWARD'S ACTIVATIONS, in the denoise phase (see
+  // h3_forward_scratch_bytes_): a presence marker where the geometry is
+  // not known, which the preflight then answers for.
+  {
+    int pw = _width, ph = _height, pf = _frames;
+    const std::size_t den = planned_geometry_(root, &pw, &ph, &pf)
+                                ? h3_forward_scratch_bytes_(dit)
+                                : model_memory::kUnknownArena;
+    for (auto& c : model_memory::scratch_claims(
+             fmt("{}-h3-dit", this->id())(),
+             den > 0 ? den : model_memory::kUnknownArena,
+             model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
+  // THE RUNTIME ADAPTERS' FACTORS -- 6.2 GB for Open-H3-Regenerate-2K's
+  // rank-576 merge (read F32, held bf16). A streamed DiT spills every
+  // main block's to a file and holds the largest block's set beside the
+  // refiner's (spill_lora_); a block residency keeps takes its factors
+  // back (keep_lora_), so on a box with room the run converges on every
+  // factor held. Booked as the DiT is: at that, streamable to the set.
+  // (The load reads every factor before it spills, a transient this does
+  // not book.)
+  {
+    using T = genai::MetalMiniMaxH3Transformer;
+    T::Config tc;
+    const int nl = T::config_from_json(dit, tc, nullptr) ? tc.n_layers : 0;
+    tc.time_mlp_dir = h3_time_mlp_dir_(root, part, tc);
+    // A rank holds its cut of the split projections' factors.
+    const genai::TpShare share = h3_tp_share_(tc);
+    bool off_curve = false;
+    int bound_steps = h3_steps_();
+    for (const std::string& f : h3_plan_lora_files_()) {
+      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr,
+                                        share.active() ? &share : nullptr);
+      off_curve = off_curve || (tc.pruned() && T::moves_time_embedding(f));
+      bound_steps = std::max(bound_steps, T::flow_map_steps(f));
+      if (fp.whole == 0) { continue; }
+      ResourceClaim lc = model_memory::weight_claim_streamable(f, fp.streamed);
+      bag::set_integer(lc.extra, model_memory::kClaimHeldBytes,
+                       (std::int64_t)fp.whole);
+      out.push_back(std::move(lc));
+    }
+    // A PRUNED DiT under an adapter that moves its timestep embedding
+    // bakes the part the curve cannot carry, through the released AdaLN,
+    // as the denoise starts (bake_adaln): its tables for the schedule's
+    // rows (four a step at most) and one released block read at a time.
+    if (off_curve) {
+      for (auto& c : model_memory::scratch_claims(
+               fmt("{}-h3-off-curve", this->id())(),
+               T::off_curve_bytes(tc, std::max(1, bound_steps) * 4),
+               model_memory::kPhaseDenoise)) {
+        out.push_back(std::move(c));
+      }
+    }
+  }
+  // A REFINE encodes the silence its soundtrack is held at with the audio
+  // VAE, loaded at the denoise's start and let go before the first
+  // forward (h3_silence_rows_).
+  if (refines_()) {
+    // Never the root in its place: that would book the repository.
+    const std::string adir =
+        genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(root);
+    for (auto& c : model_memory::weight_claims_in_phase(
+             {adir}, model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
+  // ANE RESIDENCY: one unit, in the denoise phase. CoreML holds the
+  // module's bytes where no other ledger can see them, and the feed-forward
+  // runs on ONE shared runtime-weight module, so the cost is fixed --
+  // granted whole or not at all. See apply_h3_ane_().
+  if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+    for (auto& c : model_memory::coreml_claims(ane_claim_label_(),
+                                               h3_ane_bytes_(), 1,
+                                               model_memory::kPhaseDenoise)) {
+      out.push_back(std::move(c));
+    }
+  }
+  // VDN's branch is a SECOND checkpoint -- 4.28 GB over 50 blocks -- and
+  // it is declared here or it is invisible: every driver runs
+  // initialize() concurrently, so a peer that sizes itself against this
+  // stage before the branch loads sizes against a model that is 4 GB
+  // smaller than the one it will be sharing the box with.
+  //
+  // STREAMABLE, and to almost nothing, because the branch follows the
+  // DiT: if the DiT streams, the branch streams with it and holds one
+  // block. Claiming the full size as a floor would refuse graphs that
+  // stream perfectly well; claiming only the floor would let one in that
+  // then cannot hold both preloaded.
+  const std::string vdn_dir = vdn_dir_();
+  if (!vdn_dir.empty()) {
+    // The record's SUBTREE, not the repo root: the two VDN stages are
+    // published from one repo and both keys resolve to it, so the root
+    // holds no linear_branch/ at all. Handed the root, the scan below
+    // finds nothing and this stage claims NOTHING for a 4.28 GB
+    // checkpoint -- which is the silent half of the same mistake the
+    // attach reports loudly.
+    const std::string vroot =
+        resolved_subtree_dir(resolve_model(session(), vdn_dir));
+    const std::string vdir = (fs::path(vroot) / "linear_branch").string();
+    std::error_code vec;
+    std::size_t whole = 0;
+    for (const auto& de : fs::directory_iterator(vdir, vec)) {
+      if (vec) { break; }
+      if (de.is_regular_file(vec)
+          && de.path().extension() == ".safetensors") {
+        whole += (std::size_t)de.file_size(vec);
+      }
+    }
+    if (whole > 0) {
+      // One block plus the fp32 widening the kernels need, which is what
+      // a streamed branch actually holds at any instant.
+      const int nl = 50;
+      const std::size_t floor = (whole / (std::size_t)nl) * 2u;
+      out.push_back(model_memory::weight_claim_streamable(vdir, floor));
+    }
+  }
   for (auto& c : arena) { out.push_back(std::move(c)); }
   return out;
 #else
@@ -634,6 +2388,10 @@ GenerateVideoStage::declare_memory() const
     if (!planned_geometry_(root, &fw, &fh, &ff)) { return m; }
     m.outputs.resize(2, 0);
     m.outputs[0] = fam->latent_bytes(root, fw, fh, ff);
+    // Same figure as the denoise claim in declare_resources, in this
+    // ledger's terms, so the two plans cannot disagree about it.
+    m.scratch = fam->denoise_scratch_bytes(
+        root, fw, fh, ff, _model_cfg.is_object() ? &_model_cfg : nullptr);
     std::size_t alat = 0, apcm = 0, aarena = 0;
     if (_fps > 0.0 &&
         fam->audio_cost(root, ff, _fps, &alat, &apcm, &aarena)) {
@@ -645,9 +2403,7 @@ GenerateVideoStage::declare_memory() const
   const std::string part =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  const std::string dit = h3_dit_(root, part);
   // NAMED by its directory, so two stages over one checkpoint are one
   // set of weights in the plan rather than two.
   // Remembered HERE as well as in decide_resources, because this method
@@ -655,24 +2411,58 @@ GenerateVideoStage::declare_memory() const
   // is `destroy` -- so under `auto` the pooling below had an empty
   // string and did nothing, silently.
   _dit_dir_declared_ = dit;
-  m.hold(dit, model_memory::dir_weights_bytes(dit),
-         genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit),
-         // `destroy` only, the same condition the phase claim carries:
-         // `auto` resolves against a figure this would itself change.
-         _unload_cfg == model_memory::UnloadPolicy::kDestroy,
-         // ...and `auto` is the RECLAIMABLE case -- held while there is
-         // room, given back under pressure, found still there or
-         // reloaded when next used.
-         _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  // A rank of a split DiT holds its share, every block kept, with its
+  // bake's tables (h3_tp_held_bytes_) -- and, where a preloaded load held
+  // the w4 layouts, their growth on the share -- streamable to its floor.
+  std::size_t tp_floor = 0;
+  if (const std::size_t share = h3_tp_held_bytes_(dit, false, &tp_floor);
+      share > 0) {
+    const std::size_t tp = share + _h3_tp_hold_growth_;
+    m.hold(dit, tp, tp_floor,
+           _unload_cfg == model_memory::UnloadPolicy::kDestroy,
+           _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  } else {
+    // A preload holding its w4 projections' int8 layout holds that
+    // layout's growth too (0 until the load decides it; see
+    // _h3_i8_hold_growth_).
+    m.hold(dit, model_memory::dir_weights_bytes(dit) + _h3_i8_hold_growth_,
+           genai::MetalMiniMaxH3Transformer::streaming_floor_bytes(dit) +
+               h3_int8_slot_bytes_(session(), dit, _i8_gemm, _i8_tier),
+           // `destroy` only, the same condition the phase claim carries:
+           // `auto` resolves against a figure this would itself change.
+           _unload_cfg == model_memory::UnloadPolicy::kDestroy,
+           // ...and `auto` is the RECLAIMABLE case -- held while there is
+           // room, given back under pressure, found still there or
+           // reloaded when next used.
+           _unload_cfg == model_memory::UnloadPolicy::kAuto);
+  }
+  // The runtime adapters' factors, as declare_resources() books them;
+  // they go with the DiT, and nothing parks them (they are not a set).
+  {
+    using T = genai::MetalMiniMaxH3Transformer;
+    T::Config tc;
+    const int nl = T::config_from_json(dit, tc, nullptr) ? tc.n_layers : 0;
+    tc.time_mlp_dir = h3_time_mlp_dir_(root, part, tc);
+    const genai::TpShare share = h3_tp_share_(tc);
+    for (const std::string& f : h3_plan_lora_files_()) {
+      const auto fp = T::lora_footprint(f, nl, tc.pruned() ? &tc : nullptr,
+                                        share.active() ? &share : nullptr);
+      m.hold(f, fp.whole, fp.streamed,
+             _unload_cfg == model_memory::UnloadPolicy::kDestroy);
+    }
+  }
 
   int aw = _width, ah = _height, af = _frames;
   if (!planned_geometry_(root, &aw, &ah, &af)) { return m; }
+  // The forward's activations, as the denoise claim books them.
+  m.scratch = h3_forward_scratch_bytes_(dit);
   // oport 0 is the video latent, oport 1 the audio latent. Sized from
   // the same rounded geometry the arena uses, so the two cannot
   // describe different clips.
   m.outputs.resize(2, 0);
   m.outputs[0] = genai::MetalMiniMaxH3VideoVae::latent_bytes(aw, ah, af);
-  if (_fps > 0.0) {
+  if (_fps > 0.0 && !refines_() && !genai::ph3::is_root(root) &&
+      !genai::h3i::is_root(root)) {
     const int alf = genai::MetalMiniMaxH3AudioVae::latent_frames_for_seconds(
         (double)af / _fps);
     std::size_t pcm = 0, aarena = 0;
@@ -703,14 +2493,23 @@ GenerateVideoStage::decide_resources() const
   const std::string part =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           resolve_model(session(), _hf_dir).model_type);
-  std::string dit =
-      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, part);
-  if (dit == root) { dit = (fs::path(root) / "transformer").string(); }
+  const std::string dit = h3_dit_(root, part);
   // Remembered, so the release below names exactly what was claimed --
   // the resolver can answer differently once the model has loaded, and
   // a release under a different name reads as a promise never kept.
   _dit_dir_declared_ = dit;
-  return model_memory::weight_claims_in_phase({dit},
+  // MiniMax-H3's runtime adapters go with it: the model owns their
+  // factors. (A registered family claims for itself.)
+  std::vector<std::string> dirs{dit};
+  _lora_files_declared_.clear();
+  if (genai::VideoModelRegistry::get().claim_for(
+          session(), root, resolve_model(session(), _hf_dir).model_type) ==
+      nullptr) {
+    _lora_files_declared_ = h3_plan_lora_files_();
+    dirs.insert(dirs.end(), _lora_files_declared_.begin(),
+                _lora_files_declared_.end());
+  }
+  return model_memory::weight_claims_in_phase(std::move(dirs),
                                               model_memory::kPhaseDenoise);
 #else
   return {};
@@ -722,16 +2521,89 @@ GenerateVideoStage::reset_run_state()
 {
   _emitted = 0;
   _model_latched = false;
-  _sampler_latched = false;
-  _scheduler_latched = false;
-  _cfg_latched = false;
-  _model_cfg = FlexData{};
+  // THIS launch's pre-launch constant, and nothing older. The runtime
+  // delivers constants (apply_constant) BEFORE it resets a stage, so
+  // clearing `_model_cfg` here threw the launch's own config away: the
+  // checkpoint was then identified -- and its shifts logged -- with no
+  // config at all, and the beat only took effect when the port
+  // re-delivered it. MEASURED (issue #47): a model-config at video shift
+  // 6 ran at 6 but logged "shifts 12.0/3.0". Consumed, so a relaunch
+  // whose graph has no config source does not inherit this one.
+  _model_cfg = std::move(_model_cfg_launch);
+  _model_cfg_launch = FlexData{};
+  // Every generation input starts over, and so does what it held: a
+  // run's beats pair among themselves, never with the last run's, and
+  // the seed sequence starts again from `seed`.
+  for (GenerationInput* in : {&_cond_in, &_sampler_in, &_scheduler_in,
+                              &_cfg_in, &_ref0_in, &_ref1_in,
+                              &_ref_video_in, &_ref_audio_in,
+                              &_audio_cond_in, &_init_in, &_guide_in,
+                              &_guide_audio_in}) {
+    in->reset();
+  }
+  _cond_beat.reset();
+  _neg_beat.reset();
+  _ref0_beat.reset();
+  _ref1_beat.reset();
+  _ref_video_beat.reset();
+  _ref_audio_beat.reset();
+  _audio_cond_beat.reset();
+  _init_beat.reset();
+  _guide_beat.reset();
+  _guide_audio_beat.reset();
+  _guide_ignored_said = false;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // What the sampler port said is THIS run's; a relaunch whose graph
+  // no longer wires one runs the model's default.
+  _h3_sampler = genai::SamplerChoice{};
+  _h3_sampler_flow_said = false;
+  _h3_sigmas_steps_said = false;
+#endif
+  // A relaunch may name another checkpoint, whose audio VAE encodes
+  // silence to other latents.
+  _h3_silence.clear();
+  _h3_silence_frames = 0;
+  _h3_silence_alat = 0;
+  _generation = 0;
+  _seed       = _seed_base;
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // A rank's link is a clip's, ended on every way out of one; nothing of
+  // a run's may reach the next (tensor-parallel.h). Kept weights stay.
+  if (_h3_dit) { _h3_dit->end_tp_generation(); }
+  // The preview keys were PARSED out of the beat reset above; a relaunch
+  // whose graph no longer names a preview VAE must not inherit one.
+  if (_preview) {
+    _preview->configure(LatentPreviewSpec{},
+                        genai::MetalTaeDecoder::Trim::kLeading);
+  }
+#endif
 }
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 using metal_compute::MetalCompute;
 using metal_compute::SharedBuffer;
+
+namespace {
+
+// An adapter's `bf16_conditioning_v1` (Pika H3 Flex's FL2VA): latents
+// rounded to bf16, nearest-even, before they are noised -- elementwise,
+// so the packing's order does not move it. Inf and NaN pass as they are.
+void
+round_to_bf16_(float* p, std::size_t n)
+{
+  for (std::size_t i = 0; i < n; ++i) {
+    std::uint32_t u;
+    std::memcpy(&u, &p[i], 4);
+    if ((u & 0x7f800000u) != 0x7f800000u) {
+      u += 0x7fffu + ((u >> 16) & 1u);
+    }
+    u &= 0xffff0000u;
+    std::memcpy(&p[i], &u, 4);
+  }
+}
+
+}  // namespace
 
 void
 GenerateVideoStage::resolve_config_()
@@ -797,40 +2669,157 @@ GenerateVideoStage::resolve_config_()
   const std::string want_partition =
       genai::MetalMiniMaxH3Transformer::partition_of_model_type(
           _resolved.model_type);
-  if (genai::MetalMiniMaxH3Transformer::config_from_json(_root, _h3_cfg,
-                                                         &h3err,
-                                                         want_partition)) {
+  // P-H3-Image, by its manifest: an H3 IMAGE model. Its root may carry
+  // no DiT -- FL2VA's runs in its place under PrunaAI's adapter -- and
+  // then `dit_dir` names the one that runs.
+  const bool ph3 = genai::ph3::is_root(_root);
+  // MiniMax-H3-Image, by its model_index.json: H3's audio-less DiT with
+  // its own per-step heads (minimax-h3-image.h).
+  const bool h3i = genai::h3i::is_root(_root);
+  bool h3_found = genai::MetalMiniMaxH3Transformer::config_from_json(
+      _root, _h3_cfg, &h3err, want_partition);
+  if (!h3_found && ph3) {
+    if (_dit_dir.empty()) {
+      session()->error(fmt(
+          "GenerateVideoStage('{}'): '{}' is P-H3-Image without its "
+          "transformer/: name MiniMax-H3's FL2VA DiT in dit_dir and "
+          "PrunaAI's P-H3-Image adapter in the model config's `lora`, or "
+          "fetch the transformer; inert", this->id(), _root));
+      return;
+    }
+    h3_found = genai::MetalMiniMaxH3Transformer::config_from_json(
+        h3_dit_(_root, want_partition), _h3_cfg, &h3err, want_partition);
+  }
+  if (h3_found) {
     _family = "minimax-h3";
+    // A DiT named on its own is what runs, so ITS config is the one the
+    // forward, the scratch and the plan are sized from. The root still
+    // decided the family: it is an H3 pipeline whatever DiT it carries.
+    if (!_dit_dir.empty()) {
+      const std::string d = h3_dit_(_root, want_partition);
+      std::string derr;
+      if (!genai::MetalMiniMaxH3Transformer::config_from_json(
+              d, _h3_cfg, &derr, want_partition)) {
+        // Said, and the family withdrawn so nothing runs: this is
+        // initialize(), where fail_config() is read by no one, and
+        // falling back to hf_dir's own DiT would run a model the graph
+        // did not ask for.
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): dit_dir '{}' is not a MiniMax-H3 DiT "
+            "this build reads ({}); the stage will not run", id(), _dit_dir,
+            derr));
+        _family.clear();
+      } else {
+        // ComfyUI's PRUNED form has no timestep MLP; the graph's own
+        // partition has the released one, which a full-model adapter's
+        // AdaLN modules and a flow map need on it (Config::time_mlp_dir).
+        // Named only: it is read when an adapter asks.
+        _h3_cfg.time_mlp_dir = h3_time_mlp_dir_(_root, want_partition,
+                                                _h3_cfg);
+      }
+    }
   }
   if (_family == "minimax-h3") {
     // WHICH partition. The two ship byte-identical DiT configs, so the
-    // detection above cannot tell them apart -- and running a Ref2VA
-    // checkpoint through the t2va path is the worst failure this stage
-    // has: it loads, it runs at full cost, and it generates video
-    // conditioned on nothing at all. Refuse instead.
-    // WHICH partition. The two ship byte-identical DiT configs, so the
     // detection above cannot tell them apart, and running Ref2VA
-    // weights through the t2va path is the worst failure this stage
-    // has: it loads, it runs at full cost, and it generates video
-    // conditioned on nothing at all. What closes that is the check in
-    // initialize() -- a Ref2VA checkpoint with no reference rows wired
-    // is refused there, where iport connectivity is known.
+    // weights through the t2va path BY ACCIDENT is the worst failure
+    // this stage has: it loads, it runs at full cost, and it generates
+    // video conditioned on nothing at all. initialize() warns about a
+    // graph that cannot deliver references, and process() refuses a
+    // conditioning that carries no reference list -- while honouring an
+    // explicitly EMPTY one, which is the same forward asked for on
+    // purpose (Ref2VA's prompt-only form).
     _h3_partition =
         genai::MetalMiniMaxH3Transformer::partition_of(_root, want_partition);
+    // P-H3-Image's DiT is FL2VA's (merged, or under the adapter): its
+    // text-to-image is t2va's layout, its edit the reference layout of
+    // Ref2VA-like (references on the FL2VA weights).
+    if (ph3) {
+      std::string merr;
+      if (!genai::ph3::read_manifest(_root, &_ph3_manifest, &merr)) {
+        session()->error(fmt("GenerateVideoStage('{}'): {}; inert",
+                             this->id(), merr));
+        _family.clear();
+        return;
+      }
+      _ph3 = true;
+      if (_h3_partition.empty()) { _h3_partition = "fl2va"; }
+    }
+    if (h3i) {
+      std::string merr;
+      if (!genai::h3i::read_manifest(_root, &_h3i_manifest, &merr) ||
+          _h3i_manifest.heads_file.empty()) {
+        session()->error(fmt(
+            "GenerateVideoStage('{}'): {}; inert", this->id(),
+            merr.empty() ? std::string("MiniMax-H3-Image's ") +
+                               genai::h3i::kHeadsFile + " is missing"
+                         : merr));
+        _family.clear();
+        return;
+      }
+      if (_h3_cfg.audio) {
+        session()->error(fmt(
+            "GenerateVideoStage('{}'): '{}' names MiniMax-H3-Image, whose "
+            "DiT has no audio branch, but its transformer says it has one; "
+            "inert", this->id(), _root));
+        _family.clear();
+        return;
+      }
+      _h3i = true;
+      _h3_partition.clear();
+    }
     // Which partition, and on whose authority. Worth a line: when a
     // directory holds both, "probed" and "the models DB" can disagree,
     // and the DB is the one that knows.
     session()->info(fmt(
         "GenerateVideoStage('{}'): MiniMax-H3 partition '{}' (models DB "
         "says model_type '{}', so {})", this->id(),
-        _h3_partition.empty() ? "unknown" : _h3_partition,
+        _h3i ? "image (MiniMax-H3-Image)"
+        : _h3_partition.empty() ? "unknown" : _h3_partition,
         _resolved.model_type.empty() ? "-" : _resolved.model_type,
         want_partition.empty() ? "probed the checkpoint"
                                : "taken from the record"));
     // Now that the family is known, round the frame count UP to H3's own
     // rule (see the constructor): the video VAE takes 17-frame clips and
     // keeps 5 latents from each, so only 17n+5 has a latent form.
-    align_frames_(genai::minimax_h3::align_num_frames(_frames, 17, 5));
+    if (_h3i) {
+      // ONE latent frame -- the picture -- whatever `frames` said. The
+      // size named (or the release's default) is the picture RETURNED;
+      // the canvas it is generated on is that size at least at
+      // `min_generation_area`, both sides to the nearest 32
+      // (h3i_canvas_, at every config beat).
+      _frames = 1;
+      if (!_size_set) {
+        _height = genai::h3i::kDefaultSide;
+        _width  = genai::h3i::kDefaultSide;
+      }
+      h3i_canvas_();
+    } else if (_ph3) {
+      // ONE latent frame -- the picture -- whatever `frames` said.
+      _frames = 1;
+      // Text-to-image's canvas when the graph names none: 8 megapixels,
+      // 1:1, where the model works best. An edit takes its picture's
+      // instead, when the conditioning arrives (run_h3_).
+      if (!_size_set) {
+        _height = genai::ph3::kDefaultSide;
+        _width  = genai::ph3::kDefaultSide;
+      }
+      // A named canvas is rounded to the NEAREST multiples, as the
+      // reference rounds it (align_size_ below would round up).
+      int rh = 0, rw = 0;
+      genai::ph3::round_canvas(_height, _width, genai::ph3::kCanvasMultiple,
+                               &rh, &rw);
+      if (rh != _height || rw != _width) {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): {}x{} -> {}x{}, P-H3-Image's sides "
+            "are multiples of {}", this->id(), _width, _height, rw, rh,
+            genai::ph3::kCanvasMultiple));
+        _height = rh;
+        _width  = rw;
+      }
+    } else {
+      align_frames_(genai::minimax_h3::align_num_frames(_frames, 17, 5));
+    }
     // ...and the same for the frame SIZE. H3's video VAE is 16x spatial
     // and the DiT patches 2x on top, so the legal grid is 32 -- one
     // factor coarser than the multiple-of-16 a caller naturally reaches
@@ -848,10 +2837,28 @@ GenerateVideoStage::resolve_config_()
     // NOTE: the idle-unload policy is NOT decided here. It needs the
     // streaming verdict, which only exists after the load -- see
     // resolve_unload_policy_h3_().
+    if (_ph3) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): P-H3-Image (MiniMax-H3, one latent "
+          "frame) at {}x{}, {} steps on the checkpoint's grid, no guidance",
+          this->id(), _width, _height,
+          (int)_ph3_manifest.sample_sigmas.size() - 1));
+      return;
+    }
+    if (_h3i) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): MiniMax-H3-Image (one latent frame, "
+          "no audio) -- {}x{} returned, generated at {}x{}; {} steps, one "
+          "output head a step, no guidance", this->id(), _h3i_out_w,
+          _h3i_out_h, _width, _height, _h3i_manifest.steps()));
+      return;
+    }
     session()->info(fmt(
         "GenerateVideoStage('{}'): MiniMax-H3 (video+audio) at {}x{}x{} "
-        "frames, {} steps, shifts {:.1f}/{:.1f}", this->id(), _width, _height,
-        _frames, _steps, _h3_params.video_shift, _h3_params.audio_shift));
+        "frames, {} steps{}, shifts {:.1f}/{:.1f}", this->id(), _width,
+        _height, _frames, h3_steps_(),
+        _h3_params.sigmas.empty() ? "" : " on the model config's sigmas",
+        _h3_params.video_shift, _h3_params.audio_shift));
     return;
   }
   std::string cerr;
@@ -861,6 +2868,13 @@ GenerateVideoStage::resolve_config_()
     return;
   }
   align_frames_(genai::MetalWanVae::align_num_frames(_frames));
+  // Said once rather than left to a wall clock: a tier asked for and not
+  // taken reads exactly like one that was taken and saved nothing.
+  if (genai::accel::flag(&_accel, genai::accel::kMotionCache)) {
+    session()->log_normal(fmt(
+        "GenerateVideoStage('{}'): motion_cache is not implemented for "
+        "Wan; every step runs its forward", this->id()));
+  }
   // Wan's VAE is 8x spatial against H3's 16, so its grid is 16.
   align_size_(8 * _cfg.patch_h, 8 * _cfg.patch_w);
   _two_experts = fs::exists(fs::path(_root) / "transformer_2" / "config.json");
@@ -910,6 +2924,19 @@ GenerateVideoStage::apply_model_config_()
         this->id(), want, _family));
     return;
   }
+  // The preview keys are the same on every family's config source and
+  // the port is this stage's, so they are read here, beside -- not by --
+  // the family's parser; a plugin family's beat carries them too. Only
+  // the temporal rule is the family's, and every published TAEHV but
+  // H3's trims the LEADING frames.
+  if (!_preview) {
+    _preview = std::make_unique<LatentPreviewer>(session(),
+                                                 std::string(this->id()));
+  }
+  _preview->configure(LatentPreviewSpec::from_model_config(_model_cfg),
+                      _family == "minimax-h3"
+                          ? genai::MetalTaeDecoder::Trim::kH3Chunks
+                          : genai::MetalTaeDecoder::Trim::kLeading);
   // A plugin family parses its own beat, at generate time, from the
   // request -- which is the whole point of passing it down UNREAD: a
   // knob the family adds later needs no change here. So there is
@@ -922,6 +2949,50 @@ GenerateVideoStage::apply_model_config_()
     _h3_params =
         genai::MetalMiniMaxH3Transformer::GenerationParams::from_flex(
             _model_cfg, &perr);
+    // The config's `sigmas` set the step count. A graph that also says
+    // `steps`, and another number, is told which one runs.
+    if (!_h3_params.sigmas.empty() && !_h3_sigmas_steps_said &&
+        this->config().is_object() &&
+        this->config().as_object().contains("steps") &&
+        (int)_h3_params.sigmas.size() - 1 != _steps) {
+      _h3_sigmas_steps_said = true;
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): steps {} is NOT used -- the model "
+          "config's {} sigmas run {} steps", this->id(), _steps,
+          _h3_params.sigmas.size(), _h3_params.sigmas.size() - 1));
+    }
+    // P-H3-Image's grid is FINAL -- the reference never shifts it
+    // (`shift_provided_sigmas` false), whatever a model config's shifts
+    // say: minimax-h3-model-config emits every key it has, so its 12 / 3
+    // defaults would read as asked for. An edit's picture rows sit at the
+    // level they were noised to, where the beat names none.
+    if (_ph3) {
+      _h3_params.video_shift = 1.0;
+      _h3_params.audio_shift = 1.0;
+      if (!_model_cfg.is_object() ||
+          !_model_cfg.as_object().contains("condition_timestep")) {
+        _h3_params.condition_timestep = genai::ph3::kConditionNoiseAug;
+      }
+    }
+    // MiniMax-H3-Image's likewise: its grid is the release's own and run
+    // as written, its edit pictures held at 0.999; and the canvas follows
+    // the config's `min_generation_area`.
+    if (_h3i) {
+      _h3_params.video_shift = 1.0;
+      _h3_params.audio_shift = 1.0;
+      if (!_model_cfg.is_object() ||
+          !_model_cfg.as_object().contains("condition_timestep")) {
+        _h3_params.condition_timestep = genai::h3i::kReferenceNoiseAug;
+      }
+      if (!_h3_params.sigmas.empty()) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): MiniMax-H3-Image runs its own grid "
+            "-- one output head a step -- so the model config's `sigmas` "
+            "are not used", this->id()));
+        _h3_params.sigmas.clear();
+      }
+      h3i_canvas_();
+    }
     // The LoRA is read here but consumed at LOAD, so a beat that names
     // one after the DiT is already built cannot take effect -- say so
     // rather than run the un-adapted model while the graph claims
@@ -935,37 +3006,85 @@ GenerateVideoStage::apply_model_config_()
     // what took the whole stage down rather than leaving it inert.
     // family_of() and from_flex() above already tolerate it; this has to
     // as well.
-    std::string lp;
-    double      ls = _h3_lora_scale;
-    if (_model_cfg.is_object()) {
-      const auto o = _model_cfg.as_object();
-      lp = o.contains("lora") ? std::string(o.at("lora").as_string("")) : "";
-      ls = o.contains("lora_scale") ? o.at("lora_scale").as_real(1.0) : 1.0;
-    } else {
-      lp = _h3_lora;   // nothing said; keep what a previous beat set
+    // Every adapter slot, read the same way. Slot 0 is the plain `lora`
+    // keys and slot i the `lora<i+1>` ones (stages/lora-slots.h), so a
+    // graph that names one adapter reads exactly as it always did and
+    // each further one is additive. Which is which is the CALLER's
+    // order, not a role the model knows: the usual pairing is a few-step
+    // Turbo distillation and style or identity adapters, but nothing
+    // here depends on that.
+    _h3_lora.resize(kH3LoraSlots);
+    for (int i = 0; i < kH3LoraSlots; ++i) {
+      H3LoraSlot want = _h3_lora[(std::size_t)i];   // nothing said: keep
+      const std::string_view kp = lora_slots::kPath[i];
+      const std::string_view ks = lora_slots::kScale[i];
+      const std::string_view kq = lora_slots::kQkvLayout[i];
+      if (_model_cfg.is_object()) {
+        const auto o = _model_cfg.as_object();
+        // An object beat WITHOUT the key turns that slot OFF: the config
+        // source emits the keys only when set, so their absence is the
+        // graph saying it wants no adapter there.
+        want.path = o.contains(kp)
+            ? std::string(o.at(kp).as_string("")) : "";
+        want.scale = o.contains(ks) ? o.at(ks).as_real(1.0) : 1.0;
+        if (o.contains(kq)) {
+          want.qkv = std::string(o.at(kq).as_string(""));
+        }
+      }
+      H3LoraSlot& have = _h3_lora[(std::size_t)i];
+      // The two halves of "which adapter, how strong" have different
+      // lifetimes and this is where that shows. The PATH is load-time --
+      // an adapted mlp.fc1 rules out the fused-SwiGLU kernel, which is
+      // chosen before the blocks load -- so changing it under a built
+      // DiT is refused rather than half-applied. The STRENGTH is not: it
+      // rides the accumulating GEMM as a per-forward constant, so a
+      // trigger-driven config can sweep it across beats for the cost of
+      // a setter -- PER SLOT, which is the point of having two: the
+      // distillation stays where it was trained while the style adapter
+      // is dialled.
+      if (_h3_dit != nullptr && want.path != have.path) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the DiT is already built, so the "
+            "model_config beat's `{}` is IGNORED -- it is a load-time "
+            "argument. `{}` still applies",
+            this->id(), kp, ks));
+      } else {
+        have.path = want.path;
+        have.qkv  = want.qkv;
+      }
+      if (want.scale != have.scale) {
+        have.scale = want.scale;
+        // Through the packing the load recorded: config slot i is the
+        // DiT's slot _h3_lora_model_slot[i], or none.
+        const int ms = _h3_lora_model_slot[(std::size_t)i];
+        if (_h3_dit != nullptr && ms >= 0 && _h3_dit->lora_modules(ms) > 0) {
+          _h3_dit->set_lora_scale(ms, (float)want.scale);
+          session()->log_debug(fmt(
+              "GenerateVideoStage('{}'): runtime LoRA `{}` (slot {}) "
+              "strength -> {:.3f}", this->id(), kp, ms, want.scale));
+        }
+      }
     }
-    // The two halves of "which adapter, how strong" have different
-    // lifetimes and this is where that shows. The PATH is load-time --
-    // an adapted mlp.fc1 rules out the fused-SwiGLU kernel, which is
-    // chosen before the blocks load -- so changing it under a built DiT
-    // is refused rather than half-applied. The STRENGTH is not: it rides
-    // the accumulating GEMM as a per-forward constant, so a trigger-
-    // driven config can sweep it across beats for the cost of a setter.
-    if (_h3_dit != nullptr && lp != _h3_lora) {
-      session()->warn(fmt(
-          "GenerateVideoStage('{}'): the DiT is already built, so the "
-          "model_config beat's `lora` is IGNORED -- it is a load-time "
-          "argument. `lora_scale` still applies", this->id()));
-    } else {
-      _h3_lora = lp;
-    }
-    if (ls != _h3_lora_scale) {
-      _h3_lora_scale = ls;
-      if (_h3_dit != nullptr && _h3_dit->lora_modules() > 0) {
-        _h3_dit->set_lora_scale((float)ls);
-        session()->log_debug(fmt(
-            "GenerateVideoStage('{}'): runtime LoRA strength -> {:.3f}",
-            this->id(), ls));
+    // VDN's linear branch, on the same terms as the LoRA PATH above and
+    // for the same reason: it changes what the blocks ARE -- every main
+    // block's attention becomes the hybrid -- so it is a load-time
+    // argument, and naming a different one under a built DiT is refused
+    // rather than half-taken. It lives on the H3 config source, not on
+    // this stage, because it is a fact about this family and nothing
+    // else here reads it.
+    // Through the same reader declare_resources() uses, so the key's
+    // name and its absent-versus-empty rule live in ONE place: the two
+    // disagreeing is how a graph gets its branch declared and not
+    // loaded, or the reverse.
+    const std::string want_vdn = vdn_dir_();
+    if (want_vdn != _vdn_dir) {
+      if (_h3_dit != nullptr) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the DiT is already built, so the "
+            "model_config beat's `linear_branch` is IGNORED -- it is a "
+            "load-time argument", this->id()));
+      } else {
+        _vdn_dir = want_vdn;
       }
     }
   } else {
@@ -1015,6 +3134,8 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   req.fps    = _fps;
   req.steps  = _steps;
   req.seed   = _seed;
+
+  req.accel = &_accel;
 
   req.cond          = cond;
   req.cond_rows     = cond_rows;
@@ -1070,7 +3191,12 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
   // `total`). end_step re-syncs the bar to the exact boundary anyway, so
   // the cost is the bar trailing by one block within a step.
   req.block_progress = [&block_fn, &ctx](int done, int total) {
-    block_fn(done, total);
+    // A plugin drives its own loop and has no command buffer to hang the
+    // publish on, so the two phases collapse to one call here -- which is
+    // exactly the one-phase behaviour DitBlockProgressFn had before, and
+    // still correct: staging and publishing at the same instant cannot go
+    // stale between them.
+    if (auto publish = block_fn(done, total)) { publish(); }
     return !ctx.stop_requested();
   };
   // A 22B DiT spends minutes per generation, so a Stop that only lands
@@ -1087,9 +3213,48 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
     return !ctx.stop_requested();
   };
 
+  // ALWAYS INSTALLED, even though nothing is named yet. A family that
+  // had to guard every lookup would eventually forget one, and calling
+  // an empty std::function throws -- which on this path is a family
+  // taking the host down for asking a question the answer to is "no".
+  req.input = [](std::string_view, genai::NamedTensor*) { return false; };
+  // The output seam, ALWAYS installed for the same reason. The one name
+  // this stage takes is a live preview's clean estimate, and only on a
+  // step the previewer renders -- so a family that asks first builds
+  // nothing for a preview nobody is watching.
+  const bool previewing = _preview && _preview->active();
+  req.output_wanted = [this, previewing](std::string_view name, int step,
+                                         int total) {
+    return previewing && name == genai::kOutputPreviewX0 &&
+           _preview->due(step, total);
+  };
+  req.output = [this, previewing](std::string_view name, int step,
+                                  int total, const genai::NamedTensor& t) {
+    if (!previewing || name != genai::kOutputPreviewX0) { return; }
+    // Shaped like the result latent, f32 -- or refused out loud, once:
+    // a family that got the contract wrong would otherwise preview
+    // nothing and never learn why.
+    if (t.data == nullptr || t.shape.size() != 4 ||
+        !t.is(genai::named_tensor::kF32) || t.elems() == 0) {
+      if (!_preview_shape_said) {
+        _preview_shape_said = true;
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): family '{}' handed back a '{}' that "
+            "is not an f32 [z, T, h, w] latent; no previews from it",
+            this->id(), _family, genai::kOutputPreviewX0));
+      }
+      return;
+    }
+    const float* p = static_cast<const float*>(t.data);
+    _preview->submit(std::vector<float>(p, p + t.elems()), t.shape[0],
+                     t.shape[1], t.shape[2], t.shape[3], step, total);
+  };
   try {
     const bool ok = _plugin_gen->generate(req, out);
     bar.finish();
+    // What the family holds NOW. After a clip a streaming family has
+    // built its slot pair, and its resident set has grown or shed.
+    correct_plugin_holding_("after a clip");
     return ok;
   } catch (const std::exception& e) {
     session()->error(fmt(
@@ -1102,6 +3267,46 @@ GenerateVideoStage::run_plugin_family_(RuntimeContext& ctx,
         "exception during generation", this->id(), _family));
     return false;
   }
+}
+
+// The plugin arm's plan correction, from the number a family owes the
+// host. The rule is correct_loaded_holding's (pipeline/memory-plan.h);
+// what this adds is WHEN it is asked.
+//
+// Straight after load is too early to be the only time. A block-streaming
+// family builds its slot pair on its first forward, so resident_bytes()
+// then leaves out two blocks per stack, and taking that figure as both
+// columns wrote a plan below the floor the family had declared. The
+// load-time read now fixes the floor at no less than the declared one,
+// and the read after each clip -- slots built, resident set grown or
+// shed -- moves the preload.
+void
+GenerateVideoStage::correct_plugin_holding_(const char* when)
+{
+  if (!_plugin_gen) { return; }
+  const std::size_t held = (std::size_t)_plugin_gen->resident_bytes();
+  // 0 is the documented "cannot answer cheaply". Overwriting a real
+  // plan-time figure with a decline would report the checkpoint as free.
+  if (held == 0) { return; }
+  StageMemory m = declare_memory();
+  // ONE holding only. resident_bytes() is the generator's TOTAL, so a
+  // family that declared several cannot have it apportioned between
+  // them -- and splitting it by a guess would replace figures that were
+  // at least individually honest. Left alone in that case, which means
+  // the correction is available to any family that wants it by declaring
+  // the checkpoint it streams as one entry.
+  if (m.holdings.size() != 1) { return; }
+  const bool first = _plugin_load_floor_ == 0;
+  _plugin_load_floor_ =
+      correct_loaded_holding(m.holdings[0], held, _plugin_load_floor_);
+  // Per clip, and a revision replans the whole graph: only when it moved.
+  if (!first && m.holdings[0].preload == _plugin_revised_) { return; }
+  _plugin_revised_ = m.holdings[0].preload;
+  revise_memory(m);
+  session()->log_debug(fmt(
+      "GenerateVideoStage('{}'): '{}' holds {} MB {}; the plan holds it at "
+      "{} MB, floor {} MB", this->id(), _family, held >> 20, when,
+      m.holdings[0].preload >> 20, m.holdings[0].floor >> 20));
 }
 
 bool
@@ -1131,6 +3336,42 @@ GenerateVideoStage::ensure_expert_(int which)
     // by iport0's conditioning -- so a config source that emitted once at
     // launch has already landed. Null when nothing was wired.
     args.model_config = _model_cfg.is_object() ? &_model_cfg : nullptr;
+    // What the graph asked for, so a plugin family can build the same
+    // kernel variants the in-tree ones do. Nothing here is applied on
+    // the family's behalf: these are what it was ASKED, not what it got.
+    args.accel = &_accel;
+    // THE ANE TIER'S GRANT, for a family that booked a module. Its claim
+    // went into the plan under this stage's label (declare_resources);
+    // the answer is read here, where the built-ins read theirs. A refusal
+    // turns the key OFF in the bag, which every later request carries --
+    // so the family is told no, rather than holding a module the plan
+    // left no room for. A family that implements the tier and booked
+    // nothing is taken at its word.
+    // The label goes with the args (genai::create_args::kCoreMLLabel)
+    // so the family can revise what it really holds once its tier arms.
+    FlexData create_extra = FlexData::make_object();
+    if (genai::accel::flag(&_accel, genai::accel::kAneFfn)) {
+      for (const ResourceClaim& c :
+           _plugin_family->declare_resources(_root)) {
+        std::size_t ub = 0;
+        int un = 0;
+        if (!model_memory::parse_coreml_claim(c, nullptr, &ub, &un)) {
+          continue;
+        }
+        create_extra.as_object().insert_or_assign(
+            genai::create_args::kCoreMLLabel,
+            FlexData::make_string(ane_claim_label_()));
+        if (model_memory::coreml_grant(session(), ane_claim_label_(), ub,
+                                       un) <= 0) {
+          genai::accel::set_flag(&_accel, genai::accel::kAneFfn, false);
+          session()->info(fmt(
+              "GenerateVideoStage('{}'): the ANE feed-forward was requested "
+              "but the plan left no room for {}'s module ({} MB); the family "
+              "keeps its GPU feed-forward", this->id(), _family, ub >> 20));
+        }
+        break;
+      }
+    }
     // The clip this graph intends to make, through the family's own
     // rounding, so a load-time decision that scales with the beat has the
     // right order of magnitude instead of a constant. Left at 0 when the
@@ -1141,6 +3382,9 @@ GenerateVideoStage::ensure_expert_(int which)
       if (planned_geometry_(_root, &gw, &gh, &gf)) {
         args.width = gw; args.height = gh; args.frames = gf;
       }
+    }
+    if (create_extra.as_object().size() > 0) {
+      args.borrowed_extra = &create_extra;
     }
     try {
       _plugin_gen = _plugin_family->load(args);
@@ -1171,27 +3415,64 @@ GenerateVideoStage::ensure_expert_(int which)
     // already owes the host: resident_bytes(), which docs/MODEL-MEMORY.md
     // requires of any family whose weights a WeightSet cannot see.
     //
-    // Both columns, because a streaming family has no larger form left
-    // to grow back into within this launch. Skipped at 0, which is the
-    // documented "cannot answer cheaply" -- overwriting a real plan-time
-    // figure with a decline would report the checkpoint as free.
-    // ONE holding only. resident_bytes() is the generator's TOTAL, so a
-    // family that declared several cannot have it apportioned between
-    // them -- and splitting it by a guess would replace figures that
-    // were at least individually honest. Left alone in that case, which
-    // means the correction is available to any family that wants it by
-    // declaring the checkpoint it streams as one entry.
-    const std::uint64_t held = _plugin_gen->resident_bytes();
-    StageMemory m = declare_memory();
-    if (held > 0 && m.holdings.size() == 1 &&
-        m.holdings[0].preload != (std::size_t)held) {
-      m.holdings[0].preload = (std::size_t)held;
-      m.holdings[0].floor   = (std::size_t)held;
-      revise_memory(m);
-      session()->log_debug(fmt(
-          "GenerateVideoStage('{}'): '{}' holds {} MB after loading; the "
-          "plan is corrected from what the checkpoint weighs",
-          this->id(), _family, (std::size_t)held >> 20));
+    // Not the last correction: it runs again after every clip, because
+    // what a family reports straight after load is not yet what it runs
+    // on. See correct_plugin_holding_.
+    _plugin_load_floor_ = 0;
+    _plugin_revised_    = 0;
+    correct_plugin_holding_("after loading");
+    // THE IDLE POLICY, which this arm never resolved: under `auto` a
+    // registered family kept its DiT for the life of the run, beside a
+    // VAE decode that needs the room. MEASURED with FlashVSR at 1920x1152
+    // on a 24 GB box: the decode was refused with ~12.7 GB reclaimable
+    // against the ~13 GB it holds, while the idle 1.3B DiT sat resident.
+    //
+    // Tight is what the streaming verdict above already said, or a box
+    // that cannot hold this checkpoint beside the decode arena the plan
+    // booked for it, with the usual headroom.
+    if (!_unload_resolved) {
+      _unload_resolved = true;
+      switch (_unload_cfg) {
+        case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
+        case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
+        default: {
+          // A family that STREAMED holds a fraction of its checkpoint, so
+          // letting go of it after a clip frees next to nothing and costs
+          // a whole reload per clip -- for FlashVSR its load-time folds,
+          // ~5 s a clip warm at 1920x1152. Such a family is judged by what
+          // it holds, not by the checkpoint it streams from.
+          const std::size_t held =
+              (std::size_t)_plugin_gen->resident_bytes();
+          std::size_t full = 0;
+          for (const StageHolding& h :
+               _plugin_family->declare_holdings(_root)) {
+            full += h.preload;
+          }
+          const bool streamed = held != 0 && full != 0 && held * 4 < full;
+          const std::size_t ram = model_memory::phys_ram();
+          const std::size_t need =
+              (streamed ? held
+                        : model_memory::weight_footprint(session(), {_root})) +
+              model_memory::scratch_footprint(session(),
+                                              model_memory::kPhaseDecode) +
+              model_memory::kHeadroom;
+          // A box SHORT of that room still lets go, streamed or not. Not
+          // for the bytes -- a streamed holding is a few hundred MB -- but
+          // for the ORDER: the reload is what puts the next clip's denoise
+          // behind this clip's decode. MEASURED on a 16 GB M5 at 1920x1152:
+          // kept loaded, the next denoise took its scratch first and both
+          // decodes were refused; released, both ran (~2.5 GB of swap).
+          _unload_idle = (args.prefer_streaming && !streamed) ||
+                         (ram != 0 && ram < need);
+          break;
+        }
+      }
+      if (_unload_idle) {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): memory-bounded -- '{}' lets go of its "
+            "DiT after each clip so the VAE decode has the room, and reloads "
+            "on the next", this->id(), _family));
+      }
     }
     return true;
   }
@@ -1199,6 +3480,7 @@ GenerateVideoStage::ensure_expert_(int which)
     resolve_config_();
     if (!_have_cfg) { return false; }
     if (_h3_dit) { return true; }
+    _h3_cfg.i8_tier = _i8_tier;
     auto* h3mc = session()->services()->metal_compute();
     if (h3mc == nullptr) { return false; }
     // The 33B DiT is the largest here: ~33 GB at w8, which does NOT fit
@@ -1209,17 +3491,21 @@ GenerateVideoStage::ensure_expert_(int which)
     // model's supported range anyway, so this asks the same question the
     // other DiT families ask rather than assuming the stack fits.
     namespace fs = std::filesystem;
-    const std::string dit_dir =
-        genai::MetalMiniMaxH3Transformer::resolve_dit_dir(_root,
-                                                          _h3_partition);
-    // Through the encoder's own resolver, not by spelling a sibling of
-    // the DiT: on a Comfy-Org repack the DiT's parent IS the root and the
-    // encoder lives under `text_encoders/`, so building the path by hand
-    // produced a directory that does not exist and silently dropped the
-    // encoder out of the streaming decision.
-    std::string enc_dir =
-        genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root);
-    if (enc_dir == _root || !fs::exists(enc_dir)) { enc_dir.clear(); }
+    const std::string dit_dir = h3_dit_(_root, _h3_partition);
+    _h3_dit_dir_ = dit_dir;
+    _h3_load_floor_ = 0;
+    _h3_revised_ = 0;
+    // A RANK of a split DiT (`tensor_parallel`, checked in full below).
+    // It STREAMS, THEN RETAINS as the whole model does, asked the
+    // streaming question on its SHARE: the plan books the share (its
+    // claim's held bytes), never the checkpoint's whole size, which it
+    // will not hold.
+    genai::TpShare tp_share;
+    const bool tp_rank =
+        _tp_cfg.is_object() &&
+        genai::TpShare::from_flex(_tp_cfg, _h3_cfg.n_heads, _h3_cfg.ffn,
+                                  &tp_share, nullptr) &&
+        tp_share.active();
     // What the AdaLN bake will retire, before anything loads.
     //
     // The bake runs moments after this and drops every adaln_proj -- 39%
@@ -1236,20 +3522,57 @@ GenerateVideoStage::ensure_expert_(int which)
     std::size_t dit_retires = 0;
     {
       constexpr int kRowsPerStep = 4;      // == kTimestepsUpperBound below
-      const int max_rows = _steps > 0 ? _steps * kRowsPerStep : 0;
-      if (genai::MetalMiniMaxH3Transformer::adaln_bake_certain(_h3_cfg,
+      // A flow-map adapter runs ITS grid, not `steps`, so the bound
+      // takes the larger -- read from the file's header, since nothing
+      // is loaded yet. (Its (t, r) pairs still number at most four a
+      // step: video, audio and the two pinned conditioning levels.)
+      // So does the model config's `sigmas`.
+      int bound_steps = h3_steps_();
+      for (const H3LoraSlot& sl : _h3_lora) {
+        if (sl.path.empty()) { continue; }
+        std::string ignored;
+        const std::string f = resolve_adapter_file(session(), sl.path,
+                                                   &ignored);
+        if (f.empty()) { continue; }
+        bound_steps = std::max(
+            bound_steps,
+            genai::MetalMiniMaxH3Transformer::flow_map_steps(f));
+        // So does an adapter's sampling contract, read off the manifest
+        // beside it.
+        genai::MetalMiniMaxH3Transformer::SamplingContract sc;
+        std::string cerr;
+        if (genai::MetalMiniMaxH3Transformer::sampling_contract_of(
+                f, &sc, &cerr)) {
+          bound_steps = std::max(bound_steps, (int)sc.sigmas.size() - 1);
+        }
+      }
+      const int max_rows = bound_steps > 0 ? bound_steps * kRowsPerStep : 0;
+      // (A rank's claim already leaves its AdaLN out.)
+      if (!tp_rank &&
+          genai::MetalMiniMaxH3Transformer::adaln_bake_certain(_h3_cfg,
                                                               max_rows)) {
         dit_retires =
             genai::MetalMiniMaxH3Transformer::adaln_retired_bytes(dit_dir);
       }
     }
-    const auto plan = model_memory::plan_streaming(
-        session(), dit_dir, enc_dir, model_memory::kStreamHeadroom,
-        dit_retires);
-    bool stream_blocks = plan.stream;
+    // This stage's checkpoint alone: the text encoder is a peer's, and
+    // counts through what its stage declared (h3_stream_plan).
+    const auto plan = h3_stream_plan(session(), dit_dir, dit_retires);
+    // STREAM, THEN RETAIN on every box (model_memory::stream_blocks_by_
+    // default; VPIPE_PRELOAD=1 preloads, for the A/B): the first forward
+    // reads each block as it needs it and residency keeps it, so a box
+    // with room converges on what a preload holds -- int8 layouts
+    // included (Linear::ds / ps, keep_block_) -- one forward in.
+    bool stream_blocks = model_memory::stream_blocks_by_default(plan);
     if (const char* e = std::getenv("VPIPE_H3_STREAM")) {
       stream_blocks = (std::atoi(e) != 0);
     }
+    // THE BOX IS TIGHT, apart from the mechanism: what only a tight box
+    // wants -- dropping the DiT after each clip, revising the declaration
+    // to the trunk -- keys on this. A streamed DiT on a box with room
+    // (VPIPE_H3_STREAM=1 there) keeps what residency grows, and a
+    // streamed block is the preloaded one, int8 layouts included.
+    const bool bounded = plan.stream && stream_blocks;
     // The pinned prefix is retired -- see
     // MetalMiniMaxH3Transformer::load. BlockResidency supersedes it:
     // admission against the live budget instead of a fraction of total
@@ -1261,8 +3584,81 @@ GenerateVideoStage::ensure_expert_(int which)
         "less {} GB the AdaLN bake retires) + {} GB headroom -> {}",
         this->id(), plan.footprint >> 30, plan.others >> 30,
         plan.retires >> 30, model_memory::kStreamHeadroom >> 30,
-        stream_blocks ? "STREAM blocks" : "PRELOAD"));
+        !stream_blocks ? "PRELOAD"
+        : plan.stream  ? "STREAM blocks"
+                       : "STREAM blocks, kept as the box allows"));
     _h3_cfg.i8_gemm = _i8_gemm;
+    _h3_cfg.autotune = _autotune;
+    _h3_cfg.sol     = _sol;
+    _h3_cfg.sage    = _sage;
+    // A W4 PACK'S INT8 LAYOUT on the int8 tiers: held where the box has
+    // room -- plan_streaming's own rule asked again with the layout's
+    // growth (every w4 block projection's codes again) -- and converted
+    // per projection where it has not, or the blocks stream; generate-
+    // image's rule. VPIPE_I8_W4_HOLD overrides.
+    //
+    // A RANK's growth is its SHARE's: what tp_held_bytes books for it
+    // with the layout held, less what it books without (the main blocks'
+    // w4 shares at int8 in place of their packs), asked only where the
+    // checkpoint has a w4 block projection at all. Weighed as the whole
+    // checkpoint's, a rank asked for room its share never takes.
+    _h3_cfg.i8_hold_w4 = false;
+    _h3_i8_hold_growth_ = 0;
+    _h3_tp_hold_growth_ = 0;
+    if (_i8_gemm && _i8_tier > 0 && h3mc != nullptr &&
+        h3mc->supports_matrix_cores()) {
+      std::size_t held = 0;
+      if (auto wts = genai::MetalLlamaWeights::open_model(dit_dir)) {
+        for (const std::string& nm : wts->tensor_names()) {
+          const std::string_view sx = ".weight";
+          if (nm.rfind("blocks.", 0) != 0 || nm.size() <= sx.size() ||
+              nm.compare(nm.size() - sx.size(), sx.size(), sx) != 0) {
+            continue;
+          }
+          const auto* ci = wts->info(nm);
+          const auto* sc =
+              wts->info(nm.substr(0, nm.size() - sx.size()) + ".scales");
+          if (ci != nullptr && sc != nullptr && ci->shape.size() == 2 &&
+              sc->shape.size() == 2 &&
+              (long)ci->shape[1] * 32 == (long)sc->shape[1] * 64 * 4) {
+            held += (std::size_t)ci->nbytes;
+          }
+        }
+      }
+      if (held > 0 && tp_rank) {
+        const std::size_t as_pack = h3_tp_held_bytes_(dit_dir, false);
+        const std::size_t as_layout = h3_tp_held_bytes_(dit_dir, true);
+        held = as_layout > as_pack ? as_layout - as_pack : 0;
+      }
+      if (held > 0) {
+        // By the box's room, streamed or not: residency converts each
+        // block it keeps into the layout (keep_block_), a slot converts
+        // per projection either way.
+        _h3_cfg.i8_hold_w4 =
+            !bounded &&
+            model_memory::preload_fits_extra(plan, held,
+                                             model_memory::kStreamHeadroom);
+        if (const char* e = std::getenv("VPIPE_I8_W4_HOLD")) {
+          _h3_cfg.i8_hold_w4 = std::atoi(e) != 0;
+        }
+        // What a PRELOAD holds beyond its files when the layout is held:
+        // declare_memory() books it and the load below revises the
+        // manager's declaration by it. A streamed DiT holds the layout
+        // only in the blocks it keeps, which its own revision reads.
+        if (_h3_cfg.i8_hold_w4 && !stream_blocks) {
+          (tp_rank ? _h3_tp_hold_growth_ : _h3_i8_hold_growth_) = held;
+        }
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): the w4 projections' int8 layout {} "
+            "({} MB to hold it{}; {})", this->id(),
+            _h3_cfg.i8_hold_w4 ? "HELD" : "CONVERTED PER PROJECTION",
+            held >> 20, tp_rank ? " on this rank's share" : "",
+            std::getenv("VPIPE_I8_W4_HOLD") != nullptr
+                ? "VPIPE_I8_W4_HOLD"
+                : bounded ? "the blocks stream" : "by the box's room"));
+      }
+    }
+    apply_h3_ane_();
     // The runtime LoRA, when the model_config beat named one. It is a
     // LOAD-time argument and not a per-step knob: an adapted mlp.fc1
     // rules out the fused-SwiGLU kernel, which is decided before the
@@ -1278,17 +3674,43 @@ GenerateVideoStage::ensure_expert_(int which)
     // .safetensors the loader opens. A key beats a directory scan
     // because both Turbo checkpoints of a repo land side by side, and
     // only the record says which one the key meant.
-    genai::MetalMiniMaxH3Transformer::LoraSpec lora;
-    if (!_h3_lora.empty()) {
+    // One LoraSpec per named slot, in the order the graph named them --
+    // which is the order the DiT binds and the order `lora_scale(i)`
+    // addresses afterwards. A slot whose file cannot be resolved is
+    // DROPPED rather than left as a hole, so the surviving adapters keep
+    // consecutive indices and a strength beat still reaches them.
+    std::vector<genai::MetalMiniMaxH3Transformer::LoraSpec> loras;
+    using QL = genai::MetalMiniMaxH3Transformer::LoraSpec::QkvLayout;
+    int taomate_slot = -1;
+    _h3_lora.resize(kH3LoraSlots);
+    _h3_lora_model_slot.fill(-1);
+    for (int i = 0; i < kH3LoraSlots; ++i) {
+      const H3LoraSlot& sl = _h3_lora[(std::size_t)i];
+      if (sl.path.empty()) { continue; }
       std::string lerr;
-      lora.path = resolve_adapter_file(session(), _h3_lora, &lerr);
-      if (lora.path.empty()) {
+      genai::MetalMiniMaxH3Transformer::LoraSpec spec;
+      spec.path = resolve_adapter_file(session(), sl.path, &lerr);
+      if (spec.path.empty()) {
         session()->warn(fmt(
-            "GenerateVideoStage('{}'): {} -- generating WITHOUT the "
+            "GenerateVideoStage('{}'): {} -- generating WITHOUT that "
             "adapter", this->id(), lerr));
+        continue;
       }
+      spec.scale = (float)sl.scale;
+      // LOAD-time like the path: the rows are permuted once, at bind.
+      if (sl.qkv == "per_head") { spec.qkv_layout = QL::kPerHead; }
+      else if (sl.qkv == "flat") { spec.qkv_layout = QL::kFlat; }
+      else if (!sl.qkv.empty() && sl.qkv != "auto") {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): lora_qkv_layout '{}' is not one of "
+            "auto / flat / per_head; using auto", this->id(), sl.qkv));
+      }
+      if (genai::minimax_h3::taomate::is_adapter(spec.path)) {
+        taomate_slot = (int)loras.size();
+      }
+      _h3_lora_model_slot[(std::size_t)i] = (int)loras.size();
+      loras.push_back(std::move(spec));
     }
-    lora.scale = (float)_h3_lora_scale;
     // NOTE for the pinned prefix: stream_pin_count now measures the
     // trunk but still assumes 1 GB of activation scratch, and this model
     // holds ~4 GB at its own sizes. It is not passed here because the
@@ -1296,11 +3718,319 @@ GenerateVideoStage::ensure_expert_(int which)
     // exist until a beat -- and H3 already covers that where it can be
     // known: preflight_h3_scratch_ computes the real number at the first
     // beat and parks, or refuses, if the prefix turned out too generous.
-    _h3_dit = genai::MetalMiniMaxH3Transformer::load(
-        genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
-        stream_blocks, lora.path.empty() ? nullptr : &lora);
-    resolve_unload_policy_h3_(stream_blocks);
-    if (_h3_dit && stream_blocks) {
+    // TENSOR PARALLEL: this stage is one RANK of a DiT split across
+    // hosts -- its share of the heads and the feed-forward rows, the
+    // other ranks' partial sums through the transport a plugin registered
+    // under the name given. A rank streams its share, then keeps it.
+    // Its CHANNEL is not opened here: the weights may outlive a clip --
+    // kept or let go by this host's own memory, kept warm into the next
+    // graph -- and the link must not. Each clip opens one
+    // (open_tp_channel_) and lets it go however it ends.
+    _h3_cfg.tp = {};
+    if (_tp_cfg.is_object()) {
+      bool tp_ok = true;
+      auto refuse = [&](const std::string& why) {
+        session()->error(fmt("GenerateVideoStage('{}'): tensor_parallel: {}",
+                             this->id(), why));
+        tp_ok = false;
+      };
+      genai::TpShare share;
+      std::string terr;
+      auto o = _tp_cfg.as_object();
+      const std::string tname =
+          o.contains("transport")
+              ? std::string(o.at("transport").as_string(""))
+              : std::string();
+      if (!genai::TpShare::from_flex(_tp_cfg, _h3_cfg.n_heads, _h3_cfg.ffn,
+                                     &share, &terr)) {
+        refuse(terr);
+      } else if (genai::find_tp_transport(tname) == nullptr) {
+        refuse(fmt("no transport named '{}' -- a plugin registers it",
+                   tname)());
+      } else if (!_vdn_dir.empty() || taomate_slot >= 0) {
+        refuse("not with VDN or TaoMate");
+      } else if (share.active()) {
+        _h3_cfg.tp = share;
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): rank {} of {}: heads [{}, {}) of "
+            "{}, feed-forward rows [{}, {}) of {}, through '{}' (a channel "
+            "each clip)", this->id(), share.rank, share.ranks, share.head0,
+            share.head1, share.n_heads, share.ffn0, share.ffn1,
+            share.n_ffn, tname));
+      }
+      if (!tp_ok) {
+        _h3_dit.reset();
+        return false;
+      }
+    }
+    // KEPT WARM by an earlier graph (keep_loaded): the same checkpoint,
+    // built alike -- every setting the load takes, a rank's share and its
+    // adapters by file -- taken back resident; each adapter's strength set
+    // as this stage has it (a strength is live, not a load argument).
+    // STREAM, THEN RETAIN is every box's (stream_blocks_by_default): a
+    // streamed DiT on a box with room converges on every block resident,
+    // and that is what a warm hold keeps (keep_h3_warm_ checks it). A
+    // TIGHT box -- its blocks stream for want of room -- keeps nothing.
+    _h3_may_keep = _keep_loaded > 0 && !bounded && _vdn_dir.empty() &&
+                   taomate_slot < 0 && !_h3i;
+    if (_keep_loaded > 0 && !_h3_may_keep) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): keep_loaded is not taken -- {}",
+          this->id(),
+          bounded ? "the DiT's blocks stream on this box for want of room"
+          : !_vdn_dir.empty() ? "a VDN branch rides on the DiT"
+          : taomate_slot >= 0 ? "TaoMate-H3's adapter rides on the DiT"
+                              : "MiniMax-H3-Image's per-step heads ride on "
+                                "the DiT"));
+    }
+    {
+      const auto& c = _h3_cfg;
+      // Every setting the load takes, the denoise reads off the model's
+      // config (Sol's threshold) or a bound adapter reads off it (the
+      // released timestep MLP a pruned DiT's adapters are ported
+      // through), and whether its blocks were streamed.
+      std::string k = fmt("{}|{}|i8 {} {} {} tune {}|sage {} {} {} {} {} "
+                          "{}|sol {} {} {} {} {} {} {} {}|ane {} {} {} {} "
+                          "{} {}|qkv {}|stream {}|mlp {}",
+                          dit_dir, c.partition, c.i8_gemm ? 1 : 0,
+                          c.i8_tier, c.i8_hold_w4 ? 1 : 0,
+                          c.autotune ? 1 : 0, c.sage.enabled ? 1 : 0,
+                          c.sage.dense_layers, c.sage.smooth_k ? 1 : 0,
+                          c.sage.pv8 ? 1 : 0, c.sage.pv8_from_step,
+                          c.sage.pv8_all_rows ? 1 : 0,
+                          c.sol.enabled ? 1 : 0, c.sol.tau,
+                          c.sol.dense_layers, c.sol.local_radius,
+                          c.sol.sink_start, c.sol.sink_tokens,
+                          c.sol.key_block, (int)c.sol.thresh,
+                          c.ane_ffn ? 1 : 0, c.ane_qkv ? 1 : 0,
+                          c.ane_int8 ? 1 : 0, c.ane_int8_plain ? 1 : 0,
+                          c.ane_rows, c.ane_layers, c.qkv_per_head ? 1 : 0,
+                          stream_blocks ? 1 : 0, c.time_mlp_dir)();
+      if (c.tp.active()) {
+        k += fmt("|tp {}/{} heads {}-{} ffn {}-{}", c.tp.rank, c.tp.ranks,
+                 c.tp.head0, c.tp.head1, c.tp.ffn0, c.tp.ffn1)();
+      }
+      for (const auto& l : loras) {
+        k += fmt("|lora {} {}", l.path, (int)l.qkv_layout)();
+      }
+      _h3_warm_key = std::move(k);
+    }
+    if (_h3_may_keep) {
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        _h3_dit = mgr->take_warm<genai::MetalMiniMaxH3Transformer>(
+            kWarmH3, h3_warm_dir_(), _h3_warm_key);
+        // (A miss lets another build of it go: take_warm_model.)
+      }
+      if (_h3_dit) {
+        // Every slot the model bound, its modules or curve branches alone
+        // (set_lora_scale ignores a slot it does not have).
+        for (int i = 0; i < kH3LoraSlots; ++i) {
+          const int ms = _h3_lora_model_slot[(std::size_t)i];
+          if (ms >= 0) {
+            _h3_dit->set_lora_scale(ms,
+                                    (float)_h3_lora[(std::size_t)i].scale);
+          }
+        }
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): the MiniMax-H3 DiT kept warm is taken "
+            "back{}", this->id(),
+            _h3_cfg.tp.active()
+                ? fmt(" (rank {}'s share)", _h3_cfg.tp.rank)()
+                : std::string()));
+      }
+    }
+    if (!_h3_dit) {
+      _h3_dit = genai::MetalMiniMaxH3Transformer::load(
+          genai::open_weight_set(dit_dir, session()), h3mc, _h3_cfg,
+          stream_blocks, loras);
+    }
+    // MiniMax-H3-Image: one output head a step, through the manager like
+    // every weight (12 MB beside the 66 GB stack).
+    if (_h3_dit && _h3i) {
+      std::string herr;
+      if (!_h3_dit->set_step_heads(
+              genai::open_weight_set(_h3i_manifest.heads_file, session()),
+              &herr)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): MiniMax-H3-Image's per-step heads "
+            "'{}' could not be read: {}", this->id(),
+            _h3i_manifest.heads_file, herr));
+        _h3_dit.reset();
+        return false;
+      }
+    }
+    _h3_taomate_slot = _h3_dit ? taomate_slot : -1;
+    if (_h3_taomate_slot >= 0) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): adapter slot {} is TaoMate-H3's 3-step "
+          "streaming adapter -- clips run its method (taomate: auto)",
+          this->id(), _h3_taomate_slot));
+    }
+    // VDN's hybrid attention, if the graph asked for one. AFTER the DiT
+    // loads because the branch sizes itself from the stack it joins, and
+    // a FAILED CONFIG rather than a warning because a graph that names a
+    // branch and silently runs without it produces a plausible video
+    // from weights trained for a different attention -- there is no
+    // output anyone could look at and tell.
+    if (_h3_dit && !_vdn_dir.empty()) {
+      const std::string vroot =
+          resolved_subtree_dir(resolve_model(session(), _vdn_dir));
+      std::string verr;
+      if (!_h3_dit->attach_linear_branch(vroot, &verr)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): linear_branch '{}' could not be "
+            "attached: {}", this->id(), _vdn_dir, verr));
+        _h3_dit.reset();
+        return false;
+      }
+      // The CHECKPOINT's size, not what the branch holds: nothing is
+      // loaded yet -- the blocks come in on first use -- so
+      // linear_branch_bytes() is zero here and a line reporting it says
+      // "0 MB of branch weights" on every successful attach, which reads
+      // as the branch being free rather than as nothing having happened
+      // yet.
+      std::size_t vbytes = 0;
+      {
+        namespace fs = std::filesystem;
+        std::error_code vec;
+        const fs::path vdir = fs::path(vroot) / "linear_branch";
+        for (const auto& de : fs::directory_iterator(vdir, vec)) {
+          if (vec) { break; }
+          if (de.is_regular_file(vec)
+              && de.path().extension() == ".safetensors") {
+            vbytes += (std::size_t)de.file_size(vec);
+          }
+        }
+      }
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): VDN hybrid attention on -- {} MB of "
+          "branch weights beside the DiT, {}", this->id(), vbytes >> 20,
+          stream_blocks ? "streamed with it, one block at a time"
+                        : "held resident"));
+      _h3_dit->set_vdn_radius(_vdn_range);
+      if (_vdn_range >= 0) {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): VDN softmax window {} chunk(s) "
+            "either side (vdn_range; the checkpoint's is {}), the linear "
+            "half beyond it", this->id(), _vdn_range,
+            _h3_dit->vdn_checkpoint_radius()));
+      }
+    }
+    // A FLOW-MAP adapter (HyperFlow) brings its own sampling grid, and
+    // denoise() runs it in place of `steps` -- so say so here, once,
+    // rather than let a graph that asks for 40 steps quietly get 8.
+    if (_h3_dit && _h3_dit->flow_map() != nullptr &&
+        !_h3_dit->two_time_active()) {
+      // Loaded at strength 0: both halves are off and this is the base
+      // model on the graph's own `steps` -- which is worth saying,
+      // because the adapter's name in the graph suggests otherwise.
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): HyperFlow {} is loaded on lora slot {} "
+          "at strength 0 -- the BASE model runs, on `steps: {}`",
+          this->id(), _h3_dit->flow_map()->version,
+          _h3_dit->flow_map()->slot, _steps));
+    } else if (_h3_dit && _h3_dit->flow_map() != nullptr) {
+      const auto& fm = *_h3_dit->flow_map();
+      const int fsteps =
+          fm.sigmas.empty() ? _steps : (int)fm.sigmas.size() - 1;
+      if (!_h3_params.sigmas.empty()) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} was "
+            "distilled on its own {}-step grid; the model config's "
+            "sigmas replace it ({} steps), two-time embedding at gate "
+            "{:.4g}", this->id(), fm.version, fm.slot, fsteps,
+            _h3_params.sigmas.size() - 1, fm.gate));
+      } else if (refines_()) {
+        // A refine runs the grid's TAIL, `steps` long (process()).
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} -- a "
+            "refine runs the last {} of its {}-step flow-map grid "
+            "(`steps`), two-time embedding at gate {:.4g}", this->id(),
+            fm.version, fm.slot, std::min(_steps, fsteps), fsteps,
+            fm.gate));
+      } else {
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): HyperFlow {} on lora slot {} -- "
+            "{}-step flow-map grid from the adapter (`steps: {}` is not "
+            "used while it is live), two-time embedding at gate {:.4g}",
+            this->id(), fm.version, fm.slot, fsteps, _steps, fm.gate));
+      }
+      // The grid is shifted with the GRAPH's shifts, as upstream does,
+      // but it was distilled at the file's. Warn, do not override: the
+      // shifts are a knob someone may be turning on purpose.
+      auto off = [](double want, double have) {
+        return want > 0.0 && std::fabs(want - have) > 1e-6;
+      };
+      if (off(fm.video_shift, _h3_params.video_shift) ||
+          off(fm.audio_shift, _h3_params.audio_shift)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): HyperFlow was distilled at shifts "
+            "{:.4g}/{:.4g} and this graph runs {:.4g}/{:.4g}; the "
+            "adapter's grid is shifted with the graph's, and quality is "
+            "only validated at the trained ones", this->id(),
+            fm.video_shift, fm.audio_shift, _h3_params.video_shift,
+            _h3_params.audio_shift));
+      }
+    }
+    // An adapter's SAMPLING CONTRACT (Pika H3 Flex) likewise runs its own
+    // grid and update in place of `steps`; said once, here.
+    if (_h3_dit) {
+      if (const auto* sc = _h3_dit->sampling_contract()) {
+        const std::string who =
+            sc->release.empty() ? std::string("an adapter") : sc->release;
+        if (!_h3_params.sigmas.empty()) {
+          // An explicit grid replaces the contract whole: its grid AND
+          // its update, as an explicit sigma_grid always has.
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): {} on lora slot {} states a "
+              "{}-step sampling contract{}; the model config's sigmas "
+              "REPLACE it ({} steps, stepped by Euler unless the sampler "
+              "port names another -- `dmd` is its re-noising step)",
+              this->id(), who, sc->slot, (int)sc->sigmas.size() - 1,
+              sc->renoise ? " with fresh noise each step" : "",
+              _h3_params.sigmas.size() - 1));
+        } else {
+          session()->info(fmt(
+              "GenerateVideoStage('{}'): {} on lora slot {} -- its "
+              "sampling contract runs {} steps on its own grid{} (`steps: "
+              "{}` is not used while it is live)", this->id(), who,
+              sc->slot, (int)sc->sigmas.size() - 1,
+              sc->renoise ? ", fresh noise each step" : "", _steps));
+        }
+        auto off = [](double want, double have) {
+          return want > 0.0 && std::fabs(want - have) > 1e-6;
+        };
+        if (off(sc->video_shift, _h3_params.video_shift) ||
+            off(sc->audio_shift, _h3_params.audio_shift)) {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): {} states shifts {:.4g}/{:.4g} "
+              "and this graph runs {:.4g}/{:.4g}; its grid is shifted with "
+              "the graph's, and the release names its own", this->id(),
+              sc->release, sc->video_shift, sc->audio_shift,
+              _h3_params.video_shift, _h3_params.audio_shift));
+        }
+      }
+    }
+    resolve_unload_policy_h3_(bounded);
+    const std::size_t hold_growth =
+        tp_rank ? _h3_tp_hold_growth_ : _h3_i8_hold_growth_;
+    if (_h3_dit && !stream_blocks && hold_growth > 0) {
+      // A PRELOAD that holds the w4 projections' int8 layout holds its
+      // files AND that growth, which neither ledger had heard of: the
+      // declaration said the files, and the plan's holding the same.
+      // MEASURED on the Ultra: 3.06 GB of peak footprint against the
+      // 3.33 GB the decision above computed. A RANK's files are its
+      // share (h3_tp_held_bytes_), not the checkpoint.
+      auto* mgr = session()->services()->generative_model_manager();
+      if (mgr != nullptr) {
+        const std::size_t files =
+            tp_rank ? h3_tp_held_bytes_(dit_dir)
+                    : model_memory::dir_weights_bytes(dit_dir);
+        mgr->revise_declaration(dit_dir, files + hold_growth);
+      }
+      revise_memory(declare_memory());
+    }
+    if (_h3_dit && bounded) {
       // A streamed DiT holds ~one block, not the checkpoint, so the
       // load-time claim would keep sizing every peer against 33 GB. What
       // the SET holds is the right number: the retained top-level
@@ -1309,20 +4039,23 @@ GenerateVideoStage::ensure_expert_(int which)
       auto* mgr = session()->services()->generative_model_manager();
       auto ws = mgr != nullptr ? mgr->weight_set(dit_dir) : nullptr;
       if (ws) {
-        const std::size_t held = ws->stats().bytes;
+        // ...and what the model holds beside it (streamed_holding_bytes,
+        // as the per-clip correction reads it): a rank's cut refiner.
+        const std::size_t held =
+            ws->stats().bytes + _h3_dit->streamed_holding_bytes();
         mgr->revise_declaration(dit_dir, held);
         // The same correction on the topological plan. What the plan
         // could only bound -- the checkpoint's size on disk -- the model
         // now knows exactly, because it has finished deciding what to
-        // keep. Both floors are set to what is actually held: a
-        // streaming DiT has no larger form left to grow back into
-        // within this launch.
+        // keep. Both columns are set to what is actually held -- but
+        // never below the floor it was planned at, because the set does
+        // not see the slot pair the first forward builds. See
+        // correct_loaded_holding.
         {
           StageMemory m = declare_memory();
           for (StageHolding& h : m.holdings) {
             if (h.source != dit_dir) { continue; }
-            h.preload = held;
-            h.floor = held;
+            correct_loaded_holding(h, held);
           }
           revise_memory(m);
         }
@@ -1419,6 +4152,12 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
   // connectivity is known, which is why the notice lives here and the
   // per-request refusal -- the one that actually stops a wrong
   // generation -- lives where the beat arrives.
+  //
+  // "Every request" is exact for any request that LISTS references --
+  // their rows have no way in. The one that survives is prompt-only, an
+  // explicitly empty list, which needs no rows; but it still has to come
+  // from a video-ref-encoder, and a graph that wired one would normally
+  // have wired its rows too, so the warning stands.
   if (_h3_partition == "ref2va" &&
       !(ctx.num_iports() > kRefVideoRowsPort &&
         ctx.iport_connected(kRefVideoRowsPort))) {
@@ -1426,9 +4165,10 @@ GenerateVideoStage::initialize(RuntimeContext& ctx)
         "GenerateVideoStage('{}'): '{}' is MiniMax-H3's Ref2VA partition, "
         "which conditions on a list of reference images, clips and "
         "soundtracks, but iport{} (ref_video_rows) is unwired -- every "
-        "request will be refused. Wire a `video-ref-encoder` to iport{} "
-        "and iport{}, or use the FL2VA checkpoint for text-to-video and "
-        "first/last-frame work.",
+        "request with references will be refused. Wire a "
+        "`video-ref-encoder` to iport{} and iport{} (`references: []` on "
+        "it asks for prompt-only), or use the FL2VA checkpoint for "
+        "text-to-video and first/last-frame work.",
         this->id(), _root, kRefVideoRowsPort, kRefVideoRowsPort,
         kRefAudioRowsPort));
   }
@@ -1455,24 +4195,88 @@ namespace h3 = genai::minimax_h3;
 // needs the working set -- which on MiniMax-H3 is exactly what happened:
 // the DiT stayed resident and a 251 MB video decode was refused with zero
 // headroom and 5.3 GB physically free.
+// A STREAMED H3 DiT grows as residency keeps its blocks, and those are
+// the model's own buffers: its weight set reports only the cached trunk.
+// So after every clip both ledgers are told the whole holding -- the set's
+// entries plus the promoted blocks, the slot pair (given back first when
+// the stack is whole) and the AdaLN tables. The image families' rule
+// (correct_dit_holding_), and the same bug before it: the declaration sat
+// at the trunk while residency held tens of GB.
 void
-GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
+GenerateVideoStage::correct_h3_holding_()
+{
+  if (!_h3_dit || !_h3_dit->streaming() || _h3_dit_dir_.empty()) { return; }
+  (void)_h3_dit->release_idle_slots();
+  auto* mgr = session()->services()->generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto ws = mgr->weight_set(_h3_dit_dir_);
+  const std::size_t held =
+      (ws ? ws->stats().bytes : 0) + _h3_dit->streamed_holding_bytes();
+  if (held == 0) { return; }
+  mgr->revise_declaration(_h3_dit_dir_, held);
+  StageMemory m = declare_memory();
+  StageHolding* h = nullptr;
+  for (StageHolding& x : m.holdings) {
+    if (x.source == _h3_dit_dir_) { h = &x; break; }
+  }
+  if (h == nullptr) { return; }
+  _h3_load_floor_ = correct_loaded_holding(*h, held, _h3_load_floor_);
+  if (h->preload == _h3_revised_) { return; }
+  _h3_revised_ = h->preload;
+  revise_memory(m);
+  session()->log_debug(fmt(
+      "GenerateVideoStage('{}'): the streamed DiT holds {} MB after a "
+      "clip ({} of {} blocks kept); the plan holds it at {} MB, floor {} MB",
+      this->id(), held >> 20, _h3_dit->resident_block_count(),
+      _h3_cfg.n_layers, h->preload >> 20, h->floor >> 20));
+}
+
+std::shared_ptr<genai::TpChannel>
+GenerateVideoStage::open_tp_channel_(std::string* err)
+{
+  auto fail = [&](const std::string& why) {
+    if (err != nullptr) { *err = why; }
+    return std::shared_ptr<genai::TpChannel>();
+  };
+  if (!_h3_cfg.tp.active() || !_tp_cfg.is_object()) {
+    return fail("this stage is not a rank");
+  }
+  auto o = _tp_cfg.as_object();
+  const std::string tname = o.contains("transport")
+                                ? std::string(o.at("transport").as_string(""))
+                                : std::string();
+  genai::TpTransport* tr = genai::find_tp_transport(tname);
+  if (tr == nullptr) {
+    return fail(fmt("no transport named '{}' -- a plugin registers it",
+                    tname)());
+  }
+  const FlexData params = o.contains("params") ? o.at("params") : FlexData();
+  // The transport is a plugin's: an exception is its refusal.
+  std::string terr;
+  std::shared_ptr<genai::TpChannel> ch;
+  try {
+    ch = tr->open(params, _h3_cfg.tp, &terr);
+  } catch (const std::exception& e) {
+    ch.reset();
+    terr = std::string("it threw: ") + e.what();
+  } catch (...) {
+    ch.reset();
+    terr = "it threw";
+  }
+  if (!ch) { return fail(fmt("transport '{}': {}", tname, terr)()); }
+  return ch;
+}
+
+void
+GenerateVideoStage::resolve_unload_policy_h3_(bool tight)
 {
   if (_unload_resolved) { return; }
   _unload_resolved = true;
-  std::vector<std::string> peers;
-  for (const std::string& p :
-       {genai::MiniMaxH3TextEncoder::resolve_encoder_dir(_root),
-        genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(_root)}) {
-    if (!p.empty() && p != _root) { peers.push_back(p); }
-  }
   switch (_unload_cfg) {
     case model_memory::UnloadPolicy::kAlways: _unload_idle = true;  break;
     case model_memory::UnloadPolicy::kNever:  _unload_idle = false; break;
     default:
-      _unload_idle = streamed ||
-                     model_memory::bounded(session(), peers,
-                                           model_memory::kHeadroom);
+      _unload_idle = tight || h3_box_bounded(session());
       break;
   }
   if (_unload_idle) {
@@ -1480,7 +4284,7 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
         "GenerateVideoStage('{}'): memory-bounded -- the DiT is dropped "
         "after each clip so the VAE decode has working set, and reloads "
         "on the next prompt{}", this->id(),
-        streamed ? " (its blocks stream, so the box is already tight)" : ""));
+        tight ? " (its blocks stream, so the box is already tight)" : ""));
   }
 }
 
@@ -1506,7 +4310,10 @@ GenerateVideoStage::resolve_unload_policy_h3_(bool streamed)
 // 9.9 GB of this process compressed. SharedBuffer::set_wired() is what
 // would pin them, and the block-residency path is its only caller.
 bool
-GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
+GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows,
+                                          const h3::PackedLayout& L,
+                                          int grid_h, int grid_w,
+                                          std::size_t pageable)
 {
   auto* mc = session()->services()->metal_compute();
   if (mc == nullptr || seq <= 0) { return true; }
@@ -1517,10 +4324,211 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
   // buffers are sub-MB at any plausible value (mod is n_t x adaln_out),
   // so an upper bound costs nothing and keeps this callable before the
   // schedule exists.
-  constexpr int kTimestepsUpperBound = 4;
-  const bool dq = _h3_dit && _h3_dit->uses_matrix_cores();
-  const std::size_t need = genai::MetalMiniMaxH3Transformer::scratch_bytes(
-      _h3_cfg, seq, text_rows, kTimestepsUpperBound, dq);
+  // THE MODEL'S OWN SLOT COUNT, not a second guess at it. The scratch is
+  // sized for this many distinct timesteps whatever a single forward
+  // presents, so a preflight against a smaller number would under-size
+  // the box and one against a larger would refuse runs that fit.
+  constexpr int kTimestepsUpperBound =
+      genai::MetalMiniMaxH3Transformer::kTimestepSlots;
+  const bool dq = _h3_dit && _h3_dit->uses_dequant_scratch();
+  // AND THE BRANCH'S, which is a second allocation of the same order and
+  // is spent inside the first forward -- after this. Left out, the
+  // reserve below is short by a gigabyte or more and the DiT keeps
+  // blocks resident against a budget that has not heard of the branch;
+  // what follows is swap rather than a smaller resident set, which is
+  // the wrong failure. Zero when no branch is attached, and zero when
+  // the window covers the clip and the linear half does not run.
+  //
+  // Most of it is no longer a second allocation at all: the branch
+  // carves its scratch out of the DiT's attention arena, which is dead
+  // for exactly the stretch it runs in, so `vdn_arena` is a FLOOR on a
+  // buffer that exists either way and `vdn` is only what is left over
+  // -- the branch's two host-written constants and the readout. At both
+  // geometries measured the arena is the wider of the two and the floor
+  // costs nothing at all.
+  std::size_t vdn_arena = 0;
+  const std::size_t vdn =
+      _h3_dit ? _h3_dit->vdn_scratch_bytes(L, grid_h, grid_w, text_rows,
+                                           &vdn_arena)
+              : 0;
+  // Banded where the DiT will band it (its rule, at this sequence).
+  const int band = _h3_dit && taomate_slot_() < 0
+                       ? _h3_dit->forward_band(seq, text_rows)
+                       : 0;
+  // A RANK of a split DiT at its share's widths: _h3_cfg keeps the
+  // checkpoint's (the model narrows its own copy at load).
+  const std::size_t dit = genai::MetalMiniMaxH3Transformer::scratch_bytes(
+      genai::MetalMiniMaxH3Transformer::rank_config(_h3_cfg), seq, text_rows,
+      kTimestepsUpperBound, dq, /*narrow_ff=*/false, vdn_arena, band,
+      _h3_dit ? _h3_dit->fp8_widen_bytes() : 0);
+  // AND SOL'S, which is the same story again: a second allocation of
+  // the same order, spent at the first routed block and therefore after
+  // this. Almost all of it is lent rather than allocated -- the fused
+  // qkv projection and the arena's last attention window are both dead
+  // while Sol runs -- so what comes back is the remainder, and it is
+  // the real carve rather than a subtraction. Zero when Sol is off, and
+  // zero before the DiT exists to be asked.
+  const std::size_t sol =
+      _h3_dit ? _h3_dit->sol_scratch_bytes(seq, text_rows) : 0;
+  // AND SAGE'S, which nothing counted until now: its int8 twins of q
+  // and k are one byte per element where the tensors are two, so at
+  // video geometry they are ~1.5 GB the plan had never heard of. Zero
+  // when the setting is off, and reduced by whatever the forward arena
+  // could lend -- see MetalMiniMaxH3Transformer::sage_lend_bytes_.
+  const std::size_t sage =
+      _h3_dit ? _h3_dit->sage_scratch_bytes(seq, text_rows) : 0;
+  // AND THE INT8 CONTEXT'S: activation codes at the widest GEMM, the
+  // per-call weight scratch and split-K's planes, grown inside the first
+  // forward and kept. Zero when i8_gemm is off.
+  const std::size_t i8 =
+      _h3_dit ? _h3_dit->i8_scratch_bytes(seq, text_rows) : 0;
+  // AND THE ANE MODULE'S, when the plan granted it: CoreML holds its staged
+  // weights and the host rows beside this forward, at THIS sequence rather
+  // than the planned one. Counted in `need`, so the refusal is judged with
+  // it and the residency reserve below leaves it clear -- a streamed DiT
+  // growing blocks into memory the ANE already holds is the same failure
+  // as growing into the scratch.
+  // ane_runtime_bytes counts the qkv module too when the graph asked for
+  // it (it was added here a second time); armed, the modules' own figure.
+  const std::size_t ane =
+      !_h3_cfg.ane_ffn ? 0
+      : (_h3_dit && _h3_dit->ane_armed())
+          ? _h3_dit->ane_held_bytes()
+          : genai::MetalMiniMaxH3Transformer::ane_runtime_bytes(_h3_cfg, seq);
+  // AND THE ADAPTERS' [rows, rank] intermediate, every slot's region at
+  // a band's rows where the forward bands: 149 MB for Open-H3-
+  // Regenerate-2K's merge run whole (rank 1728 at 43,200 rows).
+  const std::size_t lora =
+      _h3_dit ? (std::size_t)(band > 0 ? band : seq) *
+                    (std::size_t)_h3_dit->lora_scratch_rank() * 2
+              : 0;
+  // TWO BUDGETS. The forward's Metal scratch is what the GPU working set
+  // must hold; the ANE modules are IOSurfaces and CoreML's own copies, so
+  // they count against physical RAM only. MEASURED on an M5 Pro 24 GB at
+  // 1344x768x328 (98887 rows): charging the ANE's 3.1 GB to the working set
+  // refused a clip that runs GPU-only.
+  const std::size_t gpu_need = dit + vdn + sol + sage + i8 + lora;
+  // THE PLAN'S DENOISE FIGURE, SET TO THIS FORWARD'S. The launch booked
+  // `<id>-h3-dit` at a planned sequence -- the canvas, two anchors, 512
+  // text rows -- and the rows it could not know arrive only here: a
+  // Ref2VA request's references and a keyframe presentation's vision
+  // blocks. Pika H3 Flex's Ref2VA example runs 39,729 rows where the
+  // plan counted 15,929. What sizes after this reads it: vae-decode's
+  // first beat, the next prompt's conditioning.
+  if (auto* gm = session()->services()->generative_model_manager()) {
+    const std::string label = fmt("{}-h3-dit", this->id())();
+    const std::size_t booked = gm->declared_scratch(label);
+    if (booked > 0 && gpu_need > booked + booked / 10) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): the {}-row forward's activations take "
+          "~{} MB where the launch booked ~{} MB (references and vision "
+          "rows are known only now); the plan now carries this figure",
+          this->id(), seq, gpu_need >> 20, booked >> 20));
+    }
+    gm->revise_scratch(label, gpu_need);
+  }
+  // AND WHAT THE CALLER HOLDS BESIDE THE FORWARD for the whole denoise --
+  // TaoMate-H3's clean-K/V cache, which at 864x480 is larger than every
+  // term above together. It is judged against PHYSICAL RAM and kept out
+  // of the residency's way, but NOT counted in the working-set test: the
+  // working set is the wired ceiling, and these buffers are not wired --
+  // the OS can page them, so they cannot starve the kernel the way the
+  // scratch can. MEASURED on the M4 Pro 64 GB at 864x480: 33 GB of
+  // weights, a 21 GB cache and the scratch over a 48 GB recommended
+  // working set ran every chunk forward at 37 s, its compute-bound time,
+  // with 2.8 GB of swap; the working-set test alone had refused it. With
+  // the cache on disk (`taomate_kv`, the default) this is its two slots.
+  const std::size_t need = gpu_need + ane + pageable;
+
+  // THE TWO GATES, WITH THEIR MARGINS SPELLED OUT HERE rather than left
+  // inside the predicates.
+  //
+  // fits() keeps 5% of the GPU working set in hand and fits_physical()
+  // 10% of the reclaimable RAM, and the refusal below used to report the
+  // RAW budget beside the RAW need -- so a forward wanting 14537 MB was
+  // refused against "15733 MB of GPU working set / 14806 MB
+  // reclaimable", both of them larger. Neither number was wrong and the
+  // decision was right (14537 is over 90% of 14806); the message simply
+  // compared quantities that the test does not.
+  //
+  // So the requirement is stated in the same units the test applies, and
+  // the two gates are reported apart, because they fail for different
+  // reasons and have different answers: the working set is about what
+  // this process has already allocated, the physical budget about what
+  // the machine has left.
+  constexpr double kWorkingSetMargin = 0.05;
+  // Reclaimable RAM keeps a smaller cushion than it used to (5%, was 10%) and
+  // may spend a bounded amount of other processes' resident anonymous
+  // pages -- the session's `swap_allowance_mb` against what the box
+  // actually has, below. The WORKING SET keeps its 5% untouched: that is
+  // the wired ceiling, and over-allocating there takes the machine down.
+  const double kPhysicalMargin = video_phys_margin_();
+  // PERMISSION and AVAILABILITY are different questions, so the gate may
+  // spend only the smaller: what the operator allows this session to push
+  // into swap, and what other processes are actually holding in resident
+  // anonymous pages right now.
+  const std::size_t swap_room = [this]() -> std::size_t {
+    auto* gm = session()->services()->generative_model_manager();
+    if (gm == nullptr) { return 0; }
+    return std::min(gm->swap_allowance_bytes(),
+                    genai::GenerativeModelManager::swappable_other_bytes());
+  }();
+  // SAY THE ARITHMETIC ONCE, on the first forward that consults it.
+  //
+  // Without this the allowance is only ever reported when it FAILS to be
+  // enough (the refusal and the ANE-fallback warning below both name
+  // it), so a clip that runs because of it looks exactly like a clip
+  // that never needed it -- and the one question an operator has after
+  // changing the setting is which of those just happened. Once per
+  // stage, not per forward: it is a property of the box, and a denoise
+  // calls this on every block.
+  if (!_swap_room_said) {
+    _swap_room_said = true;
+    if (auto* gm = session()->services()->generative_model_manager()) {
+      const std::size_t allow = gm->swap_allowance_bytes();
+      // ONE sample, so the terms printed below are the ones behind the
+      // figure rather than a second reading of a moving machine.
+      const auto supply = genai::GenerativeModelManager::swap_supply();
+      const std::size_t have = supply.spare;
+      // The SUPPLY is reported beside the allowance, and when it is zero
+      // the reason is reported too. A zero reads two ways that call for
+      // opposite responses -- an idle box that has no other-process
+      // anonymous memory to give (correct, and the allowance is simply
+      // not needed), or a box whose wired total already exceeds its
+      // anonymous pages (the subtraction being pessimistic). MEASURED on
+      // an idle 24 GB M5 Pro: 2.27 GB anonymous against 2.26 GB wired,
+      // so the supply clamped to 0 while 18456 MB of reclaimable RAM
+      // carried the clip on its own. Without the terms that is
+      // indistinguishable from a bug.
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): reclaimable RAM ~{} MB + up to {} MB "
+          "the OS can swap ({} MB allowed by swap_allowance_mb, {} MB other "
+          "processes are actually holding{}); {:.0f}% margin",
+          this->id(), mb.available_physical >> 20, swap_room >> 20,
+          allow >> 20, have >> 20,
+          have == 0 ? fmt(" -- nothing to spend: {} MB anonymous, less {} "
+                          "MB purgeable, {} MB wired system-wide and {} MB "
+                          "this process's own",
+                          supply.anon >> 20, supply.purgeable >> 20,
+                          supply.wired >> 20, supply.self_anon >> 20)()
+                    : std::string(),
+          100.0 * kPhysicalMargin));
+    }
+  }
+  auto grossed_up = [](std::size_t n, double margin) -> std::size_t {
+    return (std::size_t)((double)n / (1.0 - margin));
+  };
+  const std::size_t need_ws   = grossed_up(gpu_need, kWorkingSetMargin);
+  // The physical margin is slack for the SCRATCH ESTIMATE; the ANE modules
+  // are fixed-size slots and one-chunk host buffers, so they are added at
+  // face value. Grossing them up too charged a 24 GB M5 Pro ~1.6 GB of
+  // margin for a ~1.1 GB module and ran a clip without it.
+  const std::size_t need_phys =
+      grossed_up(gpu_need, kPhysicalMargin) + ane + pageable;
+  auto fits_phys = [&](const auto& b, std::size_t extra) {
+    return b.available_physical + swap_room >=
+           grossed_up(gpu_need, kPhysicalMargin) + extra;
+  };
 
   // Tell the DiT how much room to leave clear when it decides whether to
   // keep a streamed block resident. Its growth must not eat the scratch
@@ -1534,7 +4542,10 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
   // Both budgets, for the reason generate-image gives: fits() is our Metal
   // working set and misses other processes' resident memory; fits_physical
   // is host-wide reclaimable RAM and catches it.
-  if (mb.fits(need) && mb.fits_physical(need)) { return true; }
+  if (mb.fits(gpu_need, kWorkingSetMargin) &&
+      fits_phys(mb, ane + pageable)) {
+    return true;
+  }
 
   // Make room. Parking hands weight pages to the kernel as purgeable --
   // reversible, and free unless something actually takes them.
@@ -1543,22 +4554,136 @@ GenerateVideoStage::preflight_h3_scratch_(int seq, int text_rows)
     parked = gm->reclaim_at_least(need);
   }
   mb = mc->memory_budget();
-  if (mb.fits(need) && mb.fits_physical(need)) {
+  if (mb.fits(gpu_need, kWorkingSetMargin) &&
+      fits_phys(mb, ane + pageable)) {
     session()->info(fmt(
         "GenerateVideoStage('{}'): parked ~{} MB to fit the {}-row forward's "
-        "~{} MB of scratch", this->id(), parked >> 20, seq, need >> 20));
+        "~{} MB of scratch{}", this->id(), parked >> 20, seq, need >> 20,
+        vdn > 0 ? fmt(" ({} MB of it the VDN branch's, plus {} MB of arena "
+                      "it shares with the attention)", vdn >> 20,
+                      vdn_arena >> 20)()
+        // SAGE IS NAMED WHEN IT COSTS SOMETHING, because unlike Sol's
+        // it is not always borrowed: it fits in the forward arena only
+        // when Sol has not taken that buffer, and this is the figure
+        // that used to be missing from the sum entirely.
+        : sage > 0 ? fmt(" ({} MB of it SageAttention's int8 q/k; "
+                         "Sol-Attn's own scratch is borrowed, not added)",
+                         sage >> 20)()
+        : _sol.enabled ? std::string(" (Sol-Attn's own scratch is "
+                                     "borrowed, not added)")
+                       : std::string()));
     return true;
   }
+  // WHICH GATE FAILED, and by how much, in the units the gate uses.
+  // THE ANE IS THE OPTIONAL PART. When the clip fits without its modules,
+  // run the GPU alone -- a slower clip -- instead of refusing the clip.
+  if (ane > 0 && mb.fits(gpu_need, kWorkingSetMargin) &&
+      fits_phys(mb, pageable)) {
+    if (_h3_dit) {
+      _h3_dit->disable_ane();
+      _h3_dit->set_residency_reserve(gpu_need + pageable + (1ull << 30));
+    }
+    _h3_cfg.ane_ffn = false;
+    _h3_cfg.ane_qkv = false;
+    if (auto* gm = session()->services()->generative_model_manager()) {
+      gm->revise_scratch("coreml:" + ane_claim_label_(), 0);
+    }
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): the {}-row forward fits only without the "
+        "ANE modules' ~{} MB (reclaimable RAM ~{} MB{} against ~{} MB wanted "
+        "with them; GPU working set ~{} MB against ~{} MB) -- running the "
+        "GPU alone for this clip", this->id(), seq, ane >> 20,
+        mb.available_physical >> 20,
+        swap_room > 0 ? fmt(" + {} MB other apps' pages the OS can swap",
+                            swap_room >> 20)()
+                      : std::string(),
+        need_phys >> 20, mb.headroom >> 20, need_ws >> 20));
+    return true;
+  }
+  const bool ws_ok = mb.fits(gpu_need, kWorkingSetMargin);
+  const bool ph_ok = fits_phys(mb, ane + pageable);
+  auto gate = [](const char* what, bool ok, std::size_t want,
+                 std::size_t have) {
+    return ok ? fmt("{} needs ~{} MB, has ~{} MB -- ok", what, want >> 20,
+                    have >> 20)()
+              : fmt("{} needs ~{} MB, has ~{} MB -- SHORT BY {} MB", what,
+                    want >> 20, have >> 20,
+                    want > have ? (want - have) >> 20 : 0u)();
+  };
+  // The same numbers for the host to act on (common/host-report.h):
+  // what the forward wanted, part by part -- summing to `need` -- and
+  // each budget's need and room in the units its gate applies.
+  {
+    auto u = [](std::size_t b) { return FlexData::make_uint(b); };
+    FlexData parts = FlexData::make_array();
+    auto part = [&](const char* name, std::size_t b) {
+      if (b == 0) { return; }
+      FlexData e = FlexData::make_object();
+      e.as_object().insert("name", FlexData::make_string(name));
+      e.as_object().insert("bytes", u(b));
+      parts.as_array().push_back(std::move(e));
+    };
+    part("transformer", dit);
+    part("vdn_branch", vdn);
+    part("sol_attn", sol);
+    part("sage_attn", sage);
+    part("ane", ane);
+    part("stream_kv", pageable);
+    FlexData gates = FlexData::make_array();
+    auto gate_doc = [&](const char* name, bool ok, std::size_t want,
+                        std::size_t have) {
+      FlexData e = FlexData::make_object();
+      auto eo = e.as_object();
+      eo.insert("name", FlexData::make_string(name));
+      eo.insert("need", u(want));
+      eo.insert("have", u(have));
+      eo.insert("ok", FlexData::make_bool(ok));
+      gates.as_array().push_back(std::move(e));
+    };
+    gate_doc("gpu_working_set", ws_ok, need_ws, mb.headroom);
+    gate_doc("reclaimable_ram", ph_ok, need_phys,
+             mb.available_physical + swap_room);
+    FlexData d = FlexData::make_object();
+    auto o = d.as_object();
+    o.insert("stage", FlexData::make_string(this->id()));
+    o.insert("step", FlexData::make_string("denoise"));
+    o.insert("rows", FlexData::make_uint((std::uint64_t)seq));
+    o.insert("grid_h", FlexData::make_uint((std::uint64_t)grid_h));
+    o.insert("grid_w", FlexData::make_uint((std::uint64_t)grid_w));
+    o.insert("need", u(need));
+    o.insert("parts", std::move(parts));
+    o.insert("gates", std::move(gates));
+    o.insert("parked", u(parked));
+    o.insert("swap_room", u(swap_room));
+    host_report(session(), "memory", std::move(d));
+  }
   session()->error(fmt(
-      "GenerateVideoStage('{}'): not enough memory for a {}-row forward -- "
-      "it needs ~{} MB of scratch and there is ~{} MB of GPU working set / "
-      "~{} MB reclaimable{}. Refusing rather than thrashing: wired Metal "
-      "buffers cannot be paged out, so overcommitting here takes the whole "
-      "machine down rather than failing this stage. Use a smaller "
+      "GenerateVideoStage('{}'): not enough memory for a {}-row forward. "
+      "It wants ~{} MB of scratch{}, which with the safety margins the "
+      "budget keeps ({:.0f}% of the working set, {:.0f}% of reclaimable "
+      "RAM{}) means: {}; {}{}. Refusing rather than thrashing: wired Metal "
+      "buffers cannot be paged out, so overcommitting here takes the "
+      "whole machine down rather than failing this stage. Use a smaller "
       "height/width/frames, or free another model first",
-      this->id(), seq, need >> 20, mb.headroom >> 20,
-      mb.available_physical >> 20,
-      parked > 0 ? fmt(" after parking ~{} MB", parked >> 20)()
+      this->id(), seq, need >> 20,
+      vdn > 0 ? fmt(" ({} MB of it the VDN branch's own, and {} MB of "
+                    "arena it shares with the attention -- a shorter clip "
+                    "or no `linear_branch` would need neither)", vdn >> 20,
+                    vdn_arena >> 20)()
+      : _sol.enabled
+          ? std::string(" (Sol-Attn borrows its scratch from buffers this "
+                        "forward already holds, so turning `sol_attn` off "
+                        "would not free any of this)")
+          : std::string(),
+      100.0 * kWorkingSetMargin, 100.0 * kPhysicalMargin,
+      swap_room > 0
+          ? fmt(", which counts {} MB of other apps' anonymous pages the OS "
+                "can compress or swap", swap_room >> 20)()
+          : std::string(),
+      gate("GPU working set", ws_ok, need_ws, mb.headroom),
+      gate("reclaimable RAM", ph_ok, need_phys,
+           mb.available_physical + swap_room),
+      parked > 0 ? fmt(" (after parking ~{} MB)", parked >> 20)()
                  : std::string()));
   return false;
 }
@@ -1581,14 +4706,20 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
   // as_object()/as_array() return VIEWS into their owner, so every value
   // taken out of one is bound to a local before it is read.
   const auto so = sideband.as_object();
-  if (!so.contains("references")) { return true; }
-  const FlexData refs = so.at("references");
+  namespace ck = genai::cond_sideband;
+  if (!so.contains(ck::kReferences)) { return true; }
+  const FlexData refs = so.at(ck::kReferences);
   if (!refs.is_array()) { return true; }
   const auto ra = refs.as_array();
-  if (ra.size() == 0) { return true; }
+  // An empty array is SAID, not absent, and falls through: the tags and
+  // the row beats are read the same way, and rows arriving for a
+  // request that lists no references are caught where the layout's
+  // counts are compared with them.
+  out->said = true;
 
   out->refs.clear();
   out->refs.reserve(ra.size());
+  out->posterior_draws.clear();
   for (std::size_t i = 0; i < ra.size(); ++i) {
     const FlexData e = ra[i];
     if (!e.is_object()) {
@@ -1598,24 +4729,29 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
       return false;
     }
     const auto eo = e.as_object();
-    auto num = [&](const char* k) -> int {
+    auto num = [&](std::string_view k) -> int {
       return eo.contains(k) ? (int)eo.at(k).as_int() : 0;
     };
     h3::Reference r;
-    const FlexData kd = eo.contains("kind") ? eo.at("kind") : FlexData{};
+    const FlexData kd =
+        eo.contains(ck::kKind) ? eo.at(ck::kKind) : FlexData{};
     const std::string kind = kd.is_string() ? std::string(kd.as_string()) : "";
-    r.kind = kind == "video"   ? h3::Reference::Kind::kVideo
-             : kind == "audio" ? h3::Reference::Kind::kAudio
-                               : h3::Reference::Kind::kImage;
-    r.num_latent_frames = num("latent_frames");
-    r.latent_height     = num("latent_height");
-    r.latent_width      = num("latent_width");
-    r.num_audio_latents = num("audio_latents");
+    r.kind = kind == ck::kVideo   ? h3::Reference::Kind::kVideo
+             : kind == ck::kAudio ? h3::Reference::Kind::kAudio
+                                  : h3::Reference::Kind::kImage;
+    r.num_latent_frames = num(ck::kLatentFrames);
+    r.latent_height     = num(ck::kLatentHeight);
+    r.latent_width      = num(ck::kLatentWidth);
+    r.num_audio_latents = num(ck::kAudioLatents);
     out->refs.push_back(r);
+    out->posterior_draws.push_back(
+        eo.contains(ck::kPosteriorDraws)
+            ? std::max<std::int64_t>(0, eo.at(ck::kPosteriorDraws).as_int())
+            : 0);
   }
 
-  if (so.contains("token_tags")) {
-    const FlexData t = so.at("token_tags");
+  if (so.contains(ck::kTokenTags)) {
+    const FlexData t = so.at(ck::kTokenTags);
     if (t.is_array()) {
       const auto ta = t.as_array();
       out->text_tags.reserve(ta.size());
@@ -1625,22 +4761,16 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
     }
   }
 
-  auto rows_of = [](const TensorBeatPayload* t, int want_elems,
-                    const float** data) -> int {
-    *data = nullptr;
-    if (t == nullptr || t->shape.size() != 2) { return 0; }
-    if ((int)t->shape[1] != want_elems) { return -1; }
-    if (t->shape[0] > 0) { *data = t->as_f32(); }
-    return (int)t->shape[0];
-  };
   const int PE = _h3_cfg.video_patch_elems();
   const int AC = _h3_cfg.audio_channels;
-  const int vr = rows_of(video_rows, PE, &out->video_rows);
-  const int ar = rows_of(audio_rows, AC, &out->audio_rows);
+  const int vr = h3_reference_rows(video_rows, PE, &out->video_rows);
+  const int ar = h3_reference_rows(audio_rows, AC, &out->audio_rows);
   if (vr < 0 || ar < 0) {
+    const TensorBeatPayload* bad = vr < 0 ? video_rows : audio_rows;
     session()->warn(fmt(
-        "GenerateVideoStage('{}'): the reference rows are not [n, {}] / "
-        "[n, {}]; skipping", this->id(), PE, AC));
+        "GenerateVideoStage('{}'): the reference {} rows are [{}, {}], not "
+        "[n, {}]; skipping", this->id(), vr < 0 ? "video" : "audio",
+        bad->shape[0], bad->shape[1], vr < 0 ? PE : AC));
     return false;
   }
   out->n_video_rows = vr;
@@ -1651,12 +4781,186 @@ GenerateVideoStage::parse_h3_references_(const FlexData& sideband,
 // The minimax-h3 denoise: one packed sequence carrying both modalities,
 // so this produces two latents where the Wan path produces one.
 bool
+GenerateVideoStage::h3_silence_rows_(int frames, double fps,
+                                     std::vector<float>* rows, int* alat)
+{
+  if (!_h3_silence.empty() && _h3_silence_frames == frames &&
+      _h3_silence_fps == fps) {
+    *rows = _h3_silence;
+    *alat = _h3_silence_alat;
+    return true;
+  }
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || fps <= 0.0 || frames <= 0) { return false; }
+  const std::string adir =
+      genai::MetalMiniMaxH3AudioVae::resolve_vae_dir(_root);
+  genai::MetalMiniMaxH3AudioVae::Config acfg;
+  std::string aerr;
+  if (!genai::MetalMiniMaxH3AudioVae::config_from_json(
+          adir.empty() ? _root : adir, acfg, &aerr)) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): a refine is conditioned on an encoded "
+        "silence and no audio VAE was found under '{}' ({})", this->id(),
+        _root, aerr));
+    return false;
+  }
+  // Transient: loaded for one encode of zeros and let go, before the
+  // denoise needs the room -- through the manager, which the plan's
+  // claim on it (declare_resources) and its release are about.
+  const std::string vdir = adir.empty() ? _root : adir;
+  auto* mgr = session()->services()->generative_model_manager();
+  auto release = [&] {
+    if (mgr != nullptr) {
+      mgr->drop_weights(vdir);
+      mgr->note_phase_released(vdir);
+    }
+  };
+  auto avae = genai::MetalMiniMaxH3AudioVae::load(
+      genai::open_weight_set(vdir, session()), mc, acfg);
+  if (!avae) {
+    release();
+    session()->warn(fmt("GenerateVideoStage('{}'): the audio VAE did not "
+                        "load", this->id()));
+    return false;
+  }
+  // The release's encode_silence: round(frames / fps * rate) samples of
+  // stereo zeros, the posterior's mean, whitened.
+  const int samples =
+      (int)std::nearbyint((double)frames / fps * (double)acfg.sample_rate);
+  const std::vector<float> pcm((std::size_t)2 * samples, 0.0f);
+  std::vector<float> lat;
+  int nf = 0;
+  const bool encoded =
+      avae->encode(pcm.data(), 2, samples, &lat, &nf, &aerr) && nf > 0;
+  avae.reset();
+  release();
+  if (!encoded) {
+    session()->warn(fmt("GenerateVideoStage('{}'): encoding the silence "
+                        "failed ({})", this->id(), aerr));
+    return false;
+  }
+  const int AC = acfg.latent_channels;
+  const bool whiten = (int)acfg.latents_mean.size() == AC &&
+                      (int)acfg.latents_std.size() == AC;
+  for (std::size_t k = 0; k < lat.size(); ++k) {
+    const std::size_t ch = k % (std::size_t)AC;
+    const float mu = whiten ? acfg.latents_mean[ch] : 0.0f;
+    const float sd = whiten ? acfg.latents_std[ch] : 1.0f;
+    lat[k] = sd != 0.0f ? (lat[k] - mu) / sd : (lat[k] - mu);
+  }
+  _h3_silence = lat;
+  _h3_silence_frames = frames;
+  _h3_silence_fps = fps;
+  _h3_silence_alat = nf;
+  *rows = std::move(lat);
+  *alat = nf;
+  return true;
+}
+
+// See the declaration. The guide is checked against THIS clip -- its
+// latent grid and its soundtrack's length -- because a guide made for
+// another (a load-tensor window cut at the wrong size, a clip of another
+// canvas) still arrives as a well-shaped tensor.
+bool
+GenerateVideoStage::parse_h3_guide_(const TensorBeatPayload* video,
+                                    const TensorBeatPayload* audio,
+                                    H3Guide* out)
+{
+  if (out == nullptr) { return false; }
+  *out = H3Guide{};
+  constexpr int kFramesPerChunk = 17, kLatentsPerChunk = 5;
+  const int aligned =
+      h3::align_num_frames(_frames, kFramesPerChunk, kLatentsPerChunk);
+  const int alat = _h3_params.audio_latents(aligned, _fps);
+  // `frame` off a beat's sideband: SAID or not, and negative counts from
+  // the clip's end, as ComfyUI's guide does.
+  auto frame_of = [&](const TensorBeatPayload* t, int* f) {
+    if (t == nullptr || !t->sideband.is_object()) { return false; }
+    const auto o = t->sideband.as_object();
+    if (!o.contains("frame")) { return false; }
+    const FlexData v = o.at("frame");
+    *f = (int)std::lround(v.as_real(0.0));
+    return true;
+  };
+  auto bad = [&](const std::string& m) {
+    session()->warn(fmt("GenerateVideoStage('{}'): the guide {}; "
+                        "generating without it", this->id(), m));
+    return false;
+  };
+  int frame = 0;
+  bool said = frame_of(video, &frame);
+  if (video != nullptr) {
+    const int lh0 = _height / 16, lw0 = _width / 16;
+    if (video->dtype != TensorBeat::DType::F32 ||
+        video->shape.size() != 4 ||
+        (int)video->shape[0] != _h3_cfg.video_channels ||
+        video->shape[1] <= 0 || (int)video->shape[2] != lh0 ||
+        (int)video->shape[3] != lw0) {
+      return bad(fmt("latent must be f32 [{}, n, {}, {}] -- this clip's "
+                     "latent grid; got {}", _h3_cfg.video_channels, lh0,
+                     lw0, video->describe())());
+    }
+    out->video  = video->as_f32();
+    out->frames = (int)video->shape[1];
+  }
+  if (audio != nullptr) {
+    int af = 0;
+    if (frame_of(audio, &af)) {
+      if (said && af != frame) {
+        return bad(fmt("video starts at frame {} and its audio at {}",
+                       frame, af)());
+      }
+      frame = af;
+      said = true;
+    }
+    if (audio->dtype != TensorBeat::DType::F32 ||
+        audio->shape.size() != 3 || audio->shape[0] != h3::kAudioChannels ||
+        (int)audio->shape[1] != _h3_cfg.audio_channels ||
+        audio->shape[2] <= 0) {
+      return bad(fmt("audio must be f32 [{}, {}, m] as the audio_latent "
+                     "oport writes it; got {}", h3::kAudioChannels,
+                     _h3_cfg.audio_channels, audio->describe())());
+    }
+    out->audio         = audio->as_f32();
+    out->audio_stride  = (int)audio->shape[2];
+    out->audio_latents = out->audio_stride;
+  }
+  if (frame < 0) { frame += aligned; }
+  const int span = h3::guide_pixel_frames(out->frames);
+  if (frame < 0 || frame + std::max(span, 1) > aligned) {
+    return bad(fmt("of {} pixel frames at frame {} does not lie within "
+                   "the clip's {}", std::max(span, 1), frame, aligned)());
+  }
+  out->frame = frame;
+  // Its soundtrack CUT where the generated one ends: the streams share
+  // one clock, 5/3 audio latents a pixel frame.
+  if (out->audio != nullptr) {
+    const int room = (int)std::floor(
+        (double)alat - h3::kRopeFrameRescale * (double)frame + 1e-9);
+    if (room < 1) {
+      return bad(fmt("audio starts at frame {}, past the soundtrack's "
+                     "{} latents", frame, alat)());
+    }
+    if (out->audio_latents > room) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): the guide's {} audio latents cut to "
+          "the {} left from frame {}", this->id(), out->audio_latents,
+          room, frame));
+      out->audio_latents = room;
+    }
+  }
+  return out->video != nullptr || out->audio != nullptr;
+}
+
+bool
 GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
-                            int ref_frames, const H3References* r2v,
+                            int ref_frames, bool ref_last_only,
+                            const H3References* r2v,
                             std::vector<float>* video_out,
                             std::vector<int>* video_shape,
                             std::vector<float>* audio_out,
-                            std::vector<int>* audio_shape)
+                            std::vector<int>* audio_shape,
+                            const H3Refine* refine, const H3Guide* guide)
 {
   auto* mc = session()->services()->metal_compute();
   if (mc == nullptr || !_h3_dit) { return false; }
@@ -1664,8 +4968,23 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
 
   // Latent geometry. The video VAE compresses 16x spatially and 4x in
   // time with the causal round-UP the encoder does, so the frame count
-  // is not a plain division.
-  const int lh = _height / 16, lw = _width / 16;
+  // is not a plain division. A refine's is the latent's own.
+  int lh = refine != nullptr ? refine->lh : _height / 16;
+  int lw = refine != nullptr ? refine->lw : _width / 16;
+  // A P-H3-Image edit with no canvas named renders at its picture's size
+  // -- the first reference, which video-ref-encoder put on the canvas
+  // rule (at least the manifest's canvas_min_pixels).
+  if (_ph3 && !_size_set && refine == nullptr && r2v != nullptr &&
+      !r2v->refs.empty() && r2v->refs.front().latent_height > 0 &&
+      r2v->refs.front().latent_width > 0) {
+    lh = r2v->refs.front().latent_height;
+    lw = r2v->refs.front().latent_width;
+    if (lh * 16 != _height || lw * 16 != _width) {
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): the edit renders at its picture's "
+          "{}x{}", this->id(), lw * 16, lh * 16));
+    }
+  }
   // The video VAE encodes in 17-frame clips that yield 5 latent frames
   // each and then drops 3, so a request has to be snapped UP to a length
   // the chunking can actually produce. These two are the released
@@ -1673,10 +4992,17 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // changed them would want them read from video_vae/config.json rather
   // than assumed here.
   constexpr int kFramesPerChunk = 17, kLatentsPerChunk = 5;
+  // P-H3-Image's picture is ONE latent frame -- no pixel-frame count
+  // has that latent form -- beside a fixed two audio latents.
   const int aligned =
-      h3::align_num_frames(_frames, kFramesPerChunk, kLatentsPerChunk);
+      refine != nullptr ? refine->frames
+      : _ph3 || _h3i    ? 1
+          : h3::align_num_frames(_frames, kFramesPerChunk, kLatentsPerChunk);
   const int lt =
-      h3::video_latent_num_frames(aligned, kFramesPerChunk, kLatentsPerChunk);
+      refine != nullptr ? refine->lt
+      : _ph3 || _h3i    ? 1
+                        : h3::video_latent_num_frames(aligned, kFramesPerChunk,
+                                                      kLatentsPerChunk);
   if (lh <= 0 || lw <= 0 || lt <= 0) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): {}x{}x{} does not give a usable "
@@ -1687,7 +5013,14 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // modalities stay the same duration by construction -- unless the
   // config asked for a soundtrack of its own length. The rule is the
   // model's, so the model layer states it.
-  const int alat = _h3_params.audio_latents(aligned, _fps);
+  // A refine's soundtrack is the silence it is conditioned on.
+  const int alat =
+      refine != nullptr
+          ? (int)(refine->audio_rows.size() /
+                  ((std::size_t)h3::kAudioChannels * c.audio_channels))
+      : _ph3 ? genai::ph3::kAudioLatents
+      : _h3i ? 0   // no audio branch, no audio rows
+             : _h3_params.audio_latents(aligned, _fps);
 
   h3::PackedLayout L;
   // Text rows are tagged 1 EXCEPT the rows of a vision block, which
@@ -1698,14 +5031,61 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   std::vector<int> tags((std::size_t)text_rows, h3::kTextTag);
   if (r2v != nullptr && (int)r2v->text_tags.size() == text_rows) {
     tags = r2v->text_tags;
+  } else if (r2v == nullptr && !_h3_cond_tags.empty()) {
+    // The FL2VA presentation of a keyframe: its vision block's rows.
+    if ((int)_h3_cond_tags.size() == text_rows) {
+      tags = _h3_cond_tags;
+    } else {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the conditioning's {} row tags do not "
+          "match its {} rows; every row is read as text", this->id(),
+          _h3_cond_tags.size(), text_rows));
+    }
   }
   // One latent frame per anchor. No ref => text-to-video-and-audio; one
   // => a first-frame anchor; two => first AND last, which is what the
-  // FL2VA partition is named for.
+  // FL2VA partition is named for; a last frame alone => one anchor at
+  // the last frame's time (l2va), the clip generated up to it.
+  //
+  // A request carrying REFERENCES takes none of them, and that is
+  // structural rather than a policy: build_ref2va_packed_sequence() has
+  // no keyframe parameter at all, because its layout is
+  // [text | reference blocks | target audio | target video] where the
+  // keyframe one is [text | keyframe conditions | ...]. There is no slot
+  // to put an anchor in -- on either partition, since Ref2VA-like builds
+  // the reference layout from FL2VA weights.
+  //
+  // SAID, not dropped quietly. The graph is wired, the beat is read, and
+  // the latent then goes nowhere -- and the symptom is a clip whose
+  // subject and wardrobe transferred while its opening frame did not,
+  // which reads as the model disobeying rather than as a mode that does
+  // not exist.
+  bool kf_ignored = false;
   std::vector<h3::Anchor> anchors;
-  if (r2v == nullptr && ref != nullptr && ref_frames > 0) {
-    anchors.push_back(h3::Anchor::kFirst);
-    if (ref_frames >= 2) { anchors.push_back(h3::Anchor::kLast); }
+  if (refine == nullptr && ref != nullptr) {
+    for (H3AnchorEnd e : h3_anchor_ends(r2v != nullptr, ref_frames,
+                                        ref_last_only, &kf_ignored)) {
+      anchors.push_back(e == H3AnchorEnd::kFirst ? h3::Anchor::kFirst
+                                                 : h3::Anchor::kLast);
+    }
+  }
+  if (kf_ignored && !_kf_on_ref2va_said) {
+    _kf_on_ref2va_said = true;
+    // A prompt-only Ref2VA request lands here too: it lists no
+    // references, but it is packed by the reference builder all the
+    // same, so it has no slot either.
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): a keyframe anchor is wired on iport {} "
+        "but this request {}, whose layout has no keyframe "
+        "slot -- the anchor is ignored. A reference image conditions the "
+        "whole clip (subject, wardrobe, style) and cannot pin one frame; "
+        "asking for it in the prompt does nothing either. Anchoring an "
+        "opening frame is the keyframe layout's job, and the two are "
+        "mutually exclusive whichever partition is resident.",
+        this->id(), kRefPort,
+        r2v->refs.empty()
+            ? "is prompt-only Ref2VA (an explicitly empty reference list)"
+            : "carries REFERENCES"));
   }
   // h3::kAudioChannels is the STEREO count (2) -- how many soundtrack
   // channels the audio rows are packed channel-major over. It is NOT
@@ -1714,14 +5094,23 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // the model was trained with; every one of them is a real row that the
   // 33B forward pays for, and the result still decodes, just as a
   // soundtrack whose two "channels" are slices of one 32-way split.
+  // A guide rides the keyframe layout only; process() leaves it null
+  // for any other.
+  std::vector<h3::Guide> guides;
+  if (guide != nullptr && r2v == nullptr && refine == nullptr) {
+    guides.push_back({guide->frame, guide->frames, guide->audio_latents});
+  }
+  // MiniMax-H3-Image packs [text | pictures | the picture] whether or
+  // not it edits: the reference layout, with no soundtrack anywhere.
+  const std::vector<h3::Reference> no_refs;
   const bool packed =
-      r2v != nullptr
-          ? h3::build_ref2va_packed_sequence(tags, r2v->refs, lt, lh, lw,
-                                             alat, c.patch_h, c.patch_w,
-                                             h3::kAudioChannels, &L)
+      r2v != nullptr || _h3i
+          ? h3::build_ref2va_packed_sequence(
+                tags, r2v != nullptr ? r2v->refs : no_refs, lt, lh, lw,
+                alat, c.patch_h, c.patch_w, h3::kAudioChannels, &L)
           : h3::build_packed_sequence(tags, lt, lh, lw, alat, c.patch_h,
                                       c.patch_w, h3::kAudioChannels, anchors,
-                                      &L);
+                                      &L, guides);
   if (!packed) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): could not pack a {}x{}x{} latent with {} "
@@ -1730,8 +5119,42 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     return false;
   }
   // The sequence length is known now and nothing large has been allocated
-  // yet, which is the only moment a preflight is worth anything.
-  if (!preflight_h3_scratch_(L.seq_len, text_rows)) { return false; }
+  // yet, which is the only moment a preflight is worth anything. VDN's
+  // window first: it decides whether the linear half runs, and so what
+  // the preflight books for it -- with a reach by step, the narrowest of
+  // them (the least window, the most left to the linear half), the
+  // request's own put back after: each step's forward sets its own.
+  if (_h3_dit) {
+    int narrow = _vdn_range;
+    if (!_vdn_range_steps.empty()) {
+      const int own = _h3_dit->vdn_checkpoint_radius();
+      narrow = INT_MAX;
+      for (int r : _vdn_range_steps) {
+        narrow = std::min(narrow, r < 0 ? own : r);
+      }
+    }
+    _h3_dit->set_vdn_radius(narrow);
+  }
+  // What the denoise holds on the host beside the forward: the latent
+  // state this stage owns (both modalities, references included) and the
+  // loop's own buffers -- the velocity read back, a re-noising or
+  // res_multistep step's extra state, MotionCache's residual, a preview's
+  // estimate. Physical RAM, paged if it must be; 384 bytes a video row
+  // each, ~51 MB a buffer at 2K x 124 frames.
+  const std::size_t host =
+      ((std::size_t)L.video_indices.size() * c.video_patch_elems() +
+       (std::size_t)L.audio_indices.size() * c.audio_channels) *
+          sizeof(float) +
+      genai::denoise_host_bytes(
+          L, c, genai::motion_cache::config_from_flex(&_accel).enabled,
+          _preview && _preview->active());
+  const bool booked = preflight_h3_scratch_(L.seq_len, text_rows, L,
+                                            lh / c.patch_h, lw / c.patch_w,
+                                            host);
+  if (_h3_dit) { _h3_dit->set_vdn_radius(_vdn_range); }
+  if (!booked) {
+    return false;
+  }
 
   const int PE = c.video_patch_elems();
   const int AC = c.audio_channels;
@@ -1743,7 +5166,52 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   const int arows = (int)L.audio_indices.size();
   std::vector<float> vid((std::size_t)vrows * PE);
   std::vector<float> aud((std::size_t)arows * AC);
-  {
+  // MiniMax-H3-Image's references' noise, packed as their rows, mixed in
+  // once the rows are copied below.
+  std::vector<float> h3i_ref_noise;
+  if (_h3i) {
+    // The release's noise: torch's CPU generator at the seed (its
+    // `generator_device: cpu`, the same on every machine). An edit's
+    // posteriors drew first (video-ref-encoder's `posterior_draws`), then
+    // the picture's [z, 1, lh, lw], then each picture's, channel-major,
+    // packed as the rows are.
+    genai::TorchCpuRandn g(_seed);
+    if (r2v != nullptr) {
+      for (std::int64_t n : r2v->posterior_draws) {
+        if (n > 0) { (void)g.randn((std::size_t)n); }
+      }
+    }
+    const std::size_t ncv0 = (std::size_t)L.num_condition_video_rows;
+    const std::vector<float> nz =
+        g.randn((std::size_t)c.video_channels * lh * lw);
+    if (nz.size() != (std::size_t)c.video_channels * lh * lw ||
+        vid.size() < (ncv0 + (std::size_t)(lh / c.patch_h) *
+                                 (lw / c.patch_w)) * PE) {
+      session()->warn(fmt("GenerateVideoStage('{}'): cannot draw a {}x{} "
+                          "latent's noise", this->id(), lw, lh));
+      return false;
+    }
+    h3::patchify_latent_frames(nz.data(), c.video_channels, 1, 0, 1, lh, lw,
+                               c.patch_h, c.patch_w,
+                               vid.data() + ncv0 * PE);
+    if (r2v != nullptr) {
+      for (const h3::Reference& rf : r2v->refs) {
+        if (rf.kind != h3::Reference::Kind::kImage) { continue; }
+        const std::vector<float> rn = g.randn(
+            (std::size_t)c.video_channels * rf.latent_height *
+            rf.latent_width);
+        const std::size_t at = h3i_ref_noise.size();
+        h3i_ref_noise.resize(at + (std::size_t)(rf.latent_height /
+                                                c.patch_h) *
+                                      (rf.latent_width / c.patch_w) * PE);
+        if (rn.empty()) { return false; }
+        h3::patchify_latent_frames(rn.data(), c.video_channels, 1, 0, 1,
+                                   rf.latent_height, rf.latent_width,
+                                   c.patch_h, c.patch_w,
+                                   h3i_ref_noise.data() + at);
+      }
+    }
+  } else {
     std::mt19937_64 rng(_seed);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     for (auto& v : vid) { v = nd(rng); }
@@ -1781,6 +5249,66 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
     slurp("VPIPE_H3_NOISE_AUD", aud, "audio");
   }
 
+  // A REFINE: the clip, patchified into the generated rows exactly as
+  // an anchor is, and put back to the first sigma --
+  // (1 - s0) x + s0 noise, each product rounded and then the sum, as the
+  // release's f32 tensors with Python-float scalars give it. Its
+  // soundtrack is the silence, which the loop never steps. Both go
+  // AFTER the rows a refine in context holds clean (its references'),
+  // which lead each modality's buffer.
+  const std::size_t ncv = (std::size_t)L.num_condition_video_rows;
+  const std::size_t nca = (std::size_t)L.num_condition_audio_rows;
+  if (refine != nullptr) {
+    const std::size_t tail = aud.size() - nca * AC;
+    if (refine->audio_rows.size() != tail) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the refine's soundtrack has {} values "
+          "where the layout packs {}; skipping", this->id(),
+          refine->audio_rows.size(), tail));
+      return false;
+    }
+    std::memcpy(aud.data() + nca * AC, refine->audio_rows.data(),
+                tail * sizeof(float));
+  }
+  if (refine != nullptr) {
+#pragma clang fp contract(off)
+    const double s0 = refine->sigmas.front();
+    const float ka = (float)(1.0 - s0), kb = (float)s0;
+    const int gh0 = lh / c.patch_h, gw0 = lw / c.patch_w;
+    const int cells = gh0 * gw0;
+    const std::size_t rplane = (std::size_t)lh * lw;
+    if (ncv + (std::size_t)lt * cells != (std::size_t)vrows) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the layout packs {} video rows where "
+          "a refine of [{}, {}, {}] after {} held rows needs {}; skipping",
+          this->id(), vrows, lt, lh, lw, ncv,
+          ncv + (std::size_t)lt * cells));
+      return false;
+    }
+    for (int t = 0; t < lt; ++t) {
+      for (int cell = 0; cell < cells; ++cell) {
+        float* row =
+            vid.data() + (ncv + (std::size_t)t * cells + cell) * PE;
+        const int by = (cell / gw0) * c.patch_h;
+        const int bx = (cell % gw0) * c.patch_w;
+        for (int ch = 0; ch < c.video_channels; ++ch) {
+          for (int y = 0; y < c.patch_h; ++y) {
+            for (int x = 0; x < c.patch_w; ++x) {
+              float& v = row[((std::size_t)ch * c.patch_h + y) * c.patch_w +
+                             x];
+              const float clean =
+                  refine->latent[((std::size_t)ch * lt + t) * rplane +
+                                 (std::size_t)(by + y) * lw + (bx + x)];
+              const float p0 = ka * clean;
+              const float p1 = kb * v;
+              v = p0 + p1;
+            }
+          }
+        }
+      }
+    }
+  }
+
   // The `ref2va` references are ALREADY packed into rows -- the encoder
   // did it, where each reference's own latent geometry was known -- so
   // they are copied straight into the leading conditioning rows of both
@@ -1811,6 +5339,27 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
       std::memcpy(aud.data(), r2v->audio_rows,
                   (std::size_t)r2v->n_audio_rows * AC * sizeof(float));
     }
+    // MiniMax-H3-Image's pictures come clean (their posterior sampled and
+    // whitened) and are noised here, to the level they are held at, with
+    // noise off the request's generator: t z + (1 - t) n in float32.
+    if (_h3i) {
+#pragma clang fp contract(off)
+      const std::size_t n = (std::size_t)r2v->n_video_rows * PE;
+      if (h3i_ref_noise.size() != n) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the pictures pack {} values and "
+            "their noise {}; skipping", this->id(), n,
+            h3i_ref_noise.size()));
+        return false;
+      }
+      const float t = (float)_h3_params.condition_timestep;
+      const float u = 1.0f - t;
+      for (std::size_t k = 0; k < n; ++k) {
+        const float a0 = t * vid[k];
+        const float a1 = u * h3i_ref_noise[k];
+        vid[k] = a0 + a1;
+      }
+    }
     // Diagnostic: blank the reference rows, leaving the layout, the
     // presentation and the noise byte-identical. "Do the reference
     // LATENTS reach the picture" cannot be answered by changing the
@@ -1839,27 +5388,80 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // order the generated frames use. The denoise loop never writes these
   // rows, so what is put here is what the model sees at every step.
   if (!anchors.empty()) {
-    const int gh0 = lh / c.patch_h, gw0 = lw / c.patch_w;
-    const int rows_per_frame = gh0 * gw0;
-    const std::size_t rplane = (std::size_t)lh * lw;
-    const int ZCr = c.video_channels;
+    const int rows_per_frame = (lh / c.patch_h) * (lw / c.patch_w);
+    const std::size_t per_anchor = (std::size_t)rows_per_frame * PE;
     for (std::size_t k = 0; k < anchors.size(); ++k) {
-      for (int cell = 0; cell < rows_per_frame; ++cell) {
-        float* row = vid.data() +
-                     ((std::size_t)k * rows_per_frame + cell) * PE;
-        const int by = (cell / gw0) * c.patch_h;
-        const int bx = (cell % gw0) * c.patch_w;
-        for (int ch = 0; ch < ZCr; ++ch) {
-          for (int y = 0; y < c.patch_h; ++y) {
-            for (int x = 0; x < c.patch_w; ++x) {
-              row[((std::size_t)ch * c.patch_h + y) * c.patch_w + x] =
-                  ref[((std::size_t)ch * ref_frames + (int)k) * rplane +
-                      (std::size_t)(by + y) * lw + (bx + x)];
-            }
-          }
-        }
-      }
+      h3::patchify_latent_frames(ref, c.video_channels, ref_frames, (int)k,
+                                 1, lh, lw, c.patch_h, c.patch_w,
+                                 vid.data() + k * per_anchor);
     }
+    // An adapter's `bf16_conditioning_v1` (Pika H3 Flex's FL2VA): the
+    // keyframe latents are rounded to bf16 before they are noised.
+    const auto* sc = refine == nullptr ? _h3_dit->sampling_contract()
+                                       : nullptr;
+    if (sc != nullptr && sc->bf16_conditioning) {
+      round_to_bf16_(vid.data(), anchors.size() * per_anchor);
+    }
+    // The CONDITION NOISE AUGMENTATION every visual conditioning row
+    // takes (minimax_h3::augment_condition_values): `ct*z + (1-ct)*noise`
+    // at the level the rows are held at, which is the one quantity the
+    // references name for both. The references' encoder always applied
+    // it; the keyframe anchors had been packed clean, held at 0.999 but
+    // never noised to it. 1.0 leaves them clean, as before.
+    for (std::size_t k = 0; k < anchors.size(); ++k) {
+      genai::minimax_h3::augment_condition_values(
+          vid.data() + k * per_anchor, per_anchor,
+          _h3_params.condition_timestep, 0);
+    }
+    std::string ends;
+    for (h3::Anchor a : anchors) {
+      ends += ends.empty() ? "" : " + ";
+      ends += a == h3::Anchor::kFirst ? "first" : "last";
+    }
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): {} keyframe anchor{} ({} frame){}, "
+        "noised to t {:.4g}", this->id(), anchors.size(),
+        anchors.size() == 1 ? "" : "s", ends,
+        sc != nullptr && sc->bf16_conditioning
+            ? " rounded to bf16 (the adapter's conditioning policy)" : "",
+        _h3_params.condition_timestep));
+  }
+
+  // The GUIDE's rows: its latent frames patchified after the anchors in
+  // the cell order every frame uses, noised to the keyframe level as an
+  // anchor is (one condition, one stream), and its soundtrack laid
+  // channel-major at the head of the audio buffer, where a reference
+  // soundtrack's rows go -- already the DiT's whitened rows, so taken as
+  // they are. The loop never writes either.
+  if (!guides.empty()) {
+    const int rows_per_frame = (lh / c.patch_h) * (lw / c.patch_w);
+    const std::size_t base =
+        anchors.size() * (std::size_t)rows_per_frame * PE;
+    const int gf = guide->frames;
+    const std::size_t gvals = (std::size_t)gf * rows_per_frame * PE;
+    if (gf > 0) {
+      h3::patchify_latent_frames(guide->video, c.video_channels, gf, 0, gf,
+                                 lh, lw, c.patch_h, c.patch_w,
+                                 vid.data() + base);
+    }
+    const auto* sc = _h3_dit->sampling_contract();
+    if (sc != nullptr && sc->bf16_conditioning) {
+      round_to_bf16_(vid.data() + base, gvals);
+    }
+    genai::minimax_h3::augment_condition_values(
+        vid.data() + base, gvals, _h3_params.condition_timestep, 0);
+    const int m = guide->audio_latents;
+    if (m > 0) {
+      h3::pack_audio_latent_rows(guide->audio, AC, guide->audio_stride, m,
+                                 aud.data());
+    }
+    session()->info(fmt(
+        "GenerateVideoStage('{}'): a guide from frame {} -- {} latent "
+        "frame{} ({} pixel frames) noised to t {:.4g}, {} audio latents "
+        "held at t {:.4g}", this->id(), guide->frame, gf,
+        gf == 1 ? "" : "s", h3::guide_pixel_frames(gf),
+        _h3_params.condition_timestep, m,
+        _h3_params.condition_audio_timestep));
   }
 
   // Diagnostic: write the text conditioning the DiT is about to read to
@@ -1898,34 +5500,152 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   req.video  = vid.data();
   req.audio  = aud.data();
   req.num_steps   = _steps;
+  if (refine != nullptr) {
+    req.refine_sigmas = refine->sigmas;
+    req.num_steps = (int)refine->sigmas.size() - 1;
+  }
+  // The model config's sigmas, the video's as run, in place of every
+  // grid but a refine's (which took them already: see process()). The
+  // loop reads them off set_params() below.
+  const bool given = refine == nullptr && !_h3_params.sigmas.empty();
+  if (given) { req.num_steps = (int)_h3_params.sigmas.size() - 1; }
+  // An adapter's sampling contract runs its own grid; the loop takes it
+  // off the DiT, and the step count here is what Sage's int8 P*V start
+  // and the progress bar read.
+  const genai::MetalMiniMaxH3Transformer::SamplingContract* contract =
+      refine == nullptr && !given ? _h3_dit->sampling_contract() : nullptr;
+  if (contract != nullptr) {
+    req.num_steps = (int)contract->sigmas.size() - 1;
+  }
+  // P-H3-Image's grid, AS RUN (its shifts are 1: see apply_model_config_)
+  // -- 8 forwards, whatever `steps` says. An adapter's contract or a
+  // refine would name another; neither rides this model.
+  if (_ph3 && refine == nullptr && contract == nullptr && !given) {
+    req.sigma_grid = _ph3_manifest.sample_sigmas;
+    req.num_steps = (int)req.sigma_grid.size() - 1;
+  }
+  // How a step is taken, as the sampler port said. A flow map's step is
+  // its jump, Euler; anything else is said once and dropped.
+  req.update = _h3_sampler.update;
+  if (_h3_dit->two_time_active() &&
+      (req.update == genai::StepUpdate::kRenoise ||
+       req.update == genai::StepUpdate::kResMultistep)) {
+    if (!_h3_sampler_flow_said) {
+      _h3_sampler_flow_said = true;
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the sampler port's '{}' is IGNORED -- "
+          "the flow-map adapter on the DiT steps by its jump to the next "
+          "sigma, which is Euler", this->id(), _h3_sampler.method));
+    }
+    req.update = genai::StepUpdate::kAuto;
+  }
+  // The re-noising sampler's fresh noise follows the clip's seed, unless
+  // the sampler spec names one.
+  req.seed = _h3_sampler.seed != 0 ? _h3_sampler.seed : _seed;
+  // VDN's hybrid attention needs the target's grid; without a branch
+  // attached the transformer ignores it. Patches, not pixels -- the same
+  // division build_packed_sequence made to lay the rows out, so the two
+  // cannot disagree about how many tokens a frame has.
+  req.video_grid_h = lh / c.patch_h;
+  req.video_grid_w = lw / c.patch_w;
   // The shifts and both condition levels in one move, so a knob added to
   // GenerationParams reaches the loop without this call site changing.
   req.set_params(_h3_params);
+  // MiniMax-H3-Image: the release's grid as it steps it, one forward and
+  // one output head a step, Euler in the velocity form its heads were
+  // distilled with -- whatever `steps` or the sampler port say.
+  if (_h3i && refine == nullptr) {
+    const std::vector<float> g =
+        genai::h3i::grid_as_run(_h3i_manifest.sigmas);
+    req.video_sigmas.assign(g.begin(), g.end());
+    req.num_steps = (int)g.size() - 1;
+    if (req.update != genai::StepUpdate::kAuto &&
+        req.update != genai::StepUpdate::kVelocity &&
+        !_h3_sampler_flow_said) {
+      _h3_sampler_flow_said = true;
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): the sampler port's '{}' is IGNORED -- "
+          "MiniMax-H3-Image's per-step heads were distilled for Euler in "
+          "its velocity form", this->id(), _h3_sampler.method));
+    }
+    req.update = genai::StepUpdate::kVelocity;
+    req.step_heads = true;
+  }
+  req.sol_dense_steps = _sol_dense_steps;
+  req.sol_tau_steps = _sol_tau_steps;
+  req.vdn_range_steps = _vdn_range_steps;
+  // The bag, for the tiers the LOOP takes rather than the transformer --
+  // MotionCache, which decides per step whether a forward runs at all.
+  req.accel = &_accel;
   UiProgress bar = session()->open_progress("denoise");
   // Block-granular, like the image DiTs. A step here is one forward of a
   // 33B stack over a ~19k-row sequence -- tens of seconds at the model's
   // own geometry -- so a step-granular bar sits still for the entire time
   // anything is happening. H3 is guidance-distilled, so exactly ONE
-  // forward per step.
-  DenoiseProgress prog(&bar, _steps, /*forwards_per_step=*/1);
+  // forward per step. A live flow-map adapter runs its own grid, so the
+  // bar starts at THAT count rather than jumping to it after step one.
+  int bar_steps =
+      refine != nullptr || contract != nullptr || _ph3 || given
+          ? req.num_steps
+          : _steps;
+  if (refine == nullptr && !given && _h3_dit->two_time_active() &&
+      _h3_dit->flow_map() != nullptr &&
+      !_h3_dit->flow_map()->sigmas.empty()) {
+    bar_steps = (int)_h3_dit->flow_map()->sigmas.size() - 1;
+  }
+  DenoiseProgress prog(&bar, bar_steps, /*forwards_per_step=*/1);
   ScopedBlockProgress<genai::MetalMiniMaxH3Transformer> hook(_h3_dit.get(),
                                                              prog);
   req.progress = [&](int step, int total) {
-    // `total` is the count the SCHEDULER settled on, which is not
-    // `_steps`: that is a sigma grid including the terminal zero, and the
-    // shift can collapse duplicates on top. Adopting it is what makes the
-    // bar finish at 100% instead of at (steps-1)/steps.
+    // `total` is the count the SCHEDULER settled on, which can fall
+    // short of `_steps`: the shift can collapse duplicate sigmas, and a
+    // flow-map adapter runs its own grid. Adopting it is what makes the
+    // bar finish at 100% whatever the schedule turned out to be.
     prog.set_steps(total);
     // `step` is 1-based on entry here; end_step takes the 0-based index
     // it just finished, and re-syncs the bar to the exact boundary.
     prog.end_step(step - 1);
     return true;
   };
+  // Live previews, when process() opened a preview for this clip. The
+  // loop hands over the generated rows' clean estimate; it is laid out
+  // as the final latent is and queued for the preview thread, so the
+  // next step starts without waiting on the decode.
+  if (_preview && _preview->active()) {
+    req.preview_due = [this](int step, int total) {
+      return _preview->due(step, total);
+    };
+    req.preview = [&, this](int step, int total, const float* x0) {
+      std::vector<float> lat;
+      h3::unpatchify_latent_rows(x0, L.num_video_rows, c.video_channels,
+                                 lt, lh, lw, c.patch_h, c.patch_w, &lat);
+      _preview->submit(std::move(lat), c.video_channels, lt, lh, lw, step,
+                       total);
+    };
+  }
   std::string derr;
   const bool ok = genai::denoise(req, &derr);
   bar.finish();
+  // After a denoise, whose first forward is where the ANE tier arms or
+  // declines: set the module booking to what is HELD -- the bytes at this
+  // clip's sequence when the tier armed, 0 when it did not (the emitter did
+  // not verify, too few rows for a chunk). Both ways, every clip: a short
+  // clip that declined and a long one after it that armed must not leave
+  // the ledger at zero while the module is live. revise_scratch() refuses
+  // to create, so this is a no-op when the plan booked nothing.
+  if (_h3_dit && _h3_dit->ane_attempted()) {
+    if (auto* mgr = session()->services()->generative_model_manager()) {
+      mgr->revise_scratch(
+          "coreml:" + ane_claim_label_(),
+          _h3_dit->ane_armed() ? _h3_dit->ane_held_bytes() : 0);
+    }
+  }
   if (!ok) {
-    session()->warn(fmt("GenerateVideoStage('{}'): {}", this->id(), derr));
+    // "; skipping", as every stage that drops the beat it was given says
+    // it: the denoise's reason is what a host shows for the clip it never
+    // got (a rank whose link to its peer failed, say).
+    session()->warn(fmt("GenerateVideoStage('{}'): {}; skipping", this->id(),
+                        derr));
     return false;
   }
 
@@ -1934,27 +5654,10 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // conditioning rows lead the block, so the generated ones start at
   // num_condition_rows.
   const int ZC = c.video_channels;
-  const int ph = c.patch_h, pw = c.patch_w;
-  const int gh = lh / ph, gw = lw / pw;
-  video_out->assign((std::size_t)ZC * lt * lh * lw, 0.0f);
+  h3::unpatchify_latent_rows(
+      vid.data() + (std::size_t)L.num_condition_rows * PE, L.num_video_rows,
+      ZC, lt, lh, lw, c.patch_h, c.patch_w, video_out);
   *video_shape = {ZC, lt, lh, lw};
-  const std::size_t plane = (std::size_t)lh * lw;
-  for (int r = 0; r < L.num_video_rows; ++r) {
-    const float* row = vid.data() +
-                       ((std::size_t)L.num_condition_rows + r) * PE;
-    const int cell = r % (gh * gw);
-    const int t    = r / (gh * gw);
-    const int by   = (cell / gw) * ph, bx = (cell % gw) * pw;
-    for (int ch = 0; ch < ZC; ++ch) {
-      for (int y = 0; y < ph; ++y) {
-        for (int x = 0; x < pw; ++x) {
-          (*video_out)[(std::size_t)ch * lt * plane + (std::size_t)t * plane +
-                       (std::size_t)(by + y) * lw + (bx + x)] =
-              row[((std::size_t)ch * ph + y) * pw + x];
-        }
-      }
-    }
-  }
   // Diagnostic: the FINAL video latent, [z, T, lh, lw] f32, so it can be
   // compared cell-by-cell against the reference's. Spatial coherence is
   // a property of the LATENT, so this settles "is the tile grid already
@@ -1980,17 +5683,185 @@ GenerateVideoStage::run_h3_(const void* cond, int text_rows, const float* ref,
   // with one clean block per reference soundtrack, which is conditioning
   // and not part of what was generated.
   const int acond = L.num_condition_audio_rows;
+  h3::unpack_audio_latent_rows(aud.data() + (std::size_t)acond * AC, AC,
+                               alat, audio_out);
+  *audio_shape = {h3::kAudioChannels, AC, alat};
+  return true;
+}
+
+int
+GenerateVideoStage::taomate_slot_() const
+{
+  std::string mode = "auto";
+  if (_model_cfg.is_object()) {
+    const auto o = _model_cfg.as_object();
+    if (o.contains("taomate")) {
+      mode = std::string(o.at("taomate").as_string("auto"));
+    }
+  }
+  if (mode == "off" || !_h3_dit) { return -1; }
+  if (_h3_taomate_slot >= 0) { return _h3_taomate_slot; }
+  // `on` with an adapter the tensor check did not recognise: the first
+  // slot, as asked.
+  if (mode == "on" && _h3_dit->lora_slots() > 0 &&
+      _h3_dit->lora_modules(0) > 0) {
+    return 0;
+  }
+  return -1;
+}
+
+bool
+GenerateVideoStage::run_h3_taomate_(const void* cond, int text_rows,
+                                    int slot, std::vector<float>* video_out,
+                                    std::vector<int>* video_shape,
+                                    std::vector<float>* audio_out,
+                                    std::vector<int>* audio_shape)
+{
+  namespace tmh = genai::minimax_h3::taomate;
+  auto* mc = session()->services()->metal_compute();
+  if (mc == nullptr || !_h3_dit) { return false; }
+  const auto& c = _h3_cfg;
+  const int lh = _height / 16, lw = _width / 16;
+  if (lh <= 0 || lw <= 0 || lh % 2 != 0 || lw % 2 != 0) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): TaoMate-H3 needs both edges a multiple "
+        "of 32 (got {}x{})", this->id(), _width, _height));
+    return false;
+  }
+  const int short_edge = std::min(_width, _height);
+  if (short_edge != 480 && short_edge != 768 && short_edge != 1088) {
+    session()->warn(fmt(
+        "GenerateVideoStage('{}'): TaoMate-H3 was validated at a 480, 768 "
+        "or 1088 short edge; {}x{} runs, untested", this->id(), _width,
+        _height));
+  }
+  // Whole 5-second requests: the first carries the clip's 5-frame
+  // prefix (124 native frames), each later one 119 more. The fewest that
+  // cover the frames asked for -- the same "at or above" rule the VAE's
+  // own alignment applies, so `frames: 120` (already 124 by here) is one.
+  const int steady = tmh::kRequestFrames - tmh::kPrefixFrames;
+  int R = 1;
+  while (tmh::kRequestFrames + (R - 1) * steady < _frames) { ++R; }
+  const int native = tmh::kRequestFrames + (R - 1) * steady;
+  // Where the cache lives (minimax-h3-model-config's `taomate_kv`): on
+  // disk unless asked otherwise, in 8 bits where the GEMMs already are.
+  std::string kv_mode = "auto";
+  if (_model_cfg.is_object()) {
+    const auto o = _model_cfg.as_object();
+    if (o.contains("taomate_kv")) {
+      kv_mode = std::string(o.at("taomate_kv").as_string("auto"));
+    }
+  }
+  const bool kv_disk = kv_mode != "memory";
+  const int kv_bits =
+      kv_mode == "int8" || (kv_mode == "auto" && c.i8_gemm) ? 8 : 16;
+  const genai::minimax_h3::StreamKv::Storage kv_st =
+      tmh::kv_storage(lh, lw, kv_disk, kv_bits);
+  const std::size_t kv = tmh::kv_cache_bytes(lh, lw, text_rows, c.n_layers,
+                                             c.n_heads, c.head_dim, kv_st);
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): TaoMate-H3 -- {} request(s) of 5 s, {} "
+      "native frames at {}x{}; base-model audio teacher, then 4 chunks x "
+      "(3 steps + a commit) a request; clean-K/V cache {}{}{}",
+      this->id(), R, native, _width, _height,
+      kv_disk ? fmt("on disk ({}), {} MB held for it", kv_bits == 8
+                                                          ? "8-bit"
+                                                          : "bf16",
+                    kv >> 20)()
+              : fmt("in memory, {} MB", kv >> 20)(),
+      _steps > 0 && _steps != 3
+          ? fmt("; `steps` {} does not apply (the method is 3 a chunk)",
+                _steps)()
+          : std::string(),
+      !_h3_params.sigmas.empty() ||
+              _h3_sampler.update != genai::StepUpdate::kAuto
+          ? "; the model config's sigmas and the sampler port do not "
+            "apply either (the method runs its own grid and steps)"
+          : ""));
+
+  // The longest forward the run makes is request 0's first chunk; the
+  // preflight judges the box against it plus the cache, and declares
+  // both as the reserve a streamed DiT's residency must leave clear.
+  {
+    h3::PackedLayout L0;
+    const std::vector<int> tags((std::size_t)text_rows, h3::kTextTag);
+    if (!tmh::build_chunk_layout(tags, tmh::request_plan(0).phases[0], lh,
+                                 lw, text_rows, 0, 0, &L0) ||
+        !preflight_h3_scratch_(
+            tmh::max_chunk_seq(lh, lw, text_rows), text_rows, L0,
+            lh / c.patch_h, lw / c.patch_w, kv)) {
+      return false;
+    }
+  }
+
+  metal_compute::SharedBuffer tb =
+      mc->make_shared_buffer((std::size_t)text_rows * c.text_dim * 2);
+  if (tb.empty()) { return false; }
+  std::memcpy(tb.contents(), cond, (std::size_t)text_rows * c.text_dim * 2);
+
+  std::vector<tmh::Request> reqs((std::size_t)R);
+  for (tmh::Request& q : reqs) {
+    q.text = &tb;
+    q.text_tags.assign((std::size_t)text_rows, h3::kTextTag);
+    q.seed = _seed;
+  }
+  tmh::RunConfig rc;
+  rc.latent_h = lh;
+  rc.latent_w = lw;
+  rc.audio_seed = _seed;
+  rc.lora_slot = slot;
+  rc.kv_disk = kv_disk;
+  rc.kv_bits = kv_bits;
+  // `slot` is the DiT's, which is not the config's once the load has
+  // packed the named slots, so the strength comes from the DiT.
+  rc.lora_scale = _h3_dit->lora_scale(slot);
+  UiProgress bar = session()->open_progress("denoise");
+  rc.progress = [&bar](int done, int total) {
+    bar.update((std::uint64_t)done, (std::uint64_t)total);
+    return true;
+  };
+  rc.log = [this](const std::string& m) {
+    session()->info(fmt("GenerateVideoStage('{}'): {}", this->id(), m));
+  };
+  tmh::RunResult res;
+  std::string err;
+  if (!tmh::run(_h3_dit.get(), rc, reqs, &res, &err)) {
+    if (!res.stopped) {
+      session()->warn(fmt("GenerateVideoStage('{}'): TaoMate-H3: {}",
+                          this->id(), err));
+    }
+    return false;
+  }
+  bar.finish();
+
+  const int ZC = c.video_channels;
+  const int fr = (lh / c.patch_h) * (lw / c.patch_w);
+  h3::unpatchify_latent_rows(res.video_rows.data(), res.video_latents * fr,
+                             ZC, res.video_latents, lh, lw, c.patch_h,
+                             c.patch_w, video_out);
+  *video_shape = {ZC, res.video_latents, lh, lw};
+  // Channel-major [stereo * alat, AC] rows to the [stereo, AC, alat] the
+  // audio VAE decodes -- run_h3_'s own transpose.
+  const int AC = c.audio_channels;
+  const int alat = res.audio_latents;
   audio_out->assign((std::size_t)h3::kAudioChannels * AC * alat, 0.0f);
   for (int ch = 0; ch < h3::kAudioChannels; ++ch) {
     for (int i = 0; i < alat; ++i) {
       const float* row =
-          aud.data() + (std::size_t)(acond + ch * alat + i) * AC;
+          res.audio_rows.data() + ((std::size_t)ch * alat + i) * AC;
       for (int k = 0; k < AC; ++k) {
         (*audio_out)[((std::size_t)ch * AC + k) * alat + i] = row[k];
       }
     }
   }
   *audio_shape = {h3::kAudioChannels, AC, alat};
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): TaoMate-H3 done -- {} forwards, video "
+      "[{}, {}, {}, {}], audio {} latents, cache {} MB in memory{}",
+      this->id(), res.forwards, ZC, res.video_latents, lh, lw, alat,
+      res.kv_bytes >> 20,
+      kv_disk ? fmt(", {} MB on disk at most", res.kv_disk_peak >> 20)()
+              : std::string()));
   return true;
 }
 
@@ -2006,6 +5877,21 @@ GenerateVideoStage::tag_model_(TensorBeat& tb) const
 Job
 GenerateVideoStage::process(RuntimeContext& ctx)
 {
+  // ONE CALL, ONE CLIP. Every input is read here, up front, and paired
+  // by the rule in stages/generation-input.h -- the one generate-image
+  // follows: an input whose source sends one beat and ends serves every
+  // clip of the run, one that keeps sending is consumed a beat per clip,
+  // and the run ends when a consumed input runs out or when nothing new
+  // arrives at all.
+  //
+  // ALL of them, and before anything can end the clip early -- a missing
+  // DiT, a malformed beat. Pairing is by position in each stream, so an
+  // input skipped once pairs every later clip with the wrong beat. The
+  // model (iport2) is the exception: it is what LOADS, once, not an
+  // input of each clip.
+  using Took = GenerationInput::Took;
+  GenerationRound round;
+
   if (!_model_latched && ctx.num_iports() > kModelPort &&
       ctx.iport_connected(kModelPort)) {
     auto mb = co_await ctx.read(kModelPort);
@@ -2015,48 +5901,95 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       if (apply_model_select_beat(mfd->data, _hf_dir)) { resolve_config_(); }
     }
   }
-  if (!_sampler_latched && ctx.num_iports() > kSamplerPort &&
-      ctx.iport_connected(kSamplerPort)) {
+  // The sampler / scheduler specs: a select source emits one and ends, so
+  // it serves every clip.
+  if (ctx.num_iports() > kSamplerPort && ctx.iport_connected(kSamplerPort) &&
+      _sampler_in.wants()) {
     auto sb = co_await ctx.read(kSamplerPort);
-    _sampler_latched = true;
-    if (const auto* sfd =
-            sb ? dynamic_cast<const FlexDataPayload*>(sb.get()) : nullptr) {
-      std::string serr;
-      _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
-      if (!serr.empty()) {
-        session()->warn(fmt("GenerateVideoStage('{}'): sampler spec: {}",
-                            this->id(), serr));
+    const Took took = _sampler_in.took(sb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* sfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(sb.get()) : nullptr) {
+      if (_family == "minimax-h3") {
+        // Its own scheduler's steps, by the spec's method -- a method it
+        // does not run is said, and its default runs.
+        std::string why;
+        if (genai::sampler_choice_from_spec(sfd->data, &_h3_sampler,
+                                            &why)) {
+          session()->info(fmt(
+              "GenerateVideoStage('{}'): sampler '{}' from the sampler "
+              "port -- minimax-h3 steps by {}{}{}", this->id(),
+              _h3_sampler.method,
+              genai::step_update_name(_h3_sampler.update),
+              _h3_sampler.seed != 0
+                  ? fmt(", re-noise seed {}", _h3_sampler.seed)()
+                  : std::string(),
+              _h3_sampler.note.empty() ? std::string()
+                                       : "; " + _h3_sampler.note));
+        } else {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): sampler spec: {}; the model's "
+              "default runs", this->id(), why));
+        }
+      } else {
+        std::string serr;
+        _sampler_spec = genai::FlowSamplerSpec::from_flex(sfd->data, &serr);
+        if (!serr.empty()) {
+          session()->warn(fmt("GenerateVideoStage('{}'): sampler spec: {}",
+                              this->id(), serr));
+        }
       }
     }
   }
-  if (!_scheduler_latched && ctx.num_iports() > kSchedPort &&
-      ctx.iport_connected(kSchedPort)) {
+  if (ctx.num_iports() > kSchedPort && ctx.iport_connected(kSchedPort) &&
+      _scheduler_in.wants()) {
     auto cb = co_await ctx.read(kSchedPort);
-    _scheduler_latched = true;
-    if (const auto* cfd =
-            cb ? dynamic_cast<const FlexDataPayload*>(cb.get()) : nullptr) {
+    const Took took = _scheduler_in.took(cb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* cfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(cb.get()) : nullptr) {
       std::string cerr;
       _scheduler_spec = genai::FlowSchedulerSpec::from_flex(cfd->data, &cerr);
       if (!cerr.empty()) {
         session()->warn(fmt("GenerateVideoStage('{}'): scheduler spec: {}",
                             this->id(), cerr));
       }
+      // Two step counts, and only one of them runs. A family that
+      // samples from the spec takes the SCHEDULER's; MiniMax-H3 carries
+      // its own schedule and takes this stage's. Either way the other
+      // number sits in the graph looking authoritative, so when the graph
+      // named both and they disagree, say which one ran.
+      const bool said = this->config().is_object() &&
+                        this->config().as_object().contains("steps");
+      if (said && _scheduler_spec.steps > 0 &&
+          _scheduler_spec.steps != _steps) {
+        if (_family == "minimax-h3") {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): the wired scheduler's {} steps are "
+              "NOT used -- minimax-h3 runs its own schedule, {} steps (a "
+              "grid of its own goes in its model config's `sigmas`)",
+              this->id(), _scheduler_spec.steps, h3_steps_()));
+        } else {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): steps {} is IGNORED -- the wired "
+              "scheduler runs {} steps and owns the count. Set it on the "
+              "scheduler-select stage, or make the two agree",
+              this->id(), _steps, _scheduler_spec.steps));
+        }
+      }
     }
   }
 
-  // The model config. Latched like the sampler and scheduler, but
-  // RE-READ whenever another beat is waiting: a config source with no
-  // trigger emits once for the whole run, while one driven by a trigger
-  // emits per request. Blocking on the first beat and polling after
-  // serves both -- the first request waits for the parameters it was
-  // wired to use, and later ones pick up a change without waiting for
-  // one that may never come.
+  // The model config: a source with no trigger emits once and ends, so
+  // its beat serves every clip, while one driven by a trigger emits a
+  // beat per request.
   if (ctx.num_iports() > kModelCfgPort && ctx.iport_connected(kModelCfgPort) &&
-      (!_cfg_latched || ctx.backlog(kModelCfgPort) > 0)) {
+      _cfg_in.wants()) {
     auto gb = co_await ctx.read(kModelCfgPort);
-    _cfg_latched = true;
-    if (const auto* gfd =
-            gb ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
+    const Took took = _cfg_in.took(gb != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (const auto* gfd = took == Took::kFresh
+            ? dynamic_cast<const FlexDataPayload*>(gb.get()) : nullptr) {
       _model_cfg = gfd->data;
       // Only if the family is already known; otherwise resolve_config_
       // applies it the moment it is.
@@ -2064,9 +5997,71 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     }
   }
 
-  auto in = co_await ctx.read(0);
-  if (!in) { ctx.signal_done(); co_return; }
-  const auto* cond = dynamic_cast<const TensorBeatPayload*>(in.get());
+  // The conditioning -- and with a NEW one, its negative. The conditioner
+  // emits the negative BEFORE the positive, so by the time the positive
+  // lands its pair is already queued: a non-blocking poll rather than a
+  // read that could deadlock when there is no negative. No conditioning
+  // at all ends the run.
+  if (_cond_in.wants()) {
+    auto in = co_await ctx.read(0);
+    const Took took = _cond_in.took(in != nullptr);
+    if (round.note(took) || took == Took::kNone) {
+      ctx.signal_done();
+      co_return;
+    }
+    if (took == Took::kFresh) {
+      _cond_beat = std::move(in);
+      _neg_beat.reset();
+      if (ctx.num_iports() > 1 && ctx.iport_connected(1) &&
+          ctx.backlog(1) > 0) {
+        _neg_beat = co_await ctx.read(1);
+      }
+    }
+  }
+  if (!_cond_beat) { ctx.signal_done(); co_return; }
+  // The keyframe / first-frame latents, the `ref2va` reference rows and
+  // the audio conditioning. Blocking reads when wired, never polls: a
+  // video-ref-encoder emits BOTH row beats every request, with 0 rows
+  // when a modality is absent, so a poll would be a race where a read is
+  // not. A single first frame under many prompts is sent once and held.
+  struct HeldInput {
+    unsigned                          port;
+    GenerationInput*                  in;
+    std::unique_ptr<BeatPayloadIntf>* beat;
+  };
+  const HeldInput held[] = {
+    {kRefPort, &_ref0_in, &_ref0_beat},
+    {kRefPort1, &_ref1_in, &_ref1_beat},
+    {kRefVideoRowsPort, &_ref_video_in, &_ref_video_beat},
+    {kRefAudioRowsPort, &_ref_audio_in, &_ref_audio_beat},
+    {kAudioCondPort, &_audio_cond_in, &_audio_cond_beat},
+    {kInitPort, &_init_in, &_init_beat},
+    {kGuidePort, &_guide_in, &_guide_beat},
+    {kGuideAudioPort, &_guide_audio_in, &_guide_audio_beat},
+  };
+  for (const HeldInput& h : held) {
+    if (ctx.num_iports() <= h.port || !ctx.iport_connected(h.port) ||
+        !h.in->wants()) {
+      continue;
+    }
+    auto b = co_await ctx.read(h.port);
+    const Took took = h.in->took(b != nullptr);
+    if (round.note(took)) { ctx.signal_done(); co_return; }
+    if (took == Took::kFresh) { *h.beat = std::move(b); }
+  }
+  // Nothing new on any input: everything is broadcasting, and this clip
+  // would repeat the last one exactly.
+  if (round.idle()) { ctx.signal_done(); co_return; }
+  // THIS clip's seed, before anything can end it early.
+  _seed = generation_seed(_seed_seq, _seed_base, _generation);
+  ++_generation;
+  session()->info(fmt(
+      "GenerateVideoStage('{}'): generation {}, seed {}{}", this->id(),
+      _generation, _seed,
+      _seed_seq == SeedSequence::kRandomize ? " (randomized)" : ""));
+
+  const BeatPayloadIntf* in = _cond_beat.get();
+  const auto* cond = dynamic_cast<const TensorBeatPayload*>(in);
   if (cond == nullptr || cond->shape.size() != 2) {
     session()->warn(fmt(
         "GenerateVideoStage('{}'): expected a [text_seq, {}] conditioning "
@@ -2074,50 +6069,15 @@ GenerateVideoStage::process(RuntimeContext& ctx)
         in->describe()));
     co_return;
   }
-  // The negative is emitted BEFORE the positive by the conditioner, so by
-  // the time the positive lands its pair is already queued -- a non-blocking
-  // poll rather than a read that could deadlock when there is no negative.
-  std::unique_ptr<BeatPayloadIntf> negb;
-  if (ctx.num_iports() > 1 && ctx.iport_connected(1) && ctx.backlog(1) > 0) {
-    negb = co_await ctx.read(1);
-  }
-  const auto* neg =
-      negb ? dynamic_cast<const TensorBeatPayload*>(negb.get()) : nullptr;
-  std::unique_ptr<BeatPayloadIntf> refb;
-  if (ctx.num_iports() > kRefPort && ctx.iport_connected(kRefPort)) {
-    refb = co_await ctx.read(kRefPort);
-  }
-  const auto* ref =
-      refb ? dynamic_cast<const TensorBeatPayload*>(refb.get()) : nullptr;
-  std::unique_ptr<BeatPayloadIntf> refb1;
-  if (ctx.num_iports() > kRefPort1 && ctx.iport_connected(kRefPort1)) {
-    refb1 = co_await ctx.read(kRefPort1);
-  }
-  const auto* ref1 =
-      refb1 ? dynamic_cast<const TensorBeatPayload*>(refb1.get()) : nullptr;
-  // The `ref2va` reference rows. Read unconditionally when wired: a
-  // video-ref-encoder emits BOTH every request, with 0 rows when a
-  // modality is absent, so a poll would be a race where a read is not.
-  std::unique_ptr<BeatPayloadIntf> rvb, rab;
-  if (ctx.num_iports() > kRefVideoRowsPort &&
-      ctx.iport_connected(kRefVideoRowsPort)) {
-    rvb = co_await ctx.read(kRefVideoRowsPort);
-  }
-  if (ctx.num_iports() > kRefAudioRowsPort &&
-      ctx.iport_connected(kRefAudioRowsPort)) {
-    rab = co_await ctx.read(kRefAudioRowsPort);
-  }
-  std::unique_ptr<BeatPayloadIntf> acb;
-  if (ctx.num_iports() > kAudioCondPort &&
-      ctx.iport_connected(kAudioCondPort)) {
-    acb = co_await ctx.read(kAudioCondPort);
-  }
-  const auto* act =
-      acb ? dynamic_cast<const TensorBeatPayload*>(acb.get()) : nullptr;
-  const auto* rvt =
-      rvb ? dynamic_cast<const TensorBeatPayload*>(rvb.get()) : nullptr;
-  const auto* rat =
-      rab ? dynamic_cast<const TensorBeatPayload*>(rab.get()) : nullptr;
+  auto tensor_of = [](const std::unique_ptr<BeatPayloadIntf>& b) {
+    return b ? dynamic_cast<const TensorBeatPayload*>(b.get()) : nullptr;
+  };
+  const auto* neg  = tensor_of(_neg_beat);
+  const auto* ref  = tensor_of(_ref0_beat);
+  const auto* ref1 = tensor_of(_ref1_beat);
+  const auto* act  = tensor_of(_audio_cond_beat);
+  const auto* rvt  = tensor_of(_ref_video_beat);
+  const auto* rat  = tensor_of(_ref_audio_beat);
 
   if (!ensure_expert_(0)) {
     session()->warn(fmt(
@@ -2128,6 +6088,11 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   // ---- a plugin family: it owns the whole generation ------------------
   if (_plugin_family != nullptr && _plugin_gen) {
     genai::VideoGenResult res;
+    // Previews for THIS clip, as for the built-in families: the family
+    // hands its clean estimate back through the request's output seam
+    // and the render happens here, off its thread.
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         _fps, _frames);
     if (!run_plugin_family_(ctx, cond->data.data(), (int)cond->shape[0],
                             (int)cond->shape[1], &cond->sideband,
                             neg ? neg->data.data() : nullptr,
@@ -2146,7 +6111,69 @@ GenerateVideoStage::process(RuntimeContext& ctx)
           "4-D video latent; nothing to publish", this->id(), _family));
       co_return;
     }
-    if (_unload_idle) { _plugin_gen->release_idle(); }
+    // THE SAME THREE STEPS THE BUILT-IN ARM TAKES, and they were missing
+    // here. `release_idle()` is the FAMILY letting go of what it holds;
+    // it is not the manager giving the bytes back, and it is not the
+    // phase promise being kept. A registered family therefore declared
+    // its DiT phase-limited, ran, and left the checkpoint resident in
+    // the manager for the life of the session -- with the only evidence
+    // a line at the end of the launch saying the promise was broken.
+    //
+    // MEASURED on the LTX-2.5 plugin's own text-to-video graph: the
+    // process sat at 24 GB of resident weights with the pipeline
+    // drained and nothing left to run.
+    //
+    // drop_weights / pool_weights can only return what the family has
+    // actually stopped borrowing -- a generator still holding its
+    // shared_ptr<WeightSet> keeps the set alive and the manager says so
+    // rather than parking under a live reader. That diagnostic is the
+    // point: a family whose release_idle() keeps its borrow now hears
+    // about it instead of being silently ineffective.
+    // A STREAM THE FAMILY IS STILL IN holds the generator: it carries the
+    // stream's state into the next request (FlashVSR's key/value
+    // windows), and releasing it would cut the stream there -- the next
+    // beat would find nothing to continue. It is released after the
+    // stream's final beat, by the same policy as any other.
+    bool stream_open = false;
+    if (res.sideband.is_object()) {
+      FlexData rsb = res.sideband;          // as_object() is a view: keep it
+      auto ro = rsb.as_object();
+      stream_open = ro.contains(sideband::kStreamFinal) &&
+                    !ro.at(sideband::kStreamFinal).as_bool(true);
+    }
+    if (_unload_idle && stream_open) {
+      session()->log_debug(fmt(
+          "GenerateVideoStage('{}'): '{}' is mid-stream; keeping it for the "
+          "next beat", this->id(), _family));
+    }
+    if (_unload_idle && !stream_open) {
+      // The family's own release, then the generator itself: a family
+      // with nothing to release (FlashVSR's holds one DiT and no cache)
+      // would otherwise keep its WeightSet borrowed, and the drop below
+      // could return nothing. ensure_expert_ rebuilds it on the next
+      // clip.
+      _plugin_gen->release_idle();
+      _plugin_gen.reset();
+      preview_scope.release = true;
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        if (!_dit_dir_declared_.empty()) {
+          // `auto` DROPS here too. It only unloads once it has judged the
+          // box tight, and pooling is not a release for a family whose
+          // weights are derived() -- a conversion has no source to re-read,
+          // so it cannot be parked and stays resident, unborrowed. MEASURED
+          // with FlashVSR (f32 checkpoint, every matrix a bf16 derive): the
+          // 1920x1152 decode found 3.56 GB still live in GPU buffers and was
+          // refused ~0.4 GB short, with the 1.3B DiT long finished.
+          if (_unload_cfg == model_memory::UnloadPolicy::kDestroy ||
+              _unload_cfg == model_memory::UnloadPolicy::kAuto) {
+            mgr->drop_weights(_dit_dir_declared_);
+          } else {
+            mgr->pool_weights(_dit_dir_declared_);
+          }
+          mgr->note_phase_released(_dit_dir_declared_);
+        }
+      }
+    }
 
     auto vout = std::make_unique<TensorBeatPayload>();
     vout->dtype = TensorBeat::DType::F32;
@@ -2156,10 +6183,15 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     std::memcpy(vout->as_f32(), res.video.data(),
                 res.video.size() * sizeof(float));
     {
-      FlexData sb = FlexData::make_object();
-      sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
+      // What the family said back first, then the stage's own keys over
+      // it. VideoGenResult::sideband promised this forwarding and the
+      // plugin arm never did it.
+      FlexData sb = res.sideband.is_object() ? res.sideband
+                                             : FlexData::make_object();
+      sb.as_object().insert_or_assign(sideband::kFps,
+                                      FlexData::make_real(_fps));
       sb.as_object().insert_or_assign(
-          "frames", FlexData::make_int((std::int64_t)_frames));
+          sideband::kFrames, FlexData::make_int((std::int64_t)_frames));
       vout->sideband = std::move(sb);
     }
     ++_emitted;
@@ -2187,7 +6219,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       if (res.latents_per_second > 0.0) {
         FlexData sb = FlexData::make_object();
         sb.as_object().insert_or_assign(
-            "latents_per_second",
+            sideband::kLatentsPerSecond,
             FlexData::make_real(res.latents_per_second));
         aout->sideband = std::move(sb);
       }
@@ -2225,20 +6257,115 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     if (!parse_h3_references_(cond->sideband, rvt, rat, &r2v)) {
       co_return;   // already warned
     }
-    have_r2v = !r2v.refs.empty();
-    if (_h3_partition == "ref2va" && !have_r2v) {
+    // A keyframe presentation's per-row tags (diffusion-conditioner
+    // showed Qwen3-VL the keyframes: their vision blocks' rows are
+    // video). Per beat: the next prompt may come without a picture.
+    _h3_cond_tags.clear();
+    if (!r2v.said && cond->sideband.is_object()) {
+      const auto so = cond->sideband.as_object();
+      namespace ck = genai::cond_sideband;
+      if (so.contains(ck::kTokenTags)) {
+        const FlexData t = so.at(ck::kTokenTags);
+        if (t.is_array()) {
+          const auto ta = t.as_array();
+          for (std::size_t i = 0; i < ta.size(); ++i) {
+            _h3_cond_tags.push_back((int)ta[i].as_int());
+          }
+        }
+      }
+    }
+    // A conditioning with NO `references` key did not come from a
+    // video-ref-encoder, and on the Ref2VA partition that is still
+    // refused: it is what a mis-wired graph delivers, and it would load,
+    // run at full cost and condition on nothing anyone asked for.
+    //
+    // An EMPTY list is a different request. The encoder emits it only
+    // when it was told to (`references: []`, or wired ports that each
+    // said "nothing this time"), so it is Ref2VA's prompt-only form:
+    // the layout is t2va's row for row, read by the Ref2VA weights. On
+    // the FL2VA partition the same empty list is simply t2va / fl2va,
+    // so it takes that path -- keyframe anchors included -- rather than
+    // the reference one, which has no slot for them.
+    const H3Route route = h3_reference_route(
+        r2v.said, (int)r2v.refs.size(), _h3_partition);
+    if (route == H3Route::kRefuse) {
       session()->warn(fmt(
           "GenerateVideoStage('{}'): a Ref2VA checkpoint is resident but the "
-          "conditioning carries no references; a Ref2VA forward without them "
-          "generates video conditioned on nothing. Skipping", this->id()));
+          "conditioning carries no reference list -- it did not come from a "
+          "video-ref-encoder, and a Ref2VA forward on it generates video "
+          "conditioned on nothing anyone asked for. For a prompt-only "
+          "request, set `references: []` on the video-ref-encoder. "
+          "Skipping", this->id()));
       co_return;
     }
-    if (have_r2v && _h3_partition == "fl2va") {
-      session()->warn(fmt(
-          "GenerateVideoStage('{}'): the conditioning carries references but "
-          "'{}' is the FL2VA partition, which has no reference blocks; "
-          "skipping", this->id(), _root));
-      co_return;
+    have_r2v = route == H3Route::kReference;
+    if (have_r2v && r2v.refs.empty() && !_ref2va_prompt_only_said) {
+      _ref2va_prompt_only_said = true;
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): prompt-only Ref2VA -- the request's "
+          "reference list is explicitly empty, so the Ref2VA weights "
+          "denoise from the prompt alone over the text-to-video layout",
+          this->id()));
+    }
+    // REFERENCES ON THE FL2VA PARTITION: upstream's Ref2VA-like mode.
+    //
+    // This was refused, on the reading that FL2VA "has no reference
+    // blocks". The blocks are not the weights' -- they are the packed
+    // SEQUENCE's, and `build_ref2va_packed_sequence` builds it for
+    // whichever checkpoint is resident, since the two partitions ship
+    // byte-identical transformer configs. OpenVDN published the mode on
+    // 2026-09-17 with a rendered example: the references go in through
+    // the FL2VA weights, one block and one rotary slot each ahead of the
+    // generated rows, and the weights that read them are the loaded
+    // t2va/fl2va ones rather than MiniMax-H3's own `transformer_ref`.
+    //
+    // ZERO-SHOT, and named as such every run it is used. It is an
+    // ability of the FL2VA checkpoint rather than a task it was trained
+    // for, and the failure mode if it does not hold on some request is a
+    // clip that ignores its references while looking perfectly ordinary
+    // -- so the log says which mode ran rather than leaving the reader
+    // to infer it from the graph.
+    // P-H3-Image's EDIT: the same packing, but the task its weights were
+    // trained for -- no zero-shot about it.
+    if (!r2v.refs.empty() && _ph3 && !_ref2va_like_said) {
+      _ref2va_like_said = true;
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): a P-H3-Image edit -- {} picture{} "
+          "packed ahead of the generated one, the first the one edited",
+          this->id(), r2v.refs.size(), r2v.refs.size() == 1 ? "" : "s"));
+    }
+    if (!r2v.refs.empty() && _h3_partition == "fl2va" && !_ph3) {
+      if (!_ref2va_like_said) {
+        _ref2va_like_said = true;
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): {} reference{} on the FL2VA "
+            "partition -- upstream's Ref2VA-like mode. The references are "
+            "packed as Ref2VA's own blocks and read by these FL2VA "
+            "weights, which is a zero-shot ability of this checkpoint and "
+            "not a task it was trained for; MiniMax-H3's Ref2VA partition "
+            "is the trained route. Upstream renders these at a 768 short "
+            "edge (`reference_image_short_edge` on video-ref-encoder), a "
+            "quarter of the Ref2VA recipe's tokens",
+            this->id(), r2v.refs.size(), r2v.refs.size() == 1 ? "" : "s"));
+      }
+      // Upstream's mode is IMAGE references. Clips and soundtracks pack
+      // and run -- the layout is the same one either way -- but nothing
+      // published says the FL2VA weights read them, and a reference that
+      // is merely ignored looks exactly like one honoured badly.
+      const bool non_image =
+          std::any_of(r2v.refs.begin(), r2v.refs.end(),
+                      [](const h3::Reference& r) {
+                        return r.kind != h3::Reference::Kind::kImage;
+                      });
+      if (non_image && !_ref2va_like_media_said) {
+        _ref2va_like_media_said = true;
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): a reference clip or soundtrack on "
+            "the FL2VA partition. Upstream's Ref2VA-like mode is image "
+            "references only; this packs and runs, but no published result "
+            "covers it. The Ref2VA partition is where clips and "
+            "soundtracks are a trained input", this->id()));
+      }
     }
     // The keyframe anchor arrives on the SAME port Wan's i2v latent
     // does, from a vae-encode over the keyframe image -- so a graph
@@ -2267,21 +6394,33 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // vae-encodes, not one that somehow emits two latent frames. They
     // are concatenated here, on the frame axis, into the [z, k, lh, lw]
     // block run_h3_ patchifies (anchor k -> conditioning frame k).
+    //
+    // A LAST frame with NO first-frame beat is `l2va`: the clip
+    // generated up to that frame, one anchor at the last frame's time.
+    // Both references take it (diffusers' `last_image` alone,
+    // vllm-omni's keyframe signature (-1,)). A first frame that WAS
+    // wired and did not fit is a different case -- the graph asked for
+    // first-and-last -- and is not quietly turned into l2va.
     std::vector<float> stacked;
+    bool last_only = false;
     if (ref1 != nullptr) {
-      if (refp == nullptr) {
-        // Dropping it silently would run a plain t2v while the graph
-        // says otherwise. L2V is not a partition this model was
-        // trained for, so the honest move is to name what was ignored.
-        session()->warn(fmt(
-            "GenerateVideoStage('{}'): a LAST-frame anchor on iport{} needs "
-            "a FIRST-frame anchor on iport{} too; ignoring it", this->id(),
-            kRefPort1, kRefPort));
-      } else if (!anchor_ok(ref1)) {
+      if (!anchor_ok(ref1)) {
         session()->warn(fmt(
             "GenerateVideoStage('{}'): last-frame keyframe latent does not "
-            "match [{}, n, {}, {}]; generating with the first frame only",
-            this->id(), _h3_cfg.video_channels, lh0, lw0));
+            "match [{}, n, {}, {}]; generating {}", this->id(),
+            _h3_cfg.video_channels, lh0, lw0,
+            refp != nullptr ? "with the first frame only"
+                            : "without it"));
+      } else if (ref == nullptr) {
+        refp = ref1->as_f32();
+        ref_frames = (int)ref1->shape[1];
+        last_only = true;
+      } else if (refp == nullptr) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the first-frame anchor on iport{} "
+            "was unusable, so the last-frame anchor on iport{} is ignored "
+            "too (wire iport{} alone for a clip that ends on a frame)",
+            this->id(), kRefPort, kRefPort1, kRefPort1));
       } else {
         const int ZC = _h3_cfg.video_channels;
         const int n1 = (int)ref1->shape[1];
@@ -2309,11 +6448,240 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     // captured past this generation -- the lambda holds a reference.
     auto stopping = [&ctx]() { return ctx.stop_requested(); };
     if (_h3_dit) { _h3_dit->set_stream_stop(stopping); }
+    // ...on EVERY way out, the early ones below included: a split DiT's
+    // channel holds the stop too, on threads of its own (tensor-
+    // parallel.h: cleared after the generation), and `ctx` is gone once
+    // this returns.
+    struct StopCleared {
+      GenerateVideoStage* st;
+      ~StopCleared()
+      {
+        if (st->_h3_dit) { st->_h3_dit->set_stream_stop({}); }
+      }
+    } stop_cleared{this};
+    // A RANK's generation (tensor-parallel.h) ends on every way out too,
+    // and BEFORE the stop is cleared (declared after it, so destroyed
+    // first): a channel still waiting on a peer then sees the stop. The
+    // ordinary way out ends it as soon as the denoise returns, below.
+    struct TpGenerationEnded {
+      GenerateVideoStage* st;
+      ~TpGenerationEnded()
+      {
+        if (st->_h3_dit) { st->_h3_dit->end_tp_generation(); }
+      }
+    } tp_generation_ended{this};
+    // Previews for THIS clip, on oport2. Ended when this block is left --
+    // after the latents are written on the ordinary path, so the last
+    // step's preview renders while vae-decode is already working -- and
+    // on every early return too. begin() declines, loading nothing, when
+    // the port is unwired or the config names no preview VAE.
+    LatentPreviewer::Scope preview_scope(_preview.get(), ctx, kPreviewPort,
+                                         _fps, _frames);
+    // ---- a REFINE: the init latent, re-noised and denoised again ----
+    const auto* init = tensor_of(_init_beat);
+    H3Refine refine;
+    const H3Refine* rp = nullptr;
+    FlexData init_sb;
+    if (init != nullptr) {
+      const auto& hc = _h3_cfg;
+      if (init->dtype != TensorBeat::DType::F32 || init->shape.size() != 4 ||
+          (int)init->shape[0] != hc.video_channels || init->shape[1] <= 0 ||
+          init->shape[2] % hc.patch_h != 0 ||
+          init->shape[3] % hc.patch_w != 0) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): the init latent must be f32 [{}, T, "
+            "H/16, W/16] with H/16 and W/16 multiples of {}; got {}; "
+            "skipping", this->id(), hc.video_channels, hc.patch_h,
+            init->describe()));
+        co_return;
+      }
+      refine.latent = init->as_f32();
+      refine.lt = (int)init->shape[1];
+      refine.lh = (int)init->shape[2];
+      refine.lw = (int)init->shape[3];
+      // The pixel frames those latents stand for: the length the
+      // chunking rounds to (17n + 5), which is what the soundtrack spans.
+      for (int a = 1; a <= 17 * refine.lt + 22; ++a) {
+        const int al = h3::align_num_frames(a, 17, 5);
+        if (h3::video_latent_num_frames(al, 17, 5) == refine.lt) {
+          refine.frames = al;
+          break;
+        }
+      }
+      init_sb = init->sideband.is_object() ? init->sideband
+                                           : FlexData::make_object();
+      double rfps = _fps;
+      {
+        auto io = init_sb.as_object();
+        if (io.contains(sideband::kFps) &&
+            io.at(sideband::kFps).as_real(0.0) > 0.0) {
+          rfps = io.at(sideband::kFps).as_real(rfps);
+        }
+      }
+      // The model config's sigmas, when it names them, ARE a refine's:
+      // the video's as run, the first the level it is re-noised to.
+      // Else, under a live FLOW-MAP adapter, the last `steps` steps of
+      // its own grid at the video shift -- Open-H3-Regenerate-2K-IC's
+      // up3 / up4 (3 / 4 steps of HyperFlow's 8, from sigma 0.835 /
+      // 0.923), and hf8 all eight from 1, where the re-noise below is the
+      // noise alone. Else the base release's rule.
+      const genai::MetalMiniMaxH3Transformer::FlowMap* fmap =
+          _h3_dit && _h3_dit->two_time_active() ? _h3_dit->flow_map()
+                                                : nullptr;
+      std::string sig_from = "the refine's rule";
+      if (!_h3_params.sigmas.empty()) {
+        refine.sigmas = _h3_params.sigmas;
+        sig_from = "the model config's sigmas";
+      } else if (fmap != nullptr && fmap->sigmas.size() >= 2) {
+        const int fsteps = (int)fmap->sigmas.size() - 1;
+        refine.sigmas = genai::MiniMaxH3Scheduler::grid_tail(
+            fmap->sigmas, _h3_params.video_shift, _steps);
+        sig_from = fmt("the last {} of the flow map's {} steps at shift "
+                       "{:.4g}", std::min(_steps, fsteps), fsteps,
+                       _h3_params.video_shift)();
+        if (_steps > fsteps) {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): `steps: {}` under the flow-map "
+              "adapter, whose grid has {}; the refine runs all {}, from "
+              "pure noise", this->id(), _steps, fsteps, fsteps));
+        }
+        if (_h3_params.refine_start_sigma >= 0.0) {
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): refine_start_sigma {:.4g} is not "
+              "used under the flow-map adapter -- the refine starts at "
+              "its grid point `steps` from the end", this->id(),
+              _h3_params.refine_start_sigma));
+        }
+      } else {
+        refine.sigmas = genai::MiniMaxH3Scheduler::refine_sigmas(
+            _steps, _h3_params.refine_start_sigma,
+            _h3_params.refine_shift);
+      }
+      int salat = 0;
+      if (refine.frames <= 0 || refine.sigmas.size() < 2 ||
+          !h3_silence_rows_(refine.frames, rfps, &refine.audio_rows,
+                            &salat)) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): cannot set up the refine of a {}-"
+            "latent-frame clip ({} steps); skipping", this->id(), refine.lt,
+            _steps));
+        co_return;
+      }
+      if (refp != nullptr) {
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): a refine re-noises the init latent; "
+            "the keyframe inputs are IGNORED (its layout has no keyframe "
+            "slot)", this->id()));
+        refp = nullptr;
+        ref_frames = 0;
+        last_only = false;
+      }
+      // REFERENCES stay: a refine IN CONTEXT -- Open-H3-Regenerate-2K-
+      // IC's, the draft a clean reference video ahead of the clip
+      // regenerated from it, on the reference layout.
+      if (have_r2v && !r2v.refs.empty() && !_refine_in_context_said) {
+        _refine_in_context_said = true;
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): a refine IN CONTEXT -- {} "
+            "reference{} held clean ahead of the re-noised clip, on the "
+            "reference layout (Open-H3-Regenerate-2K-IC: the draft as "
+            "<Video 1>)", this->id(), r2v.refs.size(),
+            r2v.refs.size() == 1 ? "" : "s"));
+      }
+      if (_h3_partition == "ref2va" && !have_r2v && !_refine_ref2va_said) {
+        _refine_ref2va_said = true;
+        session()->warn(fmt(
+            "GenerateVideoStage('{}'): refining with the Ref2VA weights. "
+            "Open-H3-Regenerate-2K refines with MiniMax-H3's text-to-video "
+            "DiT (the FL2VA partition, or the diffusers root's "
+            "transformer/), which its LoRA was trained on", this->id()));
+      }
+      std::string grid;
+      for (double sg : refine.sigmas) {
+        grid += fmt("{}{:.6f}", grid.empty() ? "" : ", ", sg)();
+      }
+      session()->info(fmt(
+          "GenerateVideoStage('{}'): REFINE of [{}, {}, {}, {}] ({} frames "
+          "at {:.3g} fps) -- {} steps over sigmas [{}] ({}){}, the audio "
+          "an encoded silence of {} latents held clean", this->id(),
+          hc.video_channels, refine.lt, refine.lh, refine.lw, refine.frames,
+          rfps, refine.sigmas.size() - 1, grid, sig_from,
+          fmap != nullptr ? ", each step its flow-map jump" : "", salat));
+      rp = &refine;
+    }
+    const int tm_slot = rp != nullptr ? -1 : taomate_slot_();
+    if (tm_slot >= 0 && (refp != nullptr || have_r2v)) {
+      session()->warn(fmt(
+          "GenerateVideoStage('{}'): TaoMate-H3 is text-to-audio-video only; "
+          "the keyframe / reference inputs are IGNORED for this clip",
+          this->id()));
+    }
+    // ---- a GUIDE: latent frames and their soundtrack, pinned where
+    // they lie -- the keyframe layout's, so a request whose layout is
+    // another's says it ran without one rather than dropping it quietly.
+    // Decided BEFORE the beats are read against this clip: a refine's
+    // grid is its init latent's, not this stage's width and height, so
+    // checking an ignored guide against them would warn about the wrong
+    // thing. An EMPTY tensor is "no guide this time", as on every
+    // reference port, and says nothing.
+    H3Guide guide;
+    const H3Guide* gp = nullptr;
+    {
+      auto given = [&](const std::unique_ptr<BeatPayloadIntf>& b) {
+        const TensorBeatPayload* t = tensor_of(b);
+        return t != nullptr && !t->shape.empty() && t->element_count() > 0
+                   ? t : nullptr;
+      };
+      const auto* gv = given(_guide_beat);
+      const auto* ga = given(_guide_audio_beat);
+      const char* why =
+          rp != nullptr ? "a refine re-noises its init latent alone"
+          : tm_slot >= 0 ? "TaoMate-H3 streams from the prompt alone"
+          : have_r2v
+              ? "a request with references packs the reference layout, "
+                "which has no slot for one"
+              : nullptr;
+      if (gv == nullptr && ga == nullptr) {
+        // no guide
+      } else if (why != nullptr) {
+        if (!_guide_ignored_said) {
+          _guide_ignored_said = true;
+          session()->warn(fmt(
+              "GenerateVideoStage('{}'): a guide is wired on iport{} / "
+              "iport{} but {} -- the guide is IGNORED", this->id(),
+              kGuidePort, kGuideAudioPort, why));
+        }
+      } else if (parse_h3_guide_(gv, ga, &guide)) {
+        gp = &guide;
+      }
+    }
+    // A RANK opens this clip's channel to the other ranks (it waits for
+    // them there, as the transport does) and a fresh exchange count: what
+    // its last clip did -- stopped part way, run on a channel since let
+    // go, on weights this host reloaded or kept -- is not carried in.
+    if (_h3_dit && _h3_cfg.tp.active()) {
+      std::string terr;
+      std::shared_ptr<genai::TpChannel> ch = open_tp_channel_(&terr);
+      if (!ch || !_h3_dit->begin_tp_generation(std::move(ch), &terr)) {
+        session()->warn(fmt("GenerateVideoStage('{}'): tensor_parallel: "
+                            "{}; skipping", this->id(), terr));
+        co_return;
+      }
+    }
     const bool ok_h3 =
-        run_h3_(cond->data.data(), (int)cond->shape[0], refp, ref_frames,
-                have_r2v ? &r2v : nullptr,
-                &vlat, &vshape, &alat_out, &ashape);
+        tm_slot >= 0
+            ? run_h3_taomate_(cond->data.data(), (int)cond->shape[0],
+                              tm_slot, &vlat, &vshape, &alat_out, &ashape)
+            : run_h3_(cond->data.data(), (int)cond->shape[0], refp,
+                      ref_frames, last_only, have_r2v ? &r2v : nullptr,
+                      &vlat, &vshape, &alat_out, &ashape, rp, gp);
+    // The clip's link let go -- the stop still set -- before anything
+    // else: the peers learn this clip is over, and the next opens anew.
+    if (_h3_dit) { _h3_dit->end_tp_generation(); }
     if (_h3_dit) { _h3_dit->set_stream_stop({}); }
+    // What the DiT held WHILE it denoised, before any drop below -- the
+    // figure a peer sizes against.
+    correct_h3_holding_();
     // What the adaptive residency actually reached. This is the number
     // that says whether the machine got used: with 0 pinned at load, every
     // resident block here was earned at runtime out of free headroom, and
@@ -2336,32 +6704,49 @@ GenerateVideoStage::process(RuntimeContext& ctx)
       co_return;
     }
     if (_unload_idle) {
-      // POOLED BEFORE THE RESET, and the order is the whole thing:
-      // pool_weights() finds the set through a WEAK reference, so once
-      // this model has dropped its last strong one there is nothing left
-      // to pool and the call is a silent no-op.
+      // SETTLED with the manager, which owns the checkpoint: the reset
+      // below only ends this stage's borrow, and the call asks for it to
+      // be parked now if nobody else is borrowing it. The order against
+      // the reset used to be the whole thing -- the manager's reference
+      // was weak, so pooling after it was a silent no-op -- and is now
+      // free either way.
       //
       // `auto` means REMOVABLE, not gone: the checkpoint stays alive and
       // purgeable so a relaunch pays no reload, and the kernel may take
       // the pages meanwhile. `destroy` is the caller asking for the bytes
       // back now, so it keeps dropping them.
       //
-      // The pool refuses a set the AdaLN bake specialised, which is this
-      // model on every schedule -- so today this reports the refusal
-      // rather than pooling. That is the correct outcome and not a
-      // wasted call: it is what makes the reload visible.
-      if (_unload_cfg == model_memory::UnloadPolicy::kAuto) {
-        if (auto* mgr = session()->services()->generative_model_manager()) {
+      // Settling REFUSES a set the AdaLN bake specialised, which is this
+      // model on every schedule -- it is dropped rather than kept, so
+      // the reload is real and visible either way.
+      //
+      // KEPT WARM instead (keep_loaded), where the box has room for it
+      // beside the decode: the manager's hold then, the checkpoint's
+      // weights with it.
+      const bool kept = keep_h3_warm_();
+      _h3_dit.reset();
+      // The preview TAE goes with it, once its last render is out: small
+      // weights, but its decode scratch is what an idle stage should not
+      // keep.
+      preview_scope.release = true;
+      if (auto* mgr = session()->services()->generative_model_manager();
+          mgr != nullptr && !kept) {
+        if (_unload_cfg == model_memory::UnloadPolicy::kDestroy) {
+          mgr->drop_weights(_dit_dir_declared_);
+        } else {
           mgr->pool_weights(_dit_dir_declared_);
         }
       }
-      _h3_dit.reset();
       // The other half of the denoise-phase claim. Peers sized against
       // the promise that these bytes are gone by the time the decodes
       // run; this is where it is kept, and saying so is what stops the
       // manager reporting it broken at the end of the launch.
       if (auto* mgr = session()->services()->generative_model_manager()) {
         mgr->note_phase_released(_dit_dir_declared_);
+        // ...and the adapters' factors, freed with the model.
+        for (const std::string& f : _lora_files_declared_) {
+          mgr->note_phase_released(f);
+        }
       }
     }
 
@@ -2370,11 +6755,43 @@ GenerateVideoStage::process(RuntimeContext& ctx)
     vout->shape = {vshape[0], vshape[1], vshape[2], vshape[3]};
     vout->resize_contiguous(vlat.size());
     std::memcpy(vout->as_f32(), vlat.data(), vlat.size() * sizeof(float));
-    {
+    if (rp != nullptr) {
+      // A refine carries what its input said about itself -- the frame
+      // count and rate it stands for, and a crop box a latent-upscale
+      // put on it (a 1080-row target computes at 1088) -- for
+      // vae-decode, which cuts the picture back to it.
+      FlexData sb = init_sb;
+      auto so = sb.as_object();
+      if (!so.contains(sideband::kFps)) {
+        so.insert_or_assign(sideband::kFps, FlexData::make_real(_fps));
+      }
+      // The input's own length: a 121-frame draft encodes to the 124 a
+      // whole number of chunks needs, and the decoder keeps 121 of them.
+      std::int64_t real = refine.frames;
+      if (so.contains(sideband::kFrames)) {
+        real = so.at(sideband::kFrames).as_int(real);
+      }
+      if (real <= 0 || real > refine.frames) { real = refine.frames; }
+      so.insert_or_assign(sideband::kFrames, FlexData::make_int(real));
+      if (real < refine.frames) {
+        so.insert_or_assign(sideband::kValidFrames, FlexData::make_int(real));
+      }
+      vout->sideband = std::move(sb);
+    } else {
       FlexData sb = FlexData::make_object();
-      sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
+      sb.as_object().insert_or_assign(sideband::kFps,
+                                      FlexData::make_real(_fps));
       sb.as_object().insert_or_assign(
-          "frames", FlexData::make_int((std::int64_t)_frames));
+          sideband::kFrames, FlexData::make_int((std::int64_t)_frames));
+      // MiniMax-H3-Image generated on a larger canvas than it returns:
+      // vae-decode resizes the picture back, as the release does.
+      if (_h3i && (_h3i_out_w != vshape[3] * 16 ||
+                   _h3i_out_h != vshape[2] * 16)) {
+        FlexData sz = FlexData::make_array();
+        sz.as_array().push_back(FlexData::make_int(_h3i_out_w));
+        sz.as_array().push_back(FlexData::make_int(_h3i_out_h));
+        sb.as_object().insert_or_assign(sideband::kResizeTo, std::move(sz));
+      }
       vout->sideband = std::move(sb);
     }
     ++_emitted;
@@ -2388,7 +6805,22 @@ GenerateVideoStage::process(RuntimeContext& ctx)
 
     // The audio half. Written only when the port is connected: the audio
     // VAE is a separate decode stage, and a graph that only wants video
-    // should not have to wire a sink for a beat it will not read.
+    // should not have to wire a sink for a beat it will not read. A
+    // refine generates none -- its soundtrack was the silence it was
+    // conditioned on -- so the draft's own goes in the file.
+    if (rp != nullptr) {
+      if (ctx.num_oports() > 1 && !_refine_audio_said) {
+        _refine_audio_said = true;
+        session()->info(fmt(
+            "GenerateVideoStage('{}'): a refine writes no soundtrack (it "
+            "was conditioned on silence); mux the draft's own audio",
+            this->id()));
+      }
+      co_return;
+    }
+    // P-H3-Image's two audio latents are scaffolding the model was
+    // trained with, not a soundtrack: thrown away, as the reference does.
+    if (_ph3 || _h3i) { co_return; }
     if (ctx.num_oports() > 1 && !alat_out.empty()) {
       auto aout = std::make_unique<TensorBeatPayload>();
       aout->dtype = TensorBeat::DType::F32;
@@ -2398,7 +6830,7 @@ GenerateVideoStage::process(RuntimeContext& ctx)
                   alat_out.size() * sizeof(float));
       FlexData sb = FlexData::make_object();
       sb.as_object().insert_or_assign(
-          "latents_per_second",
+          sideband::kLatentsPerSecond,
           FlexData::make_int((std::int64_t)h3::kAudioLatentsPerSecond));
       aout->sideband = std::move(sb);
       tag_model_(*aout);
@@ -2609,8 +7041,8 @@ GenerateVideoStage::process(RuntimeContext& ctx)
   out->resize_contiguous(nlat);
   std::memcpy(out->as_f32(), x.data(), nlat * sizeof(float));
   FlexData sb = FlexData::make_object();
-  sb.as_object().insert_or_assign("fps", FlexData::make_real(_fps));
-  sb.as_object().insert_or_assign("frames",
+  sb.as_object().insert_or_assign(sideband::kFps, FlexData::make_real(_fps));
+  sb.as_object().insert_or_assign(sideband::kFrames,
                                   FlexData::make_int((std::int64_t)_frames));
   out->sideband = std::move(sb);
   ++_emitted;
@@ -2649,5 +7081,46 @@ GenerateVideoStage::process(RuntimeContext& ctx)
 
 VPIPE_REGISTER_STAGE(GenerateVideoStage)
 VPIPE_REGISTER_SPEC(GenerateVideoStage, kSpec)
+
+// The MiniMax-H3 DiT this stage runs: `dit_dir` when the graph names
+// one, else the one under the model root, through the same resolver the
+// model's own load uses -- one answer, so the plan, the claim, the
+// release and the load all name the same file.
+std::string
+GenerateVideoStage::h3_dit_(const std::string& root,
+                            const std::string& partition) const
+{
+  if (!_dit_dir.empty()) {
+    return genai::MetalMiniMaxH3Transformer::resolve_dit_dir(
+        resolve_model_dir(session(), _dit_dir), partition);
+  }
+  std::string dit =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, partition);
+  if (dit == root) {
+    dit = (std::filesystem::path(root) / "transformer").string();
+  }
+  return dit;
+}
+
+// Where a PRUNED DiT's released timestep MLP is: the graph's own
+// partition of the model root, when that DiT carries the MLP. The pruned
+// form has none; an adapter that moves the time embedding is mapped onto
+// the curve through it (Config::time_mlp_dir). Empty: not pruned, or no
+// released DiT under the root.
+std::string
+GenerateVideoStage::h3_time_mlp_dir_(
+    const std::string& root, const std::string& partition,
+    const genai::MetalMiniMaxH3Transformer::Config& dit) const
+{
+  if (!dit.pruned()) { return {}; }
+  std::string base =
+      genai::MetalMiniMaxH3Transformer::resolve_dit_dir(root, partition);
+  if (base == root) {
+    base = (std::filesystem::path(root) / "transformer").string();
+  }
+  auto w = genai::MetalLlamaWeights::open_model(base);
+  return w.has_value() && w->has("time_embedder.proj_in.weight") ? base
+                                                                 : "";
+}
 
 }  // namespace vpipe

@@ -1,6 +1,8 @@
 #ifndef VPIPE_APPLE_SILICON_COREML_MODEL_MANAGER_H
 #define VPIPE_APPLE_SILICON_COREML_MODEL_MANAGER_H
 
+#include "common/flex-data.h"
+#include "apple-silicon/coreml/ane-worker.h"
 #include "interfaces/log-sink-intf.h"
 
 #include <cstddef>
@@ -12,6 +14,10 @@
 #include <string_view>
 #include <unordered_map>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace CML {
 class Model;
@@ -58,6 +64,8 @@ struct CoreMLInputDesc {
   int                  image_height = 0;
   std::uint32_t        pixel_format = 0;           // Image CVPixelFormat
   bool                 fixed = false;
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData             extra;
 };
 
 // Per-output metadata captured at model-load time. `fixed == true`
@@ -70,6 +78,8 @@ struct CoreMLOutputDesc {
   std::vector<int64_t> shape;
   CoreMLDType          dtype = CoreMLDType::F32;
   bool                 fixed = false;
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData             extra;
 };
 
 // One MODEL INPUT bound for CoreMLLoadedModel::predict(). Populate the
@@ -90,6 +100,14 @@ struct CoreMLPredictInput {
   CoreMLDType          dtype = CoreMLDType::F32;
   std::vector<int64_t> shape;
   std::vector<int64_t> strides;
+
+  // IOSurface-backed alternative to `data`: a CVPixelBufferRef (opaque)
+  // of kCVPixelFormatType_OneComponent16Half, bound through
+  // MLMultiArray initWithPixelBuffer:shape:. `shape` must be [height,
+  // width] and `dtype` F16; `data` and `strides` are ignored. A binding
+  // failure is an error, never a silent copy -- the point of this path
+  // is the memory it avoids.
+  void*                pixel_buffer = nullptr;
 
   // Image form (used when `image != nullptr`).
   const std::uint8_t*  image = nullptr;
@@ -212,13 +230,16 @@ private:
 // rare race that wastes one load, never produces UB; the cache
 // stabilises on whichever winner wins the second lock.
 class CoreMLModelManager final {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   explicit CoreMLModelManager(const LogSinkIntf* session);
 
   CoreMLModelManager(const CoreMLModelManager&)            = delete;
   CoreMLModelManager& operator=(const CoreMLModelManager&) = delete;
 
-  ~CoreMLModelManager() = default;
+  // NOT defaulted in the header: the manager owns an AneWorker whose
+  // threads must be joined, and its Impl is incomplete here.
+  ~CoreMLModelManager();
 
   // Returns a shared model, loading on first request. `path` may be
   // a .mlmodel file (compiled to a tmp .mlmodelc inside) or a
@@ -229,6 +250,11 @@ public:
 
   // Test / diagnostics helpers.
   std::size_t cached_count() const;
+
+  // Threads for ANE dispatch, created WITH the manager rather than on
+  // first use, so nothing pays a thread creation mid-inference. Shared
+  // by every consumer of the ANE in this session -- it is one device.
+  AneWorker& ane_worker() const noexcept { return *_ane; }
 
   const LogSinkIntf* log() const noexcept { return _log; }
 
@@ -245,6 +271,7 @@ private:
     std::size_t operator()(const Key& k) const noexcept;
   };
 
+  std::unique_ptr<AneWorker>                              _ane;
   mutable std::mutex                                      _mu;
   std::unordered_map<Key,
                      std::weak_ptr<CoreMLLoadedModel>,
@@ -252,5 +279,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

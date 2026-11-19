@@ -71,6 +71,10 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 }
@@ -81,6 +85,7 @@ namespace vpipe::genai {
 
 class WeightSet : public WeightOwner,
                   public std::enable_shared_from_this<WeightSet> {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   // How a tensor is materialised.
   //
@@ -109,12 +114,14 @@ public:
   WeightSet(const WeightSet&)            = delete;
   WeightSet& operator=(const WeightSet&) = delete;
 
-  const std::string& dir() const noexcept { return _dir; }
+  // Out of line, like every WeightSet method: a plugin holds a WeightSet
+  // through a shared_ptr and must never compile knowledge of its members.
+  const std::string& dir() const noexcept;
 
   // The underlying checkpoint, for callers that need info() /
   // tensor_names() / their own read strategy (the streaming DiTs re-read
   // blocks per forward and deliberately do not cache).
-  const MetalLlamaWeights& src() const noexcept { return *_wts; }
+  const MetalLlamaWeights& src() const noexcept;
 
   bool has(const std::string& name) const;
 
@@ -306,12 +313,35 @@ public:
 
   // ---- residency policy hooks --------------------------------------
 
-  // Marked by the manager when it hands these pages to the kernel. A
-  // parked set is still fully usable: the next access reactivates it
+  // Recorded by the REGISTRY, through WeightOwner::note_parked, when it
+  // hands these pages to the kernel or takes them back. NOT settable by
+  // a caller, and that is the point: this flag is the only thing that
+  // will ever take the pages back, so a park that set the kernel's half
+  // and forgot this one left every later read serving buffers the
+  // kernel was free to empty.
+  //
+  // A parked set is still fully usable: the next access reactivates it
   // first (see ensure_active_), reloading from disk only if the kernel
   // actually took the pages.
-  void set_parked(bool p) noexcept;
+  void note_parked(bool on) override;
   bool parked() const noexcept;
+
+  // THE PARK/BORROW RACE, closed. The manager decides a set is unborrowed
+  // under ITS lock and parks it after letting go -- so a borrower handed
+  // the set in between, which reads tensors before the park lands, would
+  // keep buffers the park then makes purgeable, and read them without
+  // ever asking the set again. So every hand-out is COUNTED (the manager
+  // calls note_borrowed() under its lock as it returns the set), the
+  // count is noted where the park is decided, and the park is abandoned
+  // if it has moved.
+  void          note_borrowed() noexcept;
+  std::uint64_t borrow_epoch() const noexcept;
+  // Park through the registry, unless the set was handed out since
+  // `epoch`. The check and the walk run under _mu, which every read that
+  // hands out a cached tensor takes: a borrower is either seen here, or
+  // reads only after the park and reactivates first. Returns the bytes
+  // parked (0 when abandoned).
+  std::size_t   park_unless_borrowed_since(std::uint64_t epoch);
 
   // ---- may this outlive the launch that opened it? ---------------------
   //
@@ -370,6 +400,8 @@ private:
   // object's _mu is held by the restoring thread.
   std::atomic<bool>                    _restoring{false};
   std::atomic<bool>                    _parked{false};
+  // Hand-outs so far; see note_borrowed().
+  std::atomic<std::uint64_t>           _borrow_epoch{0};
   // See recyclable(). Default true: a set nobody specialised may be
   // handed to the next launch.
   std::atomic<bool>                    _recyclable{true};
@@ -418,5 +450,7 @@ open_weight_set(const std::string&        dir,
                 const std::string&        variant = {});
 
 }  // namespace vpipe::genai
+
+VPIPE_API_END
 
 #endif

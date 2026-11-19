@@ -8,7 +8,7 @@
 //
 // Usage:
 //   vpipe [--config CFG] [--memory-cap-mb N] [--wired-pool-mb N]
-//         LAUNCH ...
+//         [--swap-allowance-mb N] LAUNCH ...
 //
 //   LAUNCH is one of:
 //     --launch <spec>              spec is a path to a pipeline JSON/binary
@@ -40,9 +40,11 @@
 // The executable dynamically links libvpipe; pipeline output and
 // diagnostics flow through the session's default stdout delegates.
 
+#include "common/diagnostic-capture.h"
 #include "common/flex-data.h"
 #include "common/session.h"
 #include "plugin/plugin-manager.h"
+#include "vpipe/system-monitor.h"
 #include "stages/model-catalog.h"
 #include "ui/ui-view-registry.h"
 #include "common/stdio-ui-delegate.h"
@@ -141,6 +143,14 @@ const char* const kUsage =
   "                              wired_pool_mb; unset = the wired_pool_pct\n"
   "                              share of RAM (default 75%), 0 = no\n"
   "                              wiring at all.\n"
+  "  --swap-allowance-mb N       how much memory a run may plan to push\n"
+  "                              OUT to the compressor or swap, on top of\n"
+  "                              what the OS reports reclaimable. The\n"
+  "                              opposite knob to --wired-pool-mb: it\n"
+  "                              reserves nothing, so it costs throughput\n"
+  "                              rather than stability. Same as session\n"
+  "                              config swap_allowance_mb; unset = 4096,\n"
+  "                              0 = size against reclaimable RAM alone.\n"
   "  --plugin PATH               load a plugin .dylib at startup "
   "(repeatable).\n"
   "  --version                   print the version and build identity\n"
@@ -148,6 +158,12 @@ const char* const kUsage =
   "                              and exit.\n"
   "  --gpu-info                  print the GPU/OS facts that decide whether\n"
   "                              the matrix-core (M5 NAX) kernels are used.\n"
+  "  --gpu-thermal [MS]          sample the GPU for MS ms (default 600) and\n"
+  "                              print clock, ceiling, utilisation, die temp\n"
+  "                              and a throttle verdict as JSON. Reports\n"
+  "                              whether a busy GPU is being held below the\n"
+  "                              clock it is rated for, which the OS thermal\n"
+  "                              state does not.\n"
   "  --list-views                print the stage types that have a web-UI\n"
   "                              panel, as JSON. A pipeline containing one\n"
   "                              needs someone at the browser to finish.\n"
@@ -255,6 +271,35 @@ apply_override(FlexData& spec, const std::string& stage_id,
   return true;
 }
 
+// Print a refusal the way someone at a shell needs it: one `vpipe:`
+// line naming what was asked, then the reasons the operation gave,
+// indented under it.
+//
+// Those reasons also went past as [WARN] when they happened -- that is
+// the session's running log, and with several --launch arguments in
+// flight it interleaves. This block is the tool's ANSWER to one
+// argument and has to be readable on its own, so it repeats the reason
+// rather than pointing at a line somewhere above. A refusal that
+// reported no reason at all says that instead: it means the site that
+// refused never said why, which is a defect worth seeing named.
+void
+report_refusal(const char* what, const std::string& subject,
+               const vpipe::DiagnosticCapture& why)
+{
+  if (why.empty()) {
+    std::fprintf(stderr, "vpipe: %s '%s': rejected, no reason reported\n",
+                 what, subject.c_str());
+    return;
+  }
+  std::fprintf(stderr, "vpipe: %s '%s': rejected\n", what, subject.c_str());
+  for (const std::string& line : why.lines()) {
+    std::fprintf(stderr, "  %s\n", line.c_str());
+  }
+  if (why.truncated()) {
+    std::fprintf(stderr, "  (further messages omitted)\n");
+  }
+}
+
 struct Launch {
   enum Kind { Full, Single };
   Kind                     kind;
@@ -287,12 +332,10 @@ build_single(SessionIntf* s, const Launch& L, int idx)
                  L.source.c_str());
     return std::nullopt;
   }
+  vpipe::DiagnosticCapture why;
   StageHandle st = pl.insert_stage(L.source, L.source, {}, cfg.to_json());
   if (!st) {
-    std::fprintf(stderr,
-                 "vpipe: failed to create stage '%s' (unknown type or bad "
-                 "config)\n",
-                 L.source.c_str());
+    report_refusal("--launch-stage", L.source, why);
     s->unload_pipeline(pl);
     return std::nullopt;
   }
@@ -308,8 +351,12 @@ build_full(SessionIntf* s, const Launch& L)
 {
   // No edits: load_pipeline takes a path or an inline JSON spec directly.
   if (L.cfgs.empty()) {
+    vpipe::DiagnosticCapture why;
     PipelineHandle h = s->load_pipeline(L.source);
-    if (!h) { return std::nullopt; }   // loader already logged the cause
+    if (!h) {
+      report_refusal("--launch", L.source, why);
+      return std::nullopt;
+    }
     return h;
   }
 
@@ -359,8 +406,12 @@ build_full(SessionIntf* s, const Launch& L)
   }
 
   // Hand the edited spec back to the loader as an inline JSON document.
+  vpipe::DiagnosticCapture why;
   PipelineHandle h = s->load_pipeline(spec.to_json());
-  if (!h) { return std::nullopt; }   // loader already logged the cause
+  if (!h) {
+    report_refusal("--launch", L.source, why);
+    return std::nullopt;
+  }
   return h;
 }
 
@@ -428,6 +479,34 @@ run(int argc, char** argv)
       std::printf("%s\n", o.to_json().c_str());
       return 0;
 #endif
+    } else if (a == "--gpu-thermal") {
+      // Whether this machine is being held back RIGHT NOW, which
+      // NSProcessInfo.thermalState does not answer: on a fanless Mac
+      // under a long generation it reads `nominal` while the GPU clock
+      // sits at roughly two thirds of the chip's ceiling.
+      //
+      // A WINDOW, not an instant. The clock comes from a pstate
+      // RESIDENCY histogram, so it only exists as a delta between two
+      // samples -- there is no such thing as the frequency right now.
+      //
+      // Session-free: IOReport, IOKit and SMC reads only, no GPU work
+      // and no model loading, so this can run alongside a real
+      // generation rather than perturbing the thing it measures.
+#if !defined(VPIPE_BUILD_APPLE_SILICON)
+      std::printf("{\"verdict\":\"unknown\","
+                  "\"note\":\"not an Apple Silicon build\"}\n");
+      return 0;
+#else
+      int window_ms = 600;
+      if (i + 1 < argc && argv[i + 1][0] != '-') {
+        window_ms = std::atoi(argv[++i]);
+      }
+      // The library's (vpipe/system-monitor.h), which a host embedding
+      // vpipe calls too.
+      const FlexData o = SystemMonitor::gpu_thermal(window_ms);
+      std::printf("%s\n", o.to_json().c_str());
+      return 0;
+#endif
     } else if (a == "--list-views") {
       // The stage types that have a GUI panel in the web UI. A front
       // end needs this to tell a pipeline that runs unattended from one
@@ -478,7 +557,16 @@ run(int argc, char** argv)
             pre.push_back(argv[j + 1]);
           }
         }
-        if (!pre.empty()) { PluginManager::get().load_all(nullptr, pre); }
+        // With no session the loader's reason has nowhere to go, so at
+        // least NAME the plugin that was skipped: a listing that silently
+        // omits its entries is the failure described above.
+        for (const std::string& p : pre) {
+          if (!PluginManager::get().load(nullptr, p)) {
+            std::fprintf(stderr,
+                         "vpipe: plugin '%s' was not loaded (rerun with a "
+                         "pipeline to see why)\n", p.c_str());
+          }
+        }
       }
       FlexData arr = FlexData::make_array();
       auto     out = arr.as_array();
@@ -503,6 +591,12 @@ run(int argc, char** argv)
       // the process makes UNSWAPPABLE, that one bounds what it insists
       // on holding at all.
       ::setenv("VPIPE_WIRED_POOL_MB", argv[i], 1);
+    } else if (a == "--swap-allowance-mb") {
+      if (++i >= argc) { return arg_err("--swap-allowance-mb needs a value"); }
+      // Forwarded like the two above. This one is the OPPOSITE question
+      // to --wired-pool-mb: that bounds what the process makes
+      // unswappable, this bounds what a run may plan to push out.
+      ::setenv("VPIPE_SWAP_ALLOWANCE_MB", argv[i], 1);
     } else if (a == "--plugin") {
       if (++i >= argc) { return arg_err("--plugin needs a path"); }
       plugins.push_back(argv[i]);
@@ -579,10 +673,17 @@ run(int argc, char** argv)
       ++failed;
       continue;
     }
+    vpipe::DiagnosticCapture why;
     const Status st = s->launch_pipeline(*h);
     if (st.code != 0) {
       std::fprintf(stderr, "vpipe: launch failed for '%s' (status %u)\n",
                    L.source.c_str(), st.code);
+      for (const std::string& line : why.lines()) {
+        std::fprintf(stderr, "  %s\n", line.c_str());
+      }
+      if (why.empty()) {
+        std::fprintf(stderr, "  (no reason reported)\n");
+      }
       s->unload_pipeline(*h);
       ++failed;
       continue;

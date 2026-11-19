@@ -1,7 +1,10 @@
 #include "generative-models/qwen3/metal-qwen-model-exec.h"
 
+#include "generative-models/shared/dflash-drafter.h"
 #include "generative-models/weight-set.h"
+#include "common/flex-bag.h"
 
+#include <algorithm>
 #include <limits>
 
 
@@ -31,6 +34,8 @@ MetalQwenModelExec::MetalQwenModelExec(
   // second copy of them.
   _model = MetalQwenModel::load(open_weight_set(model_dir, session), mc,
                                 cfg);
+  _mc = mc;
+  _session = session;
 }
 
 MetalQwenModelExec::CtxState*
@@ -39,6 +44,7 @@ MetalQwenModelExec::state_for_(ContextId ctx)
   if (_model == nullptr) {
     return nullptr;
   }
+  std::lock_guard<std::mutex> lk(_ctx_mu);
   auto it = _ctxmap.find(ctx.v);
   if (it != _ctxmap.end()) {
     return &it->second;
@@ -60,11 +66,19 @@ MetalQwenModelExec::context_seq_len(ContextId ctx) const
   }
   // Read-only: an unmapped context has no KV yet -- do NOT lazily
   // materialize one just to report its length.
-  auto it = _ctxmap.find(ctx.v);
-  if (it == _ctxmap.end()) {
+  const ContextId cid = metal_cid_(ctx);
+  if (!cid.valid()) {
     return 0;
   }
-  return _model->context_manager()->seq_len_of(it->second.metal_cid);
+  return _model->context_manager()->seq_len_of(cid);
+}
+
+ContextId
+MetalQwenModelExec::metal_cid_(ContextId ctx) const
+{
+  std::lock_guard<std::mutex> lk(_ctx_mu);
+  auto it = _ctxmap.find(ctx.v);
+  return it != _ctxmap.end() ? it->second.metal_cid : ContextId{};
 }
 
 std::int32_t
@@ -259,10 +273,23 @@ MetalQwenModelExec::mtp_generate(
   c.on_round   = on_tokens;
   c.hit_stop   = hit_stop;
   c.sampler    = sp;
+  // The penalty seen-set's start (gpu_sampler::kPrime), if the caller
+  // sent one.
+  std::vector<std::int32_t> prime;
+  {
+    const FlexData pv = bag::value(sp.extra, gpu_sampler::kPrime);
+    if (pv.is_array()) {
+      const std::span<const std::int64_t> s = pv.as_int_span();
+      prime.assign(s.begin(), s.end());
+    }
+  }
+  c.prime      = prime;
   std::vector<std::int32_t> out;
+  // draft_len 0: the depth measured a round (MtpDepthChoice)
   const bool ok = _model->mtp_decode(st->metal_cid, first_token, max_tokens,
-                                     out, /*draft_len=*/1, /*accepted_out=*/
-                                     nullptr, /*rounds_out=*/nullptr, c);
+                                     out, /*draft_len=*/0,
+                                     /*accepted_out=*/nullptr,
+                                     /*rounds_out=*/nullptr, c);
   if (produced) { *produced = static_cast<int>(out.size()); }
   return ok;
 }
@@ -338,6 +365,21 @@ MetalQwenModelExec::prefill_embeddings_mrope_buf(
   return argmax_(_logits);
 }
 
+std::int32_t
+MetalQwenModelExec::prefill_hc_spliced(ContextId ctx,
+                                       const std::vector<float>& emb,
+                                       const std::vector<std::int32_t>& ids,
+                                       const std::vector<std::int32_t>& pos,
+                                       int n)
+{
+  if (_model == nullptr || n <= 0) { return -1; }
+  CtxState* st = state_for_(ctx);
+  if (st == nullptr) { return -1; }
+  _logits = _model->prefill_hc_spliced(st->metal_cid, emb, ids, pos, n);
+  if (_logits.empty()) { return -1; }
+  return argmax_(_logits);
+}
+
 metal_compute::SharedBuffer
 MetalQwenModelExec::embed_text_buf(std::span<const std::int32_t> ids)
 {
@@ -352,17 +394,17 @@ MetalQwenModelExec::branch_context(ContextId parent, ContextId child)
   if (_model == nullptr) {
     return false;
   }
-  auto it = _ctxmap.find(parent.v);
-  if (it == _ctxmap.end()) {
+  const ContextId metal_parent = metal_cid_(parent);
+  if (!metal_parent.valid()) {
     return false;
   }
-  ContextId metal_child =
-      _model->context_manager()->branch(it->second.metal_cid);
+  ContextId metal_child = _model->context_manager()->branch(metal_parent);
   if (!metal_child.valid()) {
     return false;
   }
   CtxState st;
   st.metal_cid = metal_child;
+  std::lock_guard<std::mutex> lk(_ctx_mu);
   _ctxmap[child.v] = st;
   return true;
 }
@@ -371,13 +413,19 @@ void
 MetalQwenModelExec::release_context(ContextId ctx)
 {
   if (_model == nullptr) { return; }
-  auto it = _ctxmap.find(ctx.v);
-  if (it == _ctxmap.end()) { return; }
+  ContextId cid;
+  {
+    std::lock_guard<std::mutex> lk(_ctx_mu);
+    auto it = _ctxmap.find(ctx.v);
+    if (it == _ctxmap.end()) { return; }
+    cid = it->second.metal_cid;
+    _ctxmap.erase(it);
+  }
   // Return this context's KV pages to the pool (refcount drop; shared
-  // prefix pages survive until the last brancher releases) and drop the
-  // bookkeeping entry so a recycled ContextId re-acquires a fresh root.
-  _model->context_manager()->release(it->second.metal_cid);
-  _ctxmap.erase(it);
+  // prefix pages survive until the last brancher releases); the entry
+  // is gone already, so a recycled ContextId re-acquires a fresh root.
+  _model->forget_context(cid);
+  _model->context_manager()->release(cid);
 }
 
 bool
@@ -399,6 +447,7 @@ MetalQwenModelExec::reserve_branch_context(ContextId child, int max_tokens)
   if (ids.empty() || !ids[0].valid()) { return false; }
   CtxState st;
   st.metal_cid = ids[0];
+  std::lock_guard<std::mutex> lk(_ctx_mu);
   _ctxmap[child.v] = st;
   return true;
 }
@@ -407,20 +456,19 @@ bool
 MetalQwenModelExec::rebranch_context(ContextId parent, ContextId child)
 {
   if (_model == nullptr) { return false; }
-  auto pit = _ctxmap.find(parent.v);
-  auto cit = _ctxmap.find(child.v);
-  if (pit == _ctxmap.end() || cit == _ctxmap.end()) { return false; }
-  return _model->context_manager()->rebranch(cit->second.metal_cid,
-                                             pit->second.metal_cid);
+  const ContextId p = metal_cid_(parent);
+  const ContextId c = metal_cid_(child);
+  if (!p.valid() || !c.valid()) { return false; }
+  return _model->context_manager()->rebranch(c, p);
 }
 
 bool
 MetalQwenModelExec::detach_branch_context(ContextId child)
 {
   if (_model == nullptr) { return false; }
-  auto cit = _ctxmap.find(child.v);
-  if (cit == _ctxmap.end()) { return false; }
-  _model->context_manager()->detach_branch(cit->second.metal_cid);
+  const ContextId c = metal_cid_(child);
+  if (!c.valid()) { return false; }
+  _model->context_manager()->detach_branch(c);
   return true;
 }
 
@@ -430,5 +478,120 @@ MetalQwenModelExec::set_i8_gemm(bool on)
   if (_model != nullptr) { _model->set_i8_gemm(on); }
 }
 
+
+void*
+MetalQwenModelExec::query_extension(std::string_view id) noexcept
+{
+  if (id == spec_decode::kExtensionId) {
+    return static_cast<SpecDecodeExt*>(this);
+  }
+  if (id == context_io::kExtensionId) {
+    return static_cast<ContextIoExt*>(this);
+  }
+  if (id == prefill_progress::kExtensionId) {
+    return static_cast<PrefillProgressExt*>(this);
+  }
+  return ModelExec::query_extension(id);
+}
+
+bool
+MetalQwenModelExec::export_context(ContextId ctx,
+                                   const ContextManager::ByteSink& out)
+{
+  if (_model == nullptr) { return false; }
+  const ContextId cid = metal_cid_(ctx);
+  if (!cid.valid()) { return false; }
+  return _model->context_manager()->export_context(cid, out);
+}
+
+bool
+MetalQwenModelExec::import_context(ContextId ctx,
+                                   const ContextManager::ByteSource& in)
+{
+  if (_model == nullptr || metal_cid_(ctx).valid()) { return false; }
+  const ContextId cid = _model->context_manager()->import_context(in);
+  if (!cid.valid()) { return false; }
+  std::lock_guard<std::mutex> lk(_ctx_mu);
+  _ctxmap[ctx.v] = CtxState{cid};
+  return true;
+}
+
+std::string_view
+MetalQwenModelExec::drafter() const noexcept
+{
+  if (_model == nullptr) { return {}; }
+  if (const MetalDFlashDrafter* d = _model->dflash()) {
+    return d->config().v2() ? spec_decode::kDrafterDFlash2
+                            : spec_decode::kDrafterDFlash;
+  }
+  return _model->has_mtp() ? spec_decode::kDrafterMtp : std::string_view{};
+}
+
+bool
+MetalQwenModelExec::attach_drafter(const std::string& dir, int bits,
+                                   std::string* err)
+{
+  if (_model == nullptr) {
+    if (err) { *err = "no model"; }
+    return false;
+  }
+  if (dir.empty()) { return _model->attach_dflash(nullptr, err); }
+  MetalDFlashDrafter::Options opt;
+  opt.quant_bits = bits;
+  opt.target_bf16 = _model->config().use_bf16;
+  // A full-attention drafter layer caches the whole context: size it to
+  // what this model's KV can hold.
+  const int kv_cap =
+      _model->config().page_tokens * _model->config().max_pages;
+  opt.max_context = kv_cap > 0 ? std::max(1024, kv_cap) : 32768;
+  auto d = MetalDFlashDrafter::load(open_weight_set(dir, _session), _mc,
+                                    opt, err);
+  if (!d) { return false; }
+  return _model->attach_dflash(std::move(d), err);
+}
+
+bool
+MetalQwenModelExec::generate(const SpecDecodeRequest& rq,
+                             SpecDecodeResult* out)
+{
+  SpecDecodeResult r;
+  if (_model == nullptr || rq.max_tokens <= 0) {
+    if (out) { *out = std::move(r); }
+    return false;
+  }
+  CtxState* st = state_for_(rq.ctx);
+  if (st == nullptr) {
+    if (out) { *out = std::move(r); }
+    return false;
+  }
+  MtpDecodeCtl c;
+  c.rope_first = rq.rope_first;
+  if (rq.is_stop) { c.is_stop = *rq.is_stop; }
+  if (rq.on_tokens) { c.on_round = *rq.on_tokens; }
+  c.hit_stop = &r.hit_stop;
+  c.drafted = &r.drafted;
+  c.sampler = rq.sampler;
+  c.prime = rq.prime;
+  std::vector<std::int32_t> ids;
+  bool ok = false;
+  if (_model->has_dflash()) {
+    MetalQwenModel::SpecStats ss;
+    ok = _model->dflash_decode(st->metal_cid, rq.first_token, rq.max_tokens,
+                               ids, c, rq.block, &ss);
+    r.rounds = ss.rounds;
+    r.drafted = ss.drafted;
+    r.accepted = ss.accepted;
+  } else if (_model->has_mtp()) {
+    long acc = 0, rounds = 0;
+    ok = _model->mtp_decode(st->metal_cid, rq.first_token, rq.max_tokens,
+                            ids, /*draft_len (measured)=*/0, &acc, &rounds,
+                            c);
+    r.rounds = rounds;
+    r.accepted = acc;
+  }
+  r.produced = static_cast<int>(ids.size());
+  if (out) { *out = std::move(r); }
+  return ok;
+}
 
 }  // namespace vpipe::genai

@@ -1,6 +1,7 @@
 #include "generative-models/weight-set.h"
 
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/memory-owner.h"
 #include "common/vpipe-format.h"
 #include "generative-models/generative-model-manager.h"
 #include "interfaces/session-context-intf.h"
@@ -58,6 +59,18 @@ WeightSet::hash_(const metal_compute::SharedBuffer& b) const
   return (h ^ n) * 1099511628211ull;
 }
 
+const std::string&
+WeightSet::dir() const noexcept
+{
+  return _dir;
+}
+
+const MetalLlamaWeights&
+WeightSet::src() const noexcept
+{
+  return *_wts;
+}
+
 WeightSet::~WeightSet() = default;
 
 shared_ptr<WeightSet>
@@ -71,52 +84,48 @@ WeightSet::open(const string& dir, const SessionContextIntf* session)
     }
     return nullptr;
   }
-  // SAY SO IF THE PACK IS MISALIGNED, once per checkpoint and here
-  // rather than where it bites.
+  // A MISALIGNED PACK IS A NOTE NOW, NOT A WARNING.
   //
-  // THE COST THIS NAMES IS THE READ, not the mapping.
+  // It used to be one, and the finding behind it was real: F_NOCACHE
+  // only bypasses the buffer cache on a page-aligned offset, so a
+  // checkpoint whose data section sits off-boundary had every streamed
+  // read silently fall back to buffered I/O and grow file-backed pages
+  // one-for-one with what it read -- tens of gigabytes competing with
+  // the wired pool. MEASURED at the time: 4 GB read with F_NOCACHE set
+  // grew file pages by 0 MB at a page-aligned offset and 1813 MB at
+  // offset+8.
   //
-  // A misaligned tensor also cannot be used where it lies -- a Metal
-  // buffer offset must be 16-byte aligned -- and that used to be the
-  // headline here. It is deliberately not any more: zero-copy mapping is
-  // not the direction. Asking the OS to manage 4 KB pages over a 10+ GB
-  // checkpoint costs more than owning the bytes does, and a mapped
-  // weight can be neither wired, parked nor pooled (see
-  // docs/MODEL-MEMORY.md), so a loader that maps is outside every
-  // mechanism that protects memory. Leading with a penalty on the path
-  // this tree is leaving would point an operator at the wrong repair.
+  // THAT IS FIXED IN THE READER. pread_into() now reads on the 4 KB
+  // grid into staging buffers and copies the wanted bytes out, so the
+  // cache stays clean whatever the offset. What is left of the cost is
+  // one extra memcpy per uncached read, at memory bandwidth, and with
+  // four pieces in flight it hides under the other pieces' reads.
   //
-  // What is left is the one that is paid on EVERY path: F_NOCACHE only
-  // bypasses the buffer cache on a page-aligned offset, so a misaligned
-  // checkpoint's reads silently fall back to buffered I/O and grow the
-  // file cache one-for-one with what they read. That memory comes out of
-  // the weights themselves.
+  // So the warning had outlived its cause twice over. It fired at
+  // OPEN, before anything knew whether this checkpoint would ever be
+  // streamed, and it fired on every stock VAE -- which is read Copied
+  // through mmap+memcpy and never touches F_NOCACHE at all. Worse, its
+  // remedy (re-run vpipe's quantizer, which lays the same weights down
+  // aligned) is no remedy for a published checkpoint nobody quantized:
+  // an operator reading it could do nothing but wonder.
   //
-  // The remedy is the one the operator can act on, so it is part of the
-  // message: vpipe's own quantizer used to write tensors in an order
-  // that shifted everything after the first odd-sized one, and re-running
-  // it lays the same weights down aligned.
+  // The fact is still recorded, because it still explains a throughput
+  // question when one is being asked. It is recorded where a fact goes.
   if (session != nullptr) {
     const auto a = wts->alignment();
     if (a.misaligned > 0 || a.bad_shards > 0) {
-      const bool whole = a.bad_shards > 0;
-      session->warn(fmt(
-          "weights: '{}' is not aligned ({}). Every UNCACHED read of it "
-          "silently falls back to buffered I/O, because F_NOCACHE only "
-          "bypasses the cache on a page-aligned offset -- MEASURED, "
-          "6.2 GB read from a misaligned checkpoint grew the file cache "
-          "by 6.2 GB, which is memory taken from the weights themselves. "
-          "vpipe reads it on page boundaries and copies, so the cache "
-          "stays clean at the price of a memcpy. If this model was "
-          "quantized by an earlier version of vpipe, re-running the "
-          "quantization is recommended: it writes the same weights "
-          "aligned and costs neither",
+      session->log_debug(fmt(
+          "weights: '{}' is not aligned ({}). Costs one extra copy per "
+          "STREAMED read (pread_into stages on 4 KB boundaries so the "
+          "buffer cache stays clean); nothing on the mmap+memcpy path "
+          "every preloaded model takes",
           dir,
-          whole ? fmt("{} of {} shard data sections start off-boundary, "
-                      "which shifts every tensor in them",
-                      a.bad_shards, a.shards)()
-                : fmt("{} of {} tensors start off-boundary",
-                      a.misaligned, a.tensors)()));
+          a.bad_shards > 0
+              ? fmt("{} of {} shard data sections start off-boundary, "
+                    "which shifts every tensor in them",
+                    a.bad_shards, a.shards)()
+              : fmt("{} of {} tensors start off-boundary",
+                    a.misaligned, a.tensors)()));
     }
   }
   // make_shared is not usable: the constructor is private.
@@ -125,9 +134,9 @@ WeightSet::open(const string& dir, const SessionContextIntf* session)
 }
 
 void
-WeightSet::set_parked(bool p) noexcept
+WeightSet::note_parked(bool on)
 {
-  _parked.store(p, std::memory_order_relaxed);
+  _parked.store(on, std::memory_order_relaxed);
 }
 
 bool
@@ -158,6 +167,39 @@ WeightSet::parked() const noexcept
   return _parked.load(std::memory_order_relaxed);
 }
 
+void
+WeightSet::note_borrowed() noexcept
+{
+  _borrow_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t
+WeightSet::borrow_epoch() const noexcept
+{
+  return _borrow_epoch.load(std::memory_order_relaxed);
+}
+
+size_t
+WeightSet::park_unless_borrowed_since(uint64_t epoch)
+{
+  // _mu BEFORE the registry's lock: the order ensure_active_() already
+  // takes into reactivate(), so a park and a reactivation of this set
+  // cannot wait on each other. The registry's walk re-takes _mu, which
+  // is recursive.
+  //
+  // Relaxed loads are enough. A borrower that read a tensor did so under
+  // _mu AFTER its hand-out was counted, so taking _mu here makes that
+  // count visible; one that has not read yet may or may not be seen, and
+  // either way is safe -- abandoned here, or reactivating on its first
+  // read once the park is done.
+  lock_guard<recursive_mutex> lk(_mu);
+  if (_registry == nullptr ||
+      _borrow_epoch.load(std::memory_order_relaxed) != epoch) {
+    return 0;
+  }
+  return _registry->park(this);
+}
+
 uint64_t
 WeightSet::last_use() const noexcept
 {
@@ -183,6 +225,11 @@ WeightSet::ensure_active_()
   // Safe to call with _mu already held (every caller holds it): the
   // mutex is recursive, and the begin_restore()/end_restore() bracket
   // reactivate() runs just nests one level deeper.
+  //
+  // Cleared HERE, before reactivate() -- which clears it again through
+  // note_parked(false), and that repetition is deliberate. reload_weights()
+  // reads through these same accessors, so a flag still set at that point
+  // would recurse.
   _parked.store(false, std::memory_order_relaxed);
   if (_registry != nullptr) {
     bool reloaded = false;
@@ -221,6 +268,22 @@ WeightSet::has(const string& name) const
   return _wts->has(name);
 }
 
+namespace {
+
+// Whose what a set reads is (common/memory-owner.h): its checkpoint's,
+// whichever model asked -- kept, its weights; read as a model streams,
+// its blocks. A plain read() is a language model's weights read into its
+// own members as much as a DiT's block: blocks only where its caller is
+// loading one (stream_tensor, a model's block loader).
+struct OwnedRead {
+  MemoryOwnerScope owner;
+  MemoryUseScope   use;
+  OwnedRead(const string& dir, MemoryUse u) : owner(dir, "weights"), use(u)
+  {}
+};
+
+}  // namespace
+
 metal_compute::SharedBuffer
 WeightSet::alias_(const Entry& e) const
 {
@@ -244,6 +307,7 @@ WeightSet::tensor(const string& name, metal_compute::MetalCompute* mc,
   auto it = _cache.find(name);
   if (it != _cache.end()) { return alias_(it->second); }
 
+  OwnedRead own(_dir, MemoryUse::kWeights);
   metal_compute::SharedBuffer buf =
       res == Residency::Mapped ? _wts->load_mapped(name, mc)
                                : _wts->load(name, mc);
@@ -271,6 +335,9 @@ WeightSet::read(const string& name, metal_compute::MetalCompute* mc,
                 Residency res)
 {
   if (mc == nullptr) { return {}; }
+  OwnedRead own(_dir, memory_use_now() == MemoryUse::kBlocks
+                          ? MemoryUse::kBlocks
+                          : MemoryUse::kWeights);
   {
     lock_guard<recursive_mutex> lk(_mu);
     if (_mc == nullptr) { _mc = mc; }
@@ -308,6 +375,7 @@ metal_compute::SharedBuffer
 WeightSet::stream_tensor(const string& name, metal_compute::MetalCompute* mc,
                          Residency res)
 {
+  MemoryUseScope use(MemoryUse::kBlocks);
   metal_compute::SharedBuffer buf = read(name, mc, res);
   if (!buf.empty()) {
     _streamed_reads.fetch_add(1, std::memory_order_relaxed);
@@ -357,6 +425,7 @@ WeightSet::stream_derived(
     const function<metal_compute::SharedBuffer()>& build)
 {
   if (!build) { return {}; }
+  OwnedRead own(_dir, MemoryUse::kBlocks);
   metal_compute::SharedBuffer buf = build();
   if (buf.empty()) { return buf; }
   _streamed_reads.fetch_add(1, std::memory_order_relaxed);
@@ -375,6 +444,7 @@ WeightSet::derived(const string&                                  key,
   if (it != _cache.end()) { return alias_(it->second); }
   if (!build) { return {}; }
 
+  OwnedRead own(_dir, MemoryUse::kWeights);
   metal_compute::SharedBuffer buf = build();
   if (buf.empty()) { return {}; }
 

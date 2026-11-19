@@ -23,18 +23,25 @@ TextPromptStage::TextPromptStage(const SessionContextIntf* s,
   // construct for any config so a graph can be built/edited before the text is
   // supplied.
   _text = attr_str("text");
-  if (_text.empty()) {
+  if (this->config().is_object()
+      && this->config().as_object().contains("value")) {
+    _value = this->config().as_object().at("value");
+  }
+  if (_text.empty() && _value.is_null()) {
     fail_config(fmt(
-        "TextPromptStage('{}'): config.text is required (non-empty string)",
-        this->id()));
+        "TextPromptStage('{}'): config.text (a non-empty string) or "
+        "config.value is required", this->id()));
   }
   allocate_oports(spec().oports.size());
 }
 
 namespace {
 constexpr ConfigKey kAttrs[] = {
-  {.key = "text", .type = ConfigType::Text, .required = true,
+  {.key = "text", .type = ConfigType::Text,
    .doc = "the prompt text to emit as a FlexData string"},
+  {.key = "value", .type = ConfigType::Any,
+   .doc = "a FlexData value emitted as it is in place of `text` -- an "
+          "object beat a stage takes (text-chat's conversation)"},
 };
 const PortSpec kIports[] = {
   {.name = "trigger", .doc = "optional beat that gates re-emitting the text "
@@ -82,7 +89,18 @@ TextPromptStage::process(RuntimeContext& ctx)
 {
   // With a trigger iport wired, gate each emission on one inbound beat (the
   // payload type doesn't matter, only receipt); EOS upstream ends the stage.
-  const bool has_trigger = ctx.num_iports() >= 1;
+  //
+  // WIRED, not merely DECLARED. `{"src": "", "oport": 0}` is the spelling
+  // this tree uses for an optional iport left unconnected -- the composer
+  // writes it when an edge is deleted but the port row stays, and the
+  // loader turns it into an InEdge{nullptr}. It still COUNTS in
+  // num_iports(), so testing that alone takes the trigger branch on a
+  // port nothing will ever write to: the read returns immediate EOS and
+  // this source emits NOTHING, silently, with no warning. Every stage
+  // downstream then sees EOS and the whole graph "completes" in
+  // milliseconds having done no work.
+  const bool has_trigger =
+      ctx.num_iports() >= 1 && ctx.iport_connected(0);
   if (has_trigger) {
     auto t = co_await ctx.read(0);
     if (!t) {
@@ -97,7 +115,9 @@ TextPromptStage::process(RuntimeContext& ctx)
   _done = true;
 
   co_await ctx.write(
-      0, make_payload<FlexDataPayload>(FlexData::make_string(_text)));
+      0, make_payload<FlexDataPayload>(_value.is_null()
+                                           ? FlexData::make_string(_text)
+                                           : _value));
 
   if (!has_trigger) {
     ctx.signal_done();

@@ -295,6 +295,12 @@ export const api = {
   setStageConfig:(id, sid, cfg) => req('PUT',
                        `/api/pipelines/${pid(id)}/stages/${pid(sid)}/config`,
                        cfg),
+  // A buffer-less command to a stage of a RUNNING pipeline
+  // (docs/STAGE-COMMANDS.md): resolves to {state, result} or
+  // {state, error} once the stage answers.
+  stageCommand: (id, sid, name, args) => req('POST',
+                       `/api/pipelines/${pid(id)}/stages/${pid(sid)}/command`,
+                       { name, args: args || {} }),
 
   // User I/O console + interactive getline.
   ioConsole:     (since)   => req('GET',
@@ -333,6 +339,13 @@ export const api = {
   // failure.
   wiredPoolGet:  ()        => req('GET',  '/api/system/wired-pool'),
   wiredPoolSet:  (mb)      => req('PUT',  '/api/system/wired-pool', { mb }),
+
+  // The swap allowance: how much memory a run may plan to push OUT to
+  // the compressor or swap. {mb, swappable_mb}. No 409 -- it reserves
+  // nothing, so it moves in both directions while a pipeline runs.
+  swapAllowanceGet: ()     => req('GET',  '/api/system/swap-allowance'),
+  swapAllowanceSet: (mb)   => req('PUT',  '/api/system/swap-allowance',
+                                  { mb }),
 
   // Startup permission self-test report, shown in a dialog on connect.
   // {ready, has_warnings, checks:[{name,status,detail,hints:[...]}]}.

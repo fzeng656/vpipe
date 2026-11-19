@@ -42,9 +42,15 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "common/media-decode.h"
 #include "common/session.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
+#include "generative-models/weight-set.h"
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -53,6 +59,8 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <thread>
+#include <utility>
 #include <vector>
 
 using namespace vpipe;
@@ -278,6 +286,17 @@ TEST(minimax_h3_vvae, encode_matches_golden)
   SharedBuffer mom = m->encode(xb, T, H, W, &eerr);
   if (mom.empty()) { std::printf("[minimax_h3_vvae] %s\n", eerr.c_str()); }
   ASSERT_TRUE(!mom.empty());
+  // ENGAGEMENT before accuracy: on matrix cores the convs run on the
+  // hardware convolution unless told not to, and a golden that passed on
+  // the im2col route would say nothing about it. Every level of a 32^2
+  // clip reaches it -- the deep ones through the partial-tile entry.
+  const bool want_hw = mc->supports_matrix_cores() &&
+                       std::getenv("VPIPE_VAE_NO_HWCONV") == nullptr;
+  std::printf("[minimax_h3_vvae] encode route: %s (%d tuned shapes)\n",
+              m->uses_hwconv() ? "hardware conv" : "im2col + GEMM",
+              m->hwconv_tuned_shapes());
+  EXPECT_TRUE(m->uses_hwconv() == want_hw);
+  EXPECT_TRUE(!want_hw || m->hwconv_tuned_shapes() > 0);
   // The depth override changes the channel count, so size the
   // comparison from the golden rather than from the config.
   if (mom.byte_size() < ref.size() * 2) {
@@ -325,6 +344,404 @@ TEST(minimax_h3_vvae, encode_matches_golden)
 // meaningful -- but a transposed axis or a mismatched frame count
 // destroys the correlation outright, which is the failure being looked
 // for.
+// Each half loads at its first use and holds what the plan books for it
+// (held_bytes, off the headers): a load holds neither, an encode adds the
+// encoder alone, a decode the decoder. An encoding stage held the 4.6 GB
+// decoder before, never running it.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_vvae, each_half_loads_at_its_first_use)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &err));
+  auto ws = genai::WeightSet::open(
+      MetalMiniMaxH3VideoVae::resolve_vae_dir(root), nullptr);
+  ASSERT_TRUE(ws != nullptr);
+  if (!ws) { return; }
+  auto m = MetalMiniMaxH3VideoVae::load(ws, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (!m) { return; }
+  const std::size_t at_load = ws->stats().bytes;
+  const int T = 5, H = 256, W = 256, IC = cfg.in_channels;
+  const std::size_t n = (std::size_t)IC * T * H * W;
+  SharedBuffer xb = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!xb.empty());
+  std::memset(xb.contents(), 0, n * 2);
+  SharedBuffer mom = m->encode(xb, T, H, W, &err);
+  ASSERT_TRUE(!mom.empty());
+  const std::size_t after_enc = ws->stats().bytes;
+  const int lt = m->encoded_frames(T);
+  const int lh = H / cfg.patch, lw = W / cfg.patch;
+  SharedBuffer zb = mc->make_shared_buffer(
+      (std::size_t)lt * lh * lw * cfg.z_channels * 2);
+  std::memcpy(zb.contents(), mom.contents(), zb.byte_size());
+  SharedBuffer rgb = m->decode(zb, lt, lh, lw, &err);
+  ASSERT_TRUE(!rgb.empty());
+  const std::size_t after_dec = ws->stats().bytes;
+  using Half = MetalMiniMaxH3VideoVae::Half;
+  const std::size_t enc = MetalMiniMaxH3VideoVae::held_bytes(root,
+                                                             Half::kEncoder);
+  const std::size_t dec = MetalMiniMaxH3VideoVae::held_bytes(root,
+                                                             Half::kDecoder);
+  std::printf("[minimax_h3_vvae] held: at load %zu, encoder %zu (booked "
+              "%zu), decoder %zu (booked %zu)\n", at_load,
+              after_enc - at_load, enc, after_dec - after_enc, dec);
+  EXPECT_TRUE(at_load == 0);
+  EXPECT_TRUE(after_enc - at_load == enc);
+  EXPECT_TRUE(after_dec - after_enc == dec);
+}
+
+// A SHARE OF THE DECODE (set_unit_range: a decode split between hosts)
+// writes the whole clip's buffer, zero outside its own frames, and the
+// shares' buffers ADD to the clip decoded whole -- every tile stitch and
+// chunk fade a weighted sum, each share writing the terms of its own
+// tiles. Cut at a tile in a chunk's first row, at a row inside a chunk,
+// at a chunk's end and after its first tile: frames one share wrote alone
+// the whole decode's to the bit, the rest to bf16 rounding: each share's
+// part rounded in its stitch and its fade, then their sum -- two steps of
+// the largest but for a few pixels where a share's terms cancel (up to
+// ten, 1/64 at most, measured).
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (the video VAE's folder).
+TEST(minimax_h3_vvae, decode_shares_add_to_the_whole)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config c;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, c, &err));
+  // A 2 x 2 grid of 64-pixel tiles, several chunks.
+  c.tile_size = 64;
+  c.tile_overlap_min = 16;
+  auto m = MetalMiniMaxH3VideoVae::load(root, mc, c);
+  ASSERT_TRUE(m != nullptr);
+  if (!m) { return; }
+  const int LT = 14, lh = 6, lw = 6;
+  const std::size_t lplane = (std::size_t)lh * lw;
+  std::vector<std::uint16_t> zv((std::size_t)c.z_channels * LT * lplane);
+  for (std::size_t i = 0; i < zv.size(); ++i) {
+    zv[i] = f32_to_bf16_(std::sin(0.37f * (float)i) * 0.9f);
+  }
+  SharedBuffer zb = mc->make_shared_buffer(zv.size() * 2);
+  std::memcpy(zb.contents(), zv.data(), zv.size() * 2);
+  int F = 0;
+  SharedBuffer whole = m->decode_video(zb, LT, lh, lw, &F, &err);
+  ASSERT_TRUE(!whole.empty());
+  if (whole.empty()) { return; }
+  const int units = m->decode_units(LT, lh, lw);
+  const int tcs = c.tokens_per_chunk(), td = c.token_drop;
+  const int pad = ((-(LT + td) % tcs) + tcs) % tcs;
+  const int chunks = (LT + td + pad) / tcs - (td > 0 ? 1 : 0);
+  const int per = units / std::max(1, chunks);
+  ASSERT_TRUE(per == 4);   // the 2 x 2 grid
+  ASSERT_TRUE(units >= 3 * per);
+  const std::size_t plane = (std::size_t)lh * c.patch * lw * c.patch;
+  const std::size_t n = (std::size_t)c.out_channels * F * plane;
+  const auto* wv = static_cast<const std::uint16_t*>(whole.contents());
+  for (const int cut : {1, 2, per, per + 1, 2 * per + 1, units - 1}) {
+    m->set_unit_range(0, cut);
+    int F0 = 0, F1 = 0;
+    SharedBuffer a = m->decode_video(zb, LT, lh, lw, &F0, &err);
+    m->set_unit_range(cut, -1);
+    SharedBuffer b = m->decode_video(zb, LT, lh, lw, &F1, &err);
+    ASSERT_TRUE(!a.empty() && !b.empty() && F0 == F && F1 == F);
+    if (a.empty() || b.empty()) { return; }
+    const auto* av = static_cast<const std::uint16_t*>(a.contents());
+    const auto* bv = static_cast<const std::uint16_t*>(b.contents());
+    // Each share zero outside its frames.
+    const auto fa = m->unit_frames(LT, lh, lw, 0, cut);
+    const auto fb = m->unit_frames(LT, lh, lw, cut, units);
+    ASSERT_TRUE(fa.first == 0 && fb.second == F && fb.first < fa.second);
+    // Where one share wrote alone, its frames are the whole decode's to
+    // the bit; where both did, each pixel within two of bf16's steps.
+    std::size_t stray = 0, alone_off = 0, both_off = 0, both = 0;
+    double worst = 0, worst_abs = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+      const int f = (int)((i / plane) % (std::size_t)F);
+      if ((f >= fa.second && av[i] != 0) || (f < fb.first && bv[i] != 0)) {
+        ++stray;
+      }
+      const float want = bf16_to_f32_(wv[i]);
+      if (f < fb.first || f >= fa.second) {
+        alone_off += (f < fb.first ? av[i] : bv[i]) != wv[i];
+        continue;
+      }
+      const float got = bf16_to_f32_(f32_to_bf16_(bf16_to_f32_(av[i]) +
+                                                  bf16_to_f32_(bv[i])));
+      // A step of the largest of the parts and the result: where the
+      // parts nearly cancel, their own rounding is what remains.
+      const float mag = std::max({std::fabs(want),
+                                  std::fabs(bf16_to_f32_(av[i])),
+                                  std::fabs(bf16_to_f32_(bv[i])), 1e-6f});
+      const double ulp = std::ldexp(1.0, std::ilogb(mag) - 7);
+      const double d = std::fabs((double)got - want);
+      worst = std::max(worst, d / ulp);
+      worst_abs = std::max(worst_abs, d);
+      both_off += d > 2 * ulp;
+      ++both;
+    }
+    std::printf("[minimax_h3_vvae] shares cut at unit %d of %d: frames "
+                "[0, %d) + [%d, %d); alone %zu off, both worst %.1f steps "
+                "%.4f (%zu of %zu past 2)\n", cut, units, fa.second,
+                fb.first, F, alone_off, worst, worst_abs, both_off, both);
+    EXPECT_TRUE(stray == 0);
+    EXPECT_TRUE(alone_off == 0);
+    EXPECT_TRUE(worst_abs <= 1.0 / 32);
+    EXPECT_TRUE(both_off * 1000 <= both);
+  }
+}
+
+// decode_video writes each chunk into ONE clip as it goes, where it once
+// kept every chunk's piece and copied them into a second whole clip at the
+// end (two copies of the decode at the peak). The clip must be the old
+// one to the bit: restated here as it was -- every chunk through decode()
+// (a frame that fits one tile is not tiled), pieces kept, each chunk's
+// head cross-faded with the previous chunk's tail, concatenated, the pad
+// trimmed -- over a clip of several chunks.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+TEST(minimax_h3_vvae, decode_video_is_its_chunks_in_place)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  // tile 0: the checkpoint's 256-pixel tile over a frame it covers whole;
+  // else that tile size (overlap a quarter) over a 2 x 2 grid of tiles.
+  for (const int tile : {0, 64}) {
+    MetalMiniMaxH3VideoVae::Config c;
+    std::string err;
+    ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, c, &err));
+    if (tile > 0) {
+      c.tile_size = tile;
+      c.tile_overlap_min = tile / 4;
+    }
+    auto m = MetalMiniMaxH3VideoVae::load(root, mc, c);
+    ASSERT_TRUE(m != nullptr);
+    if (!m) { return; }
+    const int LT = 14, lh = tile > 0 ? 6 : 4, lw = tile > 0 ? 8 : 6;
+    const int ZC = c.z_channels, OC = c.out_channels;
+    const std::size_t lplane = (std::size_t)lh * lw;
+    std::vector<std::uint16_t> zv((std::size_t)ZC * LT * lplane);
+    for (std::size_t i = 0; i < zv.size(); ++i) {
+      zv[i] = f32_to_bf16_(std::sin(0.37f * (float)i) * 0.9f);
+    }
+    SharedBuffer zb = mc->make_shared_buffer(zv.size() * 2);
+    std::memcpy(zb.contents(), zv.data(), zv.size() * 2);
+    int F = 0;
+    SharedBuffer got = m->decode_video(zb, LT, lh, lw, &F, &err);
+    ASSERT_TRUE(!got.empty());
+    if (got.empty()) { return; }
+
+    // ---- the old algorithm ----
+    const int tcs = c.tokens_per_chunk(), td = c.token_drop, tr = c.patch_t;
+    const int tov = c.token_overlap(), fpp = c.frame_pre_pad();
+    const int fov = c.frame_overlap(), cnf = tcs * tr;
+    const int nt = LT + td;
+    const int pad = ((-nt % tcs) + tcs) % tcs;
+    const int chunks = (nt + pad) / tcs - (td > 0 ? 1 : 0);
+    const int zt = LT + pad, span = tcs + tov, cf = span * tr;
+    const std::size_t plane = (std::size_t)lh * c.patch * lw * c.patch;
+    struct Piece { std::vector<std::uint16_t> v; int n = 0; };
+    std::vector<Piece> pieces;
+    Piece overlap;
+    for (int i = 0; i < chunks; ++i) {
+      SharedBuffer sub = mc->make_shared_buffer((std::size_t)ZC * span *
+                                                lplane * 2);
+      auto* d = static_cast<std::uint16_t*>(sub.contents());
+      for (int ch = 0; ch < ZC; ++ch) {
+        for (int t = 0; t < span; ++t) {
+          const int st = std::min(std::min(i * tcs + t, zt - 1), LT - 1);
+          std::memcpy(d + ((std::size_t)ch * span + t) * lplane,
+                      zv.data() + ((std::size_t)ch * LT + st) * lplane,
+                      lplane * 2);
+        }
+      }
+      // The tiled decode as it was: every tile decoded and kept, then each
+      // cross-faded with the ORIGINAL tile above, then the one to its left,
+      // and its region written.
+      const int H = lh * c.patch, W = lw * c.patch;
+      const auto ys = minimax_h3::split_tiles(H, c.tile_size,
+                                              c.tile_overlap_min, c.patch);
+      const auto xs = minimax_h3::split_tiles(W, c.tile_size,
+                                              c.tile_overlap_min, c.patch);
+      const int rows = (int)ys.start.size(), cols = (int)xs.start.size();
+      std::vector<std::uint16_t> chunk((std::size_t)OC * cf * plane);
+      if (rows <= 1 && cols <= 1) {
+        SharedBuffer one = m->decode(sub, span, lh, lw, &err);
+        ASSERT_TRUE(!one.empty());
+        if (one.empty()) { return; }
+        std::memcpy(chunk.data(), one.contents(), chunk.size() * 2);
+      } else {
+        std::vector<std::vector<std::uint16_t>> tl;
+        for (int ti = 0; ti < rows; ++ti) {
+          for (int tj = 0; tj < cols; ++tj) {
+            const int y0 = ys.start[ti] / c.patch, th = ys.length[ti] / c.patch;
+            const int x0 = xs.start[tj] / c.patch, tw = xs.length[tj] / c.patch;
+            SharedBuffer st = mc->make_shared_buffer((std::size_t)ZC * span *
+                                                     th * tw * 2);
+            auto* sd = static_cast<std::uint16_t*>(st.contents());
+            for (int ch = 0; ch < ZC; ++ch) {
+              for (int t = 0; t < span; ++t) {
+                for (int r = 0; r < th; ++r) {
+                  std::memcpy(sd + (((std::size_t)ch * span + t) * th + r) * tw,
+                              d + ((std::size_t)ch * span + t) * lplane +
+                                  (std::size_t)(y0 + r) * lw + x0,
+                              (std::size_t)tw * 2);
+                }
+              }
+            }
+            SharedBuffer dt = m->decode(st, span, th, tw, &err);
+            ASSERT_TRUE(!dt.empty());
+            if (dt.empty()) { return; }
+            const auto* dp = static_cast<const std::uint16_t*>(dt.contents());
+            tl.emplace_back(dp, dp + (std::size_t)OC * cf * th * c.patch * tw *
+                                         c.patch);
+          }
+        }
+        std::vector<float> tmp;
+        for (int ti = 0; ti < rows; ++ti) {
+          const int th = ys.length[ti], oy = ys.start[ti];
+          for (int tj = 0; tj < cols; ++tj) {
+            const int tw = xs.length[tj], ox = xs.start[tj];
+            const auto& cur = tl[(std::size_t)(ti * cols + tj)];
+            const std::size_t tp = (std::size_t)th * tw;
+            tmp.resize((std::size_t)OC * cf * tp);
+            for (std::size_t k = 0; k < tmp.size(); ++k) {
+              tmp[k] = bf16_to_f32_(cur[k]);
+            }
+            if (ti > 0) {
+              const int ph = ys.length[ti - 1];
+              const int ext = std::min(std::min(ys.overlap[ti - 1], ph), th);
+              const auto& up = tl[(std::size_t)((ti - 1) * cols + tj)];
+              for (int q = 0; q < OC * cf; ++q) {
+                for (int r = 0; r < ext; ++r) {
+                  const float wb = (float)r / (float)ext;
+                  for (int x = 0; x < tw; ++x) {
+                    const std::size_t k = (std::size_t)q * tp + r * tw + x;
+                    tmp[k] = (1.0f - wb) *
+                                 bf16_to_f32_(up[(std::size_t)q * ph * tw +
+                                                 (ph - ext + r) * tw + x]) +
+                             wb * tmp[k];
+                  }
+                }
+              }
+            }
+            if (tj > 0) {
+              const int pw = xs.length[tj - 1];
+              const int ext = std::min(std::min(xs.overlap[tj - 1], pw), tw);
+              const auto& lf = tl[(std::size_t)(ti * cols + tj - 1)];
+              for (int q = 0; q < OC * cf; ++q) {
+                for (int r = 0; r < th; ++r) {
+                  for (int x = 0; x < ext; ++x) {
+                    const float wb = (float)x / (float)ext;
+                    const std::size_t k = (std::size_t)q * tp + r * tw + x;
+                    tmp[k] = (1.0f - wb) *
+                                 bf16_to_f32_(lf[(std::size_t)q * th * pw +
+                                                 r * pw + (pw - ext + x)]) +
+                             wb * tmp[k];
+                  }
+                }
+              }
+            }
+            const int wh = ti + 1 < rows ? th - ys.overlap[ti] : th;
+            const int ww = tj + 1 < cols ? tw - xs.overlap[tj] : tw;
+            for (int q = 0; q < OC * cf; ++q) {
+              for (int r = 0; r < wh; ++r) {
+                for (int x = 0; x < ww; ++x) {
+                  chunk[(std::size_t)q * plane + (oy + r) * W + (ox + x)] =
+                      f32_to_bf16_(tmp[(std::size_t)q * tp + r * tw + x]);
+                }
+              }
+            }
+          }
+        }
+      }
+      const std::uint16_t* cd = chunk.data();
+      for (int j = 0; j < (td > 0 ? 2 : 1); ++j) {
+        const int fs = j * cnf, avail = cf - fs;
+        if (avail <= fpp) { continue; }
+        Piece p;
+        p.n = std::min(cnf, avail) - fpp;
+        p.v.resize((std::size_t)OC * p.n * plane);
+        for (int ch = 0; ch < OC; ++ch) {
+          std::memcpy(p.v.data() + (std::size_t)ch * p.n * plane,
+                      cd + ((std::size_t)ch * cf + fs + fpp) * plane,
+                      (std::size_t)p.n * plane * 2);
+        }
+        if (j == 0) {
+          if (overlap.n > 0) {
+            const int ext = std::min(std::min(overlap.n, p.n), fov);
+            for (int ch = 0; ch < OC; ++ch) {
+              for (int f = 0; f < ext; ++f) {
+                const float wb = (float)f / (float)ext;
+                const std::size_t pb = ((std::size_t)ch * p.n + f) * plane;
+                const std::size_t ob = ((std::size_t)ch * overlap.n +
+                                        (overlap.n - ext + f)) * plane;
+                for (std::size_t q = 0; q < plane; ++q) {
+                  p.v[pb + q] = f32_to_bf16_(
+                      (1.0f - wb) * bf16_to_f32_(overlap.v[ob + q]) +
+                      wb * bf16_to_f32_(p.v[pb + q]));
+                }
+              }
+            }
+            overlap = Piece{};
+          }
+          pieces.push_back(std::move(p));
+        } else {
+          overlap = std::move(p);
+        }
+      }
+    }
+    if (overlap.n > 0) { pieces.push_back(std::move(overlap)); }
+    int frames = 0;
+    for (const Piece& p : pieces) { frames += p.n; }
+    int drop = 0;
+    for (int k = 0; k < pad; ++k) {
+      const int intra = c.clip_length % tr;
+      drop += (intra != 0 && (LT + k) % tcs == 0) ? intra : tr;
+    }
+    const int keep = frames - drop;
+    std::vector<std::uint16_t> want((std::size_t)OC * keep * plane);
+    int at = 0;
+    for (const Piece& p : pieces) {
+      for (int f = 0; f < p.n && at + f < keep; ++f) {
+        for (int ch = 0; ch < OC; ++ch) {
+          std::memcpy(want.data() + ((std::size_t)ch * keep + at + f) * plane,
+                      p.v.data() + ((std::size_t)ch * p.n + f) * plane,
+                      plane * 2);
+        }
+      }
+      at += p.n;
+    }
+    const bool same = F == keep && got.byte_size() >= want.size() * 2 &&
+                      std::memcmp(got.contents(), want.data(),
+                                  want.size() * 2) == 0;
+    const int ty = (int)minimax_h3::split_tiles(lh * c.patch, c.tile_size,
+                                                c.tile_overlap_min, c.patch)
+                       .start.size();
+    const int tx = (int)minimax_h3::split_tiles(lw * c.patch, c.tile_size,
+                                                c.tile_overlap_min, c.patch)
+                       .start.size();
+    std::printf("[minimax_h3_vvae] %d latents in %d chunks -> %d frames, "
+                "%d x %d tiles: the in-place clip %s the kept pieces'\n",
+                LT, chunks, F, ty, tx, same ? "IS" : "is NOT");
+    EXPECT_TRUE(tile == 0 || ty * tx > 1);
+    EXPECT_TRUE(chunks >= 2);
+    EXPECT_TRUE(same);
+  }
+}
+
 TEST(minimax_h3_vvae, encode_decode_round_trip)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
@@ -465,6 +882,158 @@ TEST(minimax_h3_vvae, encode_decode_round_trip)
 // two agreeing rather than image quality at that tile size.
 //
 // Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH, VPIPE_MINIMAX_H3_VVAE_VIDEO_GOLDEN.
+// THE ENCODE TICKS PER TILE, as the decode always has. A reference encode
+// is ~1.8 s per frame at 896x512, and before this the bar above it moved
+// once per REFERENCE -- minutes of one number for a long clip.
+//
+// Three things are pinned. The VAE's own count spans the whole clip
+// (clips x tiles, one total, reaching it). Its counters are the CALL's:
+// a second encode starts again from 0 against its own total, where a
+// counter left set would report against the first clip's. And the
+// reference encoder turns those ticks into a bar that moves INSIDE the
+// reference, landing exactly on the share it planned for it.
+//
+// Geometry chosen to clear the tiling floor: 256x512 is two tiles or
+// more across at the 256 tile, and 18 frames is two clips of 17.
+TEST(minimax_h3_vvae, encode_reports_progress_per_tile)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &cerr));
+  auto m = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  const int T = 18, H = 256, W = 512, IC = cfg.in_channels;
+  const int tiles =
+      (int)(minimax_h3::split_tiles(H, cfg.tile_size, cfg.tile_overlap_min,
+                                    cfg.patch).start.size() *
+            minimax_h3::split_tiles(W, cfg.tile_size, cfg.tile_overlap_min,
+                                    cfg.patch).start.size());
+  const int clips = (T + cfg.clip_length - 1) / cfg.clip_length;
+  std::printf("[minimax_h3_vvae] encode %dx%dx%d: %d clips x %d tiles\n",
+              T, W, H, clips, tiles);
+  EXPECT_TRUE(tiles >= 2 && clips == 2);
+
+  auto run = [&](int frames, std::vector<std::pair<int, int>>* seen) {
+    const std::size_t n = (std::size_t)IC * frames * H * W;
+    SharedBuffer xb = mc->make_shared_buffer(n * 2);
+    if (xb.empty()) { return false; }
+    auto* d = static_cast<std::uint16_t*>(xb.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      d[i] = f32_to_bf16_(std::sin((float)(i % 977) * 0.01f) * 0.5f);
+    }
+    m->set_tile_progress([seen](int done, int total) {
+      seen->emplace_back(done, total);
+    });
+    int lf = 0;
+    std::string err;
+    SharedBuffer out = m->encode_video(xb, frames, H, W, &lf, &err);
+    m->set_tile_progress(nullptr);
+    return !out.empty() && lf > 0;
+  };
+
+  std::vector<std::pair<int, int>> clip, still;
+  ASSERT_TRUE(run(T, &clip));
+  ASSERT_TRUE(run(1, &still));
+  auto check = [&](const std::vector<std::pair<int, int>>& v, int want,
+                  const char* what) {
+    bool steady = !v.empty(), forward = true;
+    int last = 0;
+    for (const auto& p : v) {
+      steady = steady && p.second == want;
+      forward = forward && p.first >= last;
+      last = p.first;
+    }
+    std::printf("[minimax_h3_vvae] %s: %zu reports, %d/%d .. %d/%d\n", what,
+                v.size(), v.empty() ? -1 : v.front().first,
+                v.empty() ? -1 : v.front().second,
+                v.empty() ? -1 : v.back().first,
+                v.empty() ? -1 : v.back().second);
+    EXPECT_TRUE(steady);
+    EXPECT_TRUE(forward);
+    // Both edges of every tile: entry and exit.
+    EXPECT_TRUE((int)v.size() == 2 * want);
+    EXPECT_TRUE(!v.empty() && v.front().first == 0 &&
+                v.back().first == want);
+  };
+  check(clip, clips * tiles, "clip");
+  // The second call's own total, from 0 -- not the first one's.
+  check(still, tiles, "still");
+
+  // ---- through the reference encoder ---------------------------------
+  namespace h3 = vpipe::genai::minimax_h3;
+  h3::ReferencePlan plan;
+  plan.target_frames     = 21;
+  plan.canvas_short_edge = 0;           // the clip's own 512x256
+  h3::MediaReference ref;
+  ref.kind       = h3::MediaReference::Kind::kVideo;
+  ref.num_frames = T;
+  ref.height     = H;
+  ref.width      = W;
+  ref.fps        = 24.0;
+  ref.rgb.resize((std::size_t)T * 3 * H * W);
+  for (std::size_t i = 0; i < ref.rgb.size(); ++i) {
+    ref.rgb[i] = (std::uint8_t)((i * 7) % 251);
+  }
+  std::vector<h3::MediaReference> refs;
+  refs.push_back(std::move(ref));
+
+  struct Seen {
+    std::uint64_t done, total;
+    std::string detail;
+  };
+  std::vector<Seen> seen;
+  h3::ReferenceEncoders models;
+  models.mc        = mc;
+  models.video_vae = m.get();
+  models.progress  = [&seen](std::uint64_t done, std::uint64_t total,
+                             const std::string& detail) {
+    seen.push_back({done, total, detail});
+  };
+  h3::EncodedReferences enc;
+  std::string rerr;
+  ASSERT_TRUE(h3::encode_references(refs, "p", plan, models, &enc, &rerr));
+  if (seen.empty()) { return; }
+
+  // The plan: one canvas frame for the rest, plus 2 clips x 17 frames of
+  // it through the VAE.
+  const std::uint64_t frame = (std::uint64_t)H * W;
+  const std::uint64_t want = frame + (std::uint64_t)clips *
+                                         cfg.clip_length * frame;
+  int tile_reports = 0, distinct = 0;
+  std::uint64_t prev = ~0ull;
+  bool steady = true;
+  for (const auto& p : seen) {
+    steady = steady && p.total == want;
+    if (p.detail.find("video VAE tile") != std::string::npos) {
+      ++tile_reports;
+      if (p.done != prev) { ++distinct; prev = p.done; }
+    }
+  }
+  std::printf("[minimax_h3_vvae] refenc bar: total %llu, %d tile reports, "
+              "%d distinct positions, last '%s'\n",
+              (unsigned long long)want, tile_reports, distinct,
+              seen.back().detail.c_str());
+  EXPECT_TRUE(steady);
+  EXPECT_TRUE(tile_reports == 2 * clips * tiles);
+  // It MOVES inside the reference: one position per finished tile, plus
+  // the start.
+  EXPECT_TRUE(distinct == clips * tiles + 1);
+  EXPECT_TRUE(seen.back().done == want);
+  // The VAE is left as it was found.
+  std::vector<std::pair<int, int>> after;
+  ASSERT_TRUE(run(1, &after));
+  EXPECT_TRUE((int)after.size() == 2 * tiles);
+}
+
 TEST(minimax_h3_vvae, video_chunking_matches_golden)
 {
   const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
@@ -499,6 +1068,16 @@ TEST(minimax_h3_vvae, video_chunking_matches_golden)
   }
   cfg.tile_size        = tile;
   cfg.tile_overlap_min = tov;
+  // VPIPE_MINIMAX_H3_VVAE_GOLDEN_ANE: the same golden with the ANE
+  // feed-forward tier on -- real encoded latents through the whole decoder.
+  // Pair with VPIPE_H3_VVAE_ANE_CHUNK (and _ANE_ROWS) for tiles shorter
+  // than one default chunk.
+  if (std::getenv("VPIPE_MINIMAX_H3_VVAE_GOLDEN_ANE") != nullptr) {
+    cfg.ane_ffn = true;
+    if (const char* r = std::getenv("VPIPE_MINIMAX_H3_VVAE_ANE_ROWS")) {
+      cfg.ane_rows = (float)std::atof(r);
+    }
+  }
 
   auto m = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
   ASSERT_TRUE(m != nullptr);
@@ -728,4 +1307,840 @@ TEST(minimax_h3_vvae, decode_bench)
               LT, lh, lw, frames, lw * cfg.patch, lh * cfg.patch, ms,
               ms / (double)frames, cfg.tile_size);
   EXPECT_TRUE(ms > 0.0);
+}
+
+// encode_video's wall clock and achieved rate on one clip -- the shape a
+// reference encode takes, and the number the FLOP meter is read against.
+// The rate is the GPU arithmetic the encode counted (gpu_flops()) over
+// the WALL clock, so host time inside the call counts against it.
+//
+// Env: VPIPE_MINIMAX_H3_VVAE_ENC_BENCH=1 + VPIPE_MINIMAX_H3_TEST_MODEL_PATH.
+// Geometry ..._ENC_BENCH_{T,H,W} (default 17x480x832, one clip of 12
+// tiles), ..._ENC_BENCH_REPS timed runs after a warm one (default 2), and
+// ..._ENC_BENCH_DUMP=<file> writes the last run's moments as f32.
+TEST(minimax_h3_vvae, encode_bench)
+{
+  const char* on   = std::getenv("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH");
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (on == nullptr || *on == '\0' || *on == '0') { return; }
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &err));
+  auto vae = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(vae != nullptr);
+  if (vae == nullptr) { return; }
+
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int T = envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_T", 17);
+  const int H = envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_H", 480);
+  const int W = envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_W", 832);
+  const int reps = std::max(1, envi("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_REPS",
+                                    2));
+  const int IC = cfg.in_channels;
+  const std::size_t n = (std::size_t)IC * T * H * W;
+  SharedBuffer x = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!x.empty());
+  if (x.empty()) { return; }
+  {
+    // Smooth in space, drifting in time, different per channel: a
+    // picture's statistics rather than noise's, so the norms see the
+    // kind of activation a real reference gives them.
+    auto* d = static_cast<std::uint16_t*>(x.contents());
+    std::size_t i = 0;
+    for (int c = 0; c < IC; ++c) {
+      for (int t = 0; t < T; ++t) {
+        for (int y = 0; y < H; ++y) {
+          for (int xx = 0; xx < W; ++xx) {
+            const float v = 0.6f * std::sin(0.031f * (float)xx +
+                                            0.017f * (float)y +
+                                            0.2f * (float)t + (float)c) +
+                            0.3f * std::cos(0.11f * (float)y -
+                                            0.05f * (float)xx);
+            d[i++] = f32_to_bf16_(v);
+          }
+        }
+      }
+    }
+  }
+  int lf = 0;
+  SharedBuffer out = vae->encode_video(x, T, H, W, &lf, &err);   // warm
+  if (out.empty()) { std::printf("[minimax_h3_vvae] %s\n", err.c_str()); }
+  ASSERT_TRUE(!out.empty() && lf > 0);
+  if (out.empty()) { return; }
+
+  for (int r = 0; r < reps; ++r) {
+    const std::uint64_t f0 = vae->gpu_flops().flushed();
+    const auto t0 = std::chrono::steady_clock::now();
+    out = vae->encode_video(x, T, H, W, &lf, &err);
+    const double ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    ASSERT_TRUE(!out.empty());
+    const double gf = (double)(vae->gpu_flops().flushed() - f0) * 1e-9;
+    std::printf("[minimax_h3_vvae] encode %d frames of %dx%d -> %d latent "
+                "frames in %.0f ms (%.1f ms/frame): %.1f GFLOP counted, "
+                "%.2f TFLOP/s\n", T, W, H, lf, ms, ms / (double)T, gf,
+                gf / ms);
+  }
+  if (const char* dp = std::getenv("VPIPE_MINIMAX_H3_VVAE_ENC_BENCH_DUMP")) {
+    std::FILE* f = std::fopen(dp, "wb");
+    if (f != nullptr) {
+      const auto* d = static_cast<const std::uint16_t*>(out.contents());
+      const std::size_t m = out.byte_size() / 2;
+      std::vector<float> v(m);
+      for (std::size_t k = 0; k < m; ++k) { v[k] = bf16_to_f32_(d[k]); }
+      std::fwrite(v.data(), 4, m, f);
+      std::fclose(f);
+      std::printf("[minimax_h3_vvae] dumped %zu floats to %s\n", m, dp);
+    }
+  }
+}
+
+// The ANE feed-forward tier against the GPU alone, one decode() tile.
+//
+// The split is exact arithmetic -- the feed-forward is row-independent -- so
+// what separates the runs is fp16 on the ANE's rows against bf16. Small, and
+// not zero: zero would mean no row reached the ANE.
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH, geometry ..._ANE_{LT,LH,LW}
+// (default 7x16x16: one production tile, 1797 rows), VPIPE_H3_VVAE_ANE_ROWS
+// pins the share.
+TEST(minimax_h3_vvae, decode_ane_matches_gpu)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto envi = [](const char* k, int d) {
+    const char* v = std::getenv(k);
+    return (v != nullptr && *v != '\0') ? std::atoi(v) : d;
+  };
+  const int LT = envi("VPIPE_MINIMAX_H3_VVAE_ANE_LT", 7);
+  const int lh = envi("VPIPE_MINIMAX_H3_VVAE_ANE_LH", 16);
+  const int lw = envi("VPIPE_MINIMAX_H3_VVAE_ANE_LW", 16);
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string err;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &err));
+
+  const std::size_t n = (std::size_t)cfg.z_channels * LT * lh * lw;
+  SharedBuffer z = mc->make_shared_buffer(n * 2);
+  ASSERT_TRUE(!z.empty());
+  if (z.empty()) { return; }
+  {
+    std::uint32_t sd = 0x51ced00du;
+    auto* d = static_cast<std::uint16_t*>(z.contents());
+    for (std::size_t i = 0; i < n; ++i) {
+      sd = sd * 1664525u + 1013904223u;
+      d[i] = f32_to_bf16_(((float)(sd >> 9) / 4194304.0f - 1.0f));
+    }
+  }
+  struct Arm {
+    std::vector<float> rgb;
+    double best_ms = 0.0;
+    bool   armed   = false;
+  };
+  auto run = [&](bool ane) {
+    Arm arm;
+    MetalMiniMaxH3VideoVae::Config rc = cfg;
+    rc.ane_ffn = ane;
+    if (const char* r = std::getenv("VPIPE_H3_VVAE_ANE_ROWS")) {
+      rc.ane_rows = (float)std::atof(r);
+    }
+    auto m = MetalMiniMaxH3VideoVae::load(root, mc, rc);
+    if (m == nullptr) { return arm; }
+    for (int i = 0; i < 3; ++i) {         // 0 warms, then best of two
+      const auto t0 = std::chrono::steady_clock::now();
+      std::string derr;
+      SharedBuffer out = m->decode(z, LT, lh, lw, &derr);
+      const double ms = std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (out.empty()) {
+        std::printf("[minimax_h3_vvae] decode: %s\n", derr.c_str());
+        return Arm{};
+      }
+      if (i == 0) {
+        const auto* p = static_cast<const std::uint16_t*>(out.contents());
+        arm.rgb.resize(out.byte_size() / 2);
+        for (std::size_t k = 0; k < arm.rgb.size(); ++k) {
+          arm.rgb[k] = bf16_to_f32_(p[k]);
+        }
+      } else if (arm.best_ms == 0.0 || ms < arm.best_ms) {
+        arm.best_ms = ms;
+      }
+    }
+    arm.armed = m->ane_armed();
+    return arm;
+  };
+  const Arm gpu = run(false);
+  const Arm ane = run(true);
+  ASSERT_TRUE(!gpu.rgb.empty() && gpu.rgb.size() == ane.rgb.size());
+  if (gpu.rgb.empty() || gpu.rgb.size() != ane.rgb.size()) { return; }
+  double num = 0.0, den = 0.0, worst = 0.0;
+  std::size_t bad = 0;
+  for (std::size_t k = 0; k < gpu.rgb.size(); ++k) {
+    if (!std::isfinite(ane.rgb[k])) { ++bad; continue; }
+    const double d = (double)ane.rgb[k] - (double)gpu.rgb[k];
+    num += d * d;
+    den += (double)gpu.rgb[k] * (double)gpu.rgb[k];
+    worst = std::max(worst, std::fabs(d));
+  }
+  const double rel = den > 0.0 ? std::sqrt(num / den) : 0.0;
+  std::printf("[minimax_h3_vvae] ANE vs GPU decode %dx%dx%d: rel-L2 %.6f, max "
+              "abs %.4f, %zu non-finite | GPU-only %.0f ms, ANE split %.0f "
+              "ms, %.3fx\n", LT, lh, lw, rel, worst, bad, gpu.best_ms,
+              ane.best_ms, ane.best_ms > 0.0 ? gpu.best_ms / ane.best_ms : 0.0);
+  EXPECT_TRUE(ane.armed);
+  EXPECT_TRUE(bad == 0);
+  EXPECT_TRUE(rel < 0.02 && rel > 0.0);
+  if (!ane.armed) { return; }
+
+  // THE GPU FALLBACK, forced (VPIPE_ANE_FAIL: the tier reads it when the
+  // first decode builds it). The FIRST split losing every ANE row leaves
+  // the whole decode the GPU's, which proves no later block split again.
+  // A PINNED share of 512-row chunks losing only its SECOND chunk is the
+  // in-place case -- s.nm is the feed-forward's input and output, so the
+  // rows before the loss are outputs and the rows after it must still be
+  // inputs; recomputing the wrong range lands far from the GPU arm.
+  auto failing = [&](const char* spec, bool pinned, bool* latched) {
+    std::vector<float> rgb;
+    MetalMiniMaxH3VideoVae::Config rc = cfg;
+    rc.ane_ffn  = true;
+    rc.ane_rows = pinned ? 1.0f : 0.0f;
+    auto m = MetalMiniMaxH3VideoVae::load(root, mc, rc);
+    if (m == nullptr) { return rgb; }
+    setenv("VPIPE_ANE_FAIL", spec, 1);
+    if (pinned) { setenv("VPIPE_H3_VVAE_ANE_CHUNK", "512", 1); }
+    std::string derr;
+    SharedBuffer out = m->decode(z, LT, lh, lw, &derr);
+    unsetenv("VPIPE_ANE_FAIL");
+    if (pinned) { unsetenv("VPIPE_H3_VVAE_ANE_CHUNK"); }
+    if (out.empty()) {
+      std::printf("[minimax_h3_vvae] decode: %s\n", derr.c_str());
+      return rgb;
+    }
+    const auto* p = static_cast<const std::uint16_t*>(out.contents());
+    rgb.resize(out.byte_size() / 2);
+    for (std::size_t k = 0; k < rgb.size(); ++k) {
+      rgb[k] = bf16_to_f32_(p[k]);
+    }
+    *latched = m->ane_gpu_only();
+    return rgb;
+  };
+  auto rel_of = [&](const std::vector<float>& a, bool* finite) {
+    double nm2 = 0.0, dn2 = 0.0;
+    *finite = !a.empty();
+    for (std::size_t k = 0; k < a.size() && k < gpu.rgb.size(); ++k) {
+      if (!std::isfinite(a[k])) { *finite = false; continue; }
+      const double d = (double)a[k] - (double)gpu.rgb[k];
+      nm2 += d * d;
+      dn2 += (double)gpu.rgb[k] * (double)gpu.rgb[k];
+    }
+    return dn2 > 0.0 ? std::sqrt(nm2 / dn2) : 0.0;
+  };
+  bool l0 = false, l1 = false, fin0 = false, fin1 = false;
+  const std::vector<float> f0 = failing("0:0", false, &l0);
+  const std::vector<float> f1 = failing("0:1", true, &l1);
+  ASSERT_TRUE(f0.size() == gpu.rgb.size() && f1.size() == gpu.rgb.size());
+  if (f0.size() != gpu.rgb.size() || f1.size() != gpu.rgb.size()) {
+    return;
+  }
+  const double r_f0 = rel_of(f0, &fin0);
+  const double r_f1 = rel_of(f1, &fin1);
+  std::printf("[minimax_h3_vvae] ANE rows lost -> GPU: rel-L2 %.4e (first "
+              "split, every row), %.4e (second 512-row chunk of a pinned "
+              "share) against GPU-only\n", r_f0, r_f1);
+  EXPECT_TRUE(l0);                 // engaged: the tier fell back
+  EXPECT_TRUE(l1);
+  EXPECT_TRUE(fin0 && fin1);
+  EXPECT_TRUE(r_f0 < 1e-6);        // every row the GPU's
+  EXPECT_TRUE(r_f0 < 0.01 * rel);
+  EXPECT_TRUE(r_f1 < 0.02);        // the right rows were recomputed
+  EXPECT_TRUE(r_f1 > r_f0);        // and the ANE's first chunk kept
+}
+
+// ---------------------------------------------------------------------
+// The SINGLE-LATENT-FRAME image decode.
+//
+// H3's encoder turns one still into exactly one latent frame, and the
+// chunked video decoder cannot turn that back into a picture: it spends
+// `token_drop` frames priming its temporal window, so it needs 7 latent
+// frames before it emits anything and refuses 1 outright. An
+// image-trained checkpoint closes the gap by fine-tuning the decoder to
+// read one token alone -- the encoder, `quant_conv` and the whitening
+// are left frozen, so the LATENT SPACE is the same one and a latent from
+// any H3 model decodes here.
+//
+// What these check that nothing else does:
+//
+//   * the capability is read from the CHECKPOINT and never assumed.
+//     Both files carry the same 562 tensor names at the same shapes, so
+//     nothing about the weights distinguishes them and the video
+//     decoder would return a correctly shaped picture of the wrong
+//     thing.
+//   * which of the `patch_t` pixel frames a latent token expands to is
+//     the picture. Off by one is not a crash and not noise -- it is a
+//     plausible, blurred image, because the neighbouring frames of a
+//     still's block are near-copies of it.
+//
+// Env: VPIPE_MINIMAX_H3_IMAGE_VAE_PATH (the image checkpoint),
+// VPIPE_MINIMAX_H3_IMAGE_SRC (a photograph to round-trip).
+// ---------------------------------------------------------------------
+
+namespace {
+
+// The reference's pixel normalization, which is IMAGENET's and not
+// [-1, 1]: a round trip run in the wrong space reconstructs a
+// contrast-shifted image rather than a broken one.
+constexpr float kInMean[3] = {0.485f, 0.456f, 0.406f};
+constexpr float kInStd[3]  = {0.229f, 0.224f, 0.225f};
+
+}  // namespace
+
+TEST(minimax_h3_vvae, image_capability_is_declared_by_the_checkpoint)
+{
+  const char* img = std::getenv("VPIPE_MINIMAX_H3_IMAGE_VAE_PATH");
+  if (img == nullptr || *img == '\0') { return; }
+
+  MetalMiniMaxH3VideoVae::Config icfg;
+  std::string ierr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(img, icfg, &ierr));
+  if (!ierr.empty()) { std::printf("[minimax_h3_vvae] %s\n", ierr.c_str()); }
+  EXPECT_TRUE(icfg.t1_direct);
+  // The released checkpoint's slice, which is also the pad the chunked
+  // path already discards -- `frame_pre_pad()` for a 17-frame clip at a
+  // temporal stride of 4. Agreeing with that derivation is why the
+  // default is safe; it is still READ, because a later fine-tune is
+  // free to park the picture elsewhere.
+  EXPECT_TRUE(icfg.t1_output_slice == 3);
+  EXPECT_TRUE(icfg.t1_output_slice == icfg.frame_pre_pad());
+  // Same geometry and same latent space as the video checkpoint: this is
+  // what makes it a drop-in decoder rather than a second model.
+  EXPECT_TRUE(icfg.z_channels == 24 && icfg.patch == 16 && icfg.patch_t == 4);
+
+  // The tiling must land on the patch grid, or `split_tiles` lays a
+  // union that overruns the image -- see
+  // minimax_h3_layout.vae_tile_split_needs_patch_aligned_geometry.
+  EXPECT_TRUE(icfg.tile_size % icfg.patch == 0);
+  EXPECT_TRUE(icfg.tile_overlap_min % icfg.patch == 0);
+
+  // And the env override cannot put it off that grid. A value that is
+  // not a whole number of patches is IGNORED rather than honoured,
+  // which is the same answer the config path gives by refusing.
+  const int was = icfg.tile_size;
+  ::setenv("VPIPE_H3_VVAE_TILE", "250", 1);
+  MetalMiniMaxH3VideoVae::Config bad;
+  const bool ok = MetalMiniMaxH3VideoVae::config_from_json(img, bad, nullptr);
+  ::unsetenv("VPIPE_H3_VVAE_TILE");
+  EXPECT_TRUE(ok);
+  EXPECT_TRUE(bad.tile_size == was);
+
+  // The VIDEO checkpoint must NOT claim it.
+  const char* vid = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (vid == nullptr || *vid == '\0') { return; }
+  MetalMiniMaxH3VideoVae::Config vcfg;
+  std::string verr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(vid, vcfg, &verr));
+  EXPECT_TRUE(!vcfg.t1_direct);
+}
+
+TEST(minimax_h3_vvae, image_round_trip)
+{
+  const char* img = std::getenv("VPIPE_MINIMAX_H3_IMAGE_VAE_PATH");
+  const char* src = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SRC");
+  if (img == nullptr || *img == '\0' || src == nullptr || *src == '\0') {
+    return;
+  }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  std::string derr;
+  auto pic = decode_image_file(sess.ffmpeg_libraries(), src, &derr);
+  if (!pic.has_value()) { std::printf("[minimax_h3_vvae] %s\n", derr.c_str()); }
+  ASSERT_TRUE(pic.has_value());
+  if (!pic.has_value()) { return; }
+
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(img, cfg, &cerr));
+  ASSERT_TRUE(cfg.t1_direct);
+  if (!cfg.t1_direct) { return; }
+
+  // A CENTRE CROP to a whole number of latent cells, not a resample: a
+  // resample is a second lossy step and this measures one. 512 is the
+  // size the checkpoint's own validation number is quoted at.
+  int side = 512;
+  if (const char* s = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SIDE")) {
+    side = std::atoi(s);
+  }
+  side = std::min({side, pic->width, pic->height});
+  side -= side % cfg.patch;
+  ASSERT_TRUE(side >= cfg.patch);
+  if (side < cfg.patch) { return; }
+  const int x0 = (pic->width - side) / 2, y0 = (pic->height - side) / 2;
+
+  const int IC = cfg.in_channels, H = side, W = side;
+  const std::size_t plane = (std::size_t)H * W;
+  SharedBuffer xb = mc->make_shared_buffer((std::size_t)IC * plane * 2);
+  ASSERT_TRUE(!xb.empty());
+  std::vector<float> ref((std::size_t)IC * plane);   // the source, in [0,1]
+  {
+    auto* d = static_cast<std::uint16_t*>(xb.contents());
+    for (int c = 0; c < IC; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          const std::size_t s =
+              ((std::size_t)c * pic->height + (y0 + y)) * pic->width + x0 + x;
+          const float p = (float)pic->rgb[s] / 255.0f;
+          const std::size_t i = (std::size_t)c * plane + (std::size_t)y * W + x;
+          ref[i] = p;
+          d[i] = f32_to_bf16_((p - kInMean[c]) / kInStd[c]);
+        }
+      }
+    }
+  }
+
+  // Slice override, for the sweep that shows the checkpoint's own answer
+  // is the right one: the four pixel frames of a still's block are near
+  // copies of each other, so a wrong slice is a blurred picture rather
+  // than a broken one and no shape check would catch it.
+  if (const char* s = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SLICE")) {
+    cfg.t1_output_slice = std::atoi(s);
+  }
+  auto m = MetalMiniMaxH3VideoVae::load(img, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(m->can_decode_image());
+
+  // ONE still in, ONE latent frame out -- the encoder's own answer, not
+  // an assumption: `encoded_frames(1)` is 1 because the causal temporal
+  // padding leaves a length-1 axis at length 1.
+  std::string eerr;
+  SharedBuffer mom = m->encode(xb, 1, H, W, &eerr);
+  if (mom.empty()) { std::printf("[minimax_h3_vvae] %s\n", eerr.c_str()); }
+  ASSERT_TRUE(!mom.empty());
+  if (mom.empty()) { return; }
+  ASSERT_TRUE(m->encoded_frames(1) == 1);
+
+  const int lh = H / cfg.patch, lw = W / cfg.patch;
+  const std::size_t voxels = (std::size_t)lh * lw;
+  // Moments are mean|logvar on the channel axis, so the mean is the
+  // leading z_channels planes -- already channel-first, no repacking.
+  SharedBuffer zb = mc->make_shared_buffer(voxels * cfg.z_channels * 2);
+  ASSERT_TRUE(!zb.empty());
+  std::memcpy(zb.contents(), mom.contents(),
+              voxels * (std::size_t)cfg.z_channels * 2);
+
+  // PSNR over the two, in [0, 1] -- the quantity the checkpoint's own
+  // validation number is stated in, so the two are comparable.
+  auto psnr_of = [&](const SharedBuffer& out) {
+    const auto* o = static_cast<const std::uint16_t*>(out.contents());
+    double se = 0.0;
+    for (int c = 0; c < IC; ++c) {
+      for (std::size_t i = 0; i < plane; ++i) {
+        const std::size_t k = (std::size_t)c * plane + i;
+        const float v = bf16_to_f32_(o[k]) * kInStd[c] + kInMean[c];
+        const double d = (double)v - (double)ref[k];
+        se += d * d;
+      }
+    }
+    const double mse = se / (double)((std::size_t)IC * plane);
+    return mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+  };
+
+  // TILED against WHOLE-IMAGE, because the two are different functions
+  // and only one of them is what the checkpoint was validated as. The
+  // decoder's rope is normalized to the extent it is handed, so a 256
+  // tile and a whole 512 image put every token at a different
+  // coordinate; the video path tiles because attention is quadratic,
+  // which is a cost argument and not a correctness one at image sizes.
+  //
+  // ONE MODEL RESIDENT AT A TIME. `load(dir, ...)` opens a PRIVATE
+  // weight set, so holding both arms at once is two copies of a 5.2 GB
+  // checkpoint -- which on a 16 GB box is not a slow test but a wedged
+  // machine. The first is released before the second is opened, and the
+  // latent outlives both because it is an ordinary buffer.
+  std::string terr;
+  SharedBuffer tiled = m->decode_image(zb, lh, lw, &terr);
+  if (tiled.empty()) { std::printf("[minimax_h3_vvae] %s\n", terr.c_str()); }
+  ASSERT_TRUE(!tiled.empty());
+  if (tiled.empty()) { return; }
+  const double tiled_db = psnr_of(tiled);
+  const int tile_was = cfg.tile_size;
+  tiled = SharedBuffer{};
+  m.reset();
+
+  MetalMiniMaxH3VideoVae::Config wcfg = cfg;
+  wcfg.tile_size = std::max(H, W);          // one tile = no tiling
+  auto wm = MetalMiniMaxH3VideoVae::load(img, mc, wcfg);
+  ASSERT_TRUE(wm != nullptr);
+  if (wm == nullptr) { return; }
+  std::string werr;
+  SharedBuffer whole = wm->decode_image(zb, lh, lw, &werr);
+  if (whole.empty()) { std::printf("[minimax_h3_vvae] %s\n", werr.c_str()); }
+  ASSERT_TRUE(!whole.empty());
+  if (whole.empty()) { return; }
+  const double whole_db = psnr_of(whole);
+
+  std::printf("[minimax_h3_vvae] image round trip %dx%d (latent %dx%d), slice "
+              "%d: PSNR %.2f dB tiled@%d, %.2f dB whole-image | the "
+              "checkpoint reports 30.44 dB over a 64-image 512px set\n",
+              H, W, lh, lw, cfg.t1_output_slice, tiled_db, tile_was, whole_db);
+
+  // A FLOOR, not the published number: that one is a mean over 64
+  // images and this is one crop. What it catches is the failure that
+  // looks like success -- a wrong output slice, the un-fine-tuned
+  // decoder, or the wrong pixel normalization, all of which land far
+  // below this while still producing a picture-shaped buffer.
+  EXPECT_TRUE(tiled_db > 25.0);
+
+  // TILING AT THE CHECKPOINT'S OWN 256 IS REQUIRED, not an optimization,
+  // and this is the assertion that says so. MEASURED on a 512px centre
+  // crop: 30.97 dB tiled against 23.27 dB whole-image -- 7.7 dB, and the
+  // tiled arm lands on the 30.44 dB the checkpoint reports while the
+  // whole-image arm is nowhere near it.
+  //
+  // The reason is the rope, not the seams. `build_rope_` normalizes
+  // every axis to the extent it is HANDED, so a 512px decode puts each
+  // token at a coordinate no 256px tile ever occupies -- and this
+  // decoder was fine-tuned on a 256 -> 384 px curriculum. Bigger tiles
+  // are not "less seam for more compute" here; they are a different
+  // function, and a worse one.
+  //
+  // ONLY ABOVE THE TILE. At or below `tile_size` the image is a single
+  // tile and the two arms are the SAME function -- MEASURED 28.14 dB
+  // against 28.14 dB at 256px -- so asserting a strict win there fails
+  // on an equality rather than on a defect.
+  if (H > tile_was || W > tile_was) {
+    EXPECT_TRUE(tiled_db > whole_db);
+  } else {
+    EXPECT_TRUE(std::fabs(tiled_db - whole_db) < 1e-6);
+  }
+}
+
+// The STOCK video checkpoint reads a still as the reference's ComfyUI VAE
+// does -- a chunk of copies of the token, its first real frame kept --
+// and that is the picture, where the token decoded alone is not. With
+// VPIPE_MINIMAX_H3_IMAGE_SRC a real picture is round-tripped both ways.
+TEST(minimax_h3_vvae, decode_image_reads_a_still_on_a_video_checkpoint)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &cerr));
+  ASSERT_TRUE(!cfg.t1_direct);
+  auto m = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+  EXPECT_TRUE(m->can_decode_image());
+
+  // A picture of the grid's size, whatever the latent holds.
+  {
+    const int lh = 4, lw = 4;
+    SharedBuffer zb =
+        mc->make_shared_buffer((std::size_t)lh * lw * cfg.z_channels * 2);
+    ASSERT_TRUE(!zb.empty());
+    std::memset(zb.contents(), 0, zb.byte_size());
+    std::string err;
+    SharedBuffer out = m->decode_image(zb, lh, lw, &err);
+    if (out.empty()) { std::printf("[minimax_h3_vvae] %s\n", err.c_str()); }
+    ASSERT_TRUE(!out.empty());
+    EXPECT_TRUE(out.byte_size() == (std::size_t)cfg.out_channels *
+                                       (lh * cfg.patch) * (lw * cfg.patch) *
+                                       2);
+  }
+
+  const char* src = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SRC");
+  if (src == nullptr || *src == '\0') { return; }
+  std::string derr;
+  auto pic = decode_image_file(sess.ffmpeg_libraries(), src, &derr);
+  if (!pic.has_value()) { std::printf("[minimax_h3_vvae] %s\n", derr.c_str()); }
+  ASSERT_TRUE(pic.has_value());
+  if (!pic.has_value()) { return; }
+
+  // A centre crop to whole latent cells, as image_round_trip takes.
+  int side = 512;
+  if (const char* s = std::getenv("VPIPE_MINIMAX_H3_IMAGE_SIDE")) {
+    side = std::atoi(s);
+  }
+  side = std::min({side, pic->width, pic->height});
+  side -= side % cfg.patch;
+  ASSERT_TRUE(side >= cfg.patch);
+  if (side < cfg.patch) { return; }
+  const int x0 = (pic->width - side) / 2, y0 = (pic->height - side) / 2;
+  const int IC = cfg.in_channels, H = side, W = side;
+  const std::size_t plane = (std::size_t)H * W;
+  SharedBuffer xb = mc->make_shared_buffer((std::size_t)IC * plane * 2);
+  ASSERT_TRUE(!xb.empty());
+  std::vector<float> ref((std::size_t)IC * plane);   // the source, in [0,1]
+  {
+    auto* d = static_cast<std::uint16_t*>(xb.contents());
+    for (int c = 0; c < IC; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          const std::size_t s =
+              ((std::size_t)c * pic->height + (y0 + y)) * pic->width + x0 + x;
+          const float p = (float)pic->rgb[s] / 255.0f;
+          const std::size_t i = (std::size_t)c * plane + (std::size_t)y * W + x;
+          ref[i] = p;
+          d[i] = f32_to_bf16_((p - kInMean[c]) / kInStd[c]);
+        }
+      }
+    }
+  }
+
+  std::string eerr;
+  SharedBuffer mom = m->encode(xb, 1, H, W, &eerr);
+  if (mom.empty()) { std::printf("[minimax_h3_vvae] %s\n", eerr.c_str()); }
+  ASSERT_TRUE(!mom.empty());
+  if (mom.empty()) { return; }
+  ASSERT_TRUE(m->encoded_frames(1) == 1);
+  const int lh = H / cfg.patch, lw = W / cfg.patch;
+  const std::size_t voxels = (std::size_t)lh * lw;
+  SharedBuffer zb = mc->make_shared_buffer(voxels * cfg.z_channels * 2);
+  ASSERT_TRUE(!zb.empty());
+  std::memcpy(zb.contents(), mom.contents(),
+              voxels * (std::size_t)cfg.z_channels * 2);
+
+  auto psnr_of = [&](const SharedBuffer& out) {
+    const auto* o = static_cast<const std::uint16_t*>(out.contents());
+    double se = 0.0;
+    for (int c = 0; c < IC; ++c) {
+      for (std::size_t i = 0; i < plane; ++i) {
+        const std::size_t k = (std::size_t)c * plane + i;
+        const float v = bf16_to_f32_(o[k]) * kInStd[c] + kInMean[c];
+        const double d = (double)v - (double)ref[k];
+        se += d * d;
+      }
+    }
+    const double mse = se / (double)((std::size_t)IC * plane);
+    return mse > 0.0 ? 10.0 * std::log10(1.0 / mse) : 99.0;
+  };
+
+  std::string terr;
+  SharedBuffer copies = m->decode_image(zb, lh, lw, &terr);
+  if (copies.empty()) { std::printf("[minimax_h3_vvae] %s\n", terr.c_str()); }
+  ASSERT_TRUE(!copies.empty());
+  if (copies.empty()) { return; }
+  const double copies_db = psnr_of(copies);
+  copies = SharedBuffer{};
+  m.reset();   // one 5 GB model resident at a time
+
+  // The token ALONE, through the same weights: what a checkpoint
+  // claiming `t1_direct` that was never fine-tuned for it would decode.
+  MetalMiniMaxH3VideoVae::Config lone = cfg;
+  lone.t1_direct       = true;
+  lone.t1_output_slice = cfg.frame_pre_pad();
+  auto lm = MetalMiniMaxH3VideoVae::load(root, mc, lone);
+  ASSERT_TRUE(lm != nullptr);
+  if (lm == nullptr) { return; }
+  std::string lerr;
+  SharedBuffer alone = lm->decode_image(zb, lh, lw, &lerr);
+  ASSERT_TRUE(!alone.empty());
+  if (alone.empty()) { return; }
+  const double alone_db = psnr_of(alone);
+
+  std::printf("[minimax_h3_vvae] still round trip on the video checkpoint "
+              "%dx%d (latent %dx%d): PSNR %.2f dB as %d copies, %.2f dB "
+              "alone\n", H, W, lh, lw, copies_db, cfg.tokens_per_chunk(),
+              alone_db);
+  // MEASURED on a 512 crop of a photographed fox: 33.00 dB as 5 copies,
+  // 17.15 alone -- the image checkpoint's own figure is 30.44 over its
+  // 64-image set. The floor is image_round_trip's.
+  EXPECT_TRUE(copies_db > 25.0);
+  EXPECT_TRUE(copies_db > alone_db + 6.0);
+}
+
+// A still on the stock decoder stitches only the frame it keeps, and
+// holds what still_decode_bytes books. Three geometries -- one tile, a
+// row of two, a 5 x 5 grid (1024^2) -- each decoded twice from one
+// latent: as it runs, and with every frame of the copies stitched and
+// the frame cut after (VPIPE_H3_VVAE_STILL_WHOLE, the route before).
+// The two pictures must be the SAME bytes, the kept-frame route hold no
+// more than its booking, and less than the whole route. A 2 x 2 decode
+// between arms puts the ViT scratch back to a few rows, so each arm
+// builds its own. The token
+// alone (`t1_direct`, frame 3 of 4) is cut the same way, and checked
+// the same way.
+TEST(minimax_h3_vvae, a_still_decode_holds_what_it_books)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &cerr));
+  ASSERT_TRUE(!cfg.t1_direct);
+  unsetenv("VPIPE_H3_VVAE_STILL_WHOLE");
+
+  auto latent = [&](int lh, int lw, std::uint32_t seed) {
+    SharedBuffer zb = mc->make_shared_buffer((std::size_t)cfg.z_channels *
+                                             lh * lw * 2);
+    auto* d = static_cast<std::uint16_t*>(zb.contents());
+    std::uint32_t x = seed;
+    const std::size_t n = (std::size_t)cfg.z_channels * lh * lw;
+    for (std::size_t i = 0; i < n; ++i) {
+      x = x * 1664525u + 1013904223u;
+      d[i] = f32_to_bf16_(((float)(x >> 8) / 16777216.0f - 0.5f) * 2.0f);
+    }
+    return zb;
+  };
+  // The device's growth over `base` while `fn` runs, sampled.
+  auto peak_of = [&](auto&& fn) {
+    const std::size_t base = mc->memory_budget_settled().allocated;
+    std::atomic<std::size_t> peak{base};
+    std::atomic<bool> stop{false};
+    std::thread sampler([&] {
+      while (!stop.load()) {
+        const std::size_t a = mc->memory_budget().allocated;
+        if (a > peak.load()) { peak.store(a); }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+    });
+    fn();
+    stop.store(true);
+    sampler.join();
+    const std::size_t top =
+        std::max(peak.load(), mc->memory_budget().allocated);
+    return top > base ? top - base : (std::size_t)0;
+  };
+
+  for (const bool lone : {false, true}) {
+    MetalMiniMaxH3VideoVae::Config c = cfg;
+    if (lone) {
+      c.t1_direct       = true;
+      c.t1_output_slice = cfg.frame_pre_pad();
+    }
+    auto m = MetalMiniMaxH3VideoVae::load(root, mc, c);
+    ASSERT_TRUE(m != nullptr);
+    if (m == nullptr) { return; }
+    SharedBuffer z2 = latent(2, 2, 7);
+    auto settle = [&]() {
+      std::string e;
+      ASSERT_TRUE(!m->decode_image(z2, 2, 2, &e).empty());
+    };
+    settle();   // the decoder half loads here
+
+    struct Geo { int lh, lw; };
+    for (const Geo g : {Geo{16, 16}, Geo{16, 32}, Geo{64, 64}}) {
+      SharedBuffer zb = latent(g.lh, g.lw, 1234u + (std::uint32_t)g.lw);
+      SharedBuffer kept, whole;
+      std::string e1, e2;
+      settle();
+      const std::size_t used_kept =
+          peak_of([&] { kept = m->decode_image(zb, g.lh, g.lw, &e1); });
+      settle();
+      setenv("VPIPE_H3_VVAE_STILL_WHOLE", "1", 1);
+      const std::size_t used_whole =
+          peak_of([&] { whole = m->decode_image(zb, g.lh, g.lw, &e2); });
+      unsetenv("VPIPE_H3_VVAE_STILL_WHOLE");
+      if (kept.empty()) { std::printf("[minimax_h3_vvae] %s\n", e1.c_str()); }
+      if (whole.empty()) {
+        std::printf("[minimax_h3_vvae] %s\n", e2.c_str());
+      }
+      ASSERT_TRUE(!kept.empty() && !whole.empty());
+      if (kept.empty() || whole.empty()) { return; }
+      const std::size_t bytes = (std::size_t)cfg.out_channels *
+                                (g.lh * cfg.patch) * (g.lw * cfg.patch) * 2;
+      EXPECT_TRUE(kept.byte_size() == bytes);
+      EXPECT_TRUE(whole.byte_size() >= bytes);
+      const bool same =
+          whole.byte_size() >= bytes &&
+          std::memcmp(kept.contents(), whole.contents(), bytes) == 0;
+      const std::size_t booked =
+          MetalMiniMaxH3VideoVae::still_decode_bytes(c, g.lh, g.lw);
+      std::printf("[minimax_h3_vvae] still %s %dx%d: kept frame %.1f MB, "
+                  "every frame %.1f MB, booked %.1f MB; pictures %s\n",
+                  lone ? "alone" : "as copies", g.lw * cfg.patch,
+                  g.lh * cfg.patch, used_kept / 1048576.0,
+                  used_whole / 1048576.0, booked / 1048576.0,
+                  same ? "IDENTICAL" : "DIFFER");
+      EXPECT_TRUE(same);
+      // The sampler reads Metal allocations only; the booking also holds
+      // the input latent, made before the base was read, and the
+      // stitch's host copy of a tile -- so it sits above, by a little.
+      EXPECT_TRUE(used_kept <= booked + ((std::size_t)2 << 20));
+      EXPECT_TRUE(used_kept * 2 >= booked);
+      // One tile is one decode either way, its frame cut out of it; past
+      // one, the whole route held every frame of the stitch and the rows.
+      const bool tiled = g.lh * cfg.patch > cfg.tile_size ||
+                         g.lw * cfg.patch > cfg.tile_size;
+      EXPECT_TRUE(tiled ? used_kept < used_whole
+                        : used_kept <= used_whole + ((std::size_t)1 << 20));
+    }
+    m.reset();   // one 5 GB model resident at a time
+  }
+}
+
+// Each still's bar counts ITS OWN tiles. decode_tiled_ sets the tile
+// counters only when they are 0, so a decode_image that left them set
+// had the next still report on past its total (a second 3-tile still
+// read 4/3 .. 6/3) and a larger one keep the first one's total. Three
+// stills in a row -- 3 tiles, the same again, then 25 -- each must
+// report done <= total throughout, against its own tile count, and end
+// at total / total.
+TEST(minimax_h3_vvae, a_still_reports_its_own_tiles)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (root == nullptr || *root == '\0') { return; }
+
+  Session sess;
+  MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  MetalMiniMaxH3VideoVae::Config cfg;
+  std::string cerr;
+  ASSERT_TRUE(MetalMiniMaxH3VideoVae::config_from_json(root, cfg, &cerr));
+  auto m = MetalMiniMaxH3VideoVae::load(root, mc, cfg);
+  ASSERT_TRUE(m != nullptr);
+  if (m == nullptr) { return; }
+
+  std::vector<std::pair<int, int>> seen;
+  m->set_tile_progress([&seen](int d, int t) { seen.emplace_back(d, t); });
+  struct Geo { int lh, lw; };
+  for (const Geo g : {Geo{16, 32}, Geo{16, 32}, Geo{64, 64}}) {
+    const auto ys = minimax_h3::split_tiles(g.lh * cfg.patch, cfg.tile_size,
+                                            cfg.tile_overlap_min, cfg.patch);
+    const auto xs = minimax_h3::split_tiles(g.lw * cfg.patch, cfg.tile_size,
+                                            cfg.tile_overlap_min, cfg.patch);
+    const int tiles = (int)(ys.start.size() * xs.start.size());
+    SharedBuffer zb = mc->make_shared_buffer((std::size_t)cfg.z_channels *
+                                             g.lh * g.lw * 2);
+    ASSERT_TRUE(!zb.empty());
+    std::memset(zb.contents(), 0, zb.byte_size());
+    seen.clear();
+    std::string err;
+    SharedBuffer pic = m->decode_image(zb, g.lh, g.lw, &err);
+    if (pic.empty()) { std::printf("[minimax_h3_vvae] %s\n", err.c_str()); }
+    ASSERT_TRUE(!pic.empty());
+    bool own = !seen.empty();
+    for (const auto& [d, t] : seen) { own = own && t == tiles && d <= t; }
+    const bool ended =
+        !seen.empty() && seen.back().first == tiles &&
+        seen.back().second == tiles;
+    std::printf("[minimax_h3_vvae] a %dx%d still (%d tiles): %zu reports, "
+                "last %d/%d\n", g.lw * cfg.patch, g.lh * cfg.patch, tiles,
+                seen.size(), seen.empty() ? -1 : seen.back().first,
+                seen.empty() ? -1 : seen.back().second);
+    EXPECT_TRUE(own);
+    EXPECT_TRUE(ended);
+  }
+  m->set_tile_progress(nullptr);
 }

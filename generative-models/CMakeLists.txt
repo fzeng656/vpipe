@@ -10,26 +10,52 @@
 
 set(LOCAL_SOURCES
   chat-template.cc
+  detect-profile.cc
+  family-profile.cc
+  quantize-profile.cc
   context-manager.cc
   generative-model-manager.cc
   weight-registry.cc
   weight-set.cc
+  moe-expert-cache.cc
+  safetensors-ranges.cc
   loaded-language-model.cc
+  lm-run-memory.cc
   metal-token-muxer.cc
   model-exec-registry.cc
   vae-model-registry.cc
+  image-model-registry.cc
   video-model-registry.cc
+  tensor-parallel.cc
   quantize-family-registry.cc
   hidden-state-encoder.cc
   model-loader.cc
   sampler.cc
   tokenizer.cc
+  video-turn.cc
+  shared/ane-module.cc
+  shared/ane-ffn.cc
+  shared/ane-tier.cc
   shared/comfy-checkpoint.cc
   shared/comfy-output-config.cc
+  shared/dflash-drafter.cc
+  shared/drawthings-store.cc
   shared/gguf-convert.cc
   shared/gguf-file.cc
+  shared/nvfp4.cc
   shared/grounded-encode-params.cc
   shared/i8-gemm.cc
+  shared/metal-tae-decoder.cc
+  shared/lora-names.cc
+  shared/runtime-lora.cc
+  shared/torch-zip.cc
+  shared/sol-attention.cc
+  shared/metal-sol-attention.cc
+  shared/metal-sage-attention.cc
+  shared/motion-cache.cc
+  shared/wan-vae-names.cc
+  shared/wired-pool.cc
+  shared/tp-overlap.cc
   shared/mcp/file-sandbox.cc
   shared/mcp/mcp-tools.cc
   shared/mcp/python-sandbox.cc
@@ -38,6 +64,9 @@ set(LOCAL_SOURCES
   shared/kernel-sets/decode-gqa-attn-set.cc
   shared/kernel-sets/prefill-gqa-attn-set.cc
   shared/whisper-feature-extractor.cc
+  shared/stft.cc
+  shared/yaml-subset.cc
+  shared/overlap-demix.cc
   gemma4/gemma-hidden-state-encoder.cc
   gemma4/gemma4-audio-feature-extractor.cc
   gemma4/gemma4-unified-embedder.cc
@@ -47,15 +76,21 @@ set(LOCAL_SOURCES
   gemma4/metal-gemma4-vision.cc
   qwen3/metal-audio-encoder.cc
   qwen3/metal-qwen-model.cc
+  qwen3/metal-qwen-hc.cc
+  qwen3/metal-qwen-encoder-chat.cc
+  qwen3/metal-qwen-raw-layers.cc
   qwen3/metal-qwen-model-exec.cc
   qwen3/metal-qwen-vision.cc
   llama3/metal-llama-model.cc
   llama3/metal-llama-model-exec.cc
   llama3/metal-llama-weights.cc
+  mistral3/metal-pixtral-vision.cc
   moss/metal-moss-tts-model.cc
   moss/metal-moss-codec.cc
   moss/metal-moss-codec-v2.cc
   moss/moss-v15-processor.cc
+  moss/moss-delay-processor.cc
+  moss/moss-text-normalizer.cc
   moss/metal-moss-local-transformer.cc
   moss/metal-moss-local-model.cc
   moss/metal-moss-v15-model.cc
@@ -65,36 +100,97 @@ set(LOCAL_SOURCES
   krea2/metal-krea2-vae.cc
   krea2/metal-krea2-calibration.cc
   krea2/flow-sampler.cc
+  krea2/krea2-native-checkpoint.cc
+  shared/fp8-layout.cc
+  shared/fp8-expand.cc
   qwen-image/metal-qwen-image-transformer.cc
+  qwen-image/qwen-image21-layout.cc
+  qwen-image/metal-qwen-image21-transformer.cc
+  qwen-image/qwen-image21-trainer.cc
+  qwen-image/qwen-image21-lora-trainer.cc
   qwen-image/metal-qwen-image-calibration.cc
   qwen-image/metal-qwen25-vision.cc
-  mage/metal-mage-vae.cc
-  mage/mage-watermark.cc
-  mage/mage-screen.cc
-  mage/mage-screen-policy.cc
+  z-image/z-image-layout.cc
+  z-image/metal-z-image-transformer.cc
+  fibo2/fibo2-layout.cc
+  fibo2/metal-fibo2-transformer.cc
+  moss-image/metal-moss-image-transformer.cc
+  yue2/yue2-protocol.cc
+  yue2/metal-yue2-model.cc
+  yue2/metal-oobleck-decoder.cc
+  yue2/yue2-vae-family.cc
+  minimax-music3/music3-protocol.cc
+  minimax-music3/metal-music3-dit.cc
+  minimax-music3/metal-music3-ar.cc
+  minimax-music3/music3-vae-family.cc
+  bs-roformer/bs-roformer-config.cc
+  bs-roformer/metal-bs-roformer.cc
+  rife/metal-rife.cc
+  relayvsr/relayvsr-ops.cc
+  relayvsr/metal-relayvsr-wan.cc
+  relayvsr/metal-relayvsr-decoder.cc
+  relayvsr/relayvsr-stream.cc
+  drama3/drama3-prompt.cc
+  drama3/metal-drama3-tower.cc
+  deepseek-v41/deepseek-v41-config.cc
+  deepseek-v41/deepseek-v41-engram.cc
+  deepseek-v41/metal-deepseek-v41-model.cc
+  deepseek-v41/metal-deepseek-v41-model-exec.cc
+  deepseek-v41/metal-deepseek-v41-vision.cc
+  lfm3/metal-lfm3-model.cc
+  lfm3/metal-lfm3-model-exec.cc
+  lfm3/metal-lfm3-vision.cc
+  drama3/metal-drama3-model.cc
+  drama3/metal-fish-codec.cc
   flux2/metal-flux2-transformer.cc
   flux2/metal-flux2-vae.cc
   flux2/metal-flux2-calibration.cc
+  flux3/metal-flux3-transformer.cc
   boogu/metal-boogu-transformer.cc
   boogu/metal-boogu-calibration.cc
+  flashvsr/flashvsr-lq-proj.cc
+  flashvsr/metal-flashvsr-transformer.cc
+  flashvsr/flashvsr-family.cc
+  flashvsr/flashvsr-tiny-decoder.cc
+  vosr/metal-dinov2-encoder.cc
+  vosr/metal-vosr-transformer.cc
   wan/metal-wan-vae.cc
   wan/metal-umt5-encoder.cc
   wan/metal-wan-transformer.cc
   minimax-h3/minimax-h3-layout.cc
+  minimax-h3/minimax-h3-diffusers-layout.cc
+  minimax-h3/vdn-geometry.cc
+  minimax-h3/vdn-delta-solve.cc
+  minimax-h3/vdn-linear-features.cc
+  minimax-h3/vdn-linear-branch.cc
+  minimax-h3/vdn-window-softmax.cc
+  minimax-h3/vdn-config.cc
+  minimax-h3/metal-vdn-branch.cc
   minimax-h3/minimax-h3-references.cc
+  minimax-h3/p-h3-image.cc
+  minimax-h3/minimax-h3-image.cc
   minimax-h3/minimax-h3-reference-encoder.cc
   minimax-h3/metal-minimax-h3-transformer.cc
   minimax-h3/metal-minimax-h3-video-vae.cc
   minimax-h3/metal-minimax-h3-audio-vae.cc
+  minimax-h3/metal-minimax-h3-fast-vae.cc
+  minimax-h3/metal-minimax-h3-latent-upscaler.cc
   minimax-h3/minimax-h3-scheduler.cc
   minimax-h3/minimax-h3-text-encoder.cc
   minimax-h3/minimax-h3-denoise.cc
+  minimax-h3/minimax-h3-taomate.cc
+  minimax-h3/minimax-h3-stream-kv.cc
   lora-fusion.cc
+  train/train-ops.cc
+  train/lora-params.cc
+  train/optimizer.cc
+  train/sample-cache.cc
   quantize/affine-quantizer.cc
   quantize/arch-detect.cc
   quantize/calibration.cc
   quantize/calibration-corpus.cc
   quantize/model-quantizer.cc
+  quantize/quant-source.cc
   quantize/safetensors-writer.cc
   eval/lm-eval.cc
 )
@@ -104,6 +200,8 @@ set(LOCAL_HEADERS
   generative-model-manager.h
   weight-registry.h
   weight-set.h
+  moe-expert-cache.h
+  safetensors-ranges.h
   loaded-language-model.h
   metal-token-muxer.h
   model-exec.h
@@ -115,17 +213,45 @@ set(LOCAL_HEADERS
   sampler.h
   token-muxer.h
   tokenizer.h
+  video-turn.h
   shared/comfy-checkpoint.h
   shared/comfy-output-config.h
+  shared/drawthings-store.h
   shared/gguf-convert.h
   shared/gguf-file.h
   shared/grounded-encode-params.h
+  shared/torch-zip.h
+  shared/wired-pool.h
+  shared/tp-overlap.h
   shared/mcp/file-sandbox.h
   shared/mcp/mcp-tools.h
   shared/mcp/python-sandbox.h
   shared/mcp/shell-tool.h
   shared/mcp/url-fetch.h
   shared/whisper-feature-extractor.h
+  shared/stft.h
+  shared/yaml-subset.h
+  shared/overlap-demix.h
+  bs-roformer/bs-roformer-config.h
+  bs-roformer/metal-bs-roformer.h
+  rife/metal-rife.h
+  relayvsr/relayvsr-ops.h
+  relayvsr/metal-relayvsr-wan.h
+  relayvsr/metal-relayvsr-decoder.h
+  relayvsr/relayvsr-stream.h
+  drama3/drama3-prompt.h
+  drama3/metal-drama3-tower.h
+  deepseek-v41/deepseek-v41-config.h
+  deepseek-v41/deepseek-v41-engram.h
+  deepseek-v41/metal-deepseek-v41-model.h
+  deepseek-v41/metal-deepseek-v41-model-exec.h
+  deepseek-v41/metal-deepseek-v41-vision.h
+  lfm3/lfm3-weights.h
+  lfm3/metal-lfm3-model.h
+  lfm3/metal-lfm3-model-exec.h
+  lfm3/metal-lfm3-vision.h
+  drama3/metal-drama3-model.h
+  drama3/metal-fish-codec.h
   gemma4/gemma4-audio-feature-extractor.h
   gemma4/gemma4-unified-embedder.h
   gemma4/metal-gemma-model.h
@@ -134,8 +260,21 @@ set(LOCAL_HEADERS
   gemma4/metal-gemma4-vision.h
   qwen3/metal-audio-encoder.h
   qwen3/metal-qwen-model.h
+  qwen3/metal-qwen-encoder-chat.h
+  qwen3/metal-qwen-raw-layers.h
   qwen3/metal-qwen-model-exec.h
   qwen3/metal-qwen-vision.h
+  mistral3/metal-pixtral-vision.h
+  qwen-image/qwen-image21-layout.h
+  qwen-image/metal-qwen-image21-transformer.h
+  qwen-image/qwen-image21-trainer.h
+  qwen-image/qwen-image21-lora-trainer.h
+  z-image/z-image-layout.h
+  z-image/metal-z-image-transformer.h
+  fibo2/fibo2-layout.h
+  fibo2/metal-fibo2-transformer.h
+  moss-image/metal-moss-image-transformer.h
+  flux3/metal-flux3-transformer.h
   llama3/metal-llama-model.h
   llama3/metal-llama-model-exec.h
   llama3/metal-llama-weights.h
@@ -143,6 +282,8 @@ set(LOCAL_HEADERS
   moss/metal-moss-codec.h
   moss/metal-moss-codec-v2.h
   moss/moss-v15-processor.h
+  moss/moss-delay-processor.h
+  moss/moss-text-normalizer.h
   moss/metal-moss-local-transformer.h
   moss/metal-moss-local-model.h
   moss/metal-moss-v15-model.h
@@ -150,11 +291,26 @@ set(LOCAL_HEADERS
   moss/metal-moss-rt-model.h
   boogu/metal-boogu-transformer.h
   boogu/metal-boogu-calibration.h
+  flashvsr/flashvsr-lq-proj.h
+  flashvsr/metal-flashvsr-transformer.h
+  flashvsr/flashvsr-family.h
+  flashvsr/flashvsr-tiny-decoder.h
+  vosr/metal-dinov2-encoder.h
+  vosr/metal-vosr-transformer.h
   wan/metal-wan-vae.h
   wan/metal-umt5-encoder.h
   wan/metal-wan-transformer.h
   minimax-h3/minimax-h3-layout.h
+  minimax-h3/vdn-geometry.h
+  minimax-h3/vdn-delta-solve.h
+  minimax-h3/vdn-linear-features.h
+  minimax-h3/vdn-linear-branch.h
+  minimax-h3/vdn-window-softmax.h
+  minimax-h3/vdn-config.h
+  minimax-h3/metal-vdn-branch.h
   minimax-h3/minimax-h3-references.h
+  minimax-h3/p-h3-image.h
+  minimax-h3/minimax-h3-image.h
   minimax-h3/minimax-h3-reference-encoder.h
   minimax-h3/metal-minimax-h3-transformer.h
   minimax-h3/metal-minimax-h3-video-vae.h
@@ -162,10 +318,13 @@ set(LOCAL_HEADERS
   minimax-h3/minimax-h3-scheduler.h
   minimax-h3/minimax-h3-text-encoder.h
   minimax-h3/minimax-h3-denoise.h
-  mage/metal-mage-vae.h
-  mage/metal-mage-flow-transformer.h
-  mage/mage-watermark.h
-  mage/mage-screen.h
+  minimax-h3/minimax-h3-taomate.h
+  minimax-h3/minimax-h3-stream-kv.h
+  train/train-ops.h
+  train/lora-params.h
+  train/optimizer.h
+  train/lora-trainer.h
+  train/sample-cache.h
   quantize/affine-quantizer.h
   quantize/arch-detect.h
   quantize/calibration.h

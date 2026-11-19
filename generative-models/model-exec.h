@@ -1,16 +1,22 @@
 #ifndef VPIPE_GENERATIVE_MODELS_MODEL_EXEC_H
 #define VPIPE_GENERATIVE_MODELS_MODEL_EXEC_H
 
+#include "common/flex-data.h"
 #include "generative-models/context-manager.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
 
+#include <string_view>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <span>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe::genai {
 
@@ -31,7 +37,18 @@ struct GpuSamplerParams {
   float         presence_penalty   = 0.0f;
   std::uint64_t seed               = 0;
   int           n_iter             = 24;
+  // Anything this struct has no field for: see common/flex-bag.h. Keys:
+  // gpu_sampler::* below.
+  FlexData      extra;
 };
+
+// GpuSamplerParams::extra keys.
+namespace gpu_sampler {
+// int array: the token ids the repetition / presence seen-set starts from
+// -- pdecode_begin's `prompt` -- for a decode handed it no other way
+// (ModelExec::mtp_generate). Absent: an empty seen-set.
+inline constexpr std::string_view kPrime = "prime";
+}  // namespace gpu_sampler
 
 // Abstract LLM forward-pass driver. One concrete subclass per
 // supported model architecture (LlamaModelExec for the dense
@@ -421,6 +438,8 @@ public:
   // (optional) is true iff a stop token ended it. Token-exact vs the serial
   // decode (greedy: argmax loop; sampling: decode_pipelined with the same
   // per-slot seed). Default: unsupported.
+  // sp.extra[gpu_sampler::kPrime]: the prompt the penalty seen-set starts
+  // from (pdecode_begin's `prompt`).
   virtual bool
   mtp_generate(ContextId ctx, std::int32_t first_token, int max_tokens,
                int rope_first, const GpuSamplerParams& sp,
@@ -455,11 +474,27 @@ public:
   // rate) with on-the-fly per-(row, 512-group) activation quantization.
   // LOSSY (int8, ~1e-2 rel per GEMM -- NOT token-exact) and strictly
   // opt-in; decode is untouched. Default no-op; execs whose model
-  // implements the route (the metal Qwen exec) override.
+  // implements the route (the metal Qwen and LFM3 execs) override. The
+  // model keeps its context when asked for the state it is already in.
   virtual void set_i8_gemm(bool on) { (void)on; }
 
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 }
+
+VPIPE_API_END
 
 #endif

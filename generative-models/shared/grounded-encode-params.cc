@@ -14,24 +14,44 @@ GroundedEncodeParams::for_family(const std::string& family)
     p.long_edge = 768;
     return p;
   }
-  if (family == "mage-flow") {
-    // pipeline.py `vl_cond_long_edge`. The processor bounds come from
-    // preprocessor_config.json, whose shortest_edge is 65536 against the
-    // Qwen default of 3136 -- so a small or very wide reference is
-    // UPSCALED before patching, which the default bound would skip.
-    p.long_edge  = 384;
-    p.min_pixels = 65536;
-    p.max_pixels = 16777216;
-    return p;
-  }
+  // A REGISTERED family has no row here: its numbers arrive with it, in
+  // its own conditioning profile (generative-models/conditioner-profile.h).
+  // This table is for the families the host itself implements.
   if (family == "boogu-image") {
     // BooguImagePipeline's VLM preprocessing: max side 768, area capped
     // at 384x384. BOTH, not either -- which is why the long edge here is
-    // Mage-Flow's doubled rather than equal to it.
+    // double the 384 of a family that caps the edge alone.
     p.long_edge    = 768;
     p.pixel_budget = (std::size_t)384 * 384;
     p.min_pixels   = 65536;
     p.max_pixels   = 16777216;
+    return p;
+  }
+  if (family == "qwen-image-21") {
+    // ONE resize feeds both the text encoder and the VAE -- the
+    // reference says so in as many words -- so this geometry is not a
+    // conditioning preference, it is a CONTRACT with the DiT. Each
+    // encoder image slot stands for a 2x2 group of latent tokens, so
+    // the tower's merged grid must be exactly half the VAE's: at patch
+    // 16 / merge 2 the tower sees H/32 and the VAE H/16, which holds
+    // only while both read the same pixels.
+    //
+    // The pipeline's `output_resolution` defaults to 1024 and it resizes
+    // to that AREA, aspect preserved, rounded to 32 -- not to a long
+    // edge, so there is no long_edge here.
+    p.long_edge    = 0;
+    p.pixel_budget = (std::size_t)1024 * 1024;
+    p.min_pixels   = 65536;
+    p.max_pixels   = 16777216;
+    return p;
+  }
+  if (family == "fibo2") {
+    // BriaFibo2ImageProcessor: Qwen3-VL sees each crop thumbnailed to at
+    // most 768 a side (the VAE takes the crop itself), and the checkpoint's
+    // processor bounds the smart-resize after it.
+    p.long_edge  = 768;
+    p.min_pixels = 3136;
+    p.max_pixels = 1605632;
     return p;
   }
   if (family == "qwen-image-edit") {

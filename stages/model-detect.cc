@@ -1,10 +1,26 @@
 #include "stages/model-detect.h"
 
+#include "generative-models/bs-roformer/bs-roformer-config.h"
+#include "generative-models/relayvsr/relayvsr-stream.h"
+#include "generative-models/rife/metal-rife.h"
+#include "generative-models/krea2/krea2-native-checkpoint.h"
+#include "generative-models/detect-profile.h"
+#include "generative-models/image-model-registry.h"
+#include "generative-models/vae-model-registry.h"
+#include "generative-models/video-model-registry.h"
+
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
+#include "generative-models/qwen-image/metal-qwen-image21-transformer.h"
+#include "generative-models/wan/metal-wan-vae.h"
 
 #include "common/flex-data.h"
 #include "generative-models/shared/comfy-checkpoint.h"
+#include "generative-models/shared/gguf-file.h"
 #include "stages/model-catalog.h"
+#include "stages/model-registry.h"
 
 #include <algorithm>
 #include <cctype>
@@ -173,18 +189,37 @@ family_version_(const std::string& mt, std::string& family,
   static const Row kRows[] = {
       {"qwen3.5",                "Qwen",        "3.5"},
       {"qwen3.6",                "Qwen",        "3.6"},
+      {"qwen3.8-flash",          "Qwen",        "3.8 Flash-Next"},
+      {"deepseek-v4.1",          "DeepSeek",    "4.1"},
       {"qwen3-asr",              "Qwen",        "3-ASR"},
       {"qwen3.5-vision-encoder", "Qwen",        "3.5"},
       {"gemma4",                 "Gemma",       "4"},
       {"gemma4_unified",         "Gemma",       "4"},
       {"gemma4-vision-encoder",  "Gemma",       "4"},
       {"llama3",                 "Llama",       "3"},
+      {"mistral3",               "Ministral",   "3"},
+      {"lfm3-vl",                "LFM",         "3-VL"},
+      {"lfm3",                   "LFM",         "3"},
       {"krea2",                  "Krea",        "2"},
       {"krea2-lora",             "Krea",        "2"},
       {"flux2",                  "FLUX",        "2"},
+      {"flux2-lora",             "FLUX",        "2"},
+      {"flux3",                  "FLUX",        "3 Image Klein"},
+      {"flux3-dit",              "FLUX",        "3 Image Klein"},
+      {"flux3-lora",             "FLUX",        "3 Image Klein"},
+      {"fibo2",                  "Fibo",        "2.0"},
+      {"fibo2-dit",              "Fibo",        "2.0"},
+      {"fibo2-lora",             "Fibo",        "2.0"},
+      {"qwen-image",             "Qwen-Image",  "2512"},
       {"qwen-image-edit",        "Qwen-Image",  "Edit-2511"},
-      {"mage-flow",              "Mage-Flow",   "Gen"},
-      {"mage-flow-edit",         "Mage-Flow",   "Edit"},
+      {"qwen-image-21",          "Qwen-Image",  "2.1"},
+      {"qwen-image-21-dit",      "Qwen-Image",  "2.1"},
+      {"qwen-image-21-lora",     "Qwen-Image",  "2.1"},
+      {"z-image",                "Z-Image",     "1"},
+      {"z-image-dit",            "Z-Image",     "1"},
+      {"moss-image",             "MOSS-Image",  "1"},
+      {"moss-image-dit",         "MOSS-Image",  "1"},
+      {"moss-image-lora",        "MOSS-Image",  "1"},
       {"boogu-image",            "Boogu-Image", "0.1"},
       {"boogu-image-edit",       "Boogu-Image", "0.1-Edit"},
       {"wan-i2v",                "Wan",         "2.2-I2V"},
@@ -193,17 +228,43 @@ family_version_(const std::string& mt, std::string& family,
       {"minimax-h3-ref2va",      "MiniMax",     "H3-Ref2VA"},
       {"minimax-h3-dit",         "MiniMax",     "H3-FL2VA"},
       {"minimax-h3-text-encoder", "MiniMax",    "H3-FL2VA"},
+      {"p-h3-image",             "P-H3",        "Image"},
+      {"minimax-h3-image",       "MiniMax",     "H3-Image"},
       {"moss-tts",               "MOSS",        "TTS"},
       {"moss-tts-local",         "MOSS",        "TTS-Local"},
       {"moss-tts-realtime",      "MOSS",        "TTS-Realtime"},
       {"moss-codec",             "MOSS",        "Audio-Tokenizer"},
       {"moss-codec-v2",          "MOSS",        "Audio-Tokenizer"},
+      {"fish-drama3",            "Fish Audio",  "Drama 3"},
+      {"yue2",                   "YuE",         "2"},
+      {"minimax-music3",         "MiniMax",     "Music3"},
+      {"yue2-vae",               "YuE",         "2-Vae"},
+      {"bs-roformer",            "BS-RoFormer", "MSST"},
+      {"rife",                   "RIFE",        "Practical-RIFE 4"},
+      {"relayvsr",               "RelayVSR",    "1.0"},
+      {"dflash",                 "DFlash",      "1"},
+      {"dflash2",                "DFlash",      "2"},
       {"yolo",                   "YOLOX",       "L"},
       {"silero-vad",             "Silero",      "VAD"},
       {"audio-tagging",          "BEATs",       "iter3+"},
   };
   for (const auto& r : kRows) {
     if (mt == r.mt) { family = r.family; version = r.version; return; }
+  }
+  // A REGISTERED family's own labels. The table above is the families
+  // this tree implements; a plugin's belongs with the plugin, and
+  // without it an out-of-tree checkpoint shows in a browser as a model
+  // type and no name.
+  if (const FlexData* p = genai::detect::for_model_type(mt)) {
+    const std::string f = genai::detect::text(p, genai::detect::kLabelFamily,
+                                              "");
+    if (!f.empty()) { family = f; }
+    const bool is_edit =
+        genai::detect::text(p, genai::detect::kModelTypeEdit, "") == mt;
+    const std::string v = genai::detect::text(
+        p, is_edit ? genai::detect::kLabelVersionEdit
+                   : genai::detect::kLabelVersion, "");
+    if (!v.empty()) { version = v; }
   }
 }
 
@@ -225,6 +286,11 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   auto starts = [&](const char* p) { return mt.rfind(p, 0) == 0; };
 
   if (starts("qwen3_asr") || starts("qwen3asr")) { return "qwen3-asr"; }
+  // Qwen3.8-Flash-Next: the Qwen3.5-MoE backbone under hyper-connections
+  // (metal-qwen-hc.cc), a model_type of its own.
+  if (starts("qwen4_exp")) { return "qwen3.8-flash"; }
+  // DeepSeek-V4.1-Flash (generative-models/deepseek-v41/).
+  if (starts("deepseek_v41")) { return "deepseek-v4.1"; }
   if (starts("qwen3_5") || starts("qwen3_6")) {
     if (starts("qwen3_6") || has_(name_lc, "qwen3.6")
         || has_(name_lc, "qwen3_6")) {
@@ -241,7 +307,39 @@ lm_tag_(const std::string& cfg_type, const std::string& name_lc,
   if (starts("moss_tts_local"))    { return "moss-tts-local"; }
   if (starts("moss_tts_realtime")) { return "moss-tts-realtime"; }
   if (starts("moss_tts"))          { return "moss-tts"; }
+  // Fish Audio Drama 3: a speech LM over a Qwen3.5 MoE backbone.
+  if (starts("fish_omni"))         { return "fish-drama3"; }
+  // YuE2 names its VAE export "yue2_vae": test that first.
+  if (starts("yue2_vae"))          { return "yue2-vae"; }
+  if (starts("yue2"))              { return "yue2"; }
+  // MiniMax-Music3's diffusers root (generative-models/minimax-music3/).
+  if (starts("minimax_music3"))    { return "minimax-music3"; }
   if (starts("llama"))             { return "llama3"; }
+  // Mistral3ForConditionalGeneration (Ministral-3): the Pixtral tower +
+  // a dense decoder, run on the metal Qwen path.
+  if (starts("mistral3"))          { return "mistral3"; }
+  // Liquid AI's LFM3 (generative-models/lfm3/): the VL checkpoint first.
+  if (starts("lfm3_vl"))           { return "lfm3-vl"; }
+  if (starts("lfm3"))              { return "lfm3"; }
+  return {};
+}
+
+// A DFlash / DFlash 2 drafter's config.json names its architecture
+// (DFlashDraftModel / DFlash2DraftModel); "" for anything else.
+std::string
+dflash_tag_(const FlexData& cfg)
+{
+  if (!cfg.is_object()) { return {}; }
+  const FlexData::ConstObjectView o = cfg.as_object();
+  if (!o.contains("architectures")) { return {}; }
+  const FlexData arch = o.at("architectures");
+  if (!arch.is_array()) { return {}; }
+  const FlexData::ConstArrayView a = arch.as_array();
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    const std::string s(a[i].as_string());
+    if (s == "DFlash2DraftModel") { return "dflash2"; }
+    if (s == "DFlashDraftModel") { return "dflash"; }
+  }
   return {};
 }
 
@@ -263,12 +361,39 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
   // NOT inferred from the name the way `edit` is below: a wrong `edit` guess
   // picks a sibling checkpoint, while a wrong recipe guess silently produces
   // wrong IMAGES from a model that loads and runs perfectly.
+  // A REGISTERED family, asked FIRST only in the sense that its answer
+  // is checked before the fall-through below -- the built-in names are
+  // still matched first, so a plugin cannot take a class name this tree
+  // owns. Without this a checkpoint of an out-of-tree family sitting in
+  // a models directory cannot be named at all.
+  //
+  // Deliberately a LABELLING answer, not a loading one: what runs a
+  // checkpoint is `claims()` on the model registries, which reads the
+  // weights rather than a table.
   if (cls == "Flux2Transformer2DModel")      { return "flux2"; }
+  // FLUX.3 Image Klein -- a different network from FLUX.2 (three token
+  // modes, a flow map), sharing only the VAE. One tag for text-to-image
+  // and editing: a reference is an optional token mode of the same DiT.
+  if (cls == "Flux3Transformer2DModel")      { return "flux3"; }
+  // Fibo 2.0 (Bria). One tag for the edit and generation checkpoints:
+  // the pictures to edit are an optional input of the same DiT.
+  if (cls == "BriaFibo2Transformer2DModel")  { return "fibo2"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit"; }
-  if (cls == "MageFlow") {
-    return edit ? "mage-flow-edit" : "mage-flow";
-  }
+  // Qwen-Image-2.1. NOT split on `edit` the way Boogu is: one checkpoint
+  // answers both tasks, because a reference image occupies vision slots
+  // in the text encoder's own sequence instead of a separate
+  // conditioning path. There is no sibling to pick wrongly.
+  if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21"; }
+  // Z-Image. ONE tag for both published checkpoints: Turbo and the
+  // undistilled base ship byte-identical transformer configs, and what
+  // separates them -- the scheduler shift and whether CFG is wanted --
+  // is read from scheduler_config.json and the graph, never inferred
+  // from a name. A tag per variant would promise a distinction this
+  // file cannot actually make.
+  if (cls == "ZImageTransformer2DModel") { return "z-image"; }
+  // MOSS-Image. One tag for Base and SFT: the configs are identical.
+  if (cls == "MOSSImageTransformer") { return "moss-image"; }
   if (cls == "BooguImageTransformer2DModel") {
     // The t2i and edit repos ship the SAME transformer config (only the
     // weights differ), so the name is the only signal.
@@ -282,7 +407,14 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
     // guessing from the directory.
     return int_field_(cfg, "in_channels", 16) > 16 ? "wan-i2v" : "wan-t2v";
   }
-  if (cls == "MiniMaxH3DiTModel") {
+  // The diffusers spelling of the same DiT. On MiniMaxAI's repository root
+  // it is the pipeline that carries BOTH partitions' DiTs (transformer/,
+  // transformer_ref/) and a manifest naming neither, so the partition
+  // stays empty there and the root is untagged -- a directory holding two
+  // models, which only a record can name, as for a checkout holding both
+  // released partitions.
+  if (cls == "MiniMaxH3DiTModel" ||
+      cls == genai::minimax_h3::kDiffusersDitClass) {
     // The two partitions ship BYTE-IDENTICAL transformer configs (same
     // 535 tensor names, same shapes), so the DiT alone cannot tell them
     // apart and the pipeline manifest has to -- and it matters, because
@@ -295,7 +427,9 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
     if (partition == "ref2va") { return "minimax-h3-ref2va"; }
     return {};
   }
-  return {};
+  // Last: a REGISTERED family. Asked after every built-in name so a
+  // plugin cannot take a class this tree owns.
+  return genai::detect::model_type_for_class(cls, edit);
 }
 
 // ---- a Comfy-Org repack ----------------------------------------------
@@ -309,9 +443,17 @@ dit_tag_(const std::string& cls, const std::string& name_lc,
 // Comfy-Org's architecture tag, and the filename carries whatever the
 // architecture alone cannot say (for MiniMax-H3, which of the two
 // partitions the weights are).
+//
+// EVERY DiT in the repack has to agree, or there is no answer.
+// Comfy-Org's MiniMax-H3 repo publishes BOTH partitions under
+// diffusion_models/, and scan_repo walks it in filename order -- so
+// taking the first tag registered a two-partition checkout as whichever
+// sorts first, silently and always the same way.
 std::string
 comfy_repo_tag_(const fs::path& root)
 {
+  std::string tag;
+  bool seen = false;
   for (const genai::comfy::Component& c :
        genai::comfy::scan_repo(root.string())) {
     if (c.role != "diffusion_models" || c.meta_key != "config") { continue; }
@@ -326,18 +468,23 @@ comfy_repo_tag_(const fs::path& root)
     if (!t.is_object()) { continue; }
     const std::string im = str_field_(t, "image_model");
     const std::string name_lc = lower_(fs::path(c.file).filename().string());
+    std::string one;
     if (im == "minimax_h3") {
       // The repack embeds no partition, so the FILENAME is the only
       // signal -- the weights themselves are indistinguishable. A
       // `pruned` DiT is a different model rather than a different
       // packing of this one, so it stays untagged.
-      if (has_(name_lc, "pruned")) { return {}; }
-      if (has_(name_lc, "fl2va"))  { return "minimax-h3-fl2va"; }
-      if (has_(name_lc, "ref2va")) { return "minimax-h3-ref2va"; }
-      return {};
+      if (has_(name_lc, "pruned"))      { return {}; }
+      else if (has_(name_lc, "fl2va"))  { one = "minimax-h3-fl2va"; }
+      else if (has_(name_lc, "ref2va")) { one = "minimax-h3-ref2va"; }
+      else                              { return {}; }
     }
+    if (one.empty()) { continue; }
+    if (seen && one != tag) { return {}; }   // two models, one directory
+    tag  = one;
+    seen = true;
   }
-  return {};
+  return tag;
 }
 
 // What a Comfy-Org repo actually HOLDS, for the record's `variant`.
@@ -379,9 +526,13 @@ std::string
 dit_component_tag_(const std::string& cls)
 {
   if (cls == "Flux2Transformer2DModel")      { return "flux2-dit"; }
+  if (cls == "Flux3Transformer2DModel")      { return "flux3-dit"; }
+  if (cls == "BriaFibo2Transformer2DModel")  { return "fibo2-dit"; }
   if (cls == "Krea2Transformer2DModel")      { return "krea2-dit"; }
   if (cls == "QwenImageTransformer2DModel")  { return "qwen-image-edit-dit"; }
-  if (cls == "MageFlow")                     { return "mage-flow-dit"; }
+  if (cls == "QwenImage21Transformer2DModel") { return "qwen-image-21-dit"; }
+  if (cls == "ZImageTransformer2DModel")     { return "z-image-dit"; }
+  if (cls == "MOSSImageTransformer")         { return "moss-image-dit"; }
   if (cls == "BooguImageTransformer2DModel") { return "boogu-image-dit"; }
   // Either Wan expert on its own (a quantized transformer/ or
   // transformer_2/ output) is one DiT component; which noise band it
@@ -390,6 +541,14 @@ dit_component_tag_(const std::string& cls)
   // A bare H3 DiT carries no model_index.json, so which partition it
   // came from is not knowable here -- and does not matter to a picker.
   if (cls == "MiniMaxH3DiTModel")            { return "minimax-h3-dit"; }
+  // The same DiT in the diffusers naming (minimax-h3-diffusers-layout.h),
+  // which the H3 loader reads as it is.
+  if (cls == "MiniMaxH3Transformer3DModel")  { return "minimax-h3-dit"; }
+  // Last: a REGISTERED family's DiT, named after the model type its
+  // detect profile reports for the class -- asked after every built-in
+  // name, so a plugin cannot take a class this tree owns.
+  const std::string mt = genai::detect::model_type_for_class(cls, false);
+  if (!mt.empty()) { return mt + "-dit"; }
   return {};
 }
 
@@ -489,7 +648,53 @@ from_catalog_(const ModelCatalogEntry& e, DetectedModel& d)
   if (d.inputs.empty() && d.outputs.empty()) {
     catalog_default_io(e.model_type, d.inputs, d.outputs);
   }
-  d.detected_by = "catalog";
+  d.files              = e.files;
+  d.detected_by        = "catalog";
+}
+
+// WHICH catalogue entry a directory holds, when its repo publishes more
+// than one.
+//
+// `catalog_by_path` answers with the first, which is right only for a
+// repo with a single model -- and several here are not. MiniMax-H3 ships
+// FL2VA and Ref2VA from one repo in BOTH packings, and lightx2v
+// publishes eleven Turbo adapters from one repo whose parents differ
+// (FL2VA and Ref2VA side by side), which is the field the LoRA pickers
+// filter on. Taking the first offered a Ref2VA adapter to an FL2VA
+// graph and registered a Ref2VA checkpoint as FL2VA -- the second being
+// the worse of the two, since the partitions are byte-identical apart
+// from the manifest and the wrong one loads, runs and conditions on
+// nothing.
+//
+// The entries differ in the FILES they pin, and those files are on
+// disk, so that is what decides. The rule is the unique strict maximum
+// of files present, not "all of them": a hand-copied checkout that is
+// missing a tokenizer is still unambiguously that model, while an exact
+// tie -- both partitions in one directory, which is what Comfy-Org's
+// repo actually holds -- has no right answer and gets none.
+//
+// Entries pinning nothing cannot take part: an empty list is present in
+// every directory, so counting it as a match would make the unpinned
+// entry win everywhere.
+const ModelCatalogEntry*
+catalog_pick_present_(const std::vector<const ModelCatalogEntry*>& cands,
+                      const fs::path& root)
+{
+  const ModelCatalogEntry* best = nullptr;
+  std::size_t best_n = 0;
+  bool tied = false;
+  for (const ModelCatalogEntry* e : cands) {
+    if (e == nullptr || e->files.empty()) { continue; }
+    std::size_t n = 0;
+    std::error_code ec;
+    for (const std::string& f : e->files) {
+      if (fs::exists(root / f, ec) && !ec) { ++n; }
+    }
+    if (n == 0) { continue; }
+    if (n > best_n) { best = e; best_n = n; tied = false; }
+    else if (n == best_n) { tied = true; }
+  }
+  return tied ? nullptr : best;
 }
 
 // Whether the ABSENCE of a vision_config / audio_config in this family's
@@ -505,7 +710,7 @@ bool
 io_trim_is_meaningful_(const std::string& mt)
 {
   return mt == "qwen3.5" || mt == "qwen3.6" || mt == "gemma4"
-         || mt == "gemma4_unified";
+         || mt == "gemma4_unified" || mt == "mistral3" || mt == "lfm3-vl";
 }
 
 // Drop modalities the checkpoint plainly does not carry. The per-type
@@ -626,15 +831,43 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     return d;
   }
   if (!hf_path.empty()) {
-    if (const ModelCatalogEntry* e = catalog_by_path(hf_path)) {
-      from_catalog_(*e, d);
+    // One repo can publish several models, and then the path alone does
+    // not name one -- what is actually on disk does. See
+    // catalog_pick_present_.
+    const std::vector<const ModelCatalogEntry*> cands =
+        catalog_all_by_path(hf_path);
+    const ModelCatalogEntry* pick =
+        cands.size() == 1 ? cands.front()
+                          : catalog_pick_present_(cands, root);
+    if (pick != nullptr) {
+      from_catalog_(*pick, d);
       return d;
     }
+    // More than one and no way to tell: fall through and probe. The
+    // probes below read the checkpoint rather than the path, and one of
+    // them may still know (a Comfy repack names its partition in the
+    // filename); if none does, the type stays empty, which is the right
+    // answer for a directory holding two models.
   }
 
   // ---- 2. a diffusers pipeline (transformer/ + vae/) ------------------
+  // P-H3-Image first, by its manifest: its transformer/ (when it carries
+  // one) is an H3 DiT with no partition named, which the probe below
+  // would leave untagged -- and the root may carry no DiT at all.
+  if (d.is_dir && genai::ph3::is_root(dir)) {
+    d.model_type  = "p-h3-image";
+    d.detected_by = "p-h3-image-manifest";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+  // MiniMax-H3-Image, by its model_index.json: an audio-less H3 DiT whose
+  // `_minimax_h3.partition` ("image") is neither of the video ones.
+  if (d.is_dir && d.model_type.empty() && genai::h3i::is_root(dir)) {
+    d.model_type  = "minimax-h3-image";
+    d.detected_by = "minimax-h3-image-manifest";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
   const FlexData dit_cfg = read_json_(root / "transformer" / "config.json");
-  if (dit_cfg.is_object()) {
+  if (dit_cfg.is_object() && d.model_type.empty()) {
     // as_object() returns a VIEW, so the manifest has to outlive the
     // lookup -- bind it to a local rather than chaining off the call.
     const FlexData  mi = read_json_(root / "model_index.json");
@@ -650,6 +883,62 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     if (!d.model_type.empty()) {
       d.detected_by = "diffusers";
     }
+  }
+
+  // ---- 2'. a checkpoint a REGISTERED FAMILY claims --------------------
+  // A plugin family's `claims()` is the structural test its own loader
+  // runs, which is a better identity than any class-name table: a
+  // detect profile can only match on `_class_name`, and a generic one
+  // ("DiffusionTransformer") would label every checkpoint that shares
+  // it. The registries are asked after the built-in tags, so a family
+  // can never relabel a checkpoint the host already knows. The family's
+  // detect profile, keyed by its tag, then supplies the labels and the
+  // modalities below.
+  if (d.model_type.empty() && d.is_dir) {
+    if (genai::ImageModelFamily* f =
+            genai::ImageModelRegistry::get().claim_for(nullptr, dir, "")) {
+      d.model_type  = std::string(f->tag());
+      d.detected_by = "family-claims";
+    } else if (genai::VideoModelFamily* v =
+                   genai::VideoModelRegistry::get().claim_for(nullptr, dir,
+                                                              "")) {
+      d.model_type  = std::string(v->tag());
+      d.detected_by = "family-claims";
+    }
+    if (!d.model_type.empty()) {
+      catalog_default_io(d.model_type, d.inputs, d.outputs);
+    }
+  }
+
+  // ---- 2a. a Krea-2 DiT in Krea's own single-file layout --------------
+  // What community fine-tunes ship: the DiT alone, one .safetensors in the
+  // reference naming (usually FP8), with no config and no metadata -- the
+  // tensor names are the only identity it has. generate-image reads it as
+  // it is through `dit_dir`, so it registers as the DiT it is.
+  if (d.model_type.empty() && !d.is_dir &&
+      genai::krea2::is_native_dit_file(dir)) {
+    d.model_type    = "krea2-dit";
+    d.detected_by   = "krea2-native";
+    d.weight_format = "safetensors";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+  // Two more DiTs published as ONE file with no config, and read as they
+  // are through a `dit_dir`: Qwen-Image-2.1 under its diffusers names
+  // (unsloth's FP8), and MiniMax-H3 under the diffusers naming
+  // (lightx2v's FP8 turbo DiT). Both registered by their tensor names.
+  if (d.model_type.empty() && !d.is_dir &&
+      genai::MetalQwenImage21Transformer::is_single_file_dit(dir)) {
+    d.model_type    = "qwen-image-21-dit";
+    d.detected_by   = "single-file";
+    d.weight_format = "safetensors";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+  if (d.model_type.empty() && !d.is_dir &&
+      genai::minimax_h3::is_diffusers_dit_file(dir)) {
+    d.model_type    = "minimax-h3-dit";
+    d.detected_by   = "diffusers-names";
+    d.weight_format = "safetensors";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
   }
 
   // ---- 2b. a Comfy-Org repack (no transformer/config.json) ------------
@@ -714,8 +1003,13 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
       d.model_type  = comp;
       d.detected_by = "component-tag";
     } else if (base == "text_encoder") {
+      // The released partition's manifest carries `_minimax_h3`; the
+      // diffusers pipeline at the repository root names its class
+      // instead, over a byte-identical encoder.
       const FlexData mi2 = read_json_(root.parent_path() / "model_index.json");
-      if (has_field_(mi2, "_minimax_h3")) {
+      if (has_field_(mi2, "_minimax_h3") ||
+          genai::minimax_h3::is_diffusers_pipeline_root(
+              root.parent_path().string())) {
         d.model_type  = "minimax-h3-text-encoder";
         d.detected_by = "pipeline";
       }
@@ -725,6 +1019,48 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
       // does not generate anything on its own.
       d.category = "component";
       d.param_class = "32B";
+    }
+  }
+
+  // ---- 2d. an MSST source separator ----------------------------------
+  // A torch .ckpt beside the YAML that describes it, no config.json: the
+  // shape every Music-Source-Separation-Training checkpoint ships in.
+  // The YAML names the network; only a BS-RoFormer is runnable here (the
+  // audio-separate stage), so only that one is tagged.
+  if (d.model_type.empty() && genai::looks_like_bs_roformer_dir(dir)) {
+    d.model_type    = "bs-roformer";
+    d.detected_by   = "msst-yaml";
+    d.weight_format = "torch";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+
+  // ---- 2e. a RIFE frame interpolator --------------------------------------
+  // Practical-RIFE's train_log/: flownet.pkl beside the python that
+  // defines it, no config.json. Tagged only when its tensors are the
+  // network temporal-resample's `rife` runs (4.22-4.26).
+  if (d.model_type.empty() && genai::MetalRife::looks_like_rife(dir)) {
+    d.model_type    = "rife";
+    d.detected_by   = "flownet";
+    d.weight_format = "torch";
+    catalog_default_io(d.model_type, d.inputs, d.outputs);
+  }
+
+  // ---- 2f. RelayVSR ------------------------------------------------------
+  // Two safetensors and no config.json: a keyframe DiT (format
+  // refvsr-wan-v1) and its decoder (refvsr-flash-v1), told by the format
+  // each states in its metadata -- what relayvsr-upscale runs.
+  // Only where the release's two names are there: the formats are read
+  // from the headers, and a scan of every safetensors in every directory
+  // the models DB walks is not worth that.
+  if (d.model_type.empty() && fs::is_directory(root) &&
+      fs::exists(root / "wan.safetensors") &&
+      fs::exists(root / "flash.safetensors")) {
+    genai::RelayVsrFiles rf;
+    if (genai::resolve_relayvsr_files(dir, &rf)) {
+      d.model_type    = "relayvsr";
+      d.detected_by   = "refvsr-metadata";
+      d.weight_format = "safetensors";
+      catalog_default_io(d.model_type, d.inputs, d.outputs);
     }
   }
 
@@ -744,6 +1080,13 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
           d.category    = "component";
           d.detected_by = "diffusers-component";
         }
+      } else if (const std::string df = dflash_tag_(cfg); !df.empty()) {
+        // A DFlash drafter reports model_type "qwen3" (its layers are
+        // Qwen3's) but runs nothing on its own: a supplement of its
+        // target, named by text-chat's draft_model.
+        d.model_type  = df;
+        d.category    = "supplement";
+        d.detected_by = "config";
       } else {
         d.model_type =
             lm_tag_(str_field_(cfg, "model_type"), base_lc, d.param_class);
@@ -756,7 +1099,10 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
 
   // ---- 4. a GGUF checkpoint -------------------------------------------
   std::string gguf;
-  if (d.model_type.empty() && d.is_dir && has_ext_(root, ".gguf", &gguf)) {
+  const bool gguf_file =
+      !d.is_dir && lower_(root.extension().string()) == ".gguf";
+  if (d.model_type.empty() &&
+      (gguf_file || (d.is_dir && has_ext_(root, ".gguf", &gguf)))) {
     // The repo NAME carries the family + size ("Qwen3.5-4B-GGUF"); the
     // .gguf file only carries the quant label.
     d.param_class = param_class_from_name_(base);
@@ -767,6 +1113,28 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
     } else if (has_(base_lc, "gemma")) {
       d.model_type = (!d.param_class.empty() && d.param_class[0] == 'E')
                          ? "gemma4" : "gemma4_unified";
+    } else {
+      // A name that says neither (Ternary-Bonsai-2-27B-gguf): the
+      // model's own architecture, read off its header -- the first
+      // .gguf that is not a projector (those say "clip").
+      std::vector<fs::path> files;
+      if (gguf_file) { files.push_back(root); }
+      std::error_code ec;
+      for (const auto& e : fs::directory_iterator(
+               d.is_dir ? root : fs::path(), ec)) {
+        if (lower_(e.path().extension().string()) == ".gguf") {
+          files.push_back(e.path());
+        }
+      }
+      std::sort(files.begin(), files.end());
+      for (const auto& f : files) {
+        const auto g = genai::GgufFile::open(f.string());
+        const auto a = g ? g->get_string("general.architecture")
+                         : std::nullopt;
+        if (!a || *a == "clip") { continue; }
+        if (*a == "qwen35" || *a == "qwen35moe") { d.model_type = "qwen3.5"; }
+        break;
+      }
     }
     if (!d.model_type.empty()) { d.detected_by = "gguf"; }
   }
@@ -824,20 +1192,19 @@ detect_model_dir(const std::string& dir, const std::string& hf_path_hint)
   return d;
 }
 
+namespace {
+
+// MiniMax-H3's RELEASED video VAE under `root`, "" when there is none.
+// This is the OUTER directory, not the `source/` one holding the
+// weights: the outer config.json is the one that names the class and
+// carries latents_mean / latents_std, while `source/config.json` is the
+// legacy geometry. The model loader descends the last level itself.
+// Both partition subdirectories: MiniMaxAI ships FL2VA/ and Ref2VA/ as
+// complete pipelines, and detection over a Ref2VA-only checkout that
+// probed FL2VA alone found no VAE at all.
 std::string
-resolve_vae_dir(const std::string& root)
+released_h3_video_vae_(const std::string& root)
 {
-  if (fs::exists(fs::path(root) / "vae" / "config.json")) {
-    return (fs::path(root) / "vae").string();
-  }
-  // MiniMax-H3's video VAE. This is the OUTER directory, not the
-  // `source/` one holding the weights: the outer config.json is the
-  // one that names the class and carries latents_mean / latents_std,
-  // while `source/config.json` is the legacy geometry. The model
-  // loader descends the last level itself.
-  // Both partition subdirectories: MiniMaxAI ships FL2VA/ and Ref2VA/ as
-  // complete pipelines, and detection over a Ref2VA-only checkout that
-  // probed FL2VA alone found no VAE at all.
   for (const fs::path& p : {fs::path(root) / "video_vae",
                             fs::path(root) / "FL2VA" / "video_vae",
                             fs::path(root) / "Ref2VA" / "video_vae"}) {
@@ -846,7 +1213,319 @@ resolve_vae_dir(const std::string& root)
       return p.string();
     }
   }
+  return {};
+}
+
+}  // namespace
+
+std::string
+vae_claim_dir(const std::string& vae_dir)
+{
+  // released_h3_video_vae_'s test, one level in: the outer config and
+  // the weights a level down.
+  std::error_code ec;
+  const fs::path p(vae_dir);
+  if (fs::exists(p / "source" / "model.safetensors", ec) &&
+      fs::exists(p / "config.json", ec)) {
+    return (p / "source").string();
+  }
+  return vae_dir;
+}
+
+std::string
+resolve_vae_dir(const std::string& root)
+{
+  const std::string h3 = released_h3_video_vae_(root);
+  if (fs::exists(fs::path(root) / "vae" / "config.json")) {
+    // A MiniMax-H3 checkout carries BOTH layouts: the diffusers pipeline
+    // at its root (`vae/`, AutoencoderKLMiniMaxH3) beside the released
+    // partitions' `video_vae/`. They are the same VAE -- the same
+    // tensors under other names -- so the released one answers whenever
+    // it is there. It is what MetalMiniMaxH3VideoVae::resolve_vae_dir
+    // finds first, i.e. what video-ref-encoder and generate-video's
+    // sizing open, and two answers would load the 10 GB VAE twice.
+    if (!h3.empty() &&
+        genai::minimax_h3::is_diffusers_vae_dir(
+            (fs::path(root) / "vae").string(),
+            genai::minimax_h3::kDiffusersVideoVaeClass)) {
+      return h3;
+    }
+    return (fs::path(root) / "vae").string();
+  }
+  // VOSR ships its autoencoder under the name of the model it was
+  // extracted from rather than under `vae/`, so a graph pointing every
+  // stage at one checkpoint root would otherwise find no VAE and open
+  // the root itself.
+  if (fs::exists(fs::path(root) / "Qwen-Image-vae-2d" / "config.json")) {
+    return (fs::path(root) / "Qwen-Image-vae-2d").string();
+  }
+  if (!h3.empty()) { return h3; }
+  // FlashVSR as published: its Wan 2.1 VAE is ONE torch file at the root
+  // with no config beside it. Returned by FILE, the way a Comfy-Org
+  // repack's component is, so the root's other checkpoints -- a 5.7 GB
+  // denoiser among them -- are never taken for it. The source
+  // projection's file is part of the test, so a directory that merely
+  // holds a stray VAE of that name is not this.
+  {
+    const fs::path vae = fs::path(root) / "Wan2.1_VAE.pth";
+    if (fs::exists(vae) && fs::exists(fs::path(root) / "LQ_proj_in.ckpt")) {
+      return vae.string();
+    }
+  }
+  // FlashVSR+: the same VAE, shared by a repository's variant folders
+  // (turbo/, base/) and kept one level up -- so a variant folder, which
+  // is what a record names, finds it there; the repository root finds it
+  // beside a variant.
+  {
+    const fs::path r(root);
+    auto variant = [](const fs::path& d) {
+      return fs::exists(d / "dit.safetensors") &&
+             fs::exists(d / "lq_proj_in.safetensors");
+    };
+    if (variant(r)) {
+      for (const fs::path& d : {r, r.parent_path()}) {
+        if (fs::exists(d / "Wan2.1_VAE.pth")) {
+          return (d / "Wan2.1_VAE.pth").string();
+        }
+      }
+    }
+    if (fs::exists(r / "Wan2.1_VAE.pth") &&
+        (variant(r / "turbo") || variant(r / "base"))) {
+      return (r / "Wan2.1_VAE.pth").string();
+    }
+  }
+  // A repack keeping its VAE as ONE freely-named file under `vae/`, with
+  // no config anywhere, whose REGISTERED family names that file as its
+  // weights. Returned by FILE, as FlashVSR's is, so the decode opens the
+  // VAE and not the repository (a 290 MB VAE had been claimed at a
+  // repository's 18 GB). Only that exact case: every other `vae/` --
+  // another family's single file, or several files a family picks
+  // between through its own vae_path() -- keeps resolving as it did.
+  {
+    const std::string v = (fs::path(root) / "vae").string();
+    const std::string only = resolve_vae_weights_path(v);
+    if (only != v) {
+      if (genai::VaeModelFamily* f = genai::VaeModelRegistry::get().claim_for(
+              nullptr, root, v, "")) {
+        if (f->vae_path(root, genai::VaeModelFamily::kRoleVideo) == only) {
+          return only;
+        }
+      }
+    }
+  }
   return root;
+}
+
+namespace {
+
+// Every VAE class a BUILT-IN decoder runs, and which one. The one table
+// both VAE stages read: they used to keep a copy each, whose last arm
+// was a default -- so a class neither knew was opened as a Qwen-Image
+// VAE and failed later, on a symptom (MiniMax-H3's diffusers VAE was
+// read as a 16-channel one: "carries 24/24 of the 16 latents_mean
+// entries"). A new class is a row here, or a registered family.
+struct VaeClass {
+  const char* cls;
+  const char* family;
+};
+constexpr VaeClass kVaeClasses[] = {
+    // Krea-2's and Qwen-Image's VAE, and its RGBA form (4 channels by
+    // `input_channels`, a scalar scaling_factor in place of per-channel
+    // stats -- both read by MetalKrea2Vae::config_from_json).
+    {"AutoencoderKLQwenImage", "krea2"},
+    // Qwen-Image-2.1's: the same implementation, generalized -- five
+    // levels instead of four, z 64, RGBA, an asymmetric decoder, all
+    // from config.json rather than from the class name.
+    {"AutoencoderKLQwenImage21", "krea2"},
+    // VOSR's image-only extraction of the Qwen-Image VAE: the same
+    // tensors with the temporal axis dropped, which MetalKrea2Vae reads
+    // by each tensor's rank.
+    {"AutoencoderKLQwenImage2D", "krea2"},
+    {"AutoencoderKLFlux2", "flux2"},
+    // The PLAIN diffusers AutoencoderKL (FLUX.1's, which Z-Image and
+    // Boogu-Image use) runs on the same code: MetalFlux2Vae is
+    // config-driven, and at patch 1 with a scalar shift/scale whitening
+    // it IS a plain AutoencoderKL.
+    {"AutoencoderKL", "flux2"},
+    // The VIDEO VAE. Same tensor names as the Qwen-Image one (it IS the
+    // general form of it), so the class name is the only thing that
+    // tells them apart -- and getting it wrong would decode a video
+    // latent as a single still.
+    {"AutoencoderKLWan", "wan"},
+    // MiniMax-H3's video VAE, released and diffusers (the same numbers;
+    // generative-models/minimax-h3/minimax-h3-diffusers-layout.h). Its
+    // own family because the DECODER is a 36-layer ViT -- one token per
+    // latent voxel, each projecting a whole 4x16x16 pixel block.
+    {"MiniMaxH3VideoVAE", "minimax-h3"},
+    {genai::minimax_h3::kDiffusersVideoVaeClass, "minimax-h3"},
+    // P-H3-Image's: H3's encoder with a decoder for one latent frame,
+    // which the same class runs (Config::dec_patch_t).
+    {genai::ph3::kVaeClass, "minimax-h3"},
+    // MiniMax-H3-Image's: H3's encoder with a 2D ViT decoder, (h, w)
+    // rotary over one latent frame (Config::rope_axes).
+    {genai::h3i::kVaeClass, "minimax-h3"},
+};
+
+}  // namespace
+
+std::string
+builtin_vae_family(const std::string& vae_dir, std::string* unknown_class)
+{
+  if (unknown_class != nullptr) { unknown_class->clear(); }
+  // A Comfy-Org repack ships its VAEs as bare .safetensors under `vae/`
+  // with no config.json at all; the architecture is in the file's
+  // `__metadata__` key instead, and probing for it costs one header
+  // read.
+  if (!genai::comfy::resolve_component(vae_dir, "vae", "minimax_h3_video_vae",
+                                       {"video_vae"}).empty()) {
+    return "minimax-h3";
+  }
+  std::ifstream in(fs::path(vae_dir) / "config.json");
+  if (in) {
+    FlexData fd;
+    try {
+      fd = FlexData::from_json(in);
+    } catch (...) {
+      fd = FlexData::make_null();
+    }
+    if (fd.is_object() && fd.as_object().contains("_class_name")) {
+      const FlexData c = fd.as_object().at("_class_name");  // bind the view
+      const std::string cls(c.as_string(""));
+      for (const VaeClass& v : kVaeClasses) {
+        if (cls == v.cls) { return v.family; }
+      }
+      // NAMED, and nothing here decodes it: refuse by name. Falling
+      // through to the Qwen-Image default opened it as the wrong model
+      // and failed on whatever that model checked first.
+      if (unknown_class != nullptr) { *unknown_class = cls; }
+      return {};
+    }
+  }
+  // A natively-named Wan 2.1 VAE with no config anywhere -- FlashVSR's
+  // `Wan2.1_VAE.pth`, which resolve_vae_dir() hands back by file. Its
+  // tensors say what it is. Files only, so a directory never pays for
+  // the probe.
+  std::error_code ec;
+  if (fs::is_regular_file(fs::path(vae_dir), ec) && !ec) {
+    genai::MetalWanVae::Config probe;
+    if (genai::MetalWanVae::config_for_native_checkpoint(vae_dir, probe)) {
+      return "wan";
+    }
+  }
+  // MiniMax-H3's VAE as ONE file at a repository's top, with no `vae/`
+  // and no config.json: Mamad8/MiniMax-H3-Image-VAE. Its metadata names
+  // it; the default below would open it as a Qwen-Image VAE.
+  if (!genai::comfy::resolve_component_in(vae_dir, "minimax_h3_video_vae",
+                                          {"video_vae"}).empty()) {
+    return "minimax-h3";
+  }
+  // No class at all: a STANDALONE checkpoint, whose config is borrowed
+  // from the model it serves (resolve_vae_config_path). Every one of
+  // those is a Qwen-Image VAE.
+  return "krea2";
+}
+
+std::string
+builtin_vae_classes()
+{
+  std::string s;
+  for (const VaeClass& v : kVaeClasses) {
+    if (!s.empty()) { s += ", "; }
+    s += v.cls;
+  }
+  return s;
+}
+
+std::string
+resolve_vae_weights_path(const std::string& vae_dir)
+{
+  std::error_code ec;
+  if (vae_dir.empty() || !fs::is_directory(fs::path(vae_dir), ec) || ec) {
+    return vae_dir;
+  }
+  const fs::path dir(vae_dir);
+  // Every layout MetalLlamaWeights::open_model globs for itself. Probed
+  // first so a diffusers or sharded checkpoint keeps taking the path it
+  // always did, whatever else happens to sit beside it.
+  for (const char* known : {"model.safetensors.index.json",
+                            "diffusion_pytorch_model.safetensors.index.json",
+                            "model.safetensors",
+                            "diffusion_pytorch_model.safetensors"}) {
+    if (fs::exists(dir / known, ec) && !ec) { return vae_dir; }
+  }
+  std::string only;
+  std::size_t n = 0;
+  std::error_code lec;
+  for (const auto& de : fs::directory_iterator(dir, lec)) {
+    const fs::path& p = de.path();
+    if (p.extension() != ".safetensors") { continue; }
+    const std::string fn = p.filename().string();
+    // A numbered shard is the index-less sharded layout, which
+    // open_model globs on its own.
+    if (fn.rfind("model-", 0) == 0 ||
+        fn.rfind("diffusion_pytorch_model-", 0) == 0) {
+      return vae_dir;
+    }
+    ++n;
+    if (n == 1) { only = p.string(); }
+  }
+  return (n == 1) ? only : vae_dir;
+}
+
+std::string
+resolve_vae_config_path(const SessionContextIntf* session,
+                        const std::string&        model_ref,
+                        const std::string&        vae_dir,
+                        std::string_view          expect_class)
+{
+  std::error_code ec;
+  // 1. The checkpoint's own. Probed first and unconditionally, so a file
+  //    someone put there beats anything inferred below -- including a
+  //    parent that disagrees with it.
+  const fs::path own = fs::path(vae_dir) / "config.json";
+  if (fs::exists(own, ec) && !ec) { return own.string(); }
+  if (session == nullptr || model_ref.empty()) { return {}; }
+
+  // 2. An installed model this VAE attaches to. The catalogue is what
+  //    says which those are -- `parent_model_type` on the supplement,
+  //    matched against the model_type of entries that are not
+  //    themselves supplements -- so this is not a search of the disk for
+  //    something plausible; it is the link the catalogue already
+  //    records, followed.
+  const std::string mt = resolve_model(session, model_ref).model_type;
+  if (mt.empty()) { return {}; }
+  std::string parent;
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    if (e.model_type == mt && !e.parent_model_type.empty()) {
+      parent = e.parent_model_type;
+      break;
+    }
+  }
+  if (parent.empty()) { return {}; }
+
+  for (const ModelCatalogEntry& e : model_catalog()) {
+    // A supplement is not a parent: a LoRA also carries model_type
+    // "krea2-lora" and parent "krea2", and it has no vae/ at all.
+    if (e.model_type != parent || !e.parent_model_type.empty()) { continue; }
+    const ResolvedModel rm = resolve_model(session, e.hf_path);
+    if (!rm.from_registry) { continue; }        // not installed here
+    const fs::path p = fs::path(rm.dir) / "vae" / "config.json";
+    if (!fs::exists(p, ec) || ec) { continue; }
+    if (!expect_class.empty()) {
+      // SAME FAMILY IS NOT SAME LATENT SPACE. Wan and Qwen-Image share
+      // this VAE's architecture and shapes and have entirely different
+      // latents_mean / latents_std, so a parent whose config names
+      // another class is skipped rather than borrowed -- that is the one
+      // way this fallback could produce a confident wrong answer.
+      const FlexData cfg = read_json_(p);
+      if (!cfg.is_object() ||
+          str_field_(cfg, "_class_name") != expect_class) {
+        continue;
+      }
+    }
+    return p.string();
+  }
+  return {};
 }
 
 }

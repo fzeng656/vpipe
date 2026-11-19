@@ -2,6 +2,7 @@
 
 #include "common/beat-payload-intf.h"
 #include "common/temp-root.h"
+#include "common/flex-bag.h"
 #include "common/flex-data.h"
 #include "common/media-decode.h"
 #include "common/media-line.h"
@@ -10,6 +11,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 
@@ -20,8 +22,17 @@
 #include "generative-models/gemma4/metal-gemma4-audio.h"
 #include "generative-models/gemma4/metal-gemma4-vision.h"
 #include "generative-models/loaded-language-model.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/deepseek-v41/deepseek-v41-config.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
+#include "generative-models/model-loader.h"
+#include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
+#include "generative-models/shared/dflash-drafter.h"
 #include "generative-models/shared/mcp/python-sandbox.h"
 #include "generative-models/shared/mcp/shell-tool.h"
 #include "generative-models/token-muxer.h"
@@ -34,6 +45,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -48,6 +60,253 @@
 using namespace std;
 
 namespace vpipe {
+
+namespace {
+
+// ---- a CONVERSATION beat (see the header) -------------------------------
+
+struct ConvMessage {
+  string role;      // system | user | assistant | tool
+  string content;
+  string name;      // a tool message's tool, when given
+};
+
+struct Conversation {
+  bool                on = false;
+  vector<ConvMessage> messages;
+  string              tools_json;   // one function spec a line; "" none
+  string              key;          // the context's key; "" the stage's
+  string              dir;          // where it is saved; "" nowhere
+  int                 max_new_tokens = 0;
+};
+
+// What a message is, for matching a kept context against the messages a
+// beat brings: FNV-1a over its role, name and text. An assistant
+// message matches the reply the stage decoded only when the host hands
+// it back exactly as out-port 0's `text` gave it.
+uint64_t
+message_digest(const ConvMessage& m)
+{
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](string_view s) {
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 1099511628211ull;
+    }
+    h ^= 0xff;
+    h *= 1099511628211ull;
+  };
+  mix(m.role);
+  mix(m.name);
+  mix(m.content);
+  return h;
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// What frames a conversation without being one of its messages: the
+// tools its system turn advertises, and the family's own system and
+// generation turns as this stage renders them (the reasoning
+// instruction; the empty thinking block of a template with thinking
+// off). It LEADS the digests a kept context holds, so a context made
+// under another frame -- the host changed its tools, the stage's
+// thinking mode was toggled -- is not reused for this one.
+uint64_t
+setup_digest(const genai::ChatTemplate& tpl, const string& tools_json)
+{
+  vector<int32_t> ids;
+  // With no system message: the tools turn, or the reasoning turn alone
+  // (render_system_message renders a conversation's message, an empty
+  // one too).
+  if (!tools_json.empty()) {
+    (void)tpl.render_system_message(string_view(), tools_json,
+                                    /*is_first_turn=*/true, &ids);
+  } else {
+    (void)tpl.render_reasoning_system_turn(&ids);
+  }
+  (void)tpl.render_generation_prompt(&ids);
+  ConvMessage m;
+  m.role = "setup";
+  m.name = string(tpl.family_name());
+  m.content.assign(reinterpret_cast<const char*>(ids.data()),
+                   ids.size() * sizeof(int32_t));
+  return message_digest(m);
+}
+#endif
+
+// A kept context's meta: the setup's digest (setup_digest), then the
+// digests of the messages it holds.
+constexpr string_view kConvMetaHead = "conversation/2";
+
+string
+digests_meta(const vector<uint64_t>& d)
+{
+  string s(kConvMetaHead);
+  char buf[24];
+  for (uint64_t x : d) {
+    std::snprintf(buf, sizeof buf, "\n%016llx",
+                  static_cast<unsigned long long>(x));
+    s += buf;
+  }
+  return s;
+}
+
+bool
+parse_digests_meta(string_view meta, vector<uint64_t>* out)
+{
+  out->clear();
+  if (meta.substr(0, kConvMetaHead.size()) != kConvMetaHead) {
+    return false;
+  }
+  size_t p = kConvMetaHead.size();
+  while (p < meta.size()) {
+    if (meta[p] != '\n' || p + 17 > meta.size()) { return false; }
+    uint64_t v = 0;
+    for (size_t i = p + 1; i < p + 17; ++i) {
+      const char c = meta[i];
+      v <<= 4;
+      if (c >= '0' && c <= '9') {
+        v |= (uint64_t)(c - '0');
+      } else if (c >= 'a' && c <= 'f') {
+        v |= (uint64_t)(c - 'a' + 10);
+      } else {
+        return false;
+      }
+    }
+    out->push_back(v);
+    p += 17;
+  }
+  return true;
+}
+
+// Where a keyed context is saved in its host's folder: the key, kept to
+// characters any file system takes.
+string
+context_file(const string& dir, const string& key)
+{
+  string name;
+  for (char c : key) {
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+        || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.';
+    name += ok ? c : '_';
+  }
+  if (name.empty() || name.front() == '.') { name = "context" + name; }
+  return (std::filesystem::path(dir) / (name + ".vctx")).string();
+}
+
+// The beat's object read: false (with *why) when it is not a
+// conversation this stage can take.
+bool
+parse_conversation(const FlexData& d, Conversation* c, string* why)
+{
+  const auto o = d.as_object();
+  if (!o.contains("messages")) {
+    *why = "an object beat needs \"messages\"";
+    return false;
+  }
+  const FlexData msgs = o.at("messages");
+  if (!msgs.is_array() || msgs.as_array().empty()) {
+    *why = "\"messages\" must be a non-empty array";
+    return false;
+  }
+  const auto ma = msgs.as_array();
+  for (size_t i = 0; i < ma.size(); ++i) {
+    const FlexData m = ma[i];
+    if (!m.is_object()) {
+      *why = "each message must be an object";
+      return false;
+    }
+    const auto mo = m.as_object();
+    ConvMessage cm;
+    if (mo.contains("role")) { cm.role = string(mo.at("role").as_string()); }
+    if (mo.contains("content")) {
+      cm.content = string(mo.at("content").as_string());
+    }
+    if (mo.contains("name")) { cm.name = string(mo.at("name").as_string()); }
+    if (cm.role != "system" && cm.role != "user" && cm.role != "assistant"
+        && cm.role != "tool") {
+      *why = "a message's role must be system, user, assistant or tool, "
+             "not '" + cm.role + "'";
+      return false;
+    }
+    c->messages.push_back(std::move(cm));
+  }
+  const string& last = c->messages.back().role;
+  if (last != "user" && last != "tool") {
+    *why = "the last message must be the user's or a tool's: the reply "
+           "comes after it";
+    return false;
+  }
+  if (o.contains("tools")) {
+    const FlexData tools = o.at("tools");
+    if (!tools.is_array()) {
+      *why = "\"tools\" must be an array";
+      return false;
+    }
+    const auto ta = tools.as_array();
+    for (size_t i = 0; i < ta.size(); ++i) {
+      const FlexData t = ta[i];
+      if (!t.is_object() || !t.as_object().contains("name")) {
+        *why = "each tool must be an object with a \"name\"";
+        return false;
+      }
+      // The OpenAI / Hermes function shape Qwen was trained on.
+      const auto to = t.as_object();
+      FlexData fn = FlexData::make_object();
+      {
+        auto f = fn.as_object();
+        f.insert("name", to.at("name"));
+        if (to.contains("description")) {
+          f.insert("description", to.at("description"));
+        }
+        f.insert("parameters", to.contains("parameters")
+                                   ? to.at("parameters")
+                                   : FlexData::make_object());
+      }
+      FlexData spec = FlexData::make_object();
+      {
+        auto so = spec.as_object();
+        so.insert("type", FlexData::make_string("function"));
+        so.insert("function", std::move(fn));
+      }
+      if (!c->tools_json.empty()) { c->tools_json += "\n"; }
+      c->tools_json += spec.to_json();
+    }
+  }
+  if (o.contains("context")) { c->key = string(o.at("context").as_string()); }
+  if (o.contains("context_dir")) {
+    c->dir = string(o.at("context_dir").as_string());
+  }
+  if (o.contains("max_new_tokens")) {
+    c->max_new_tokens = (int)o.at("max_new_tokens").as_int(0);
+  }
+  c->on = true;
+  return true;
+}
+
+// The reply less its tool-call blocks: what it says in words.
+string
+reply_words(const string& text, string_view open, string_view close)
+{
+  string out;
+  size_t p = 0;
+  while (p < text.size()) {
+    const size_t a = open.empty() ? string::npos : text.find(open, p);
+    if (a == string::npos) {
+      out += text.substr(p);
+      break;
+    }
+    out += text.substr(p, a - p);
+    const size_t b = text.find(close, a + open.size());
+    if (b == string::npos) { break; }
+    p = b + close.size();
+  }
+  const size_t s = out.find_first_not_of(" \t\r\n");
+  if (s == string::npos) { return {}; }
+  const size_t e = out.find_last_not_of(" \t\r\n");
+  return out.substr(s, e - s + 1);
+}
+
+}  // namespace
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
 namespace {
@@ -67,18 +326,46 @@ struct MediaItem {
 
 // Encode one decoded RGB image through whichever vision tower the LM
 // carries. Tower priority mirrors visual-qa (gemma-4 e4b tower, then
-// the encoder-less 12B unified embedder, then the Qwen metal tower).
+// the encoder-less 12B unified embedder, then the Qwen metal tower);
+// the Pixtral tower is its family's only one.
 optional<MediaItem>
-encode_image_item_(genai::MetalQwenVisionEncoder*   mvis,
-                   genai::MetalGemma4VisionEncoder* mgvis,
-                   genai::Gemma4UnifiedEmbedder*    mguni,
-                   const uint8_t*                   rgb,
-                   int                              H,
-                   int                              W)
+encode_image_item_(genai::MetalQwenVisionEncoder*    mvis,
+                   genai::MetalGemma4VisionEncoder*  mgvis,
+                   genai::Gemma4UnifiedEmbedder*     mguni,
+                   genai::MetalPixtralVisionEncoder* mpix,
+                   genai::MetalDeepseekV41Vision*    mds,
+                   genai::MetalLfm3VisionEncoder*    mlfm,
+                   const uint8_t*                    rgb,
+                   int                               H,
+                   int                               W)
 {
   MediaItem m;
   m.kind = genai::MediaChunk::Kind::Image;
-  if (mgvis) {
+  if (mlfm) {
+    // LFM3-VL: one row an <|image|> placeholder (f16), 1-D positions;
+    // the processor's own pixel bounds.
+    auto r       = mlfm->encode(rgb, H, W);
+    m.embeddings = std::move(r.embeddings);
+    m.n_tokens   = r.n_tokens;
+    m.mh         = r.grid_h;
+    m.mw         = r.grid_w;
+  } else if (mds) {
+    // DeepSeek-V4.1: the image's whole span (start, cells and row breaks,
+    // end) as host rows; 1-D positions.
+    auto r            = mds->encode(rgb, H, W);
+    m.embeddings_host = std::move(r.rows);
+    m.n_tokens        = r.n_tokens;
+    m.mh              = r.grid_h;
+    m.mw              = r.grid_w;
+  } else if (mpix) {
+    // Rows include the image's [IMG_BREAK] / [IMG_END] rows; the grid
+    // is informational (1-D RoPE family).
+    auto r       = mpix->encode(rgb, H, W);
+    m.embeddings = std::move(r.embeddings);
+    m.n_tokens   = r.n_tokens;
+    m.mh         = r.grid_h;
+    m.mw         = r.grid_w;
+  } else if (mgvis) {
     auto r       = mgvis->encode(rgb, H, W);
     m.embeddings = std::move(r.embeddings);
     m.n_tokens   = r.n_tokens;
@@ -164,6 +451,32 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   // Scalar attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
   _hf_dir        = attr_str("hf_dir");
+  _mtp_model     = attr_str("mtp_model");
+  _draft_model   = attr_str("draft_model");
+  _draft_block   = static_cast<int>(attr_int("draft_block_size"));
+  _draft_bits    = static_cast<int>(attr_int("draft_bits"));
+  if (_draft_block < 0 || _draft_block == 1) {
+    fail_config(fmt("TextChatStage('{}'): draft_block_size must be 0 "
+                    "(adaptive) or >= 2 (got {})", this->id(), _draft_block));
+  }
+  if (_draft_bits != 0 && _draft_bits != 4 && _draft_bits != 8) {
+    fail_config(fmt("TextChatStage('{}'): draft_bits must be 0, 4 or 8 "
+                    "(got {})", this->id(), _draft_bits));
+  }
+  _keep_loaded   = attr_real("keep_loaded");
+  _wire_weights  = attr_bool("wire_weights");
+  _memory_limit_mb = attr_int("memory_limit_mb");
+  if (_memory_limit_mb < 0) {
+    fail_config(fmt("TextChatStage('{}'): memory_limit_mb must be 0 (none) "
+                    "or more (got {})", this->id(), _memory_limit_mb));
+  }
+  _expert_cache_mb = attr_int("expert_cache_mb");
+  if (_expert_cache_mb < 0) {
+    fail_config(fmt("TextChatStage('{}'): expert_cache_mb must be 0 (the "
+                    "model's own) or more (got {})", this->id(),
+                    _expert_cache_mb));
+  }
+  _ngram_resident = attr_bool("ngram_resident");
   _compute_dtype = attr_str("compute_dtype");
   _page_tokens   = static_cast<int>(attr_int("page_tokens"));
   {
@@ -205,6 +518,9 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
   _web_allow_private = attr_bool("web_allow_private");
   _allow_system_temp = attr_bool("allow_system_temp");
   _stream_answer_only = attr_bool("stream_answer_only");
+  _stream_words = static_cast<int>(
+      std::max<int64_t>(0, attr_int("stream_words")));
+  _stream_speed = attr_bool("stream_speed");
 
   // disable_thinking is tri-state (unset = family default), with no flat
   // ConfigKey form, so it's read from the config object directly.
@@ -245,6 +561,11 @@ TextChatStage::TextChatStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The compute precisions the LM loader accepts, for the editor's
+// dropdown; the loader stays the authority.
+constexpr SpecExtra kComputeDtypeChoices[] = {
+  {spec_key::kChoices, "bf16,f16,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "model: a models-DB key (registered by model-fetch) or an "
@@ -254,7 +575,8 @@ constexpr ConfigKey kAttrs[] = {
    // text (so the browser hides ASR/image/audio-out models).
    .need_inputs = "text", .need_outputs = "text"},
   {.key = "compute_dtype", .type = ConfigType::String,
-   .doc = "bf16 | f16 | f32", .def_str = "bf16"},
+   .doc = "bf16 | f16 | f32", .def_str = "bf16",
+   .extra = kComputeDtypeChoices},
   {.key = "page_tokens", .type = ConfigType::Int,
    .doc = "ContextManager K/V page size", .def_int = 512},
   {.key = "max_pages", .type = ConfigType::Int,
@@ -270,13 +592,11 @@ constexpr ConfigKey kAttrs[] = {
           "into the tools turn when tools are on), verbatim from the "
           "published template. \"medium\" is the un-instructed "
           "rendering, exactly as the reference defines it, so it emits "
-          "nothing. Empty (the default) also emits nothing, which is "
-          "what every earlier Qwen3 build did -- the reference's own "
-          "default is \"xhigh\", but vpipe cannot tell a 3.8 checkpoint "
-          "from a 3.5/3.6 one (all three declare model_type "
-          "\"qwen3_5\"), so asking for xhigh is opt-in rather than "
-          "assumed. Ignored, with a warning, when thinking is off or "
-          "the family has no reasoning-effort concept",
+          "nothing. Empty (the default) is \"medium\" on a checkpoint "
+          "whose own chat template takes the control (Qwen3.8; the "
+          "reference's own default is \"xhigh\"). Ignored, with a "
+          "warning, when thinking is off or the checkpoint's template "
+          "has no such control (Qwen3.5 / 3.6)",
    .def_str = ""},
   {.key = "enable_tools", .type = ConfigType::Bool,
    .doc = "enable MCP tool calling: advertise the built-in tools "
@@ -331,10 +651,107 @@ constexpr ConfigKey kAttrs[] = {
           "text-to-speech) voices only the answer; out-port 0 still "
           "carries the full reply",
    .def_bool = false},
+  {.key = "stream_words", .type = ConfigType::Int,
+   .doc = "the streaming out-port's (index 1) chunk: flushed at a "
+          "sentence/clause punctuation past this many words (hard cap 3x, "
+          "at least 60) -- speakable units for text-to-speech; 0 flushes "
+          "every decoded piece as it comes, for a reader watching the "
+          "reply being written",
+   .def_int = 20},
+  {.key = "stream_speed", .type = ConfigType::Bool,
+   .doc = "each streaming out-port (index 1) beat carries `speed`: "
+          "{phase: prefill | decode, prefill_tps -- the last prefill "
+          "piece's tokens a second (the prompt whole where the model reads "
+          "it in one forward) -- prefill_tokens (that piece's), "
+          "prefill_done / prefill_total (the prompt so far), decode_tps -- "
+          "over the last 128 tokens decoded, or the round's so far when it "
+          "has fewer -- decoded (the round's tokens)}; a prompt being read "
+          "sends beats of no text, one a piece, and so does a decode that "
+          "sends nothing else for 250 ms (reasoning or a tool call folded "
+          "out by stream_answer_only, words gathering for stream_words). "
+          "A reader's meter",
+   .def_bool = false},
   {.key = "mtp", .type = ConfigType::Bool,
    .doc = "use the MTP speculative-decode head when the model carries one "
           "(token-exact; perf only); false forces the standard decode path",
    .def_bool = true},
+  {.key = "wire_weights", .type = ConfigType::Bool,
+   .doc = "wire (mlock) the model's buffers as they are allocated, so the "
+          "OS compressor never takes the weights mid-read: on a box short "
+          "of free memory the first forward otherwise spends tens of "
+          "seconds bringing them back. The GPU wires them at first use "
+          "anyway; charged to the wired pool",
+   .def_bool = true},
+  {.key = "memory_limit_mb", .type = ConfigType::Int,
+   .doc = "the most the model may hold in all, MB -- its weights as held, "
+          "an expert cache, a conversation's state and working memory: a "
+          "Mixture of Experts whose routed experts can live in a cache "
+          "(DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next) sizes the cache within "
+          "it, the rest of the box left to other models; DeepSeek's DSpark "
+          "head loads only where every expert is resident within it. A "
+          "dense model loads whole regardless. A model kept warm is handed "
+          "over at the size it was loaded at. 0: the box's memory",
+   .def_int = 0},
+  {.key = "expert_cache_mb", .type = ConfigType::Int,
+   .doc = "the routed experts' cache of a Mixture of Experts whose experts "
+          "can live in one (DeepSeek-V4.1-Flash, Qwen3.8-Flash-Next), MB: "
+          "at most this, within memory_limit_mb and the box as the model "
+          "sizes it. Smaller leaves room for a longer context and for the "
+          "models beside it; larger decodes faster, fewer experts read "
+          "from disk. Every expert stays resident only where all of them "
+          "fit within it (DeepSeek's DSpark head with them). A dense model "
+          "ignores it; a model kept warm is handed over at the size it "
+          "was loaded at. 0: the model's own sizing",
+   .def_int = 0},
+  {.key = "ngram_resident", .type = ConfigType::Bool,
+   .doc = "a model with an n-gram embedding table read by row from disk "
+          "(Qwen3.8-Flash-Next's, tens of GB) holds it in memory instead: "
+          "filled after the load, so loading takes no longer, and a "
+          "prompt's rows then come from memory -- the first part of a "
+          "long prompt no longer waits on a few hundred thousand disk "
+          "reads. Taken only where the model with every expert resident "
+          "and the table fit (within memory_limit_mb and expert_cache_mb "
+          "too); otherwise the rows are read from disk. Every other model "
+          "ignores it; a model kept warm is handed over as it was loaded. "
+          "false: from disk",
+   .def_bool = false},
+  {.key = "keep_loaded", .type = ConfigType::Real,
+   .doc = "seconds to keep the model loaded after this stage lets it go "
+          "(its graph unloaded): a chat that runs a graph per request "
+          "gets it back with no read and no warmup. Renewed after each "
+          "reply; released sooner when a launch needs other weights. 0 "
+          "unloads it with the graph",
+   .def_real = 0.0},
+  {.key = "mtp_model", .type = ConfigType::String,
+   .doc = "a separate MTP drafter to decode with (a models-DB key or a "
+          "directory holding its model.safetensors): the draft head a "
+          "model's conversion dropped -- mlx-community's Qwen3.8-27B-MTP-"
+          "4bit beside its Qwen3.8-27B-4bit. Empty: the head the model's "
+          "own directory carries, if any",
+   .def_str = "", .suggest_db = kModelRegistryDb},
+  {.key = "draft_model", .type = ConfigType::String,
+   .doc = "a DFlash / DFlash 2 block drafter to decode with (a models-DB "
+          "key or its directory): a small model that drafts a block of "
+          "tokens from the target's hidden states, which the model then "
+          "verifies in one forward -- incoai's Qwen3.8-27B-DFlash2 for "
+          "mlx-community's Qwen3.8-27B-4bit, its Qwen3.8-Flash-Next-"
+          "DFlash2 for Qwen3.8-Flash-Next. Greedy output is the model's "
+          "own (sampled: its own per-slot samples); perf only. Takes over "
+          "from mtp when set. Empty: none",
+   .def_str = "", .suggest_db = kModelRegistryDb},
+  {.key = "draft_block_size", .type = ConfigType::Int,
+   .doc = "tokens a DFlash round verifies (the anchor + drafts, 2 up to "
+          "the drafter's trained block). 0 (default) adapts it: each "
+          "size's measured round time against the drafts it gets "
+          "accepted -- on a GPU without matrix cores a short block wins, "
+          "since verifying a row costs nearly a decode step there",
+   .def_int = 0},
+  {.key = "draft_bits", .type = ConfigType::Int,
+   .doc = "the DFlash drafter's in-memory precision: 8 (default) or 4 -- "
+          "affine group-64, quantized at load; 4 halves its memory and "
+          "draft time for slightly fewer accepted drafts -- or 0 for its "
+          "stored bf16",
+   .def_int = 8},
   {.key = "mtp_prefix_seed", .type = ConfigType::Bool,
    .doc = "seed the MTP drafter's KV with the prompt at decode start: higher "
           "draft acceptance / decode throughput for a small extra prefill "
@@ -364,8 +781,9 @@ const PortSpec kIports[] = {
 };
 const PortSpec kOports[] = {
   {.name = "assistant",
-   .doc = "FlexData {text,prefill_ms,decode_ms,ctx_pos} per turn "
-          "(downstream optional)",
+   .doc = "FlexData {text,prefill_ms,decode_ms,decoded,prefilled,"
+          "ctx_pos, a drafter's drafter,rounds,drafted,accepted} per "
+          "turn (downstream optional)",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
   {.name = "stream",
@@ -374,8 +792,10 @@ const PortSpec kOports[] = {
           "punctuation (English + Chinese); the last beat of a reply sets "
           "end_of_response=true. Feeds a streaming consumer (e.g. "
           "text-to-speech) so it starts before the turn finishes. With "
-          "stream_answer_only, reasoning + tool-call spans are folded out "
-          "(downstream optional)",
+          "stream_answer_only, reasoning + tool-call spans are folded out; "
+          "with stream_speed, each beat carries `speed` (and a prompt "
+          "being read, or a decode that sends nothing else for 250 ms, "
+          "sends beats of no text) (downstream optional)",
    .type = &typeid(FlexDataPayload),
    .tags = "text", .clock_group = 0},
 };
@@ -485,6 +905,15 @@ TextChatStage::reset_run_state()
   _sampler_latched = false;
 }
 
+void
+TextChatStage::renew_warm_()
+{
+  if (_keep_loaded <= 0 || !_lm || session() == nullptr) { return; }
+  if (auto* mgr = session()->services()->generative_model_manager()) {
+    mgr->keep_warm(_lm, resolve_model_dir(session(), _hf_dir), _keep_loaded);
+  }
+}
+
 StageMemory
 TextChatStage::declare_memory() const
 {
@@ -496,12 +925,129 @@ TextChatStage::declare_memory() const
   return m;
 }
 
+std::string
+TextChatStage::spec_scratch_label_(const std::string& dir)
+{
+  return "spec-verify:" + dir;
+}
+
+genai::LmRunShape
+TextChatStage::run_shape_(const std::string& dir) const
+{
+  // the page pool, a conversation's context and the one parked with the
+  // warm model; an MTP head's seed or a DFlash drafter's taps prefill the
+  // prompt in one forward
+  genai::LmRunShape r;
+  r.page_tokens = _page_tokens;
+  r.max_pages = _max_pages;
+  r.kv_tokens = (std::int64_t)_page_tokens * (std::int64_t)_max_pages;
+  r.contexts = 2;
+  r.one_pass = _mtp_enabled || !_draft_model.empty();
+  r.draft_head = own_draft_head_(dir);
+  r.i8_prefill = _i8_prefill;
+  return r;
+}
+
+bool
+TextChatStage::own_draft_head_(const std::string& dir) const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // DeepSeek-V4.1's DSpark (mtp.*): ~8 GB, loaded with `mtp` where it
+  // pays -- every expert resident (the model's own rule).
+  if (!_mtp_enabled || !_mtp_model.empty() || !_draft_model.empty()) {
+    return false;
+  }
+  genai::DeepseekV41Config dc;
+  std::string err;
+  if (!genai::DeepseekV41Config::from_dir(dir, &dc, &err) || dc.n_mtp <= 0 ||
+      dc.dspark_block <= 1) {
+    return false;
+  }
+  // what it runs in with the head, the plan's figure (run_shape_)
+  genai::LmRunShape r;
+  r.page_tokens = _page_tokens;
+  r.max_pages = _max_pages;
+  r.kv_tokens = (std::int64_t)_page_tokens * (std::int64_t)_max_pages;
+  r.contexts = 2;
+  r.draft_head = true;
+  const std::size_t run = genai::lm_run_bytes(session(), dir, r);
+  const auto* sv = session() != nullptr ? session()->services() : nullptr;
+  return genai::MetalDeepseekV41ModelExec::dspark_pays(
+      session(), dir, run, sv != nullptr ? sv->metal_compute() : nullptr,
+      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20,
+      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20);
+#else
+  (void)dir;
+  return false;
+#endif
+}
+
+std::size_t
+TextChatStage::spec_scratch_bytes_(const std::string& dir) const
+{
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  // The rounds' widest: a DFlash block, or MTP's anchor + two drafts.
+  if (_draft_model.empty() && !_mtp_enabled) { return 0; }
+  // DeepSeek's verify rows fit the forward's own scratch, which its
+  // weight claim books (a block's draft scratch with the head)
+  if (own_draft_head_(dir)) { return 0; }
+  int rows = 0;
+  bool mtp = false;
+  genai::ModelLoader loader(session());
+  const auto mcfg = loader.load_config(dir);
+  if (!mcfg.has_value() || mcfg->hidden <= 0) { return 0; }
+  if (!_draft_model.empty()) {
+    const auto dc = genai::DFlashConfig::from_dir(
+        resolve_model_dir(session(), _draft_model));
+    rows = dc.has_value() ? dc->block_size : 16;
+  } else if (_mtp_enabled) {
+    std::error_code ec;
+    namespace fs = std::filesystem;
+    mtp = !_mtp_model.empty() || mcfg->num_nextn_layers > 0
+          || fs::exists(dir + "/mtp.safetensors", ec)
+          || fs::exists(dir + "/optiq/mtp.safetensors", ec);
+    rows = mtp ? 3 : 0;
+  }
+  if (rows == 0) { return 0; }
+  return genai::MetalQwenModel::verify_scratch_bytes(
+      genai::MetalQwenModel::config_from(*mcfg), rows, mtp);
+#else
+  (void)dir;
+  return 0;
+#endif
+}
+
 std::vector<ResourceClaim>
 TextChatStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return model_memory::weight_claims(
-      {resolve_model_dir(session(), _hf_dir)});
+  std::vector<std::string> dirs{resolve_model_dir(session(), _hf_dir)};
+  if (!_draft_model.empty()) {
+    dirs.push_back(resolve_model_dir(session(), _draft_model));
+  }
+  // The LM (streamable when it is a Mixture of Experts; under
+  // memory_limit_mb, or with expert_cache_mb, booked at what its cache
+  // leaves it holding), what it runs in and its vision tower at the
+  // largest picture a turn may bring; the drafter whole.
+  std::vector<ResourceClaim> out = model_memory::lm_claims(
+      session(), dirs[0], id(), run_shape_(dirs[0]), 0, 0,
+      (std::size_t)std::max<std::int64_t>(0, _memory_limit_mb) << 20,
+      (std::size_t)std::max<std::int64_t>(0, _expert_cache_mb) << 20,
+      _ngram_resident);
+  if (dirs.size() > 1) {
+    for (auto& c : model_memory::weight_claims({dirs[1]})) {
+      out.push_back(std::move(c));
+    }
+  }
+  // A drafter's verify pools its scratch for the model's life (tens of
+  // MB on a 27B: the long-context attention's partials, a block's
+  // logits). Withdrawn at load when no drafter attaches.
+  for (auto& c : model_memory::scratch_claims(
+           spec_scratch_label_(dirs[0]), spec_scratch_bytes_(dirs[0]),
+           {})) {
+    out.push_back(std::move(c));
+  }
+  return out;
 }
 
 Job
@@ -546,6 +1092,33 @@ TextChatStage::initialize(RuntimeContext& ctx)
   spec.compute_dtype = _compute_dtype;
   spec.page_tokens   = _page_tokens;
   spec.max_pages     = _max_pages;
+  if (!_mtp_model.empty()) {
+    bag::set_text(spec.extra, genai::load_spec::kMtpDir,
+                  resolve_model_dir(session(), _mtp_model));
+  } else if (own_draft_head_(spec.hf_dir)) {
+    // a draft head the model carries but loads only when asked for: the
+    // model's own directory named as its MTP drafter
+    bag::set_text(spec.extra, genai::load_spec::kMtpDir, spec.hf_dir);
+  }
+  if (!_draft_model.empty()) {
+    bag::set_text(spec.extra, genai::load_spec::kDraftDir,
+                  resolve_model_dir(session(), _draft_model));
+    bag::set_integer(spec.extra, genai::load_spec::kDraftBits, _draft_bits);
+  }
+  if (_wire_weights) {
+    bag::set_flag(spec.extra, genai::load_spec::kWireWeights, true);
+  }
+  if (_memory_limit_mb > 0) {
+    bag::set_integer(spec.extra, genai::load_spec::kMemoryLimitMb,
+                     _memory_limit_mb);
+  }
+  if (_expert_cache_mb > 0) {
+    bag::set_integer(spec.extra, genai::load_spec::kExpertCacheMb,
+                     _expert_cache_mb);
+  }
+  if (_ngram_resident) {
+    bag::set_flag(spec.extra, genai::load_spec::kNgramResident, true);
+  }
   session()->info(fmt(
       "TextChatStage('{}'): loading model from '{}' "
       "(dtype={}, page_tokens={}, max_pages={})",
@@ -559,18 +1132,35 @@ TextChatStage::initialize(RuntimeContext& ctx)
     _lm.reset();
     co_return;
   }
+  // Kept warm past this graph: the next chat's load is handed this one.
+  if (_keep_loaded > 0) { mgr->keep_warm(_lm, spec.hf_dir, _keep_loaded); }
+  // No drafter will run: the verify's scratch is never made.
+  {
+    const std::string d = _lm->spec_drafter();
+    if (d.empty()
+        || (d == genai::spec_decode::kDrafterMtp && !_mtp_enabled)) {
+      mgr->revise_scratch(spec_scratch_label_(spec.hf_dir), 0);
+    }
+  }
   // Apply the MTP prefix-seed preference before any prefill (no-op unless the
   // model carries a metal MTP head). Chat is decode-bound, so default on.
   if (_mtp_enabled) { _lm->set_mtp_prefix_seed(_mtp_prefix_seed); }
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs. No-op on
   // backends without the route; env VPIPE_I8_GEMM overrides either way.
-  if (_i8_prefill) { _lm->set_i8_prefill(true); }
+  // Asked off too: a model kept warm is handed over as the last stage left
+  // it, so a stage asking for 16 bits after one that asked for int8 would
+  // otherwise read in int8. Tagged with the launch: within one, the model
+  // runs int8 if ANY stage sharing it asked, whatever the init order.
+  _lm->request_i8_prefill(_i8_prefill, mgr->launch_epoch());
   // Cache whichever media-encoder towers this checkpoint carries; the
   // media-line turn path (attachment markers in the user line) uses
   // them to splice image/audio embeddings into the prefill. All null
   // on a text-only checkpoint -- media turns then warn and drop.
   _mvis     = _lm->metal_vision_encoder();
   _mgvis    = _lm->metal_gemma4_vision_encoder();
+  _mpix     = _lm->metal_pixtral_vision_encoder();
+  _mds      = _lm->metal_deepseek_v41_vision();
+  _mlfm     = _lm->metal_lfm3_vision();
   _mguni    = _lm->gemma4_unified_embedder();
   _m_audio  = _lm->metal_audio_encoder();
   _mg_audio = _lm->metal_gemma4_audio_encoder();
@@ -590,12 +1180,12 @@ TextChatStage::initialize(RuntimeContext& ctx)
   // When the config flag is unset the factory uses the family
   // default (Qwen3-VL: thinking-ON, Qwen3 text-only: OFF, others: n/a).
   _chat_tpl = genai::make_chat_template(
-      _lm->config().architecture, _lm->tokenizer(),
+      _lm->config(), _lm->tokenizer(),
       _disable_thinking, _reasoning_effort);
   // An effort that reached no instruction is reported, not dropped: the
-  // two ways that happens -- thinking off, or a family with no such
-  // control -- both render identically to not asking, so silence would
-  // leave a configured knob looking like it worked.
+  // two ways that happens -- thinking off, or a checkpoint whose template
+  // has no such control -- both render identically to not asking, so
+  // silence would leave a configured knob looking like it worked.
   if (!_reasoning_effort.empty() && _reasoning_effort != "medium"
       && _chat_tpl) {
     std::vector<std::int32_t> probe;
@@ -604,11 +1194,22 @@ TextChatStage::initialize(RuntimeContext& ctx)
           "TextChatStage('{}'): reasoning_effort '{}' has no effect here "
           "-- {}",
           this->id(), _reasoning_effort,
-          (_disable_thinking.has_value() && *_disable_thinking)
+          !_chat_tpl->assistant_prompt_opens_thinking()
               ? "thinking is off, and the reference template gates the "
                 "instruction on thinking being on"
-              : "this chat template has no reasoning-effort control"));
+              : "this checkpoint's chat template has no reasoning-effort "
+                "control"));
     }
+  }
+  // The effort a checkpoint that takes one gets when none was asked --
+  // vpipe's choice, not the reference's, so it is said.
+  if (_reasoning_effort.empty() && _chat_tpl
+      && !_chat_tpl->reasoning_effort().empty()) {
+    session()->info(fmt(
+        "TextChatStage('{}'): reasoning effort {}, the default for a "
+        "checkpoint whose chat template takes one (the reference's own is "
+        "xhigh; reasoning_effort sets another)",
+        this->id(), _chat_tpl->reasoning_effort()));
   }
   if (!_chat_tpl) {
     session()->warn(fmt(
@@ -708,6 +1309,11 @@ TextChatStage::process(RuntimeContext& ctx)
     ctx.signal_done();
     co_return;
   }
+  // Kept warm from the END of this reply, however it ends.
+  struct RenewWarm {
+    TextChatStage* self;
+    ~RenewWarm() { self->renew_warm_(); }
+  } renew{this};
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   // Latch the token-sampler spec off the OPTIONAL sampler iport, once: the
@@ -740,6 +1346,7 @@ TextChatStage::process(RuntimeContext& ctx)
         root.insert("text", FlexData::make_string(text));
         root.insert("prefill_ms", FlexData::make_int(prefill_ms));
         root.insert("decode_ms", FlexData::make_int(decode_ms));
+        root.insert("decoded", FlexData::make_int(0));
         root.insert("ctx_pos", FlexData::make_int(ctx_pos));
         return make_payload<FlexDataPayload>(std::move(fd));
       };
@@ -776,7 +1383,20 @@ TextChatStage::process(RuntimeContext& ctx)
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
   }
-  if (!fdp->data.is_string()) {
+  // An OBJECT beat is a CONVERSATION (see the header): every message
+  // of it, each turn -- the context kept from the last one reused for
+  // what it already holds.
+  Conversation conv;
+  if (fdp->data.is_object()) {
+    string why;
+    if (!parse_conversation(fdp->data, &conv, &why)) {
+      session()->warn(fmt(
+          "TextChatStage('{}'): not a conversation: {}", this->id(), why));
+      co_await ctx.write(0,
+          build_turn_payload("", 0, 0, current_ctx_pos()));
+      co_return;
+    }
+  } else if (!fdp->data.is_string()) {
     session()->warn(fmt(
         "TextChatStage('{}'): FlexData payload is not a string "
         "(type-discriminator-mismatch)", this->id()));
@@ -784,8 +1404,9 @@ TextChatStage::process(RuntimeContext& ctx)
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
   }
-  const string user_text = string(fdp->data.as_string(""));
-  if (user_text.empty()) {
+  string user_text = conv.on ? conv.messages.back().content
+                             : string(fdp->data.as_string(""));
+  if (!conv.on && user_text.empty()) {
     co_await ctx.write(0,
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
@@ -797,9 +1418,10 @@ TextChatStage::process(RuntimeContext& ctx)
   // BOS) re-emit it on the next turn; ChatML treats _seeded as a
   // no-op anyway. We still emit a turn beat so any feedback loop
   // sees the cleared ctx_pos and the next iteration fires.
-  if (user_text == "/clear") {
+  if (!conv.on && user_text == "/clear") {
     _chat_ctx = _lm->make_context();
     _seeded = false;
+    _conv_valid = false;
     session()->info(fmt("[chat cleared]"));
     co_await ctx.write(0,
         build_turn_payload("", 0, 0, current_ctx_pos()));
@@ -824,6 +1446,175 @@ TextChatStage::process(RuntimeContext& ctx)
         build_turn_payload("", 0, 0, current_ctx_pos()));
     co_return;
   }
+
+  // ---- a CONVERSATION: its context, and the messages still to render --
+  // The context kept under the beat's key -- the model manager holds it
+  // while the model is warm -- else the one saved in the beat's folder
+  // when the model went, else (or when the messages do not begin with
+  // what it holds) a new one. What it holds is matched message by
+  // message (message_digest); the messages after that render ahead of
+  // the turn (`conv_ids`), the first system turn advertising the host's
+  // tools. The beat's last user message is the turn's own line, below,
+  // as a plain beat's is (media markers too); a beat ending in tool
+  // results renders them and the generation prompt here.
+  vector<int32_t>  conv_ids;
+  vector<uint64_t> conv_digests;
+  bool             conv_tail_tool = false;
+  string           conv_restored;
+  int              conv_reused = 0;
+  if (!conv.on) {
+    // A plain line continues the stage's own context, which then holds
+    // no conversation a later beat could match.
+    if (!_chat_ctx.valid()) {
+      _chat_ctx = _lm->make_context();
+      _seeded = false;
+    }
+    _conv_valid = false;
+  } else {
+    auto refuse = [&](const string& why) {
+      session()->warn(fmt("TextChatStage('{}'): {}", this->id(), why));
+    };
+    vector<int32_t> probe;
+    if (!tpl->render_generation_prompt(&probe)) {
+      refuse(fmt("the '{}' chat template cannot render a conversation",
+                 tpl->family_name())());
+      co_await ctx.write(0,
+          build_turn_payload("", 0, 0, current_ctx_pos()));
+      co_return;
+    }
+    conv_digests.push_back(setup_digest(*tpl, conv.tools_json));
+    for (const auto& m : conv.messages) {
+      conv_digests.push_back(message_digest(m));
+    }
+    vector<uint64_t> held;
+    bool have = false;
+    auto* mgr = session()->services()->generative_model_manager();
+    if (!conv.key.empty()) {
+      genai::LoadedLanguageModel::Context kept;
+      string meta;
+      if (mgr != nullptr && mgr->take_context(conv.key, _lm, &kept, &meta)
+          && parse_digests_meta(meta, &held)) {
+        _chat_ctx = std::move(kept);
+        have = true;
+        conv_restored = "memory";
+      } else if (!conv.dir.empty()) {
+        const string file = context_file(conv.dir, conv.key);
+        std::error_code ec;
+        if (std::filesystem::exists(file, ec)) {
+          const auto t0 = std::chrono::steady_clock::now();
+          string err;
+          auto back = _lm->load_context(file, &meta, &err);
+          if (back.valid() && parse_digests_meta(meta, &held)) {
+            _chat_ctx = std::move(back);
+            have = true;
+            conv_restored = "disk";
+            session()->info(fmt(
+                "TextChatStage('{}'): conversation '{}' read back from "
+                "disk ({} tokens, {} ms)", this->id(), conv.key,
+                _chat_ctx.seq_len(),
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count()));
+          } else {
+            refuse(fmt("the saved conversation '{}' could not be read "
+                       "back ({}); it is prefilled again", conv.key,
+                       err)());
+          }
+          // Read back, or unreadable: the file has had its use.
+          std::filesystem::remove(file, ec);
+        }
+      }
+    } else if (_conv_valid && _chat_ctx.valid()) {
+      held = _conv_digests;
+      have = true;
+      conv_restored = "stage";
+    }
+    // Reused when it holds the same setup and at least one message, all
+    // of them the beat's first ones, and the beat brings more.
+    if (have && (held.size() < 2 || held.size() >= conv_digests.size()
+                 || !std::equal(held.begin(), held.end(),
+                                conv_digests.begin()))) {
+      have = false;
+    }
+    size_t k = 0;   // the messages the context holds
+    if (have) {
+      k = held.size() - 1;
+      _seeded = _chat_ctx.seq_len() > 0;
+    } else {
+      _chat_ctx = _lm->make_context();
+      _seeded = false;
+      conv_restored = "new";
+      if (!_chat_ctx.valid()) {
+        refuse("no context could be made for the conversation");
+        co_await ctx.write(0,
+            build_turn_payload("", 0, 0, current_ctx_pos()));
+        co_return;
+      }
+    }
+    _conv_valid = false;
+    conv_reused = _chat_ctx.seq_len();
+    const size_t n = conv.messages.size();
+    conv_tail_tool = conv.messages.back().role == "tool";
+    const size_t end = conv_tail_tool ? n : n - 1;
+    // The conversation's last user message (a system message past the
+    // first counts as one, as DeepSeek-V4.1's encoding counts it): an
+    // assistant turn after it is a step of the reply being made, which a
+    // family may render apart (render_assistant_message).
+    size_t last_user = 0;
+    for (size_t j = 0; j < n; ++j) {
+      const string& r = conv.messages[j].role;
+      if (r == "user" || (r == "system" && j > 0)) { last_user = j; }
+    }
+    size_t i = k;
+    bool ok = true;
+    if (k == 0) {
+      const bool sys = conv.messages[0].role == "system";
+      if (sys || !conv.tools_json.empty()) {
+        ok = tpl->render_system_message(
+            sys ? string_view(conv.messages[0].content) : string_view(),
+            conv.tools_json, /*is_first_turn=*/true, &conv_ids);
+        if (sys) { i = 1; }
+      }
+    }
+    while (ok && i < end) {
+      const auto& m = conv.messages[i];
+      if (m.role == "tool") {
+        vector<string> results;
+        while (i < end && conv.messages[i].role == "tool") {
+          results.push_back(conv.messages[i++].content);
+        }
+        ok = tpl->render_tool_results_message(
+            span<const string>(results.data(), results.size()), &conv_ids);
+        continue;
+      }
+      const bool first = !_seeded && conv_ids.empty();
+      ok = m.role == "assistant"
+               ? tpl->render_assistant_message(m.content, conv.tools_json,
+                                               i > last_user, first,
+                                               &conv_ids)
+               : tpl->render_message(m.role, m.content, first, &conv_ids);
+      ++i;
+    }
+    if (ok && conv_tail_tool) {
+      ok = tpl->render_generation_prompt(&conv_ids);
+    }
+    if (!ok) {
+      refuse(fmt("the '{}' chat template could not render the "
+                 "conversation", tpl->family_name())());
+      co_await ctx.write(0,
+          build_turn_payload("", 0, 0, current_ctx_pos()));
+      co_return;
+    }
+  }
+  // A conversation may ask for its own reply budget.
+  struct BudgetGuard {
+    int* at;
+    int  was;
+    ~BudgetGuard() { *at = was; }
+  } budget_guard{&_max_new_tokens, _max_new_tokens};
+  if (conv.on && conv.max_new_tokens > 0) {
+    _max_new_tokens = conv.max_new_tokens;
+  }
+
   // ---- media-line markers: processed BEFORE the tokenizer ----------
   // A marker-bearing line decomposes into ordered chunks (text runs +
   // attachments). Each attachment is decoded with FFmpeg to the
@@ -834,14 +1625,15 @@ TextChatStage::process(RuntimeContext& ctx)
   // and is dropped, keeping the surrounding text.
   vector<genai::MediaChunk> chunks;
   vector<MediaItem>         items;   // encoded media, in chunk order
-  if (media_line::has_media_marker(user_text)) {
+  if (!conv_tail_tool && media_line::has_media_marker(user_text)) {
     vector<string> perrs;
     auto segs = media_line::parse(user_text, &perrs);
     for (const auto& e : perrs) {
       session()->warn(fmt("TextChatStage('{}'): {}", this->id(), e));
     }
     const bool image_ok = tpl->image_pad_token_id() >= 0
-        && (_mvis || _mgvis || (_mguni && _mguni->has_vision()));
+        && (_mvis || _mgvis || _mpix || _mds || _mlfm ||
+            (_mguni && _mguni->has_vision()));
     const bool audio_ok = tpl->audio_pad_token_id() >= 0
         && (_m_audio || _mg_audio || (_mguni && _mguni->has_audio()));
     const FFmpegLibraries* libs = session()->services()->ffmpeg_libraries();
@@ -876,7 +1668,8 @@ TextChatStage::process(RuntimeContext& ctx)
                                       seg.bytes.size()),
                   &derr);
         if (img) {
-          item = encode_image_item_(_mvis, _mgvis, _mguni,
+          item = encode_image_item_(_mvis, _mgvis, _mguni, _mpix, _mds,
+                                    _mlfm,
                                     img->rgb.data(), img->height,
                                     img->width);
           if (!item) { derr = "vision encode failed"; }
@@ -911,7 +1704,7 @@ TextChatStage::process(RuntimeContext& ctx)
       chunks.push_back(std::move(c));
       items.push_back(std::move(*item));
     }
-  } else {
+  } else if (!conv_tail_tool) {
     genai::MediaChunk c;
     c.kind = genai::MediaChunk::Kind::Text;
     c.text = user_text;
@@ -923,9 +1716,12 @@ TextChatStage::process(RuntimeContext& ctx)
   // <bos>), so the user turn that follows must NOT emit it again -- pass
   // is_first_turn=false to the user render when a tools system turn will
   // precede it. A no-op for ChatML/Qwen (no session-start token).
-  const bool tools_active = !_tools.empty() && tpl->supports_tools();
+  // A conversation's tools are the HOST's: advertised in its system turn
+  // above and called back, never run here (see the header).
+  const bool tools_active =
+      !conv.on && !_tools.empty() && tpl->supports_tools();
   const bool tools_seed   = tools_active && !_seeded;
-  const bool user_is_first = !_seeded && !tools_seed;
+  const bool user_is_first = !_seeded && !tools_seed && conv_ids.empty();
 
   vector<int32_t> ids;
   bool have_media = !items.empty();
@@ -943,7 +1739,7 @@ TextChatStage::process(RuntimeContext& ctx)
     items.clear();
     ids.clear();
   }
-  if (!have_media && ids.empty()) {
+  if (!conv_tail_tool && !have_media && ids.empty()) {
     // Text-only turn (no markers, or every attachment dropped).
     string text_only;
     for (const auto& c : chunks) {
@@ -967,7 +1763,10 @@ TextChatStage::process(RuntimeContext& ctx)
   // declaration already lives in the K/V cache. After decode we scan
   // the reply for tool-call blocks, run them, and feed the results
   // back for another round (see the tool loop below).
-  if (tools_seed) {
+  if (conv.on) {
+    // The conversation's messages before the turn's own line.
+    ids.insert(ids.begin(), conv_ids.begin(), conv_ids.end());
+  } else if (tools_seed) {
     vector<int32_t> sys;
     // The tools turn CARRIES the reasoning-effort instruction when one
     // is set (the template merges them into one system turn, as the
@@ -1011,6 +1810,12 @@ TextChatStage::process(RuntimeContext& ctx)
   double     decode_s_total     = 0.0;
   int        prefill_n_total    = 0;
   int        decode_calls_total = 0;
+  // A drafter's rounds over the beat (its verify forwards), the draft
+  // tokens it offered and those kept: how much it bought.
+  std::string spec_drafter;
+  long       spec_rounds_total   = 0;
+  long       spec_drafted_total  = 0;
+  long       spec_accepted_total = 0;
   StopReason reason             = StopReason::StopToken;
 
   // Stop check + assistant-turn close token come from the same
@@ -1041,9 +1846,11 @@ TextChatStage::process(RuntimeContext& ctx)
   // unchanged. write_sync is used because the decode loop is synchronous
   // (no co_await inside it); the default-depth oport ring never
   // backpressures and a closed buffer (teardown) simply ends streaming.
-  constexpr int kStreamWordTarget = 20;   // flush at a punct past ~20 words
-  constexpr int kStreamWordMax    = 60;   // hard cap (runaway clause)
-  text_stream::Chunker stream_chunker(kStreamWordTarget, kStreamWordMax);
+  // Flush at a punctuation past ~`stream_words` words (20 by default),
+  // with a hard cap for a runaway clause; 0 = each piece as decoded.
+  const int stream_word_target = _stream_words;
+  const int stream_word_max    = std::max(60, 3 * _stream_words);
+  text_stream::Chunker stream_chunker(stream_word_target, stream_word_max);
   bool stream_alive = true;
   bool streamed_any = false;
   // When stream_answer_only is set, fold reasoning (<think>) and tool-call
@@ -1056,15 +1863,48 @@ TextChatStage::process(RuntimeContext& ctx)
       media_line::kThinkStart, media_line::kThinkEnd,
       tools_active ? tpl->tool_call_open_marker() : std::string_view(),
       tools_active ? tpl->tool_call_close_marker() : std::string_view());
+  // The reply's LIVE SPEED (stream_speed): what the last prefill piece
+  // read a second, and the decode's tokens a second over its last 128
+  // (the round's so far when it has fewer), each beat's as it goes out.
+  // `last_beat`: when the last beat of any kind went out.
+  struct LiveSpeed {
+    const char* phase = "prefill";
+    double prefill_tps = -1.0;
+    int    prefill_tokens = 0;
+    int    prefill_done = 0, prefill_total = 0;
+    double decode_tps = -1.0;
+    int    decoded = 0;
+    clock::time_point last_beat{};
+  } live;
   auto stream_emit =
       [&](std::string text, bool end_of_response) {
         if (!stream_alive) { return; }
+        live.last_beat = clock::now();
         FlexData fd = FlexData::make_object();
         {
           auto o = fd.as_object();
           o.insert("text", FlexData::make_string(text));
           o.insert("end_of_response",
                    FlexData::make_bool(end_of_response));
+          if (_stream_speed) {
+            FlexData sp = FlexData::make_object();
+            auto so = sp.as_object();
+            so.insert("phase", FlexData::make_string(live.phase));
+            if (live.prefill_tps >= 0.0) {
+              so.insert("prefill_tps",
+                        FlexData::make_real(live.prefill_tps));
+              so.insert("prefill_tokens",
+                        FlexData::make_int(live.prefill_tokens));
+            }
+            so.insert("prefill_done", FlexData::make_int(live.prefill_done));
+            so.insert("prefill_total",
+                      FlexData::make_int(live.prefill_total));
+            if (live.decode_tps >= 0.0) {
+              so.insert("decode_tps", FlexData::make_real(live.decode_tps));
+            }
+            so.insert("decoded", FlexData::make_int(live.decoded));
+            o.insert("speed", std::move(sp));
+          }
         }
         stream_alive =
             ctx.write_sync(1, make_payload<FlexDataPayload>(std::move(fd)));
@@ -1074,6 +1914,11 @@ TextChatStage::process(RuntimeContext& ctx)
   auto stream_consume =
       [&](const std::string& chunk) {
         if (chunk.empty() || !stream_alive) { return; }
+        if (stream_word_target == 0) {
+          streamed_any = true;
+          stream_emit(chunk, /*end_of_response=*/false);
+          return;
+        }
         if (stream_chunker.push(chunk)) {
           streamed_any = true;
           stream_emit(stream_chunker.take(), /*end_of_response=*/false);
@@ -1116,22 +1961,60 @@ TextChatStage::process(RuntimeContext& ctx)
       [&](int32_t next, std::span<const int32_t> prompt_ids)
           -> std::string {
     const auto t_decode_start = clock::now();
+    // The round's decode speed (stream_speed): each token decoded and its
+    // time, the last 129 kept -- the speed over the last 128 tokens, or
+    // over the round's from its start while it has fewer.
+    std::deque<std::pair<int, clock::time_point>> dec_at;
+    live.phase = "decode";
+    live.decoded = 0;
+    live.decode_tps = -1.0;
+    auto count_token = [&]() {
+      if (!_stream_speed) { return; }
+      const auto now = clock::now();
+      ++live.decoded;
+      dec_at.emplace_back(live.decoded, now);
+      while (dec_at.size() > 129) { dec_at.pop_front(); }
+      const auto& [n0, t0] = live.decoded > 128
+                                 ? dec_at.front()
+                                 : std::pair<int, clock::time_point>(
+                                       0, t_decode_start);
+      const double s = std::chrono::duration<double>(now - t0).count();
+      if (s > 0.0) { live.decode_tps = (live.decoded - n0) / s; }
+    };
+    // A DECODE THAT SENDS A READER NOTHING still moves the meter: reasoning
+    // or a tool call folded out by stream_answer_only, words gathering for
+    // stream_words, a token with no text yet. Each beat carries the speed,
+    // so where none has gone out for kSpeedGap a beat of no text does --
+    // as each prefill piece does. Most of an agentic turn is such a
+    // stretch.
+    constexpr auto kSpeedGap = std::chrono::milliseconds(250);
+    auto speed_heartbeat = [&]() {
+      if (_stream_speed && clock::now() - live.last_beat >= kSpeedGap) {
+        stream_emit(std::string(), /*end_of_response=*/false);
+      }
+    };
     // Stream the assistant's tokens to the user as they are produced via
     // the UI delegate's live text stream (stdout by default; the web-ui
     // console under the web delegate). We also accumulate the full text
     // so the per-turn FlexData beat on out-port 0 carries it.
     auto out_stream = session()->open_text_stream();
     std::string assistant_text;
+    // `decoded`: a token the decode wrote (not the thinking marker, nor
+    // the prefill's own first token): counted for the live speed.
     auto emit_chunk =
-        [&assistant_text, &out_stream, &stream_push](const std::string& chunk) {
-          if (chunk.empty()) {
-            return;
+        [&assistant_text, &out_stream, &stream_push, &count_token,
+         &speed_heartbeat](const std::string& chunk, bool decoded = true) {
+          if (decoded) { count_token(); }
+          if (!chunk.empty()) {
+            assistant_text += chunk;
+            out_stream->write(chunk);
+            // Feed the streaming out-port (index 1): same text as the
+            // live UI stream, re-chunked into ~20-word punctuation-
+            // bounded beats.
+            stream_push(chunk);
           }
-          assistant_text += chunk;
-          out_stream->write(chunk);
-          // Feed the streaming out-port (index 1): same text as the live
-          // UI stream, re-chunked into ~20-word punctuation-bounded beats.
-          stream_push(chunk);
+          // After the text's own beat, if it made one.
+          if (decoded) { speed_heartbeat(); }
         };
 
     auto sd = tok.make_stream_decoder();
@@ -1142,7 +2025,7 @@ TextChatStage::process(RuntimeContext& ctx)
     // generated by the model and the detokenizer rewrites it to
     // media_line::kThinkEnd (as it does both of Gemma's channel tokens).
     if (tpl->assistant_prompt_opens_thinking()) {
-      emit_chunk(string(media_line::kThinkStart));
+      emit_chunk(string(media_line::kThinkStart), /*decoded=*/false);
     }
     // Per-turn sampler — fresh seen-token set each turn so the
     // repetition / presence penalty rolls over cleanly between
@@ -1164,7 +2047,7 @@ TextChatStage::process(RuntimeContext& ctx)
       }
     }
     if (next >= 0 && !is_stop(next)) {
-      emit_chunk(tok.step(sd, next));
+      emit_chunk(tok.step(sd, next), /*decoded=*/false);
       sampler.prime(std::span<const int32_t>(&next, 1));
     }
     reason = StopReason::StopToken;
@@ -1179,14 +2062,15 @@ TextChatStage::process(RuntimeContext& ctx)
     // (greedy) or decode_pipelined (sampling, the verify samples each position).
     // The prefill's first token was already streamed above (and primes the
     // pipeline); on_tokens drops MTP's echo of it (out_ids[0] == next) and emits
-    // the rest, stopping as soon as a stop token is seen. Greedy OR penalty-free
-    // sampling -- the verify applies no repetition/presence penalty, so a
-    // penalised sampler stays on the loops below (which apply it).
-    const bool mtp_no_penalty =
-        (_sampler_params.repetition_penalty == 1.0f
-         && _sampler_params.presence_penalty == 0.0f);
-    if (next >= 0 && !is_stop(next) && _mtp_enabled && _lm->mtp_available()
-        && (!sampled_path || mtp_no_penalty)) {
+    // the rest, stopping as soon as a stop token is seen. Greedy or sampled,
+    // penalties included: the verify's seen-sets start from the prompt as
+    // pdecode_begin's does.
+    // Speculative decode: a DFlash drafter when one is attached (it was
+    // asked for by name), else the MTP head unless `mtp` opts out.
+    const std::string drafter = _lm->spec_drafter();
+    const bool use_spec = next >= 0 && !is_stop(next) && !drafter.empty() &&
+        (drafter != genai::spec_decode::kDrafterMtp || _mtp_enabled);
+    if (use_spec) {
       bool first_echo = true;
       bool stopped = false;
       int  produced = 0;
@@ -1199,8 +2083,21 @@ TextChatStage::process(RuntimeContext& ctx)
             }
             return !ctx.stop_requested() && !interrupted();
           };
-      _lm->mtp_generate(_chat_ctx, next, _max_new_tokens, _sampler_params,
-                        is_stop, on_toks, &produced, &stopped);
+      genai::SpecDecodeResult sres;
+      _lm->spec_generate(_chat_ctx, next, _max_new_tokens, _sampler_params,
+                         is_stop, on_toks, &produced, &stopped, prompt_ids,
+                         _draft_block, &sres);
+      if (sres.rounds > 0) {
+        spec_drafter = drafter;
+        spec_rounds_total += sres.rounds;
+        spec_drafted_total += sres.drafted;
+        spec_accepted_total += sres.accepted;
+        session()->info(fmt(
+            "TextChatStage('{}'): {} decode: {} tokens in {} rounds "
+            "({:.2f} a round), {}/{} drafts accepted", this->id(), drafter,
+            produced, sres.rounds, (double)produced / (double)sres.rounds,
+            sres.accepted, sres.drafted));
+      }
       if (stopped) {
         reason = StopReason::StopToken;
       } else if (interrupted()) {
@@ -1339,10 +2236,66 @@ TextChatStage::process(RuntimeContext& ctx)
   // Plain-text prefill of a round's prompt ids, timed into the
   // accumulators. Returns the predicted next token (-1 on failure).
   // Round 1 with media uses prefill_multimodal_metal inline instead.
+  // A prefill's live speed (stream_speed): each piece as the model reads
+  // it -- prefill-progress.h; a beat of no text a piece -- or, where the
+  // model reads the prompt in one forward, the prompt whole once read.
+  auto speed_beat = [&]() {
+    if (_stream_speed) { stream_emit(std::string(), false); }
+  };
+  auto prefill_timed = [&](int total, const auto& run) -> int32_t {
+    if (!_stream_speed) { return run(); }
+    live.phase = "prefill";
+    live.prefill_done = 0;
+    live.prefill_total = total;
+    auto last = clock::now();
+    int  last_done = 0;
+    bool pieces = false;
+    const bool told = _lm->set_prefill_progress(
+        [&](int done, int of) {
+          const auto now = clock::now();
+          const double sec = std::chrono::duration<double>(now - last)
+                                 .count();
+          pieces = true;
+          live.prefill_tokens = done - last_done;
+          live.prefill_tps = sec > 0.0 ? live.prefill_tokens / sec : -1.0;
+          live.prefill_done = done;
+          live.prefill_total = of;
+          last = now;
+          last_done = done;
+          speed_beat();
+        });
+    // LET GO ON EVERY WAY OUT: the callback reads this frame, and the
+    // model outlives it -- kept warm, holding a parked conversation,
+    // shared with the launch's other stages naming its checkpoint -- while
+    // a prefill can THROW (Session::error does, the routed-expert cache's
+    // failure among its callers). Cleared only after a return, a throw
+    // left the next prefill on the model calling into a dead frame.
+    struct Untell {
+      genai::LoadedLanguageModel* lm;
+      bool on;
+      ~Untell()
+      {
+        if (on) { lm->set_prefill_progress({}); }
+      }
+    } untell{_lm.get(), told};
+    const auto t0 = last;
+    const int32_t r = run();
+    if (!pieces && r >= 0) {
+      const double sec = std::chrono::duration<double>(clock::now() - t0)
+                             .count();
+      live.prefill_tokens = total;
+      live.prefill_tps = sec > 0.0 ? total / sec : -1.0;
+      live.prefill_done = total;
+      speed_beat();
+    }
+    return r;
+  };
   auto prefill_plain =
       [&](std::span<const int32_t> pids) -> int32_t {
     const auto t0 = clock::now();
-    const int32_t n = _lm->prefill(_chat_ctx, pids);
+    const int32_t n = prefill_timed(static_cast<int>(pids.size()), [&] {
+      return _lm->prefill(_chat_ctx, pids);
+    });
     const auto t1 = clock::now();
     prefill_s_total += std::chrono::duration<double>(t1 - t0).count();
     prefill_n_total += static_cast<int>(pids.size());
@@ -1393,6 +2346,7 @@ TextChatStage::process(RuntimeContext& ctx)
       genai::TokenRef r;
       if (image_pad >= 0 && id == image_pad && ii < imgs.size()) {
         r.kind = genai::TokenRef::Kind::ImageTokens;
+        r.text_id = id;
         if (!imgs[ii]->embeddings_host.empty()) {
           r.embeddings_host = &imgs[ii]->embeddings_host;
         } else {
@@ -1412,9 +2366,11 @@ TextChatStage::process(RuntimeContext& ctx)
       }
       refs.push_back(r);
     }
-    next = _lm->prefill_multimodal_metal(
-        _chat_ctx, span<const genai::TokenRef>(refs),
-        span<const pair<int, int>>(image_grids));
+    next = prefill_timed(static_cast<int>(refs.size()), [&] {
+      return _lm->prefill_multimodal_metal(
+          _chat_ctx, span<const genai::TokenRef>(refs),
+          span<const pair<int, int>>(image_grids));
+    });
     const auto t_prefill_end = clock::now();
     prefill_s_total += std::chrono::duration<double>(
         t_prefill_end - t_prefill_start).count();
@@ -1467,20 +2423,28 @@ TextChatStage::process(RuntimeContext& ctx)
                              : s.substr(0, cap) + "...[+"
                                    + std::to_string(s.size() - cap) + "B]";
     };
+    // The specs the system turn advertised: what a call's values are
+    // typed by.
+    const string tools_json = _tools.tools_json();
     int tool_round = 0;
     while (true) {
       // An interrupted turn stops here too: running the tools the
       // model asked for -- and decoding another round on top -- is
       // exactly the work the user just asked us to abandon.
       if (interrupted()) { break; }
-      const int markers = count_markers(assistant_text);
-      auto calls = tpl->parse_tool_calls(assistant_text);
+      // The calls are the ANSWER's: one the model drafted, or only
+      // mentioned, while it reasoned is not a call it made.
+      const string answer = media_line::reply_without_thinking(assistant_text);
+      const int markers = count_markers(answer);
+      const int in_reasoning = count_markers(assistant_text) - markers;
+      auto calls = tpl->parse_tool_calls(answer, tools_json);
       // One trace per scan so a tool turn is always followed in the debug
       // log -- both when it fires and when it silently produces nothing.
       session()->log_debug(fmt(
           "TextChatStage('{}'): tool scan (round {}): {} tool-call "
-          "marker(s), {} parsed call(s), reply {} chars",
-          this->id(), tool_round, markers,
+          "marker(s) in the answer ({} in the reasoning, not read), {} "
+          "parsed call(s), reply {} chars",
+          this->id(), tool_round, markers, in_reasoning,
           static_cast<int>(calls.size()),
           static_cast<int>(assistant_text.size())));
       if (calls.empty()) {
@@ -1496,9 +2460,8 @@ TextChatStage::process(RuntimeContext& ctx)
               "is returned. Enable debug logging to see the payload (a "
               "common cause is malformed arguments).",
               this->id(), markers));
-          const size_t a = assistant_text.find(call_marker);
-          const string blk = (a == string::npos)
-              ? assistant_text : assistant_text.substr(a);
+          const size_t a = answer.find(call_marker);
+          const string blk = (a == string::npos) ? answer : answer.substr(a);
           session()->log_debug(fmt(
               "TextChatStage('{}'): unparsed tool-call payload: {}",
               this->id(), excerpt(blk, 2000)));
@@ -1633,6 +2596,81 @@ TextChatStage::process(RuntimeContext& ctx)
     break;
   }
 
+  // ---- a CONVERSATION's turn ends: its context kept for the next ------
+  // Closed as the conversation rendered again reads (ChatML's "\n" after
+  // <|im_end|>), so the next beat's messages follow it exactly; then
+  // parked under its key with the model -- saved to its folder when the
+  // model goes -- or kept by the stage. The reply's tool calls go back
+  // to the host, which runs them and sends their results as the next
+  // beat's tool messages.
+  FlexData conv_calls = FlexData::make_array();
+  string   conv_finish;
+  int64_t  conv_ctx_pos = current_ctx_pos();
+  if (conv.on) {
+    if (reason != StopReason::DecodeError && _chat_ctx.valid()) {
+      vector<int32_t> sep;
+      tpl->render_turn_separator(&sep);
+      for (int32_t id : sep) { (void)_lm->next_token(_chat_ctx, id); }
+    }
+    conv_ctx_pos = current_ctx_pos();
+    vector<McpToolCall> calls;
+    if (!conv.tools_json.empty()) {
+      // The answer's calls, not the reasoning's (as in the tool rounds).
+      calls = tpl->parse_tool_calls(
+          media_line::reply_without_thinking(assistant_text),
+          conv.tools_json);
+    }
+    {
+      auto arr = conv_calls.as_array();
+      for (const auto& c : calls) {
+        FlexData o = FlexData::make_object();
+        {
+          auto oo = o.as_object();
+          oo.insert("name", FlexData::make_string(c.name));
+          oo.insert("arguments", FlexData::make_string(c.arguments_json));
+        }
+        arr.push_back(std::move(o));
+      }
+    }
+    switch (reason) {
+    case StopReason::StopToken:       conv_finish = "stop"; break;
+    case StopReason::MaxNewTokens:    conv_finish = "length"; break;
+    case StopReason::UserInterrupted: conv_finish = "interrupted"; break;
+    case StopReason::PipelineStopped: conv_finish = "stopped"; break;
+    case StopReason::DecodeError:     conv_finish = "error"; break;
+    }
+    if (!calls.empty()) { conv_finish = "tool_calls"; }
+    vector<uint64_t> held = conv_digests;
+    held.push_back(message_digest(ConvMessage{"assistant", assistant_text,
+                                              string()}));
+    if (reason == StopReason::DecodeError || !_chat_ctx.valid()) {
+      // A context a decode broke off in is not kept: the next beat
+      // starts again from its messages.
+      _chat_ctx = _lm->make_context();
+      _seeded = false;
+    } else if (!conv.key.empty()) {
+      string spill;
+      if (!conv.dir.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(conv.dir, ec);
+        spill = context_file(conv.dir, conv.key);
+      }
+      // The warm hold renewed FIRST: it runs from the last reply's end,
+      // so the host's pause plus this turn may have outlasted it, and a
+      // context parked with no hold is saved now, or let go.
+      renew_warm_();
+      if (auto* mgr = session()->services()->generative_model_manager()) {
+        mgr->park_context(conv.key, _lm, std::move(_chat_ctx),
+                          digests_meta(held), spill);
+      }
+      _chat_ctx = genai::LoadedLanguageModel::Context{};
+      _seeded = false;
+    } else {
+      _conv_digests = std::move(held);
+      _conv_valid = true;
+    }
+  }
+
   // Close the streaming out-port for this turn: the tail text goes out
   // as the final {text, end_of_response=true} beat (before the complete
   // per-turn record on out-port 0, so a consumer sees the reply end).
@@ -1654,9 +2692,26 @@ TextChatStage::process(RuntimeContext& ctx)
     root.insert("decode_ms",
         FlexData::make_int(
             static_cast<int64_t>(decode_s * 1000.0)));
-    root.insert("ctx_pos",
-        FlexData::make_int(
-            static_cast<int64_t>(_chat_ctx.seq_len())));
+    root.insert("decoded", FlexData::make_int(decode_calls_total));
+    root.insert("prefilled", FlexData::make_int(prefill_n_total));
+    root.insert("ctx_pos", FlexData::make_int(conv_ctx_pos));
+    if (spec_rounds_total > 0) {
+      root.insert("drafter", FlexData::make_string(spec_drafter));
+      root.insert("rounds", FlexData::make_int(spec_rounds_total));
+      root.insert("drafted", FlexData::make_int(spec_drafted_total));
+      root.insert("accepted", FlexData::make_int(spec_accepted_total));
+    }
+    if (conv.on) {
+      root.insert("content", FlexData::make_string(reply_words(
+          assistant_text, tpl->tool_call_open_marker(),
+          tpl->tool_call_close_marker())));
+      root.insert("tool_calls", std::move(conv_calls));
+      root.insert("finish", FlexData::make_string(conv_finish));
+      root.insert("reused", FlexData::make_int(conv_reused));
+      root.insert("restored", FlexData::make_string(conv_restored));
+      root.insert("ctx_bytes", FlexData::make_int(
+          static_cast<int64_t>(_lm->kv_bytes())));
+    }
   }
   co_await ctx.write(0,
       make_payload<FlexDataPayload>(std::move(fd)));

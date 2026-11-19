@@ -26,6 +26,10 @@ using namespace metal;
 #endif
 
 #define SDPA_MAX_PER 16  // max D/32 (supports D up to 512: Gemma-4 full-attn)
+// The wide twin's budget: ceil(1280/32), which covers the Qwen-Image-2.1
+// VAE's 1152-channel mid block with room above it. Only
+// sdpa_full_wide_f16 pays these registers.
+#define SDPA_WIDE_MAX_PER 40
 #define SDPA_MAX_G   4   // max GQA group (e4b global Hq/Hkv = 8/2 = 4); used by
                          // the kv_read_probe M=G mode (qreg/dd = per*G regs).
 
@@ -35,20 +39,27 @@ using namespace metal;
 // qi attends ALL keys 0..T_kv-1. No q_offset.
 //   0:q[Hq,n_q,D] 1:k/2:v[Hkv,T_kv,D] 3:out 4:scale 5:T_kv 6:D 7:Hq
 //   8:Hkv 9:n_q 10:kv_stride.  grid (32, Hq, n_q); threadgroup (32,1,1).
-kernel void sdpa_full_f16(
-    const device VPIPE_ELT* q        [[buffer(0)]],
-    const device VPIPE_ELT* k        [[buffer(1)]],
-    const device VPIPE_ELT* v        [[buffer(2)]],
-    device VPIPE_ELT*       out      [[buffer(3)]],
-    constant float&    scale    [[buffer(4)]],
-    constant int&      T_kv     [[buffer(5)]],
-    constant int&      D        [[buffer(6)]],
-    constant int&      Hq       [[buffer(7)]],
-    constant int&      Hkv      [[buffer(8)]],
-    constant int&      n_q      [[buffer(9)]],
-    constant int&      kv_stride [[buffer(10)]],
-    uint3 tid  [[threadgroup_position_in_grid]],
-    uint  lane [[thread_index_in_simdgroup]])
+//
+// THE BODY IS TEMPLATED ON THE REGISTER BUDGET, and that is not a
+// refactor for its own sake. `per` is ceil(D/32) and indexes two
+// per-thread float arrays, so a D past MAXP*32 walks off the end of
+// both -- in Metal, silently, producing a plausible wrong answer rather
+// than a fault. That is exactly what a D=1152 VAE mid-block attention
+// did against a MAXP of 16 (rel-L2 0.17 against the reference, uniform
+// across every channel, which reads like precision and is not).
+//
+// So there are two entry points over one body: the ordinary one keeps
+// the 16 it always had, because these arrays are REGISTERS and this
+// tree's throughput is occupancy-bound -- widening them for everybody
+// would tax every LM and vision-tower fallback for one VAE. The _wide
+// twin pays for itself only where it is dispatched. The host picks, and
+// refuses loudly past the wider bound rather than overflowing again.
+template <int MAXP>
+inline void
+sdpa_full_body(const device VPIPE_ELT* q, const device VPIPE_ELT* k,
+               const device VPIPE_ELT* v, device VPIPE_ELT* out,
+               float scale, int T_kv, int D, int Hq, int Hkv, int n_q,
+               int kv_stride, uint3 tid, uint lane)
 {
   const int h = (int)tid.y;
   const int qi = (int)tid.z;
@@ -59,13 +70,17 @@ kernel void sdpa_full_f16(
   // every access with idx < D. For D divisible by 32 (head_dim 64/256
   // etc.) per is unchanged and every guard is trivially true, so this is
   // behaviour-identical to the old D/32 form.
-  const int per = (D + 31) / 32;
+  //
+  // CLAMPED to MAXP: a caller that ignores the host-side bound gets a
+  // truncated head rather than a stack overwrite. Wrong either way, but
+  // wrong INSIDE its own memory.
+  const int per = min((D + 31) / 32, MAXP);
   const device VPIPE_ELT* qh = q + ((uint)h * n_q + qi) * D;
   const device VPIPE_ELT* kkv = k + (uint)kv * kv_stride * D;
   const device VPIPE_ELT* vkv = v + (uint)kv * kv_stride * D;
 
-  float qreg[SDPA_MAX_PER];
-  float acc[SDPA_MAX_PER];
+  float qreg[MAXP];
+  float acc[MAXP];
   for (int p = 0; p < per; ++p) {
     const int idx = lane * per + p;
     qreg[p] = idx < D ? float(qh[idx]) * scale : 0.0f;
@@ -98,6 +113,48 @@ kernel void sdpa_full_f16(
       out[((uint)h * n_q + qi) * D + idx] = VPIPE_ELT(acc[p] * inv_l);
     }
   }
+}
+
+kernel void sdpa_full_f16(
+    const device VPIPE_ELT* q        [[buffer(0)]],
+    const device VPIPE_ELT* k        [[buffer(1)]],
+    const device VPIPE_ELT* v        [[buffer(2)]],
+    device VPIPE_ELT*       out      [[buffer(3)]],
+    constant float&    scale    [[buffer(4)]],
+    constant int&      T_kv     [[buffer(5)]],
+    constant int&      D        [[buffer(6)]],
+    constant int&      Hq       [[buffer(7)]],
+    constant int&      Hkv      [[buffer(8)]],
+    constant int&      n_q      [[buffer(9)]],
+    constant int&      kv_stride [[buffer(10)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  sdpa_full_body<SDPA_MAX_PER>(q, k, v, out, scale, T_kv, D, Hq, Hkv, n_q,
+                               kv_stride, tid, lane);
+}
+
+// The wide-head twin. Same contract, same results; it exists only to
+// carry a head dim the 16-register form cannot index. Used by the
+// Qwen-Image-2.1 VAE, whose mid-block attention is one head of 1152
+// (decoder) and 768 (encoder) channels.
+kernel void sdpa_full_wide_f16(
+    const device VPIPE_ELT* q        [[buffer(0)]],
+    const device VPIPE_ELT* k        [[buffer(1)]],
+    const device VPIPE_ELT* v        [[buffer(2)]],
+    device VPIPE_ELT*       out      [[buffer(3)]],
+    constant float&    scale    [[buffer(4)]],
+    constant int&      T_kv     [[buffer(5)]],
+    constant int&      D        [[buffer(6)]],
+    constant int&      Hq       [[buffer(7)]],
+    constant int&      Hkv      [[buffer(8)]],
+    constant int&      n_q      [[buffer(9)]],
+    constant int&      kv_stride [[buffer(10)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  sdpa_full_body<SDPA_WIDE_MAX_PER>(q, k, v, out, scale, T_kv, D, Hq, Hkv,
+                                    n_q, kv_stride, tid, lane);
 }
 
 // Block-windowed (non-causal) attention: identical to sdpa_full_f16 but
@@ -2879,7 +2936,10 @@ kernel void sdpa_gqa_merge_f16(
 // == 0 (per4 = D/128; D=256/128); other shapes stay on mb256.
 //   0:q 1:kpool 2:vpool 3:o_acc(f32) 4:m(f32) 5:l(f32) 6:scale 7:D 8:Hq
 //   9:Hkv 10:q_offset 11:page_tokens 12:n_pages 13:page_table 14:split
-// grid (32, Hq, split); threadgroup (32, G, 1).
+// grid (32, Hq, split); threadgroup (32, G, 1). ROWS: grid.z = split * n
+// runs n query rows at once -- row r at position q_offset + r, its q and
+// partials at head r * Hq + qhead -- a speculative verify's rows in one
+// dispatch; each row's arithmetic is the one-row dispatch's.
 kernel void sdpa_paged_gqa_vec_f16(
     const device VPIPE_ELT* q          [[buffer(0)]],
     const device VPIPE_ELT* kpool      [[buffer(1)]],
@@ -2901,13 +2961,14 @@ kernel void sdpa_paged_gqa_vec_f16(
     uint  lane      [[thread_index_in_simdgroup]])
 {
   const int kv = (int)tid.y;
-  const int s  = (int)tid.z;
+  const int row = (int)tid.z / split;
+  const int s  = (int)tid.z - row * split;
   const int G  = Hq / Hkv;
   const int g  = (int)simd_gid;
-  const int qhead = kv * G + g;
+  const int qhead = row * Hq + kv * G + g;
   const int per = D / 32;
   const int per4 = per / 4;
-  const int q_pos = q_offset;
+  const int q_pos = q_offset + row;
   const int total = q_pos + 1;
   const uint page_stride = (uint)Hkv * page_tokens * D;
   const uint head_off = (uint)kv * page_tokens * D;
@@ -3033,12 +3094,14 @@ static inline void sdpa_gqa_kbl_impl(
   constexpr int DV = DK4 * 4;                        // head_dim
   typedef vec<VPIPE_ELT, 4> elt4;
 
-  const int s    = (int)tid.z;
+  // grid.z = split * rows: row r at q_offset + r (see sdpa_paged_gqa_vec).
+  const int row  = (int)tid.z / split;
+  const int s    = (int)tid.z - row * split;
   const int G    = Hq / Hkv;
   const int g    = (int)simd_gid;
   const int kvix = (int)tid.y;                      // 0..Hkv-1
-  const int qhead = kvix * G + g;
-  const int total = q_offset + 1;
+  const int qhead = row * Hq + kvix * G + g;
+  const int total = q_offset + row + 1;
   const uint page_stride = (uint)Hkv * page_tokens * D;
   const uint head_off    = (uint)kvix * page_tokens * D;
 
@@ -3314,10 +3377,12 @@ METAL_FUNC void sdpa_paged_gqa_vec2_impl(
     uint3 tid, uint simd_gid, uint simd_lid)
 {
   const int kvh   = (int)tid.y;            // threadgroups in y == Hkv
-  const int block = (int)tid.z;
+  // grid.z = blocks * rows: row r at q_offset + r (see sdpa_paged_gqa_vec).
+  const int row   = (int)tid.z / blocks;
+  const int block = (int)tid.z - row * blocks;
   const int G     = Hq / Hkv;
-  const int qh    = kvh * G + (int)simd_gid;
-  const int N     = q_offset + 1;          // keys 0..q_offset
+  const int qh    = row * Hq + kvh * G + (int)simd_gid;
+  const int N     = q_offset + row + 1;    // keys 0..its position
   const uint page_stride = (uint)Hkv * page_tokens * D;
   const uint head_off    = (uint)kvh * page_tokens * D;
 
@@ -4435,6 +4500,140 @@ kernel void sdpa_paged_causal_f16(
   }
 }
 
+// sdpa_paged_causal_split_f16 -- sdpa_paged_causal_f16 for a FEW query
+// rows (a decode step, a speculative verify's): the keys a row sees cut
+// into NS contiguous runs, a simdgroup each, the runs' online-softmax
+// states (max, denominator, weighted sum) merged in threadgroup memory in
+// run order. One simdgroup a row walked every key in turn -- ~0.8 us a key
+// on an M5 Ultra, so a layer's attention grew a millisecond a thousand
+// keys. The runs are a function of how many keys the row sees alone, so a
+// verify's row is computed exactly as the decode step at its position.
+//
+// MEASURED (M5 Ultra, Flash-Next's Hq 24 / Hkv 2 / D 256, bf16, a decode
+// row): 128 keys 191 -> 15 us, 512 756 -> 75, 2048 3010 -> 176, 4096
+// 6040 -> 347 (16 runs; 8 runs half as fast past 512 keys; 32 do not fit
+// a threadgroup's memory at D 256). Its sums are the same to bf16 rounding
+// (2-5 of 6144 outputs differ, by <= 5e-4).
+//
+// Same buffers as sdpa_paged_causal_f16. grid (32, NS * H_q, n_q),
+// threadgroup (32, NS, 1); D <= 32 * SDPA_SPLIT_MAX_PER.
+#ifndef SDPA_SPLIT_MAX_PER
+#define SDPA_SPLIT_MAX_PER 8
+#endif
+template <int NS>
+METAL_FUNC void sdpa_paged_split_impl(
+    const device VPIPE_ELT* q, const device VPIPE_ELT* kpool,
+    const device VPIPE_ELT* vpool, device VPIPE_ELT* out, float scale,
+    int D, int Hq, int Hkv, int n_q, int q_offset, int page_tokens,
+    int n_pages, const device int* page_table, uint3 tid, uint sid,
+    uint lane, threadgroup float* red_acc, threadgroup float* red_m,
+    threadgroup float* red_l) {
+  const int h = (int)tid.y;
+  const int qi = (int)tid.z;
+  const int kv = h / (Hq / Hkv);
+  const int per = D / 32;
+  const int q_pos = q_offset + qi;
+  const int L = q_pos + 1;                      // the keys this row sees
+  const int s0 = (int)sid * L / NS, s1 = ((int)sid + 1) * L / NS;
+
+  const device VPIPE_ELT* qh = q + ((uint)h * n_q + qi) * D;
+  const uint page_stride = (uint)Hkv * page_tokens * D;
+  const uint head_off = (uint)kv * page_tokens * D;
+  float qreg[SDPA_SPLIT_MAX_PER];
+  float acc[SDPA_SPLIT_MAX_PER];
+  for (int p = 0; p < per; ++p) {
+    qreg[p] = float(qh[lane * per + p]) * scale;
+    acc[p] = 0.0f;
+  }
+  float m = -INFINITY;
+  float l = 0.0f;
+  if (s1 > s0) {
+    // The page holding position s0: pages ascend by their first position.
+    int lo = 0, hi = n_pages - 1;
+    while (lo < hi) {
+      const int mid = (lo + hi + 1) / 2;
+      if (page_table[mid * 3 + 2] <= s0) { lo = mid; } else { hi = mid - 1; }
+    }
+    int pos = s0;
+    for (int pg = lo; pg < n_pages && pos < s1; ++pg) {
+      const int pid    = page_table[pg * 3 + 0];
+      const int nvalid = page_table[pg * 3 + 1];
+      const int gstart = page_table[pg * 3 + 2];
+      const int t0 = metal::max(pos - gstart, 0);
+      const int t1 = metal::min(nvalid, s1 - gstart);
+      const device VPIPE_ELT* kbase =
+          kpool + (uint)pid * page_stride + head_off;
+      const device VPIPE_ELT* vbase =
+          vpool + (uint)pid * page_stride + head_off;
+      for (int t = t0; t < t1; ++t) {
+        float dot = 0.0f;
+        for (int p = 0; p < per; ++p) {
+          dot += qreg[p] * float(kbase[(uint)t * D + lane * per + p]);
+        }
+        dot = simd_sum(dot);
+        const float m_new = max(m, dot);
+        const float corr = exp(m - m_new);
+        const float pj = exp(dot - m_new);
+        l = l * corr + pj;
+        for (int p = 0; p < per; ++p) {
+          acc[p] = acc[p] * corr +
+                   pj * float(vbase[(uint)t * D + lane * per + p]);
+        }
+        m = m_new;
+      }
+      pos = gstart + metal::max(t1, t0);
+    }
+  }
+  for (int p = 0; p < per; ++p) {
+    red_acc[(int)sid * (32 * SDPA_SPLIT_MAX_PER) + lane * per + p] = acc[p];
+  }
+  if (lane == 0) { red_m[sid] = m; red_l[sid] = l; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sid != 0) { return; }
+  float M = -INFINITY;
+  for (int s = 0; s < NS; ++s) { M = max(M, red_m[s]); }
+  float lt = 0.0f;
+  float w[NS];
+  for (int s = 0; s < NS; ++s) {
+    w[s] = red_l[s] > 0.0f ? exp(red_m[s] - M) : 0.0f;
+    lt += red_l[s] * w[s];
+  }
+  const float inv = 1.0f / lt;
+  for (int p = 0; p < per; ++p) {
+    float t = 0.0f;
+    for (int s = 0; s < NS; ++s) {
+      t += red_acc[s * (32 * SDPA_SPLIT_MAX_PER) + lane * per + p] * w[s];
+    }
+    out[((uint)h * n_q + qi) * D + lane * per + p] = VPIPE_ELT(t * inv);
+  }
+}
+
+#define VPIPE_SDPA_SPLIT(NAME, NS)                                           \
+  kernel void NAME(                                                          \
+      const device VPIPE_ELT* q          [[buffer(0)]],                      \
+      const device VPIPE_ELT* kpool      [[buffer(1)]],                      \
+      const device VPIPE_ELT* vpool      [[buffer(2)]],                      \
+      device VPIPE_ELT*       out        [[buffer(3)]],                      \
+      constant float&    scale      [[buffer(4)]],                           \
+      constant int&      D          [[buffer(5)]],                           \
+      constant int&      Hq         [[buffer(6)]],                           \
+      constant int&      Hkv        [[buffer(7)]],                           \
+      constant int&      n_q        [[buffer(8)]],                           \
+      constant int&      q_offset   [[buffer(9)]],                           \
+      constant int&      page_tokens[[buffer(10)]],                          \
+      constant int&      n_pages    [[buffer(11)]],                          \
+      const device int*  page_table [[buffer(12)]],                          \
+      uint3 tid  [[threadgroup_position_in_grid]],                           \
+      uint  sid  [[simdgroup_index_in_threadgroup]],                         \
+      uint  lane [[thread_index_in_simdgroup]]) {                            \
+    threadgroup float red_acc[NS * 32 * SDPA_SPLIT_MAX_PER];                 \
+    threadgroup float red_m[NS], red_l[NS];                                  \
+    sdpa_paged_split_impl<NS>(q, kpool, vpool, out, scale, D, Hq, Hkv, n_q,  \
+                              q_offset, page_tokens, n_pages, page_table,   \
+                              tid, sid, lane, red_acc, red_m, red_l);        \
+  }
+VPIPE_SDPA_SPLIT(sdpa_paged_causal_split16_f16, 16)
+
 // sdpa_paged_causal_kvl_f16 -- sdpa_paged_causal_f16 + a PREFIX KEY-MASK: a
 // query attends only to keys whose global position is < key_valid_len (in
 // addition to the causal horizon). Used by the diffusion text encoder to match
@@ -4870,3 +5069,147 @@ kernel void sdpa_paged_mma_f16(
   }
 }
 #endif  // !VPIPE_BF16
+
+// Span-masked (non-causal) attention: the generalisation of
+// sdpa_varwindow_f16 from ONE window per query to a UNION of spans, for
+// a mask whose allowed set is a handful of contiguous runs rather than a
+// single interval.
+//
+// VDN-H3's hybrid attention is that shape. A video query sees its
+// chunk-aligned window of whole frames, PLUS every global row (the
+// prompt and the soundtrack, which stay dense in both directions), PLUS
+// the two anchor frames when the configuration makes them dense columns
+// -- at most five runs, and identical for every query in the same frame
+// because the window is a property of the CHUNK. So the spans are stored
+// per GROUP (0 = the global rows, 1 + f = video frame f) rather than per
+// row: 103 groups at production geometry instead of 105k rows, and no
+// [seq, seq] mask anywhere.
+//
+// THE SPANS MUST BE DISJOINT. The online softmax below makes ONE pass
+// over the union, so a key reachable through two spans is accumulated
+// twice and gets double its share of the mass -- and the result is still
+// a normalised distribution, so nothing downstream can tell. See
+// vdn::build_window_spans, which coalesces.
+//
+//   ... same buffers as sdpa_full_f16 ...
+//   11:span_off[groups+1] 12:span_start[] 13:span_end[]
+//   14:video_start 15:tokens_per_frame 16:num_frames
+kernel void sdpa_spans_f16(
+    const device VPIPE_ELT* q          [[buffer(0)]],
+    const device VPIPE_ELT* k          [[buffer(1)]],
+    const device VPIPE_ELT* v          [[buffer(2)]],
+    device VPIPE_ELT*       out        [[buffer(3)]],
+    constant float&    scale           [[buffer(4)]],
+    constant int&      T_kv            [[buffer(5)]],
+    constant int&      D               [[buffer(6)]],
+    constant int&      Hq              [[buffer(7)]],
+    constant int&      Hkv             [[buffer(8)]],
+    constant int&      n_q             [[buffer(9)]],
+    constant int&      kv_stride       [[buffer(10)]],
+    const device int*  span_off        [[buffer(11)]],
+    const device int*  span_start      [[buffer(12)]],
+    const device int*  span_end        [[buffer(13)]],
+    constant int&      video_start     [[buffer(14)]],
+    constant int&      tokens_per_frame [[buffer(15)]],
+    constant int&      num_frames      [[buffer(16)]],
+    uint3 tid  [[threadgroup_position_in_grid]],
+    uint  lane [[thread_index_in_simdgroup]])
+{
+  (void)T_kv;
+  const int h = (int)tid.y;
+  const int qi = (int)tid.z;
+  const int kv = h / (Hq / Hkv);
+  const int per = (D + 31) / 32;
+
+  // Which group this row belongs to. A row outside the video block is a
+  // global one and takes group 0; the division is only reached when the
+  // row is inside, so it cannot run out of range.
+  const int video_end = video_start + num_frames * tokens_per_frame;
+  const int group = (qi < video_start || qi >= video_end)
+                        ? 0
+                        : 1 + (qi - video_start) / tokens_per_frame;
+
+  const device VPIPE_ELT* qh = q + ((uint)h * n_q + qi) * D;
+  const device VPIPE_ELT* kkv = k + (uint)kv * kv_stride * D;
+  const device VPIPE_ELT* vkv = v + (uint)kv * kv_stride * D;
+
+  float qreg[SDPA_MAX_PER];
+  float acc[SDPA_MAX_PER];
+  for (int p = 0; p < per; ++p) {
+    const int idx = lane * per + p;
+    qreg[p] = idx < D ? float(qh[idx]) * scale : 0.0f;
+    acc[p] = 0.0f;
+  }
+  float m = -INFINITY, l = 0.0f;
+  for (int s = span_off[group]; s < span_off[group + 1]; ++s) {
+    const int ws = span_start[s], we = span_end[s];
+    for (int j = ws; j < we; ++j) {
+      float dot = 0.0f;
+      for (int p = 0; p < per; ++p) {
+        const int idx = lane * per + p;
+        if (idx < D) { dot += qreg[p] * float(kkv[(uint)j * D + idx]); }
+      }
+      dot = simd_sum(dot);
+      const float m_new = max(m, dot);
+      const float corr = exp(m - m_new);
+      const float pj = exp(dot - m_new);
+      l = l * corr + pj;
+      for (int p = 0; p < per; ++p) {
+        const int idx = lane * per + p;
+        if (idx < D) {
+          acc[p] = acc[p] * corr + pj * float(vkv[(uint)j * D + idx]);
+        }
+      }
+      m = m_new;
+    }
+  }
+  // A row that no span admits would divide by zero. It cannot happen for
+  // a well-formed layout -- every row sees at least its own frame -- but
+  // zero is the right answer if it ever does: a NaN here reaches the
+  // residual stream and the frame it came from is unrecoverable.
+  const float inv_l = (l > 0.0f) ? 1.0f / l : 0.0f;
+  for (int p = 0; p < per; ++p) {
+    const int idx = lane * per + p;
+    if (idx < D) {
+      out[((uint)h * n_q + qi) * D + idx] = VPIPE_ELT(acc[p] * inv_l);
+    }
+  }
+}
+
+// Copy a PAGED K/V pool [n_alloc_pages, Hkv, page_tokens, D] into contiguous
+// per-head planes [Hkv, kL, D] -- the layout a strided (non-paged) attention
+// kernel reads, e.g. the M5 NAX attention in PrefillGqaAttnSet. Keys and
+// values in one pass. Page table: {page_id, n_valid, global_start} per page,
+// ascending position order; a page may be partly filled, and only positions
+// below kL are copied (mid-context prefill copies the whole prefix + chunk).
+//   0:kpool 1:vpool 2:kout 3:vout 4:Hkv 5:D 6:page_tokens 7:kL 8:page_table
+// grid (page_tokens, Hkv, n_pages).
+kernel void kv_gather_paged_f16(
+    const device VPIPE_ELT* kpool      [[buffer(0)]],
+    const device VPIPE_ELT* vpool      [[buffer(1)]],
+    device VPIPE_ELT*       kout       [[buffer(2)]],
+    device VPIPE_ELT*       vout       [[buffer(3)]],
+    constant int&           Hkv        [[buffer(4)]],
+    constant int&           D          [[buffer(5)]],
+    constant int&           page_tokens[[buffer(6)]],
+    constant int&           kL         [[buffer(7)]],
+    const device int*       page_table [[buffer(8)]],
+    uint3                   gid        [[thread_position_in_grid]])
+{
+  const int s  = (int)gid.x;
+  const int h  = (int)gid.y;
+  const int pg = (int)gid.z;
+  const int pid    = page_table[pg * 3 + 0];
+  const int nvalid = page_table[pg * 3 + 1];
+  const int gstart = page_table[pg * 3 + 2];
+  if (s >= nvalid) { return; }
+  const int t = gstart + s;
+  if (t >= kL) { return; }
+  const ulong src = (((ulong)pid * (ulong)Hkv + (ulong)h) * (ulong)page_tokens
+                     + (ulong)s) * (ulong)D;
+  const ulong dst = ((ulong)h * (ulong)kL + (ulong)t) * (ulong)D;
+  for (int d = 0; d < D; ++d) {
+    kout[dst + (ulong)d] = kpool[src + (ulong)d];
+    vout[dst + (ulong)d] = vpool[src + (ulong)d];
+  }
+}

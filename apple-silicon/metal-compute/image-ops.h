@@ -23,11 +23,18 @@ class MetalCompute;
 
 // NV12 CVPixelBuffer -> planar [3,out_h,out_w] RGB u8, center-cropped +
 // bilinear-rescaled, written into a host byte buffer (`dst_bytes`).
+//
+// `src_full_range` is the SOURCE's colour range: false for the 16..235
+// luma most encoded video carries, true for 0..255. `src_bt709` picks
+// the matrix. Getting either wrong does not fail -- the range scales the
+// picture's contrast by 219/255 and the matrix tilts its hue -- so the
+// caller reads both off the frame rather than assuming.
 bool nv12_to_planar_rgb_u8(
     MetalCompute& mc, void* cv_pixel_buffer,
     std::uint8_t* dst_bytes, std::size_t dst_capacity_bytes,
     int src_width, int src_height, int out_width, int out_height,
-    const SessionContextIntf* session);
+    const SessionContextIntf* session, bool src_full_range = false,
+    bool src_bt709 = false);
 
 // Same as above but writes directly into a Shared MTL::Buffer (the
 // destination TensorBeat's ExternalStorageHandle) -- no host readback.
@@ -35,7 +42,8 @@ bool nv12_to_planar_rgb_u8_shared(
     MetalCompute& mc, void* cv_pixel_buffer,
     const ExternalStorageHandle& dst,
     int src_width, int src_height, int out_width, int out_height,
-    const SessionContextIntf* session);
+    const SessionContextIntf* session, bool src_full_range = false,
+    bool src_bt709 = false);
 
 // Bilinear letterbox planar u8 RGB [3,in_h,in_w] -> f32 CHW
 // [3,out_h,out_w] normalised to [0,1], aspect-preserving with 114/255
@@ -109,6 +117,24 @@ bool resample_lanczos_planar_u8_to_u8(
     int out_w, int out_h, int mode, int src_x, int src_y, float scale,
     std::uint8_t pad_r, std::uint8_t pad_g, std::uint8_t pad_b,
     const SessionContextIntf* session);
+
+// The element type of a float picture resample.
+enum class PlanarFloat { F16, F32 };
+
+// Resample of a planar float picture [C,in_h,in_w] -> [C,out_h,out_w] of
+// the same element type (resample_planar_float kernels), C 3 or 4, with
+// the fit mode + solid pad of the u8 ops above. `filter`: 0 bilinear,
+// 1 Lanczos-3 (PIL LANCZOS), 2 bicubic (PIL BICUBIC) -- the same
+// geometry and coefficient tables as image-resample's CPU path, which the
+// result matches to float rounding. Samples are never clamped (a linear
+// picture exceeds 1; the windowed filters ring). An RGBA picture
+// resamples PREMULTIPLIED inside the kernel and comes back straight.
+// `pad` is in the picture's units; its alpha is the pad's own.
+bool resample_planar_float(
+    MetalCompute& mc, const ExternalStorageHandle& src, PlanarFloat elt,
+    int channels, int in_w, int in_h, const ExternalStorageHandle& dst,
+    int out_w, int out_h, int mode, int src_x, int src_y, float scale,
+    int filter, const float pad[4], const SessionContextIntf* session);
 
 // Bilinear letterbox + RGB->BGRA pack into a kCVPixelFormatType_32BGRA
 // CVPixelBuffer (destination dims read off the pixel buffer).

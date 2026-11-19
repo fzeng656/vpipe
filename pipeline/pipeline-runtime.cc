@@ -1,5 +1,6 @@
 #include "pipeline/pipeline-runtime.h"
 #include "common/graph.h"
+#include "common/memory-owner.h"
 #include "common/thread-pool.h"
 #include "common/vertex.h"
 #include "common/vpipe-format.h"
@@ -12,6 +13,7 @@
 #include "pipeline/pipeline.h"
 #include "interfaces/session-services-intf.h"
 #include "pipeline/memory-plan.h"
+#include "pipeline/resource-claim-delivery.h"
 #include "pipeline/resource-plan.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/stage.h"
@@ -572,108 +574,6 @@ PipelineRuntime::launch_()
     }
   }
 
-  // Phase 1.5: clock-domain analysis. Observational + validation:
-  // log the partitioning at info level so users can see how their
-  // graph was carved into clock domains, and reject the launch if
-  // any single domain contains a directed cycle (those need a
-  // {drain, feed} stage pair, which is future work). The explicit
-  // edge list is the post-inlining logical topology -- using it
-  // (instead of raw oport_edges()) keeps the analysis correct
-  // when call-stages have been erased.
-  ClockDomainAssignment cd = compute_clock_domains(stages, logical_edges);
-  {
-    ostringstream summary;
-    summary << "PipelineRuntime: pipeline '" << _pipeline->id()
-            << "' has " << cd.num_domains << " clock domain"
-            << (cd.num_domains == 1 ? "" : "s");
-    for (unsigned d = 0; d < cd.num_domains; ++d) {
-      summary << "; domain " << d << " = {";
-      bool first = true;
-      for (Stage* s : cd.stages_in_domain[d]) {
-        if (!first) summary << ", ";
-        summary << s->id();
-        first = false;
-      }
-      summary << "}";
-    }
-    if (!cd.crossers.empty()) {
-      summary << "; crossers = {";
-      bool first = true;
-      for (Stage* s : cd.crossers) {
-        if (!first) summary << ", ";
-        summary << s->id();
-        first = false;
-      }
-      summary << "}";
-    }
-    string s = summary.str();
-    session()->info(fmt("{}", s));
-  }
-  if (cd.intra_domain_cycle) {
-    session()->warn(fmt(
-      "PipelineRuntime: pipeline '{}' has a directed cycle within a "
-      "single clock domain (first stage on cycle: '{}'); intra-domain "
-      "feedback requires a {{drain, feed}} stage pair, which is not "
-      "yet supported. Refusing to launch.",
-      _pipeline->id(),
-      cd.cycle_stage ? cd.cycle_stage->id() : "?"));
-    return false;
-  }
-
-  // Phase 1.6: feedback-pair validation. Every feedback-tx stage names
-  // (via config.from) the feedback-rx stage it relays. The pair forms
-  // a logical one-beat-delay register that only makes sense when both
-  // endpoints already participate in the same clock domain via the
-  // rest of the graph (the "register" lives inside one clock, not
-  // across two). Verify rx exists and tx.oport=0 + rx.iport=0 fell
-  // into the same domain.
-  for (Stage* s : stages) {
-    auto* tx = dynamic_cast<FeedbackTxStage*>(s);
-    if (!tx) { continue; }
-    FeedbackRxStage* rx = tx->rx();
-    if (!rx) {
-      // initialize() will not have run yet; resolve here so we can
-      // perform the clock-domain check before launch. Re-uses
-      // tx's stored from_id.
-      const std::string& from_id = tx->from_id();
-      for (Stage* candidate : stages) {
-        if (candidate->id() != from_id) { continue; }
-        rx = dynamic_cast<FeedbackRxStage*>(candidate);
-        break;
-      }
-    }
-    if (!rx) {
-      session()->warn(fmt(
-        "PipelineRuntime: pipeline '{}': feedback-tx '{}' names "
-        "feedback-rx '{}' but no such stage exists in the pipeline. "
-        "Refusing to launch.",
-        _pipeline->id(), tx->id(), tx->from_id()));
-      return false;
-    }
-    auto it_tx = cd.port_domain.find(
-        PortKey{tx, PortKey::Kind::Out, 0});
-    auto it_rx = cd.port_domain.find(
-        PortKey{rx, PortKey::Kind::In, 0});
-    if (it_tx == cd.port_domain.end()
-        || it_rx == cd.port_domain.end()) {
-      session()->warn(fmt(
-        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' / "
-        "rx='{}' missing from clock-domain map (tx oport or rx iport "
-        "unwired?). Refusing to launch.",
-        _pipeline->id(), tx->id(), rx->id()));
-      return false;
-    }
-    if (it_tx->second != it_rx->second) {
-      session()->warn(fmt(
-        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' (domain "
-        "{}) and rx='{}' (domain {}) are in different clock domains; "
-        "feedback edges must stay within one clock domain. Refusing "
-        "to launch.",
-        _pipeline->id(), tx->id(), it_tx->second,
-        rx->id(), it_rx->second));
-      return false;
-    }
-  }
 
   // Phase 2a: allocate one OportBuffer per (producer, oport). Every
   // oport gets one, even if it has no consumers wired up -- a stage's
@@ -866,6 +766,126 @@ PipelineRuntime::launch_()
     }
   }
 
+  // Phase 3.7: clock-domain analysis, then feedback-pair validation.
+  // Observational + validation: log the partitioning at info level so
+  // users can see how their graph was carved into clock domains, and
+  // reject the launch if any single domain contains a directed cycle
+  // (those need a {drain, feed} stage pair, which is future work). The
+  // explicit edge list is the post-inlining logical topology -- using it
+  // (instead of raw oport_edges()) keeps the analysis correct when
+  // call-stages have been erased.
+  //
+  // AFTER CONSTANT FOLDING, and that ordering is load-bearing. A stage
+  // may report a clock group that depends on what it is configured to
+  // do -- vae-decode's frame oport is a rate change for a VIDEO
+  // checkpoint and one-to-one for an IMAGE one -- and for the graphs
+  // that matter the checkpoint arrives as a model-select constant, not
+  // in the stage's own config. Asked before Phase 3.6, every such stage
+  // has to answer from an empty configuration and the analysis is of a
+  // graph nobody is going to run.
+  //
+  // Still BEFORE Phase 4: both checks below refuse the launch, and
+  // refusing after begin_plan would leave a planner bracketed open.
+  ClockDomainAssignment cd = compute_clock_domains(stages, logical_edges);
+  {
+    ostringstream summary;
+    summary << "PipelineRuntime: pipeline '" << _pipeline->id()
+            << "' has " << cd.num_domains << " clock domain"
+            << (cd.num_domains == 1 ? "" : "s");
+    for (unsigned d = 0; d < cd.num_domains; ++d) {
+      summary << "; domain " << d << " = {";
+      bool first = true;
+      for (Stage* s : cd.stages_in_domain[d]) {
+        if (!first) summary << ", ";
+        summary << s->id();
+        first = false;
+      }
+      summary << "}";
+    }
+    if (!cd.crossers.empty()) {
+      summary << "; crossers = {";
+      bool first = true;
+      for (Stage* s : cd.crossers) {
+        if (!first) summary << ", ";
+        summary << s->id();
+        first = false;
+      }
+      summary << "}";
+    }
+    string s = summary.str();
+    session()->info(fmt("{}", s));
+  }
+  if (cd.intra_domain_cycle) {
+    session()->warn(fmt(
+      "PipelineRuntime: pipeline '{}' has a directed cycle within a "
+      "single clock domain (first stage on cycle: '{}'); intra-domain "
+      "feedback requires a {{drain, feed}} stage pair, which is not "
+      "yet supported. Refusing to launch.",
+      _pipeline->id(),
+      cd.cycle_stage ? cd.cycle_stage->id() : "?"));
+    return false;
+  }
+
+  // Feedback-pair validation. Every feedback-tx stage names
+  // (via config.from) the feedback-rx stage it relays. The pair forms
+  // a logical one-beat-delay register that only makes sense when both
+  // endpoints already participate in the same clock domain via the
+  // rest of the graph (the "register" lives inside one clock, not
+  // across two). Verify rx exists and tx.oport=0 + rx.iport=0 fell
+  // into the same domain.
+  for (Stage* s : stages) {
+    auto* tx = dynamic_cast<FeedbackTxStage*>(s);
+    if (!tx) { continue; }
+    FeedbackRxStage* rx = tx->rx();
+    if (!rx) {
+      // initialize() will not have run yet; resolve here so we can
+      // perform the clock-domain check before launch. Re-uses
+      // tx's stored from_id.
+      const std::string& from_id = tx->from_id();
+      for (Stage* candidate : stages) {
+        if (candidate->id() != from_id) { continue; }
+        rx = dynamic_cast<FeedbackRxStage*>(candidate);
+        break;
+      }
+    }
+    if (!rx) {
+      session()->warn(fmt(
+        "PipelineRuntime: pipeline '{}': feedback-tx '{}' names "
+        "feedback-rx '{}' but no such stage exists in the pipeline. "
+        "Refusing to launch.",
+        _pipeline->id(), tx->id(), tx->from_id()));
+      return false;
+    }
+    auto it_tx = cd.port_domain.find(
+        PortKey{tx, PortKey::Kind::Out, 0});
+    auto it_rx = cd.port_domain.find(
+        PortKey{rx, PortKey::Kind::In, 0});
+    if (it_tx == cd.port_domain.end()
+        || it_rx == cd.port_domain.end()) {
+      session()->warn(fmt(
+        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' / "
+        "rx='{}' missing from clock-domain map (tx oport or rx iport "
+        "unwired?). Refusing to launch.",
+        _pipeline->id(), tx->id(), rx->id()));
+      return false;
+    }
+    if (it_tx->second != it_rx->second) {
+      session()->warn(fmt(
+        "PipelineRuntime: pipeline '{}': feedback pair tx='{}' (domain "
+        "{}) and rx='{}' (domain {}) are in different clock domains; "
+        "feedback edges must stay within one clock domain. Refusing "
+        "to launch.",
+        _pipeline->id(), tx->id(), it_tx->second,
+        rx->id(), it_rx->second));
+      return false;
+    }
+  }
+
+  // Whose each stage's memory is (common/memory-owner.h), from what it
+  // declares below: its largest checkpoint -- a DiT beside its LoRAs, a
+  // chat's model -- and its type; a stage holding none, its type alone.
+  std::vector<MemoryOwnerId> stage_owners(stages.size(), kNoMemoryOwner);
+
   // Phase 4: resource planning, then spawn drivers.
   //
   // This has to happen BEFORE any driver starts, because initialize() is
@@ -904,6 +924,9 @@ PipelineRuntime::launch_()
               _pipeline->id(), s->id(), c.kind));
           continue;
         }
+        // The claim itself for a host planner, which reads its `extra`
+        // (resource-claim-delivery.h).
+        DeliveringResourceClaim delivering(c);
         p->claim(session(), c.key, c.phase, c.last_phase, c.floor_bytes);
       }
     }
@@ -951,6 +974,17 @@ PipelineRuntime::launch_()
         if (!m.holdings.empty() || m.scratch > 0 || !m.outputs.empty()) {
           any = true;
         }
+        const StageHolding* big = nullptr;
+        for (const StageHolding& h : m.holdings) {
+          if (!h.source.empty() && (big == nullptr ||
+                                    h.preload > big->preload)) {
+            big = &h;
+          }
+        }
+        stage_owners[mem.size() - 1] = memory_owner(
+            big != nullptr ? std::string_view(big->source)
+                           : std::string_view(),
+            s->type_name());
       }
       if (any) {
         // KEPT for the launch, not computed and dropped. Half of what
@@ -988,12 +1022,24 @@ PipelineRuntime::launch_()
   // a concurrent editor sees the pipeline as live the instant launch
   // commits. stop() clears these once the drivers have drained.
   _live_stages = stages;
-  for (Stage* s : _live_stages) {
+  for (size_t i = 0; i < stages.size(); ++i) {
+    Stage* s = stages[i];
     StageLifecycleAccess::set_running(s, true);
     // The revise channel, for exactly the span the plan exists over. A
     // stage outlives the launch it ran in, so a sink left behind would
     // be a dangling pointer the next beat writes through.
     StageLifecycleAccess::set_memory_sink(s, this);
+    // A command inbox for every stage that declares commands, published
+    // on the stage (where callers find it) and on its context (where the
+    // stage reads it) before any driver runs. Same span as the running
+    // flag, for the same reason as the sink.
+    if (!spec_commands(s->spec()).empty()) {
+      auto inbox = make_shared<CommandInbox>(
+          s->id(), session()->thread_pool());
+      _contexts[i]->attach_commands(inbox.get());
+      StageLifecycleAccess::set_command_inbox(s, inbox);
+      _inboxes.push_back(std::move(inbox));
+    }
   }
   // Stamped with the flag that makes the pipeline live, so the span
   // stop() reports is exactly the span _running is true for.
@@ -1005,8 +1051,14 @@ PipelineRuntime::launch_()
                                _init_barrier.get(),
                                &_completed, &_done_mu, &_done_cv);
     // Tag the driver coroutine with the stage's gvid so its first
-    // resume-slice (and any later ones) attribute to the stage.
-    driver.set_perf_tag(VertexGraphAccess::gvid(stages[i]));
+    // resume-slice (and any later ones) attribute to the stage -- its
+    // time, and the memory it allocates to its owner.
+    const std::uint32_t tag = VertexGraphAccess::gvid(stages[i]);
+    if (stage_owners[i] != kNoMemoryOwner) {
+      set_tag_memory_owner(session(), tag, stage_owners[i]);
+      _memory_tags.push_back(tag);
+    }
+    driver.set_perf_tag(tag);
     auto h = driver.handle();
     _drivers.push_back(std::move(driver));
     session()->thread_pool()->schedule(h);
@@ -1042,6 +1094,13 @@ void
 PipelineRuntime::stop()
 {
   pause();
+  // Cancel every command first: a stage suspended on one -- waiting for
+  // the next command, or HOLDING its output until a caller closes one --
+  // is woken here, and would otherwise keep wait_idle() waiting on a
+  // caller that may never come back.
+  for (auto& inbox : _inboxes) {
+    inbox->shutdown("the pipeline is stopping");
+  }
   // Wake any drivers currently suspended on a buffer wait list.
   for (auto& buf : _oport_bufs) {
     buf->close();
@@ -1057,7 +1116,12 @@ PipelineRuntime::stop()
   for (Stage* s : _live_stages) {
     StageLifecycleAccess::set_running(s, false);
     StageLifecycleAccess::set_memory_sink(s, nullptr);
+    StageLifecycleAccess::set_command_inbox(s, nullptr);
   }
+  for (const std::uint32_t tag : _memory_tags) {
+    clear_tag_memory_owner(session(), tag);
+  }
+  _memory_tags.clear();
   close_plan();
   // HOW LONG IT RAN, at INFO and once per launch.
   //
@@ -1079,7 +1143,7 @@ PipelineRuntime::stop()
   }
 }
 
-// Spin until every driver coroutine is officially at final_suspend.
+// Spin until every driver coroutine has stopped touching its frame.
 // `_completed.fetch_add(...)` in stage_driver_ runs INSIDE the
 // coroutine body before the implicit co_return, so by the time
 // _completed reaches _expected the coroutine has signalled "done"
@@ -1089,14 +1153,23 @@ PipelineRuntime::stop()
 // still executing its return epilogue -- libmalloc reports this
 // later as a "memory corruption of free block" abort.
 //
+// THIS WAITS ON `quiescent()`, NOT `done()`, and the difference is the
+// whole point. `done()` turns true one frame-access too early -- the
+// coroutine flips into the done state and only then runs
+// FinalAwaiter::await_suspend, which reads the promise -- so spinning
+// on it closed most of the window and left a real one. MEASURED with
+// ThreadSanitizer on a model-fetch stopped mid-download: a `.destroy`
+// here racing a `.resume` on a pool worker over the driver frame, plus
+// an unsynchronized read of the frame's done-state. `quiescent()` is
+// published with release as the coroutine's last frame write and read
+// here with acquire, so observing it means the frame is genuinely ours.
+//
 // The window is microseconds; yield is enough.
 void
 PipelineRuntime::wait_drivers_suspended_()
 {
   for (const Job& d : _drivers) {
-    auto h = d.handle();
-    if (!h) { continue; }
-    while (!h.done()) {
+    while (!d.quiescent()) {
       std::this_thread::yield();
     }
   }
@@ -1240,7 +1313,14 @@ stage_driver_(Stage*                    stage,
       stage->id()));
   }
 
+  // Nothing reads this stage's commands any more: refuse new ones and
+  // cancel any it left open, so no caller waits on a stage that ended.
+  ctx->shut_commands(fmt("stage '{}' has finished", stage->id())());
   ctx->close_outputs();
+  // And it reads no more: a producer still writing to it -- the stage
+  // failed mid-run -- is not held back by it (OportBuffer::
+  // leave_cursor), so the pipeline can end.
+  ctx->leave_inputs();
 
   {
     lock_guard<mutex> lk(*done_mu);

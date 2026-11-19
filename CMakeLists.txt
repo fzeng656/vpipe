@@ -71,6 +71,60 @@ option(VPIPE_BUILD_PYTHON
     "Build the vpipe Python extension (requires Python dev headers)"
     ON)
 
+# ---------------------------------------------------------------------
+# Sanitizers.
+#
+# `-DVPIPE_SANITIZE=thread` (or `address`, `undefined`, or a
+# comma-separated set) builds the whole tree -- library, apps and tests
+# -- under the named sanitizer.
+#
+# WHY THIS IS A BUILD OPTION rather than something to hand-roll per
+# investigation: the bugs it catches are the ones that do not reproduce
+# on demand. The teardown races between a driver coroutine and its
+# destructor were 100% reproducible on ONE Release binary and vanished
+# when that binary was merely relinked from identical source -- they
+# survive as latent UB that any unrelated layout change can re-expose.
+# ThreadSanitizer finds them every run, whether or not the crash
+# manifests, which makes it the only reliable gate.
+#
+# Notes:
+#   - Sanitizers are MUTUALLY EXCLUSIVE except undefined, which combines
+#     with either of the other two. address+thread is rejected by the
+#     compiler, so it is rejected here with a clearer message.
+#   - The build type is left alone. RelWithDebInfo is the useful pairing
+#     (optimized enough to be representative, with symbols); a plain
+#     Release build under a sanitizer reports frames without line
+#     numbers, so -g is added here regardless of build type.
+#   - Frame pointers are kept so the reports have usable stacks.
+#   - A sanitized tree must be a SEPARATE build dir: the flags land in
+#     the cache and every object needs them consistently.
+set(VPIPE_SANITIZE "" CACHE STRING
+    "Build with sanitizers: thread | address | undefined (comma-separated)")
+set_property(CACHE VPIPE_SANITIZE PROPERTY STRINGS
+    "" thread address undefined address,undefined thread,undefined)
+
+if(VPIPE_SANITIZE)
+    string(REPLACE "," ";" _vpipe_san_list "${VPIPE_SANITIZE}")
+    foreach(_san IN LISTS _vpipe_san_list)
+        if(NOT _san MATCHES "^(thread|address|undefined)$")
+            message(FATAL_ERROR
+                "VPIPE_SANITIZE: unknown sanitizer '${_san}'. "
+                "Valid: thread, address, undefined (comma-separated).")
+        endif()
+    endforeach()
+    if("thread" IN_LIST _vpipe_san_list AND "address" IN_LIST _vpipe_san_list)
+        message(FATAL_ERROR
+            "VPIPE_SANITIZE: 'thread' and 'address' cannot be combined -- "
+            "they instrument memory incompatibly. Configure two build "
+            "trees instead.")
+    endif()
+    set(_vpipe_san_flags "-fsanitize=${VPIPE_SANITIZE}"
+                         "-fno-omit-frame-pointer" "-g")
+    add_compile_options(${_vpipe_san_flags})
+    add_link_options("-fsanitize=${VPIPE_SANITIZE}")
+    message(STATUS "vpipe: sanitizer build -- ${VPIPE_SANITIZE}")
+endif()
+
 # Apple-only feature options (metal-compute / CoreML), declared up here.
 if(APPLE)
     # Auto-detect an Apple Silicon (arm64) target so the native
@@ -153,34 +207,48 @@ add_custom_target(vpipe_version ALL
 )
 
 if(VPIPE_SOURCES)
-    add_library(vpipe SHARED ${VPIPE_SOURCES} ${VPIPE_HEADERS})
-    target_include_directories(vpipe
+    # The library is compiled ONCE, into an object library, and linked two
+    # ways. libvpipe.dylib is HIDDEN BY DEFAULT: it exports exactly what the
+    # installed SDK headers declare (they push default visibility -- see
+    # common/vpipe-api.h), plus the few internals the in-tree apps need,
+    # and nothing else a plugin could come to depend on. vpipe_test links
+    # the objects DIRECTLY, because it exercises internals no export list
+    # should carry.
+    add_library(vpipe_objects OBJECT ${VPIPE_SOURCES} ${VPIPE_HEADERS})
+    set_target_properties(vpipe_objects PROPERTIES
+        POSITION_INDEPENDENT_CODE ON
+        C_VISIBILITY_PRESET hidden
+        CXX_VISIBILITY_PRESET hidden
+        OBJCXX_VISIBILITY_PRESET hidden)
+    target_include_directories(vpipe_objects
         PUBLIC
-            # Root, so a consumer of vpipe::vpipe resolves the SDK's
-            # root-relative includes ("pipeline/stage.h", ...) in-tree;
-            # the install prefix serves the same layout under include/.
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
-            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-            $<INSTALL_INTERFACE:include>
-        PRIVATE
+            # Root, so a consumer resolves the SDK's root-relative includes
+            # ("pipeline/stage.h", ...) in-tree.
+            ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/include
+        PRIVATE
             ${CMAKE_BINARY_DIR}
             ${VPIPE_FFMPEG_INCLUDE_DIRS}
     )
-    set_target_properties(vpipe PROPERTIES
-        VERSION ${PROJECT_VERSION}
-        SOVERSION ${PROJECT_VERSION_MAJOR}
-    )
-    target_link_libraries(vpipe PRIVATE lmdb pugixml ${CMAKE_DL_LIBS}
-                                        CURL::libcurl)
     # On the compile line so that an FFmpeg major-version change
     # rebuilds every TU, whatever the headers' mtimes claim. See the
     # long note in cmake/find-ffmpeg.cmake: without this, a package
     # upgrade can leave objects built against the previous ABI linked
     # into the same library, which corrupts silently instead of
     # failing. The value is never read by any code.
-    target_compile_definitions(vpipe PRIVATE
+    target_compile_definitions(vpipe_objects PRIVATE
+        VPIPE_BUILDING_LIBRARY
         VPIPE_FFMPEG_ABI_TAG="${VPIPE_FFMPEG_ABI_TAG}")
+    target_link_libraries(vpipe_objects PRIVATE lmdb pugixml CURL::libcurl)
+    add_dependencies(vpipe_objects vpipe_version)
+    # Generated by ui/ (stage-provided view assets embedded into this
+    # library); the rule lives in that subdirectory's scope.
+    add_dependencies(vpipe_objects vpipe_ui_assets)
+
+    # What linking those objects takes, wherever they are linked.
+    add_library(vpipe_link INTERFACE)
+    target_link_libraries(vpipe_link INTERFACE lmdb pugixml ${CMAKE_DL_LIBS}
+                                               CURL::libcurl)
     if(APPLE)
         # Security framework supplies CCRandomGenerateBytes; CoreFoundation
         # is brought in transitively by other Apple bits but link it
@@ -191,18 +259,14 @@ if(VPIPE_SOURCES)
         # the raw blocks inside the frames the HuggingFace content store
         # wraps its chunks in, so the model fetch needs no third-party
         # LZ4 to read them.
-        target_link_libraries(vpipe PRIVATE
+        #
+        # libsqlite3 is the system's: a Draw Things checkpoint's table of
+        # contents is an SQLite database (shared/drawthings-store.h).
+        target_link_libraries(vpipe_link INTERFACE
             "-framework Security"
             "-framework CoreFoundation"
-            compression)
-    endif()
-    if(APPLE AND VPIPE_BUILD_APPLE_SILICON AND VPIPE_MC_KERNEL_OBJS)
-        # Per-kernel OBJECT libraries produced by
-        # add_vpipe_metal_kernel(...) calls under
-        # apple-silicon/metal-compute/. Linking them as libraries
-        # bundles their .o objects into libvpipe.dylib, and CMake
-        # chains the upstream xcrun-metal/metallib rules.
-        target_link_libraries(vpipe PRIVATE ${VPIPE_MC_KERNEL_OBJS})
+            compression
+            sqlite3)
     endif()
     if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         # metal-cpp's NS::ProcessInfo references constants
@@ -215,24 +279,57 @@ if(VPIPE_SOURCES)
         # weak-import-aware and falls back to default-constructed
         # values when dyld returns null. vpipe itself never reads
         # them.
-        target_link_libraries(vpipe PRIVATE
+        # AVFoundation, CoreMedia, VideoToolbox, ImageIO, CoreGraphics:
+        # the Apple-native media path (apple-silicon/media) -- ProRes,
+        # HEVC Main10/HDR, OpenEXR and 16-bit stills; CoreImage and
+        # UniformTypeIdentifiers: camera RAW, developed.
+        target_link_libraries(vpipe_link INTERFACE
+            "-framework Accelerate"
+            "-framework AVFoundation"
+            "-framework CoreGraphics"
+            "-framework CoreImage"
+            "-framework CoreMedia"
             "-framework CoreML"
             "-framework CoreVideo"
             "-framework Foundation"
+            "-framework ImageIO"
             "-framework IOKit"
-            "-framework Metal")
-        target_link_options(vpipe PRIVATE
+            "-framework Metal"
+            "-framework UniformTypeIdentifiers"
+            "-framework VideoToolbox"
+            metal_cpp_foundation)
+        target_link_options(vpipe_link INTERFACE
             "LINKER:-undefined,dynamic_lookup")
-        target_link_libraries(vpipe PRIVATE metal_cpp_foundation)
+        target_link_libraries(vpipe_objects PRIVATE metal_cpp_foundation)
         # So shared TUs (Session, the bootstrap-context overrides)
         # can predicate on the apple-silicon backend being built.
-        target_compile_definitions(vpipe PRIVATE
+        target_compile_definitions(vpipe_objects PRIVATE
             VPIPE_BUILD_APPLE_SILICON)
     endif()
-    add_dependencies(vpipe vpipe_version)
-    # Generated by ui/ (stage-provided view assets embedded into this
-    # library); the rule lives in that subdirectory's scope.
-    add_dependencies(vpipe vpipe_ui_assets)
+
+    add_library(vpipe SHARED $<TARGET_OBJECTS:vpipe_objects>)
+    target_include_directories(vpipe
+        PUBLIC
+            # Root, so a consumer of vpipe::vpipe resolves the SDK's
+            # root-relative includes ("pipeline/stage.h", ...) in-tree;
+            # the install prefix serves the same layout under include/.
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+            $<INSTALL_INTERFACE:include>
+    )
+    set_target_properties(vpipe PROPERTIES
+        VERSION ${PROJECT_VERSION}
+        SOVERSION ${PROJECT_VERSION_MAJOR}
+    )
+    target_link_libraries(vpipe PRIVATE vpipe_link)
+    if(APPLE AND VPIPE_BUILD_APPLE_SILICON AND VPIPE_MC_KERNEL_OBJS)
+        # Per-kernel OBJECT libraries produced by
+        # add_vpipe_metal_kernel(...) calls under
+        # apple-silicon/metal-compute/. Linking them as libraries
+        # bundles their .o objects into libvpipe.dylib, and CMake
+        # chains the upstream xcrun-metal/metallib rules.
+        target_link_libraries(vpipe PRIVATE ${VPIPE_MC_KERNEL_OBJS})
+    endif()
 else()
     add_library(vpipe INTERFACE)
     target_include_directories(vpipe INTERFACE
@@ -241,16 +338,73 @@ else()
     )
 endif()
 
+# ---- the plugin TOOLKIT ---------------------------------------------------
+#
+# generative-models/shared's helpers that a plugin compiles INTO itself
+# rather than calling in libvpipe: the plugin ABI's stable surface is the
+# SDK headers exported with VPIPE_API, and these are deliberately not part
+# of it -- they change as fast as the models do. A plugin links its own
+# copy (vpipe_add_plugin does it), so the host can change them freely and
+# a plugin keeps the version it was built and tested with. They reach the
+# host only through the stable surface and the kernel contract
+# (apple-silicon/metal-compute/kernel-contract.h), which is what makes a
+# copy as old as the plugin still correct. libvpipe compiles the same
+# sources for its own use; the two copies never meet.
+if(VPIPE_BUILD_APPLE_SILICON)
+    set(VPIPE_TOOLKIT_SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/comfy-checkpoint.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/fp8-expand.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/fp8-layout.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/i8-gemm.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sage-attention.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sol-attention.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sol-attention.cc
+        # Runtime LoRA: read an adapter, bind it by module name, add
+        # (x A^T) B^T * scale onto a projection's output after whichever
+        # GEMM route ran. Every kernel it dispatches is in the contract.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/lora-names.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/runtime-lora.cc)
+    add_library(vpipe_toolkit STATIC ${VPIPE_TOOLKIT_SOURCES})
+    # EXPORT_NAME: installed, it is vpipe::toolkit -- the name
+    # vpipe_add_plugin looks for -- not vpipe::vpipe_toolkit.
+    set_target_properties(vpipe_toolkit PROPERTIES
+        OUTPUT_NAME vpipe_toolkit
+        EXPORT_NAME toolkit
+        POSITION_INDEPENDENT_CODE ON
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON)
+    target_compile_features(vpipe_toolkit PUBLIC cxx_std_20)
+    target_include_directories(vpipe_toolkit PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR})
+    target_link_libraries(vpipe_toolkit PUBLIC vpipe)
+    add_library(vpipe::toolkit ALIAS vpipe_toolkit)
+    install(TARGETS vpipe_toolkit EXPORT vpipeTargets
+        ARCHIVE DESTINATION lib)
+    # The SDK check compiles these against the INSTALLED headers alone, so
+    # a toolkit source that reaches past the SDK fails there.
+    file(WRITE ${CMAKE_BINARY_DIR}/vpipe-toolkit-sources.txt
+         "${VPIPE_TOOLKIT_SOURCES}")
+endif()
+
 add_executable(vpipe_test ${VPIPETEST_SOURCES} ${VPIPETEST_HEADERS} ${VPIPE_HEADERS})
 target_include_directories(vpipe_test
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/tests
         ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(vpipe_test PRIVATE vpipe lmdb pugixml CURL::libcurl)
+# The library's objects, linked directly (see vpipe_objects above), and
+# the executable's default-visibility symbols -- exactly libvpipe's exports
+# -- published, so a test plugin loaded into it binds to these copies.
+target_link_libraries(vpipe_test PRIVATE vpipe_objects vpipe_link)
+if(APPLE AND VPIPE_BUILD_APPLE_SILICON AND VPIPE_MC_KERNEL_OBJS)
+    target_link_libraries(vpipe_test PRIVATE ${VPIPE_MC_KERNEL_OBJS})
+endif()
+target_link_options(vpipe_test PRIVATE "LINKER:-export_dynamic")
 if(APPLE)
     # The xet-fetch tests build their own LZ4 frames to decode.
-    target_link_libraries(vpipe_test PRIVATE compression)
+    target_link_libraries(vpipe_test PRIVATE compression sqlite3)
 endif()
 if(APPLE)
     target_link_libraries(vpipe_test PRIVATE
@@ -281,15 +435,45 @@ target_include_directories(vpipe_test_echo_plugin PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_BINARY_DIR})
 target_compile_features(vpipe_test_echo_plugin PRIVATE cxx_std_20)
-target_link_libraries(vpipe_test_echo_plugin PRIVATE vpipe)
+# The test plugins do NOT link libvpipe: they bind their host symbols in
+# whichever image loaded them -- vpipe_test (objects linked directly,
+# symbols exported) or an app over libvpipe.dylib -- so one binary serves
+# both. A shipped plugin links vpipe::vpipe (vpipe_add_plugin).
+target_link_options(vpipe_test_echo_plugin PRIVATE
+    "LINKER:-undefined,dynamic_lookup")
 # A two-level-namespace MODULE already errors on undefined symbols by
 # default -- so a missing libvpipe symbol fails at plugin-link time rather
 # than silently at dlopen. (We must NOT inherit libvpipe's own
 # -undefined dynamic_lookup, which is PRIVATE to it and not transitive.)
 add_dependencies(vpipe_test vpipe_test_echo_plugin)
+# Plugins the handshake must REFUSE, one per failure it guards against.
+# One source, three builds; see tests/plugins/handshake-plugin.
+foreach(variant OLD_ABI NO_CONSTANT MISSING_FEATURE)
+    string(TOLOWER "${variant}" vlow)
+    set(tgt vpipe_test_handshake_${vlow})
+    add_library(${tgt} MODULE
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/plugins/handshake-plugin/handshake-plugin.cc)
+    set_target_properties(${tgt} PROPERTIES PREFIX "")
+    target_include_directories(${tgt} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_BINARY_DIR})
+    target_compile_features(${tgt} PRIVATE cxx_std_20)
+    target_compile_definitions(${tgt} PRIVATE HANDSHAKE_${variant})
+    target_link_options(${tgt} PRIVATE "LINKER:-undefined,dynamic_lookup")
+    add_dependencies(vpipe_test ${tgt})
+endforeach()
 if(TARGET vpipe_unit_tests)
     target_compile_definitions(vpipe_unit_tests PRIVATE
-        VPIPE_TEST_ECHO_PLUGIN="$<TARGET_FILE:vpipe_test_echo_plugin>")
+        VPIPE_TEST_ECHO_PLUGIN="$<TARGET_FILE:vpipe_test_echo_plugin>"
+        VPIPE_TEST_HANDSHAKE_OLD_ABI="$<TARGET_FILE:vpipe_test_handshake_old_abi>"
+        VPIPE_TEST_HANDSHAKE_NO_CONSTANT="$<TARGET_FILE:vpipe_test_handshake_no_constant>"
+        VPIPE_TEST_HANDSHAKE_MISSING_FEATURE="$<TARGET_FILE:vpipe_test_handshake_missing_feature>"
+        # The SHIPPED example pipelines, so a test can check them against
+        # the catalogue they name. Nothing else reads them at run time --
+        # they are documentation -- which is exactly why a wrong key in
+        # one is invisible until a user runs it.
+        VPIPE_DOCS_PIPELINES_DIR="${CMAKE_CURRENT_SOURCE_DIR}/docs/pipelines")
 endif()
 
 # A standalone .metallib compiled offline (NOT embedded into libvpipe),
@@ -304,7 +488,12 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON AND NOT VPIPE_METAL_RUNTIME_COMPILE)
     set(_probe_lib ${CMAKE_BINARY_DIR}/plugin_probe.metallib)
     add_custom_command(
         OUTPUT ${_probe_lib}
-        COMMAND xcrun -sdk macosx metal -c ${_probe_src} -o ${_probe_air}
+        # Pinned like the kernel helpers: this fixture exists to mimic a
+        # plugin's own shaders, so it has to be built the way a plugin's
+        # are. Unpinned it records the build machine's OS instead.
+        COMMAND xcrun -sdk macosx metal
+                -mmacosx-version-min=${CMAKE_OSX_DEPLOYMENT_TARGET}
+                -c ${_probe_src} -o ${_probe_air}
         COMMAND xcrun -sdk macosx metallib ${_probe_air} -o ${_probe_lib}
         DEPENDS ${_probe_src}
         COMMENT "Compiling plugin_probe.metal -> plugin_probe.metallib (test)"
@@ -360,18 +549,60 @@ install(FILES
     ${CMAKE_CURRENT_BINARY_DIR}/vpipeConfigVersion.cmake
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpipePluginHelpers.cmake
     ${CMAKE_CURRENT_SOURCE_DIR}/cmake/vpipe-embed-metallib.cmake
+    # The RUNTIME-COMPILE fallback, which vpipe_add_metal_library takes
+    # when the box has no offline Metal shader compiler. Shipping only
+    # the metallib embedder made the host's two modes unreachable from a
+    # plugin: the host quietly fell back and the plugin failed at build
+    # time with a raw xcrun error.
+    ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/cmake/embed-metal-source.cmake
     DESTINATION lib/cmake/vpipe)
+
+# The installed SDK, checked from outside: every header compiles on its own
+# and the example plugin builds against the install alone. See the script.
+# It also compares the plugin ABI against the committed snapshot for this
+# ABI version (abi/plugin-abi-<N>.txt); vpipe_abi_snapshot regenerates it.
+find_program(VPIPE_PYTHON3 NAMES python3)
+set(_vpipe_sdk_check_args
+    -DBUILD_DIR=${CMAKE_BINARY_DIR}
+    -DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+    -DCXX=${CMAKE_CXX_COMPILER}
+    -DPYTHON=${VPIPE_PYTHON3}
+    -DLIB=$<TARGET_FILE:vpipe>)
+add_custom_target(vpipe_sdk_check
+    COMMAND ${CMAKE_COMMAND} ${_vpipe_sdk_check_args}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check-sdk.cmake
+    USES_TERMINAL
+    COMMENT "Checking the installed plugin SDK and the plugin ABI")
+add_custom_target(vpipe_abi_snapshot
+    COMMAND ${CMAKE_COMMAND} ${_vpipe_sdk_check_args} -DMODE=write
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/check-sdk.cmake
+    USES_TERMINAL
+    COMMENT "Regenerating the plugin ABI snapshot (abi/)")
 
 # Curated SDK headers, installed under include/ preserving their
 # root-relative dirs so `#include "pipeline/stage.h"` resolves from the
 # prefix. Lists are the exact include-closures of the plugin entry points
 # (stage: typed-stage + runtime-context + job + flex-data + plugin/*).
 install(FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/vpipe-api.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/abi-struct.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/beat-payload-intf.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/beat-keys.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/flex-bag.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/flex-data.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/i18n.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/job.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/oport-policy.h
+    # The perf lane's ids and its RAII scope. perf-sink-intf.h (the
+    # record_perf_event_aux entry point) was already installed, but not
+    # the lane / event constants it is called with -- so a plugin model
+    # could not put its denoise on the LLM lane the built-ins use
+    # without hard-coding the numbers.
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-event.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-scope.h
+    # The achieved-FLOP/s meter (perf-flops/1): a plugin family credits
+    # its arithmetic here, through dit-flops.h below.
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/perf-flops.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/session-member.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vertex.h
     ${CMAKE_CURRENT_SOURCE_DIR}/common/vpipe-format.h
@@ -414,6 +645,10 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/oport-buffer.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/resource-plan.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/runtime-context.h
+    # runtime-context.h includes it: a stage answers commands through
+    # its context, and every plugin stage includes the context.
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-command.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/spec-extra.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-config.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-registry.h
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/stage-spec.h
@@ -421,15 +656,18 @@ install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/typed-stage.h
     DESTINATION include/pipeline)
 # Stage-level SDK for a plugin that adds a MODEL FAMILY: the catalogue
-# entry type (so its models are fetchable), the config-source base (so
-# its knobs are a stage rather than dead keys on a shared one), and the
-# memory helpers every model-holding stage sizes itself with. See
+# entry type (so its models are fetchable) and where they are fetched from
+# (model-source.h: the sources' names, a mirror's renames; the host's side
+# of a source, model-source-host.h, is not installed), the config-source
+# base (so its knobs are a stage rather than dead keys on a shared one),
+# and the memory helpers every model-holding stage sizes itself with. See
 # docs/PLUGINS.md, "Model-specific configuration".
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-catalog.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-config-source.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-memory.h
     ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-registry.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/stages/model-source.h
     DESTINATION include/stages)
 install(FILES
     ${CMAKE_CURRENT_SOURCE_DIR}/plugin/plugin-abi.h
@@ -443,10 +681,22 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-exec.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-exec-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/model-loader.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/speculative-decode.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/token-muxer.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tokenizer.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/video-turn.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/vae-model-registry.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/conditioner-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/content-screen.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/detect-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/family-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/gen-input.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/accel-keys.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/spec-keys.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/quantize-profile.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/image-model-registry.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/video-model-registry.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/tensor-parallel.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/hidden-state-encoder.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/weight-set.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/quantize-family-registry.h
@@ -478,6 +728,55 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-tile.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/mma-splitk.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/i8-gemm.h
+        # The session's kept answers every tuner above files and reads
+        # (kernel-tuning/1): a plugin's tuner skips what the session has
+        # already measured.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/tuned-answers.h
+        DESTINATION include/generative-models/shared)
+    # Sol-Attn, for the same reason i8-gemm.h is here: it is an
+    # ACCELERATION TIER a DiT opts into, not a model. It needs no weights
+    # and no checkpoint support, it reads the head-major q/k/v every
+    # unfused attention path already produces, and both of its halves are
+    # libvpipe's own flash kernel -- so an out-of-tree DiT that reaches
+    # these two headers gets the whole method, where one that cannot
+    # would have to reimplement the routing AND the block-sparse
+    # traversal that makes it pay.
+    #
+    # sol-attention.h is the configuration and the CPU oracle;
+    # metal-sol-attention.h is the driver. The kernels are already inside
+    # libvpipe, embedded, so nothing else has to ship.
+    #
+    # sage-attention.h is here for a blunter reason as well as that one:
+    # video-model-registry.h -- a header this list already installs --
+    # INCLUDES it, for the sage::Config it carries on both of its
+    # argument structs. Without it every out-of-tree video family fails
+    # to compile against the install on its first include, which is how
+    # this was found.
+    #
+    # accel-settings.h is the CONTRACT, and it is the one a family that
+    # implements none of these still wants: it is where the keys are
+    # documented and where the argument for the bag lives. It ships and
+    # updates with the host, which is the point -- the vocabulary is not
+    # in the struct layout, so a new key reaches an old binary as
+    # something it does not ask about rather than as a rebuild.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/accel-settings.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sol-attention.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sol-attention.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/sage-attention.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/metal-sage-attention.h
+        # Runtime LoRA (toolkit): the adapter reader / binder / applier,
+        # and the publisher-spelling map it binds module names with.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/lora-names.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/runtime-lora.h
+        DESTINATION include/generative-models/shared)
+    # The ANE tier (`ane_ffn` and whatever follows it), for a family that
+    # splits its own blocks. ane-tier.h ALONE: it describes the work in
+    # FlexData and binds buffers by name, so the machinery under it --
+    # ane-ffn.h, ane-module.h, the emitter -- stays uninstalled and free
+    # to change without touching the plugin ABI.
+    install(FILES
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/ane-tier.h
         DESTINATION include/generative-models/shared)
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/kernel-sets/vae-conv3x3-tune.h
@@ -485,20 +784,49 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         DESTINATION include/generative-models/shared/kernel-sets)
     # Large-model plumbing. docs/MODEL-MEMORY.md ships as the contract for
     # out-of-tree models and describes block streaming and block residency
-    # as things a loader MUST get right; block-residency.h and stream-pin.h
-    # are where both actually live, so without them the document describes
-    # machinery the reader cannot call. dit-block-progress.h is the reason
+    # as things a loader MUST get right; block-residency.h is where the
+    # latter lives, so without it the document describes machinery the
+    # reader cannot call. stream-sizing.h answers the two questions a
+    # model puts to the CHECKPOINT before it loads anything: the
+    # streaming FLOOR (trunk + one block -- every streaming model wants
+    # this) and, for a language model with no residency policy to grow
+    # into, how long a PREFIX to pin. No DiT uses the second half. dit-block-progress.h is the reason
     # a high-resolution denoise does not read as a stall -- per-STEP is
     # tens of seconds of silence at 1024px, and every DiT already walks its
-    # blocks one at a time. streamed-refill.h is the read itself: block
+    # blocks one at a time -- and dit-gpu-progress.h is what makes that
+    # report say anything: a forward is ONE deferred command stream, so a
+    # report fired from the block loop times the ENCODE, which is
+    # microseconds, and the bar leaps a step and freezes for the seconds
+    # the GPU then takes. Shipping the first without the second hands an
+    # out-of-tree model the hook and lets it wire it up the one way that
+    # does not work. streamed-refill.h is the read itself: block
     # streaming as documented costs a block-sized allocation and a
     # demand-faulted copy per block per step, and this is how a loader
-    # stops paying both.
+    # stops paying both. wired-pool.h is the half of block residency that
+    # makes it hold: a kept block is the coldest memory in the process, so
+    # without mlock it is the first thing the compressor takes and the run
+    # spends the schedule admitting and shedding the same blocks.
+    # block-slots.h is the policy on top of streamed-refill.h -- two
+    # reusable destinations and the prefetch that keeping them makes
+    # free -- and without it every out-of-tree model writes that state
+    # machine again, including the join-before-early-return discipline
+    # that is a use-after-free when it is missed.
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/block-residency.h
-        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-pin.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/block-slots.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/stream-sizing.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-block-progress.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-gpu-progress.h
+        # The same retire-time hook, carrying FLOPs to perf-flops.h.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/dit-flops.h
         ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/streamed-refill.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/wired-pool.h
+        # streamed-refill.h widens FP8 codes, so these two are part of its
+        # closure; without them no plugin that streams blocks compiles.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/fp8.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/fp8-layout.h
+        # The toolkit's own header for its FP8 expander.
+        ${CMAKE_CURRENT_SOURCE_DIR}/generative-models/shared/fp8-expand.h
         DESTINATION include/generative-models/shared)
     # weight-set.h's own dependencies. The SDK's header set has to be
     # CLOSED under #include or it does not compile -- a plugin cannot
@@ -526,6 +854,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/command-stream.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/compute-encoder.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/compute-library.h
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/kernel-contract.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/event.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/fence.h
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/metal-compute/metal-compute.h
@@ -553,10 +882,22 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     # installed -- a plugin never needs them.
     install(FILES
         ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/coreml/coreml-model-manager.h
+        # coreml-model-manager.h's own include.
+        ${CMAKE_CURRENT_SOURCE_DIR}/apple-silicon/coreml/ane-worker.h
         DESTINATION include/apple-silicon/coreml)
 endif()
 
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/LICENSE
+    DESTINATION share/doc/vpipe
+)
+# The FFmpeg the library was compiled against (cmake/find-ffmpeg.cmake,
+# step 7): what an application bundling its own FFmpeg checks it with.
+install(FILES ${CMAKE_BINARY_DIR}/ffmpeg-headers
+    DESTINATION share/vpipe
+)
+# Apache-2.0 section 4(d): a redistributed libvpipe carries the NOTICE
+# too -- an app bundling it copies this directory into its licences.
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/NOTICE
     DESTINATION share/doc/vpipe
 )
 install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/THIRD_PARTY_LICENSES.md

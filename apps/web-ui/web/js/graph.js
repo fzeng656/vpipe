@@ -22,8 +22,12 @@
 // it survives the frequent re-renders (selection changes); callers
 // reset it (pass a fresh {}) only on pipeline switch, which refits.
 
-import { el, svgEl } from './dom.js';
-import { tOr } from './i18n.js';
+import { el, svgEl, clear } from './dom.js';
+import { makeIcon } from './icons.js';
+// t() is aliased: this file has three locals called `t` (an SVG <title>,
+// an easing parameter, shortType's argument) and a shadowed import
+// would fail silently at whichever one is in scope.
+import { t as t_, tOr } from './i18n.js';
 
 const NODE_W    = 176;
 const COL_GAP   = 74;
@@ -45,6 +49,29 @@ const SWEEPS    = 16;    // barycentre crossing-min iterations
 const MIN_K     = 0.08;
 const MAX_K     = 4;
 const FIT_MAX_K = 1;     // Fit never enlarges past 1:1 (only shrinks).
+// One press of − / + (button or keyboard). The wheel uses a smaller
+// step: it arrives in a continuous stream, where a discrete press does
+// not and wants to be felt.
+const ZOOM_STEP = 1.2;
+// Wheel deltas arrive in one of three units. Only pixels are directly
+// usable as a pan distance; the other two are nominal and have to be
+// given a size, or a Firefox line-mode wheel would pan by 3 world units
+// where Chrome pans by 100.
+const WHEEL_LINE_PX = 16;
+const WHEEL_PAGE_PX = 400;
+
+// A wheel event's pan distance in screen pixels, both axes.
+function wheelPixels(e) {
+  const s = e.deltaMode === 1 ? WHEEL_LINE_PX
+          : (e.deltaMode === 2 ? WHEEL_PAGE_PX : 1);
+  let dx = e.deltaX * s, dy = e.deltaY * s;
+  // A plain mouse wheel has no horizontal axis, and shift is the
+  // conventional way to ask one for horizontal movement. Applied only
+  // when the device really sent nothing sideways, so a trackpad's
+  // diagonal swipe is not flattened into one direction.
+  if (e.shiftKey && dx === 0) { dx = dy; dy = 0; }
+  return { dx, dy };
+}
 
 // Box height from the rendered port counts. `inCount` is the number of
 // input slots actually drawn (spec-declared, not just the wired ones);
@@ -67,6 +94,18 @@ export function shortType(t) {
 function truncate(s, n) {
   s = String(s);
   return s.length > n ? s.slice(0, n - 1) + '…' : s;
+}
+
+// A port's translated doc. The overlay keys these `port.<type>.<name>`,
+// except where a stage names an input and an output alike -- there the
+// two docs are different text and get `port.<type>.in.<name>` /
+// `port.<type>.out.<name>`. Try the qualified key first; falling through
+// keeps the short key working for the ports that are unambiguous, and the
+// server's own English is the last resort.
+function portDoc(type, dir, pt) {
+  if (!pt.name) { return pt.doc || ''; }
+  const q = tOr('port.' + type + '.' + dir + '.' + pt.name, '');
+  return q || tOr('port.' + type + '.' + pt.name, pt.doc || '');
 }
 
 // `metrics` resolves per-node rendered-port counts:
@@ -447,6 +486,9 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 // Build and return a container element (<div>) holding the graph SVG
 // plus a floating zoom/center control cluster. opts:
 //   { selected, onSelect, view }  (view: shared {k,cx,cy}, mutated)
+//   wheelMode       'pan' (default) | 'zoom' -- what a BARE wheel does
+//   onWheelMode(m)  fires when the cluster's toggle flips it, so the
+//                   host can persist it as a user preference
 // Composer (editor) extras, all optional and gated on `editable`:
 //   editable        true => render port/edge edit affordances
 //   pending         {from, from_port} armed output port (rubber-band)
@@ -507,6 +549,18 @@ export function renderGraph(graph, opts = {}) {
 
   const svg = svgEl('svg', { class: 'graph' + (editable ? ' editable' : '')
                               + (pending ? ' arming' : '') });
+
+  // A transparent rect covering the whole viewBox, FIRST so it paints
+  // behind everything and hit-tests everywhere.
+  //
+  // The canvas has to be a target over its EMPTY area, or panning only
+  // works where a node or an edge happens to be. Chrome hit-tests the
+  // root <svg> box itself and needs none of this; other engines follow
+  // the SVG rule that only painted geometry is hit, and there the empty
+  // canvas is a hole. A `fill` of `transparent` is painted geometry --
+  // `none` is not, and would leave the hole exactly where it was.
+  const bgHit = svgEl('rect', { class: 'graph-bg' });
+  svg.append(bgHit);
 
   // Edges underneath nodes. Each long edge has its own routing
   // dummies inserted by computeLayout(); buildEdgePath() splines the
@@ -582,7 +636,7 @@ export function renderGraph(graph, opts = {}) {
     animNodes.push({ g, id: n.id, toX: p.x, toY: p.y });
     if (n.config_error) {
       const t = svgEl('title');
-      t.textContent = 'Needs configuration: ' + n.config_error;
+      t.textContent = t_('pl.needs_config', { msg: n.config_error });
       g.append(t);
     }
     // Drag-to-move sets this so the release's trailing click doesn't also
@@ -719,8 +773,7 @@ export function renderGraph(graph, opts = {}) {
       pg.append(lbl);
       // Tooltip carries the full name + beat type + doc.
       const tip = svgEl('title');
-      const ptDoc = pt.name ? tOr('port.' + n.type + '.' + pt.name, pt.doc)
-                            : pt.doc;
+      const ptDoc = portDoc(n.type, 'in', pt);
       tip.textContent = (pt.name ? pt.name + '  ' : '')
           + '(' + shortType(pt.type) + ')'
           + (pt.tags ? '\ntags: ' + pt.tags : '')
@@ -767,9 +820,11 @@ export function renderGraph(graph, opts = {}) {
       lbl.textContent = truncate(shortType(pt.type), 12);
       pg.append(lbl);
       const otip = svgEl('title');
+      const otDoc = portDoc(n.type, 'out', pt);
       otip.textContent = (pt.name ? pt.name + '  ' : '')
           + '(' + shortType(pt.type) + ')'
-          + (pt.tags ? '\ntags: ' + pt.tags : '');
+          + (pt.tags ? '\ntags: ' + pt.tags : '')
+          + (otDoc ? '\n' + otDoc : '');
       pg.append(otip);
       if (editable) {
         const hit = svgEl('circle', { class: 'porthit', cx: NODE_W, cy: y,
@@ -797,7 +852,7 @@ export function renderGraph(graph, opts = {}) {
       plus.textContent = '+';
       pg.append(plus);
       const lbl = svgEl('text', { class: 'portlabel add', x: 8, y: y + 3 });
-      lbl.textContent = 'add input';
+      lbl.textContent = t_('pl.add_input');
       pg.append(lbl);
       const hit = svgEl('circle', { class: 'porthit', cx: 0, cy: y, r: 9 });
       hit.addEventListener('pointerdown', (ev) => ev.stopPropagation());
@@ -827,8 +882,16 @@ export function renderGraph(graph, opts = {}) {
       view.cy = contentH / 2;
     }
     const vw = W / view.k, vh = H / view.k;
-    svg.setAttribute('viewBox',
-      `${view.cx - vw / 2} ${view.cy - vh / 2} ${vw} ${vh}`);
+    const x = view.cx - vw / 2, y = view.cy - vh / 2;
+    svg.setAttribute('viewBox', `${x} ${y} ${vw} ${vh}`);
+    // The hit rect tracks the viewBox rather than being given a huge
+    // fixed extent: a rect far larger than the view would enlarge the
+    // element's bbox, and anything that measures the content (fit,
+    // auto-arrange) would then be fitting the rect.
+    bgHit.setAttribute('x', x);
+    bgHit.setAttribute('y', y);
+    bgHit.setAttribute('width', vw);
+    bgHit.setAttribute('height', vh);
   }
 
   const setZoom = (k) => { view.k = clamp(k, MIN_K, MAX_K); applyView(); };
@@ -840,12 +903,42 @@ export function renderGraph(graph, opts = {}) {
   const ctl = (label, title, fn) =>
     el('button', { class: 'graph-ctl', title,
       onclick: (e) => { e.stopPropagation(); fn(); } }, label);
+  // WHAT A BARE WHEEL DOES, and the button that flips it. A trackpad
+  // wants pan (a two-finger swipe IS the gesture for moving a canvas,
+  // and pinch still zooms); a mouse has no swipe and no pinch, so its
+  // one wheel has to be the zoom. Neither default can serve both
+  // devices, which is why this is a choice and not a heuristic --
+  // nothing in a wheel event says which device sent it.
+  //
+  // The button shows what the wheel does NOW, not what pressing it
+  // would change to: a mode indicator someone can read at a glance
+  // beats a verb they have to reason about.
+  let wheelMode = opts.wheelMode === 'zoom' ? 'zoom' : 'pan';
+  const wheelBtn = el('button', { class: 'graph-ctl wheel-ctl',
+    type: 'button',
+    onclick: (e) => {
+      e.stopPropagation();
+      wheelMode = wheelMode === 'pan' ? 'zoom' : 'pan';
+      applyWheelMode();
+      if (typeof opts.onWheelMode === 'function') {
+        opts.onWheelMode(wheelMode);
+      }
+    } });
+  function applyWheelMode() {
+    const zoomy = wheelMode === 'zoom';
+    clear(wheelBtn).append(makeIcon(zoomy ? 'zoom' : 'pan', 'sm'));
+    wheelBtn.title = zoomy ? t_('pl.wheel_zoom') : t_('pl.wheel_pan');
+    wheelBtn.setAttribute('aria-pressed', zoomy ? 'true' : 'false');
+  }
+  applyWheelMode();
+
   const controls = el('div', { class: 'graph-controls' },
-    ctl('−', 'Zoom out', () => zoomBy(1 / 1.2)),
-    ctl('+', 'Zoom in', () => zoomBy(1.2)),
-    ctl('1:1', 'Actual size', () => setZoom(1)),
-    ctl('Fit', 'Fit whole pipeline', fit),
-    ctl('⊙', 'Center', center));
+    ctl('−', t_('pl.zoom_out'), () => zoomBy(1 / ZOOM_STEP)),
+    ctl('+', t_('pl.zoom_in'), () => zoomBy(ZOOM_STEP)),
+    ctl('1:1', t_('pl.actual_size'), () => setZoom(1)),
+    ctl('Fit', t_('pl.fit_all'), fit),
+    ctl('⊙', t_('pl.center'), center),
+    wheelBtn);
   // Auto-arrange: re-layout the graph tidily (drops manual placements).
   // Sits with the view controls; only shown when the caller wires it.
   if (opts.onAutoArrange) {
@@ -857,6 +950,12 @@ export function renderGraph(graph, opts = {}) {
   // Expose the screen->world mapper so the composer can turn a stage
   // drop point into a grid pin. Takes anything with {clientX, clientY}.
   container.clientToWorld = (evt) => clientToWorld(evt);
+  // ...and the zoom step the − / + buttons take, so a host can drive the
+  // same one from a keyboard shortcut. Exposed rather than reimplemented
+  // there: MIN_K/MAX_K and the 1.2 factor live here, and a second copy
+  // would drift from what the buttons do.
+  container.zoomBy = (f) => zoomBy(f);
+  container.zoomStep = ZOOM_STEP;
 
   // Drag to pan. The pointer is captured only once a real drag begins
   // (movement past a threshold). Capturing on pointerdown would
@@ -896,22 +995,86 @@ export function renderGraph(graph, opts = {}) {
   svg.addEventListener('pointerup', endPan);
   svg.addEventListener('pointercancel', endPan);
 
-  // Wheel to zoom, anchored at the cursor.
-  svg.addEventListener('wheel', (e) => {
+  // In 'pan' mode (the default) the wheel PANS and ctrl/cmd-wheel ZOOMS,
+  // anchored at the cursor. In 'zoom' mode the wheel zooms outright.
+  //
+  // A trackpad's two-finger swipe is the gesture people expect to move a
+  // canvas around -- it is what every map and every design tool does with
+  // it -- and it arrives as a plain wheel event carrying BOTH axes. Zoom
+  // keeps the modifier, which costs nothing: macOS reports a trackpad
+  // PINCH as a wheel event with ctrlKey already set, so pinch-to-zoom
+  // works through the same branch without a gesture handler of its own.
+  //
+  // CTRL/CMD ZOOMS IN BOTH MODES -- it is not flipped to mean "pan" in
+  // 'zoom' mode. That is the pinch again: a trackpad user who switched
+  // to 'zoom' deliberately would otherwise find their pinch panning.
+  // The way to pan in 'zoom' mode is to DRAG, which works over the whole
+  // canvas (the background hit rect covers the empty parts) and is what
+  // a mouse user reaches for anyway.
+  //
+  // The − / + buttons and the keys below are the discrete way to zoom,
+  // for a plain mouse that has no pinch and no horizontal wheel.
+  // Bound on the CONTAINER, not the svg: the request is "anywhere on
+  // the canvas", and the container is what the canvas area IS. Events
+  // over the svg bubble to it, so content behaves exactly as before,
+  // and any strip of the pane the svg does not cover now works too.
+  container.addEventListener('wheel', (e) => {
     e.preventDefault();
     const W = svg.clientWidth, H = svg.clientHeight;
     if (!W || !H) { return; }
-    const rect = svg.getBoundingClientRect();
-    const px = e.clientX - rect.left, py = e.clientY - rect.top;
     const k0 = view.k || 1;
-    const wx = (view.cx - (W / k0) / 2) + px / k0;
-    const wy = (view.cy - (H / k0) / 2) + py / k0;
-    const k = clamp(k0 * (e.deltaY < 0 ? 1.1 : 1 / 1.1), MIN_K, MAX_K);
-    view.k = k;
-    view.cx = wx - px / k + (W / k) / 2;
-    view.cy = wy - py / k + (H / k) / 2;
+
+    if (wheelMode === 'zoom' || e.ctrlKey || e.metaKey) {
+      // A PURELY HORIZONTAL wheel carries no zoom direction, and the
+      // test below would read its deltaY of 0 as "zoom out". Harmless
+      // in 'pan' mode, where such an event never reaches here, but in
+      // 'zoom' mode a trackpad's sideways swipe would shrink the graph.
+      if (e.deltaY === 0) { return; }
+      const rect = svg.getBoundingClientRect();
+      const px = e.clientX - rect.left, py = e.clientY - rect.top;
+      const wx = (view.cx - (W / k0) / 2) + px / k0;
+      const wy = (view.cy - (H / k0) / 2) + py / k0;
+      const k = clamp(k0 * (e.deltaY < 0 ? 1.1 : 1 / 1.1), MIN_K, MAX_K);
+      view.k = k;
+      view.cx = wx - px / k + (W / k) / 2;
+      view.cy = wy - py / k + (H / k) / 2;
+      applyView();
+      return;
+    }
+
+    // Deltas are screen pixels, so dividing by k moves the content under
+    // the cursor by the same screen distance at any zoom -- a swipe feels
+    // the same close up as it does zoomed out.
+    const { dx, dy } = wheelPixels(e);
+    view.cx += dx / k0;
+    view.cy += dy / k0;
     applyView();
   }, { passive: false });
+
+  // Keyboard zoom, the discrete counterpart to ctrl-wheel. Bound on the
+  // container rather than the document so the editor's own text inputs
+  // keep their keys; the canvas takes focus on pointerdown below, so the
+  // keys work after any interaction with it.
+  container.tabIndex = 0;
+  container.addEventListener('keydown', (e) => {
+    const tag = e.target && e.target.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA'
+        || (e.target && e.target.isContentEditable)) {
+      return;
+    }
+    if (e.ctrlKey || e.metaKey || e.altKey) { return; }
+    if (e.key === '-' || e.key === '_') {
+      e.preventDefault(); zoomBy(1 / ZOOM_STEP);
+    } else if (e.key === '=' || e.key === '+') {
+      e.preventDefault(); zoomBy(ZOOM_STEP);
+    } else if (e.key === '0') {
+      e.preventDefault(); setZoom(1);
+    }
+  });
+  svg.addEventListener('pointerdown', () => {
+    // preventScroll: focusing must not yank an enclosing scroller.
+    try { container.focus({ preventScroll: true }); } catch (x) {}
+  }, true);
 
   // Map a pointer event to "world" (content) coordinates -- same
   // inverse-viewBox math the wheel handler uses. Needed for the
@@ -955,7 +1118,10 @@ export function renderGraph(graph, opts = {}) {
   // connect. A trailing click after a pan (moved) is ignored.
   if (editable) {
     svg.addEventListener('click', (e) => {
-      if (e.target !== svg || moved) { return; }
+      // The background rect counts as the background -- it IS the
+      // background, and without it here a click on empty canvas would
+      // stop deselecting the moment the rect was added.
+      if ((e.target !== svg && e.target !== bgHit) || moved) { return; }
       if (opts.onEdgeSelect) { opts.onEdgeSelect(null); }
       if (opts.onBackgroundClick) { opts.onBackgroundClick(); }
     });

@@ -1,6 +1,7 @@
 #include "apps/web-ui/pipeline-api.h"
 #include "apps/web-ui/api-common.h"
 
+#include "common/diagnostic-capture.h"
 #include "common/graph.h"
 #include "common/i18n.h"
 #include "common/vertex.h"
@@ -10,12 +11,14 @@
 #include "pipeline/pipeline-handle-impl.h"
 #include "pipeline/pipeline-runtime.h"
 #include "pipeline/pipeline-spec.h"
+#include "pipeline/stage-command.h"
 #include "pipeline/stage.h"
 #include "pipeline/stage-registry.h"
 #include "plugin/plugin-manager.h"
 #include "vpipe/session-intf.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cxxabi.h>
 #include <filesystem>
 #include <fstream>
@@ -24,6 +27,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <typeinfo>
 #include <unordered_map>
 #include <unordered_set>
@@ -35,6 +39,29 @@ using namespace std;
 namespace vpipe::webui {
 
 namespace {
+
+// A refusal the operator can act on: what failed, then why it did.
+//
+// The reasons are whatever the operation reported while `why` was open
+// (see common/diagnostic-capture.h) -- the same lines the console
+// panel shows, carried in the response that refused so the browser can
+// put them in front of whoever pressed the button instead of sending
+// them to go and look. A refusal that reported NOTHING says so rather
+// than trailing an empty colon: that combination is a missing warn()
+// at the site that refused, and naming it is how it gets found.
+string
+with_reason_(string what, const DiagnosticCapture& why)
+{
+  if (why.empty()) {
+    return what + " (no reason was reported)";
+  }
+  what += ":\n";
+  what += why.text();
+  if (why.truncated()) {
+    what += "\n(further messages omitted -- see the console)";
+  }
+  return what;
+}
 
 // Demangled, human-readable name for a payload type_info. Null (an
 // "untyped" port) renders as "any".
@@ -512,8 +539,14 @@ PipelineApi::h_stage_types_(const HttpRequest&)
     // spec entry), so the registry's vpipe::StageSpec needs the prefix.
     const vpipe::StageSpec* sp = StageRegistry::get().spec(n);
     if (sp) {
+      // A spec may NAME its category, which wins over the enum: a
+      // plugin stage whose kind this tree has no enumerator for can
+      // say so without an enum change, and an enum change is an ABI
+      // change. See SpecExtra in pipeline/stage-config.h.
+      std::string_view cat = spec_extra(sp->extra, spec_key::kCategory);
+      if (cat.empty()) { cat = stage_category_name(sp->category); }
       oo.insert("category",
-                FlexData::make_string(stage_category_name(sp->category)));
+                FlexData::make_string(cat));
       oo.insert("doc", FlexData::make_string(sp->doc));
       oo.insert("display_name", FlexData::make_string(sp->display_name));
       oo.insert("iports", ports_to_flex_(sp->iports));
@@ -524,6 +557,9 @@ PipelineApi::h_stage_types_(const HttpRequest&)
       // still renders with its spec) but the composer omits them from
       // the add-a-stage toolbox.
       oo.insert("hidden", FlexData::make_bool(sp->hidden));
+      // The command channels a running instance accepts (see
+      // docs/STAGE-COMMANDS.md); [] for most stages.
+      oo.insert("commands", describe_commands(*sp));
     } else {
       oo.insert("category", fstr("generic"));
       oo.insert("doc", fstr(""));
@@ -532,6 +568,7 @@ PipelineApi::h_stage_types_(const HttpRequest&)
       oo.insert("oports", FlexData::make_array());
       oo.insert("attr_count", FlexData::make_uint(0));
       oo.insert("hidden", FlexData::make_bool(false));
+      oo.insert("commands", FlexData::make_array());
     }
     a.push_back(std::move(o));
   }
@@ -652,9 +689,15 @@ PipelineApi::h_load_pipeline_(const HttpRequest& req)
   }
 
   lock_guard<mutex> lk(_ctx.mu);
+  // Hold the reasons the loader reports while it reads this file. A
+  // malformed spec is the operator's own file and almost always their
+  // own typo, so the one thing the answer must carry is WHICH line,
+  // stage or field the loader objected to.
+  DiagnosticCapture why;
   PipelineHandle h = _ctx.session->load_pipeline(real.string());
   if (!h.valid()) {
-    return HttpResponse::error(400, "failed to load '" + path + "'");
+    return HttpResponse::error(
+        400, with_reason_("failed to load '" + path + "'", why));
   }
   Pipeline* pl = live_pipeline(h);
   if (!pl) {
@@ -880,10 +923,12 @@ PipelineApi::h_launch_pipeline_(const HttpRequest& req)
   if (p->state != State::Stopped) {
     return HttpResponse::error(409, "pipeline is already running");
   }
+  DiagnosticCapture why;
   Status s = _ctx.session->launch_pipeline(*p->handle);
   if (s.code != 0) {
-    return HttpResponse::error(500, "launch failed (status " +
-                               to_string(s.code) + ")");
+    return HttpResponse::error(
+        500, with_reason_("launch failed (status " +
+                          to_string(s.code) + ")", why));
   }
   p->state = State::Running;
   return HttpResponse::json(200, pipe_summary_(*p).to_json());
@@ -1489,6 +1534,72 @@ PipelineApi::h_get_stage_config_(const HttpRequest& req)
   return HttpResponse::json(200, o.to_json());
 }
 
+// POST /api/pipelines/:id/stages/:sid/command  {name, args?, timeout_ms?}
+//
+// A buffer-less command to a stage of a RUNNING pipeline (docs/STAGE-
+// COMMANDS.md), answered with what the stage replied. The stage is found
+// and the command posted under the lock; the wait for the reply is not,
+// since a command answered between training steps can take minutes, and
+// nothing but the command itself is touched after the lock is released.
+HttpResponse
+PipelineApi::h_stage_command_(const HttpRequest& req)
+{
+  auto body = parse_json_body(req);
+  if (!body || !body->is_object()) {
+    return HttpResponse::error(400, "command body must be a JSON object");
+  }
+  auto bo = body->as_object();
+  const string name = bo.contains("name")
+                          ? string(bo.at("name").as_string(""))
+                          : string();
+  if (name.empty()) { return HttpResponse::error(400, "missing `name`"); }
+  FlexData args = bo.contains("args") ? bo.at("args") : FlexData();
+  if (!args.is_object()) { args = FlexData::make_object(); }
+  int timeout_ms = 300000;
+  if (bo.contains("timeout_ms")) {
+    timeout_ms = (int)std::clamp<long long>(
+        bo.at("timeout_ms").as_int(timeout_ms), 0, 3600000);
+  }
+  shared_ptr<StageCommand> cmd;
+  {
+    lock_guard<mutex> lk(_ctx.mu);
+    auto pit = req.params.find("id");
+    auto sit = req.params.find("sid");
+    Pipe* p = (pit != req.params.end()) ? find_(pit->second) : nullptr;
+    if (!p) { return HttpResponse::error(404, "no such pipeline"); }
+    if (sit == req.params.end()) {
+      return HttpResponse::error(400, "missing stage id");
+    }
+    Stage* s = nullptr;
+    if (p->handle && p->handle->valid()) {
+      if (Pipeline* pl = live_pipeline(*p->handle)) {
+        for (auto it = pl->begin(); it != pl->end(); ++it) {
+          if (Stage* cs = dynamic_cast<Stage*>(*it)) {
+            if (cs->id() == sit->second) { s = cs; break; }
+          }
+        }
+      }
+    }
+    if (!s) { return HttpResponse::error(404, "no such running stage"); }
+    cmd = open_stage_command(*s, name, std::move(args), {});
+  }
+  const CommandState st = cmd->wait(timeout_ms);
+  FlexData o = FlexData::make_object();
+  auto oo = o.as_object();
+  oo.insert("state", fstr(string(command_state_name(st))));
+  if (st == CommandState::Replied) {
+    oo.insert("result", cmd->result());
+  } else {
+    oo.insert("error", fstr(st == CommandState::Pending ||
+                                    st == CommandState::Active
+                                ? string("no reply yet; the stage may "
+                                         "still be busy")
+                                : cmd->error()));
+  }
+  cmd->close();
+  return HttpResponse::json(200, o.to_json());
+}
+
 HttpResponse
 PipelineApi::h_set_stage_config_(const HttpRequest& req)
 {
@@ -1582,9 +1693,50 @@ PipelineApi::for_each_live_locked(
   }
 }
 
+PipelineApi::~PipelineApi()
+{
+  {
+    std::lock_guard<std::mutex> lk(_reap_mu);
+    _reap_stop = true;
+  }
+  _reap_cv.notify_all();
+  if (_reaper.joinable()) { _reaper.join(); }
+}
+
+// Tear down pipelines that finished on their own, without waiting for a
+// client to ask. See the declaration for why this cannot be left to the
+// GET handlers.
+//
+// The interval is a compromise and not a deadline: a run's summary is
+// worth at most this long a delay, and the walk is a few atomic reads
+// per pipeline. It waits on a condition variable rather than sleeping
+// so shutdown is immediate rather than up to one tick.
+void
+PipelineApi::reaper_loop_()
+{
+  using namespace std::chrono_literals;
+  for (;;) {
+    {
+      std::unique_lock<std::mutex> lk(_reap_mu);
+      _reap_cv.wait_for(lk, 500ms, [this] { return _reap_stop; });
+      if (_reap_stop) { return; }
+    }
+    // The SAME lock every handler takes, so a reap cannot interleave
+    // with an edit or a launch. Taken after the wait, never across it.
+    std::lock_guard<std::mutex> lk(_ctx.mu);
+    reap_completed_();
+  }
+}
+
 void
 PipelineApi::register_routes(HttpServer& s)
 {
+  // Started here rather than in the constructor: this is the point the
+  // app is actually serving, and a PipelineApi built in a test that
+  // never registers routes has no reason to run a thread.
+  if (!_reaper.joinable()) {
+    _reaper = std::thread([this] { reaper_loop_(); });
+  }
   s.route("GET", "/api/stage-types",
           [this](const HttpRequest& r) { return h_stage_types_(r); });
   s.route("GET", "/api/pipelines",
@@ -1627,6 +1779,8 @@ PipelineApi::register_routes(HttpServer& s)
           [this](const HttpRequest& r) { return h_get_stage_config_(r); });
   s.route("PUT", "/api/pipelines/:id/stages/:sid/config",
           [this](const HttpRequest& r) { return h_set_stage_config_(r); });
+  s.route("POST", "/api/pipelines/:id/stages/:sid/command",
+          [this](const HttpRequest& r) { return h_stage_command_(r); });
 }
 
 }

@@ -5,6 +5,15 @@
 
 #include "tests/unit-tests/metal-lm/metal-lm-test-common.h"
 
+#include "common/flex-bag.h"
+
+#include <atomic>
+#include <filesystem>
+#include <thread>
+
+#include <sys/resource.h>
+#include <unistd.h>
+
 // Metal image-VQA smoke: load a Qwen3-VL model on the metal backend,
 // encode a synthetic RGB image with the metal vision tower, splice
 // text + image tokens via prefill_multimodal_metal (3-axis mROPE), and
@@ -99,6 +108,135 @@ TEST(metal_lm_smoke, image_vqa_decode) {
               n_im, mh, mw, text.c_str());
   EXPECT_TRUE(gen.size() >= 2u);
   EXPECT_TRUE(!text.empty());
+}
+
+// VideoTurn (generative-models/video-turn.h) -- the turn a plugin stage
+// drives -- IS the turn built by hand from the model's own parts: the
+// frames through its tower, the template's timed video between the
+// words, one prefill, the plain greedy decode. Greedy, the reply is the
+// same token for token, its drafter included (the OptiQ checkpoint's MTP
+// head). Then a turn of words alone; the frames go with each reply.
+// Env: VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH (with a drafter), else
+// VPIPE_METAL_VQA_SMOKE_MODEL.
+TEST(metal_lm_smoke, video_turn_is_the_turn_built_by_hand) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (!path || !*path) { path = std::getenv("VPIPE_METAL_VQA_SMOKE_MODEL"); }
+  if (!path || !*path) {
+    return;
+  }
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  Session sess;
+  auto* mc = sess.metal_compute();
+  auto* mgr = sess.generative_model_manager();
+  if (mc == nullptr || !mc->valid() || !mgr) {
+    ::unsetenv("VPIPE_LLM_BACKEND");
+    return;
+  }
+  genai::LoadSpec spec;
+  spec.hf_dir = path;
+  spec.compute_dtype = "f16";
+  spec.page_tokens = 16;
+  spec.max_pages = 256;
+  auto lm = mgr->load(spec);
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  ASSERT_TRUE(lm != nullptr && lm->valid());
+  if (!lm || !lm->valid()) { return; }
+  auto* vis = lm->metal_vision_encoder();
+  ASSERT_TRUE(vis != nullptr);
+  if (!vis) { return; }
+
+  // Two frames a second apart: gradients that differ.
+  const int H = 128, W = 192;
+  std::vector<std::vector<std::uint8_t>> frames(2);
+  for (int f = 0; f < 2; ++f) {
+    frames[f].resize((std::size_t)3 * H * W);
+    for (int c = 0; c < 3; ++c) {
+      for (int y = 0; y < H; ++y) {
+        for (int x = 0; x < W; ++x) {
+          frames[f][((std::size_t)c * H + y) * W + x] =
+              (std::uint8_t)((x * (1 + f) + 2 * y + 70 * c) & 0xFF);
+        }
+      }
+    }
+  }
+  const std::string ask = "Describe what happens in this video.";
+  constexpr int kMax = 24;
+
+  auto turn = genai::VideoTurn::make(lm, &sess);
+  ASSERT_TRUE(turn != nullptr);
+  if (!turn) { return; }
+  for (int f = 0; f < 2; ++f) {
+    ASSERT_TRUE(turn->add_frame(frames[f].data(), H, W, (double)f));
+  }
+  EXPECT_TRUE(turn->frames() == 2);
+  const int tokens = turn->tokens();
+  const std::string via_turn = turn->reply("", ask, nullptr, kMax);
+  EXPECT_TRUE(turn->frames() == 0);
+  EXPECT_TRUE(turn->tokens() == 0);
+
+  // By hand.
+  auto tpl = genai::make_chat_template(lm->config(), lm->tokenizer(),
+                                       /*disable_thinking=*/true);
+  ASSERT_TRUE(tpl != nullptr);
+  if (!tpl) { return; }
+  const int S = std::max(1, vis->config().spatial_merge);
+  std::vector<genai::MetalQwenVisionEncoder::Result> enc;
+  std::vector<float> times;
+  std::vector<int> counts;
+  std::vector<std::pair<int, int>> grids;
+  for (int f = 0; f < 2; ++f) {
+    enc.push_back(vis->encode(frames[f].data(), H, W));
+    times.push_back((float)f);
+    counts.push_back(enc.back().n_tokens);
+    grids.emplace_back(enc.back().grid_h / S, enc.back().grid_w / S);
+  }
+  EXPECT_TRUE(counts[0] + counts[1] == tokens);
+  std::vector<std::int32_t> ids;
+  ASSERT_TRUE(tpl->render_video_prefix(times, counts, true, &ids));
+  ASSERT_TRUE(tpl->render_vlm_completion(ask, &ids));
+  const std::int32_t pad = tpl->video_pad_token_id();
+  std::vector<genai::TokenRef> refs;
+  std::size_t fi = 0;
+  int row = 0;
+  for (std::int32_t id : ids) {
+    genai::TokenRef r;
+    if (id == pad && fi < enc.size()) {
+      r.kind = genai::TokenRef::Kind::ImageTokens;
+      r.embeddings_buf = &enc[fi].embeddings;
+      r.image_token_offset = row++;
+      if (row >= enc[fi].n_tokens) { ++fi; row = 0; }
+    } else {
+      r.kind = genai::TokenRef::Kind::Text;
+      r.text_id = id;
+    }
+    refs.push_back(r);
+  }
+  ASSERT_TRUE(fi == enc.size());
+  auto ctx = lm->make_context();
+  std::int32_t cur = lm->prefill_multimodal_metal(
+      ctx, std::span<const genai::TokenRef>(refs),
+      std::span<const std::pair<int, int>>(grids));
+  ASSERT_TRUE(cur >= 0);
+  if (cur < 0) { return; }
+  auto sd = lm->tokenizer().make_stream_decoder();
+  std::string by_hand;
+  for (int n = 0; n < kMax && cur >= 0 && !tpl->is_stop_token(cur); ++n) {
+    by_hand += lm->tokenizer().step(sd, cur);
+    if (n + 1 >= kMax) { break; }
+    cur = lm->next_token(ctx);
+  }
+  by_hand = tpl->sanitize_output(std::move(by_hand));
+  std::printf("[metal_lm_smoke.video_turn] %d tokens, drafter '%s'\n"
+              "  turn:    '%s'\n  by hand: '%s'\n", tokens,
+              lm->spec_drafter().c_str(), via_turn.c_str(), by_hand.c_str());
+  EXPECT_TRUE(!via_turn.empty());
+  EXPECT_TRUE(via_turn == by_hand);
+
+  // Words alone.
+  const std::string words = turn->reply("Answer in one word.",
+                                        "What colour is the sky?", nullptr,
+                                        8);
+  EXPECT_TRUE(!words.empty());
 }
 
 // MULTIMODAL MTP token-exactness: the spec-decode path on a POST-IMAGE context
@@ -781,4 +919,177 @@ TEST(metal_lm_smoke, qwen_gguf_loader_detects_mmproj_vision) {
   EXPECT_TRUE(v.out_hidden_size == w->config.hidden);
   EXPECT_TRUE(v.spatial_merge_size == 2 && v.temporal_patch_size == 2);
   EXPECT_TRUE(v.num_position_embeddings > 0);
+}
+
+// A Qwen-VL checkpoint's own picture bounds reach the tower: its
+// preprocessor_config.json `size` (pixel COUNTS on this processor) for a
+// still picture, video_preprocessor_config.json's for a clip. Without the
+// file, or where `size` is an edge length (Pixtral's: no merge_size), the
+// tower keeps its defaults. And the scratch estimate a plan books grows
+// with the bound -- and a caller's budget holds it down.
+TEST(metal_lm_smoke, picture_bounds_come_from_the_checkpoint)
+{
+  namespace fs = std::filesystem;
+  using genai::MetalQwenVisionEncoder;
+  namespace mk = genai::model_config;
+  const fs::path root = fs::temp_directory_path() /
+                        ("vpipe-vis-bounds-" + std::to_string(::getpid()));
+  const char* cfg =
+      "{\"architectures\": [\"Qwen3_5ForConditionalGeneration\"], "
+      "\"model_type\": \"qwen3_5\", \"vision_config\": {\"depth\": 27, "
+      "\"hidden_size\": 1152, \"num_heads\": 16, \"patch_size\": 16, "
+      "\"spatial_merge_size\": 2, \"temporal_patch_size\": 2, "
+      "\"out_hidden_size\": 2560, \"intermediate_size\": 4304, "
+      "\"num_position_embeddings\": 2304}}";
+  struct Arm {
+    const char* name;
+    const char* pp;      // preprocessor_config.json, or none
+    const char* vp;      // video_preprocessor_config.json, or none
+    long long lo, hi, vlo, vhi;
+  };
+  const MetalQwenVisionEncoder::Config def;
+  const Arm arms[] = {
+    {"qwen3vl",
+     "{\"size\": {\"shortest_edge\": 65536, \"longest_edge\": 16777216}, "
+     "\"patch_size\": 16, \"temporal_patch_size\": 2, \"merge_size\": 2}",
+     "{\"size\": {\"shortest_edge\": 4096, \"longest_edge\": 25165824}, "
+     "\"patch_size\": 16, \"temporal_patch_size\": 2, \"merge_size\": 2}",
+     65536, 16777216, 4096, 25165824},
+    {"qwen25vl",
+     "{\"min_pixels\": 3136, \"max_pixels\": 12845056, \"patch_size\": 14, "
+     "\"temporal_patch_size\": 2, \"merge_size\": 2}", nullptr,
+     3136, 12845056, def.video_min_pixels, def.video_max_pixels},
+    {"edge", "{\"size\": {\"longest_edge\": 1540}, \"patch_size\": 14}",
+     nullptr, def.min_pixels, def.max_pixels, def.video_min_pixels,
+     def.video_max_pixels},
+    {"none", nullptr, nullptr, def.min_pixels, def.max_pixels,
+     def.video_min_pixels, def.video_max_pixels},
+  };
+  for (const Arm& a : arms) {
+    const fs::path d = root / a.name;
+    fs::create_directories(d);
+    std::ofstream(d / "config.json") << cfg;
+    if (a.pp != nullptr) {
+      std::ofstream(d / "preprocessor_config.json") << a.pp;
+    }
+    if (a.vp != nullptr) {
+      std::ofstream(d / "video_preprocessor_config.json") << a.vp;
+    }
+    genai::ModelLoader loader(nullptr);
+    const auto mc = loader.load_config(d.string());
+    ASSERT_TRUE(mc.has_value() && mc->vision.present);
+    if (!mc) { continue; }
+    const auto v = MetalQwenVisionEncoder::config_from(*mc);
+    std::printf("[vision-bounds] %s: picture %d .. %d, clip %lld .. %lld\n",
+                a.name, v.min_pixels, v.max_pixels,
+                (long long)v.video_min_pixels,
+                (long long)v.video_max_pixels);
+    EXPECT_TRUE(v.min_pixels == a.lo && v.max_pixels == a.hi);
+    EXPECT_TRUE(v.video_min_pixels == a.vlo && v.video_max_pixels == a.vhi);
+    if (std::string(a.name) == "edge") {
+      EXPECT_FALSE(vpipe::bag::has(mc->extra, mk::kVisionMaxPixels));
+    }
+  }
+  // The estimate: linear in the picture's patches, a budget holds it.
+  MetalQwenVisionEncoder::Config c;
+  c.depth = 27; c.hidden = 1152; c.n_heads = 16; c.patch_size = 16;
+  c.spatial_merge = 2; c.temporal_patch = 2; c.out_hidden = 2560;
+  c.intermediate = 4304;
+  c.max_pixels = 16777216;
+  const std::size_t big = MetalQwenVisionEncoder::encode_scratch_bytes(c);
+  const std::size_t one =
+      MetalQwenVisionEncoder::encode_scratch_bytes(c, 28LL * 28 * 1280);
+  std::printf("[vision-bounds] a picture's scratch at 16.7 MP: %zu MB; at "
+              "~1 MP: %zu MB\n", big >> 20, one >> 20);
+  EXPECT_TRUE(big > 15 * one && big < 18 * one);
+  std::error_code ec;
+  fs::remove_all(root, ec);
+}
+
+// THE LIFT, through the real tower: a 2048^2 picture keeps its size
+// (64 x 64 merged tokens, where the old ~1 MP cap gave about a quarter),
+// and a caller's budget (a live frame's) still holds one down. Prints the
+// encode's time and the process's peak footprint against the estimate.
+// Env: VPIPE_METAL_VQA_SMOKE_MODEL (a Qwen3.5-VL checkpoint whose
+// preprocessor_config.json states the Qwen3-VL bounds);
+// VPIPE_VISION_LARGEST=1 adds the largest picture (4096^2, 16384 tokens).
+TEST(metal_lm_smoke, a_large_picture_keeps_its_size)
+{
+  const char* path = std::getenv("VPIPE_METAL_VQA_SMOKE_MODEL");
+  if (!path || !*path) { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  using genai::MetalQwenVisionEncoder;
+  genai::ModelLoader loader(&sess);
+  const auto mcfg = loader.load_config(path);
+  ASSERT_TRUE(mcfg.has_value() && mcfg->vision.present);
+  if (!mcfg || !mcfg->vision.present) { return; }
+  const auto vc = MetalQwenVisionEncoder::config_from(*mcfg);
+  if (vc.max_pixels <= 28 * 28 * 1280) {
+    std::printf("[vision-lift] %s states no larger bound; skipped\n", path);
+    return;
+  }
+  auto vis = MetalQwenVisionEncoder::load(path, mc, vc);
+  ASSERT_TRUE(vis != nullptr);
+  if (!vis) { return; }
+  const int cell = vc.patch_size * vc.spatial_merge;
+  auto peak_mb = [] {
+    struct rusage ru{};
+    getrusage(RUSAGE_SELF, &ru);
+    return (double)ru.ru_maxrss / 1048576.0;
+  };
+  std::vector<int> sides{2048};
+  if (std::getenv("VPIPE_VISION_LARGEST") != nullptr) {
+    sides.push_back(4096);
+  }
+  for (const int side : sides) {
+    std::vector<std::uint8_t> rgb((std::size_t)3 * side * side);
+    for (std::size_t i = 0; i < rgb.size(); ++i) {
+      rgb[i] = (std::uint8_t)((i * 2654435761u) >> 24);
+    }
+    // The device's allocated size, sampled while the encode runs (the
+    // Metal buffers are the transient; a CPU-side resident size misses
+    // what only the GPU touches).
+    const std::size_t base = mc->memory_budget().allocated;
+    std::atomic<bool> done{false};
+    std::atomic<std::size_t> top{base};
+    std::thread probe([&] {
+      while (!done.load()) {
+        const std::size_t a = mc->memory_budget().allocated;
+        if (a > top.load()) { top.store(a); }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      }
+    });
+    const double before = peak_mb();
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = vis->encode(rgb.data(), side, side);
+    const double s = std::chrono::duration<double>(
+                         std::chrono::steady_clock::now() - t0).count();
+    done.store(true);
+    probe.join();
+    const double grew = peak_mb() - before +
+                        (double)(top.load() - base) / 1048576.0;
+    const int want = (side / cell) * (side / cell);
+    std::printf("[vision-lift] %d^2: %d tokens (%d x %d) in %.1f s; the "
+                "GPU's allocations rose %.0f MB at their peak and the host's "
+                "resident size %.0f MB; the estimate %zu MB\n", side,
+                r.n_tokens, r.grid_h / vc.spatial_merge,
+                r.grid_w / vc.spatial_merge, s,
+                (double)(top.load() - base) / 1048576.0,
+                grew - (double)(top.load() - base) / 1048576.0,
+                MetalQwenVisionEncoder::encode_scratch_bytes(
+                    vc, (std::int64_t)side * side) >> 20);
+    EXPECT_TRUE(r.n_tokens == want);
+  }
+  // A live frame's budget still holds a picture down.
+  {
+    const int side = 2048;
+    std::vector<std::uint8_t> rgb((std::size_t)3 * side * side, 128);
+    const auto r = vis->encode(rgb.data(), side, side, 28LL * 28 * 1280);
+    std::printf("[vision-lift] 2048^2 under a ~1 MP budget: %d tokens\n",
+                r.n_tokens);
+    EXPECT_TRUE(r.n_tokens > 0 &&
+                (std::int64_t)r.n_tokens * cell * cell <= 28LL * 28 * 1280);
+  }
 }

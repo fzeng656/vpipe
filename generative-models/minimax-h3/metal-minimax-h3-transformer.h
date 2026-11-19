@@ -4,22 +4,38 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
+#include "generative-models/shared/ane-ffn.h"
+#include "generative-models/minimax-h3/metal-vdn-branch.h"
+#include "generative-models/minimax-h3/minimax-h3-diffusers-layout.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-stream-kv.h"
+#include "generative-models/shared/fp8-expand.h"
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/i8-gemm.h"
 #include "generative-models/shared/mma-splitk.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
+#include "generative-models/shared/tp-overlap.h"
+#include "generative-models/tensor-parallel.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/metal-sol-attention.h"
+#include "generative-models/shared/runtime-lora.h"
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/sol-attention.h"
 
 namespace vpipe {
 namespace genai {
 
 class WeightSet;   // generative-models/weight-set.h
+namespace minimax_h3 { class StreamKv; }   // minimax-h3-stream-kv.h
 
 // The MiniMax-H3 omni denoiser (MiniMaxH3DiTModel): a 33B dense
 // SINGLE-STREAM transformer that predicts video AND audio velocity from
@@ -76,6 +92,32 @@ class WeightSet;   // generative-models/weight-set.h
 // That is not done yet (see the note on _mod in the .cc).
 class MetalMiniMaxH3Transformer {
  public:
+  // Rows one matmul2d dispatch may touch, over an N-wide destination
+  // contracting a K-wide source.
+  //
+  // The mma tiles address through `dextents<int32_t, 2>`, so the tile
+  // whose base crosses 2^31 BYTES stops storing -- silently, leaving
+  // whatever was in the buffer. MEASURED at H3's fc1 shape
+  // ([38222, 28672] bf16 = 2.19 GB, the 1344x768 x 124-frame sequence):
+  // rows 37504..38221 came back exactly as they went in. Banding M
+  // rebases each dispatch, which keeps every offset the kernel computes
+  // small; below the line the band is the whole thing and nothing about
+  // the encoding changes. VPIPE_H3_MMA_ROW_BAND forces a band, which is
+  // how a small shape can be tested against its own unbanded self.
+  //
+  // BOTH extents, because the limit is a property of every operand and
+  // not of the destination. Banding on N alone protects the widest
+  // tensor a projection WRITES and leaves the one it READS unguarded --
+  // which is invisible on three of H3's four projections and reachable
+  // on the fourth: fc2 has the block's smallest N (5376, so its band is
+  // 199680 and never bites) and its largest K (14336, so at 75136 rows
+  // its source is 2.15 GB). MEASURED, minimax_h3_blocks.
+  // tail_rows_match_a_small_reference at [76800, 14336] bf16: mma128
+  // and mma128x256tn2 return 9633792 wrong elements, every row from
+  // 75008 = ceil128(2^31 / 28672) to the end, against a small-buffer
+  // reference. steel, the int8 arm and split-K are clean.
+  static int mma_row_band(int N, int K);
+
   struct Config {
     int hidden        = 5376;
     int n_heads       = 56;
@@ -92,7 +134,28 @@ class MetalMiniMaxH3Transformer {
     int freq_dim      = 256;      // sinusoidal timestep width
     int time_hidden   = 5376;
     int time_dim      = 2688;     // AdaLN projection input
+    // ComfyUI's PRUNED form (its "curve form", community DiTs saved
+    // pruned): no timestep MLP. A `adaln_t_table` [curve_grid, time_dim]
+    // (1025 x 8) holds points of the time-embedding curve, lerped at
+    // t * (curve_grid - 1), and every AdaLN projection is [D, time_dim]
+    // over that point, with no silu, in f32. 0 = the released form.
+    int curve_grid    = 0;
+    bool pruned() const { return curve_grid > 0; }
+    // PRUNED only: a checkpoint that carries the RELEASED timestep MLP
+    // (`time_embedder.*`; the graph's own partition), for what needs
+    // the full embedding on a pruned DiT -- a full-model adapter's AdaLN
+    // modules, ported onto the curve, and an adapted or flow-map
+    // embedding, projected onto it (see CurveBasis). Empty: those are
+    // skipped (AdaLN modules) or refused (a flow map), as before.
+    std::string time_mlp_dir;
+    // The audio branch (`audio_enabled`): its patch projection and its
+    // head. MiniMax-H3-Image's stack has neither, and its layouts no
+    // audio rows (minimax-h3-image.h).
+    bool audio = true;
     int rope_freq_dim = 16;       // per AXIS; 3 axes, doubled -> rot 96
+    // Only for a checkpoint with no `rope.inv_freq` tensor (the
+    // diffusers layout), which the table is then computed from.
+    float rope_theta  = 10000.0f;
     float norm_eps       = 1e-5f;
     float qk_norm_eps    = 1e-5f;
     float final_norm_eps = 1e-5f;
@@ -123,6 +186,102 @@ class MetalMiniMaxH3Transformer {
     // hand) at a cost of 4.8% extra int8 MACs, inside its 10% cap.
     // Set from generate-video's `i8_gemm`; VPIPE_I8_GEMM overrides.
     bool i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
+    // ...and which int8 GEMM (I8GemmContext::Tier, generate-video's
+    // `i8_gemm_tier`): 0 accurate (the per-call route above), 1 fast,
+    // 2 token, 3 token unrotated. The last three HOLD the 50 main
+    // blocks' four projections in I8GemmContext's int8 layout (rotated
+    // coarse groups, or one scale a row and a token), converted once
+    // into the entry a kept block holds; a Draw Things i8x checkpoint's
+    // codes ARE the unrotated token layout and are read as stored,
+    // kept or streamed. Off under the ANE tier, whose stagers read the
+    // checkpoint's own weights. VPIPE_I8_TIER / VPIPE_I8_TOKEN_ROT
+    // override it.
+    int i8_tier = 0;
+    // A w4 pack's block projections on the fast / token tiers: HOLD
+    // their int8 layout (true; twice their bytes, the fastest) or keep
+    // the pack and convert it before each GEMM into one scratch (false,
+    // the default; a streamed block always does). The engine's call --
+    // generate-image sets it where the box has room.
+    bool i8_hold_w4 = false;
+
+    // Sol-Attn (LOSSY), from generate-video's `sol_attn*` keys. Off by
+    // default. Attention here is dense self-attention over the packed
+    // sequence, which is exactly the shape the method approximates; the
+    // KV SINK is set from the layout rather than from config, because
+    // the prompt and the soundtrack sit in that sequence and a prompt
+    // read through a block centroid is a prompt half-read.
+    //
+    // MUTUALLY EXCLUSIVE WITH THE VDN LINEAR BRANCH, and not as a
+    // policy: VDN replaces attention with a windowed softmax whose
+    // complement a linear recurrence carries, so approximating the
+    // softmax half would leave the two halves describing different key
+    // sets and the partition -- the whole invariant of that design --
+    // would stop holding.
+    //
+    // INDEPENDENT OF `i8_gemm` above, and settable with it. The two act
+    // on different halves of a block: i8_gemm on the GEMMs, this on the
+    // attention between them. Neither reads the other's state.
+    sol::Config sol;
+    // SageAttention. Independent of `sol` beside it and of `i8_gemm`:
+    // Sol decides which key blocks are attended, Sage how the ones that
+    // are get computed, and i8_gemm how the GEMMs around them do. None
+    // of the three reads the others.
+    sage::Config sage;
+
+    // ---- the ANE tier (LOSSY, opt-in) -------------------------------
+    //
+    // The block feed-forward on the Apple Neural Engine beside the GPU:
+    // the rows are split between the two engines and run concurrently,
+    // which is exact because a feed-forward is row-independent. ONE
+    // runtime-weight module serves every block (see shared/ane-ffn.h), so
+    // the tier's memory is fixed -- ane_runtime_bytes() -- and it compiles
+    // once per shape. fp16 on the ANE, which is safe for the feed-forward
+    // alone: only its output re-enters the bf16 residual stream, and that
+    // addition stays on the GPU. A 4/8-bit affine checkpoint is
+    // dequantized into the module's inputs per block.
+    //
+    // `ane_rows` is the ANE's share of the rows, 0 auto-balancing from the
+    // measured times; `ane_layers` caps how many blocks use it, 0 all.
+    // Refiner blocks never do: they run over the text rows alone, far
+    // under one chunk. A runtime LoRA on fc1 or fc2 is merged into the
+    // ANE's staged weights per block; the GPU's rows apply it as usual.
+    // Set from generate-video's `ane_*` keys once the plan has granted the
+    // module; VPIPE_H3_ANE_CHUNK / VPIPE_H3_ANE_PROFILE for tuning.
+    bool  ane_ffn    = false;
+    float ane_rows   = 0.0f;
+    int   ane_layers = 0;
+    // The fused qkv projection split onto the ANE the same way, on its
+    // own matmul tier (auto share, same on/off controller). Set from
+    // generate-video's `ane_qkv` key, which REQUIRES `ane_ffn`: the two
+    // modules are booked as one CoreML unit and granted together.
+    // VPIPE_H3_ANE_QKV=1 also turns it on.
+    bool  ane_qkv    = false;
+    // Both ANE modules in ROTATED INT8 (W8A8; AneFeedForward::Options::
+    // int8): generate-video's `ane_int8`. LOSSY -- the GPU token tier's
+    // arithmetic on the ANE's rows; VPIPE_ANE_INT8 overrides it.
+    bool  ane_int8   = false;
+    // ...unrotated: the GPU token_plain tier's arithmetic (generate-video's
+    // `ane_int8_tier: token_plain`). Only with ane_int8.
+    bool  ane_int8_plain = false;
+
+    // TENSOR PARALLEL (generative-models/tensor-parallel.h): this rank's
+    // share of the heads and the feed-forward rows. Given to load() with
+    // n_heads and ffn the CHECKPOINT's; the model keeps them as the
+    // share's -- a rank is a narrower H3, every GEMM, scratch and kernel
+    // sized by its share -- and adds the other ranks' partials after the
+    // out projection and fc2 of every block -- a long sequence's in row
+    // bands, each band's exchanges under the GPU work of the bands beside
+    // it (band_rows, TpOverlap) -- through the channel a generation is
+    // given (begin_tp_generation). Dense or affine weights, no VDN or
+    // TaoMate: load() refuses the rest. The ANE tier is the share's
+    // (ane_runtime_bytes sizes it so), and splits each band's rows with
+    // the GPU: a rank's bands are its rows' and its floor's alone, the
+    // same whether its ANE (or its peer's) runs.
+    TpShare tp;
 
     int inner() const { return n_heads * head_dim; }        // 7168
     int video_patch_elems() const
@@ -168,6 +327,22 @@ class MetalMiniMaxH3Transformer {
     // keeps the two modalities the same length by construction; a
     // positive value is for a clip whose audio is deliberately not.
     double audio_seconds = 0.0;
+    // A REFINE (generate-video's init_latent: Open-H3-Regenerate-2K):
+    // the noise the clip is put back to, and the shift its steps follow
+    // -- MiniMaxH3Scheduler::refine_sigmas. Negative start = the
+    // release's own grid for the step count (0.909375 at 3 steps).
+    double refine_start_sigma = -1.0;
+    double refine_shift       = 6.0;
+    // The VIDEO's sigmas AS RUN, terminal 0 included (`sigmas`: an array
+    // of numbers, or the comma-separated string a graph writes) -- in
+    // place of the grid `steps` and the shifts make, and so of the step
+    // count: one forward a sigma but the last. The audio's follow from
+    // them through the two shifts (DenoiseRequest::video_sigmas). Empty:
+    // the model's own grid.
+    std::vector<double> sigmas;
+    // MiniMax-H3-Image only: the smallest area a picture is GENERATED
+    // at (`min_generation_area`), 0 the model's own (minimax-h3-image.h).
+    std::int64_t min_generation_area = 0;
 
     // Parse the `minimax-h3-model-config` beat. Absent keys keep the
     // defaults above; `err` collects what was ignored, and is not fatal.
@@ -276,21 +451,126 @@ class MetalMiniMaxH3Transformer {
   // nowhere for a pre-activation delta to land.
   struct LoraSpec {
     std::string path;          // a single .safetensors of lora_A/B pairs
-    float       scale = 1.0f;  // folded into A at load; 1.0 = as trained
+    // The strength at load; 1.0 = as trained. Applied per forward, so
+    // live: set_lora_scale() changes it.
+    float       scale = 1.0f;
+
+    // Which row order the adapter's FUSED `attn.qkv_proj` is in.
+    //
+    // The two publishers order that projection's 3*inner output rows
+    // differently -- Comfy-Org's repack FLAT ([all q | all k | all v]),
+    // every MiniMaxAI release PER HEAD -- and this tree re-orders
+    // neither, pointing the attention at the right offsets instead. So
+    // an adapter's delta has to be in the same order as the base it is
+    // added to, and one built for the other publisher lands on the
+    // wrong channels in every block.
+    //
+    // kAuto reads FLAT, because every H3 adapter published so far is:
+    // lightx2v's ComfyUI copies measurably (their B is exactly
+    // block-diagonal), larryvrh's Turbo by its repo's own
+    // `base_model: Comfy-Org/MiniMax-H3`. On a per-head DiT the rows
+    // are then permuted at bind. kPerHead is the escape hatch for an
+    // adapter actually trained on MiniMaxAI's weights -- none is known,
+    // and assuming one exists would silently break every adapter that
+    // does.
+    enum class QkvLayout { kAuto, kFlat, kPerHead };
+    QkvLayout qkv_layout = QkvLayout::kAuto;
   };
+
+  // How many adapters may ride the DiT at once: the shared Stack's
+  // eight, which is what the stages' `lora` .. `lora8` keys name.
+  //
+  // The common request is a few-step Turbo distillation, which is a
+  // correction to the WHOLE model and belongs at the strength it was
+  // trained at, beside style or identity adapters, which are the things
+  // actually being dialled. They stay SEPARATE slots rather than one
+  // merged set of factors because their strengths move independently --
+  // concatenating them on the rank axis is exact arithmetic (A = [s1 A1;
+  // s2 A2], B = [B1 | B2]) and would be free in the forward, but it
+  // folds every strength into A and so turns the live knob back into a
+  // rebuild, for the adapters most likely to be swept. Each slot costs
+  // its own pair of skinny GEMMs and its own rows of the [seq, rank]
+  // scratch; the base tile absorbs one adapter's second GEMM.
+  static constexpr int kMaxLoraSlots = lora::Stack::kMax;
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(const std::string& dit_dir, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
   static std::unique_ptr<MetalMiniMaxH3Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
        const Config& cfg, bool stream_blocks = false,
-       const LoraSpec* lora = nullptr);
+       const std::vector<LoraSpec>& loras = {});
 
-  // How many projections carry a runtime adapter (0 = none attached).
-  int lora_modules() const { return _lora_modules; }
+  // How many projections carry a runtime adapter, summed over the slots
+  // that bound (0 = none attached).
+  int lora_modules() const;
+  // An AdaLN curve branch's input (see CurveSet) for each timestep, as
+  // the reference reads it: pos = t * (knots - 1), lo = floor(pos)
+  // clamped to knots - 2, torch.lerp(table[lo], table[lo + 1], pos - lo)
+  // -- its two-sided form, in f32. `table` is [knots, 8], `out` [t, 8].
+  static void curve_coords(const std::vector<float>& table, int knots,
+                           const std::vector<float>& t, float* out);
+  // The same for ONE slot, so a caller can report which adapter took.
+  int lora_modules(int slot) const;
+  // Slots that bound. Indices below this are live; the rest are not.
+  int lora_slots() const { return static_cast<int>(_lora.size()); }
+  // Of a slot's projections, how many bound BANDED (split q/k/v with no
+  // block-diagonal zeros; see lora::Factors::banded).
+  int lora_banded(int slot) const;
+  // Bytes every slot's GPU factors hold -- what attaching the adapters
+  // costs in memory, which is not what they cost on disk.
+  std::size_t lora_bytes() const;
+  // The width of the forward's [rows, rank] adapter scratch, every
+  // slot's widest projection together.
+  int lora_scratch_rank() const { return _lora_rank_total; }
+  // GEMMs run on ComfyUI's int8 ConvRot (or W4A8) codes as stored, on the
+  // token tier (Linear::cr), since load -- engagement, for a test.
+  std::uint64_t convrot_native_gemms() const { return _cr_gemms; }
+  // Of the projections held from the load, how many are in the int8
+  // tier's layout: the refiner's (`refiner`), else the main blocks'.
+  // The refiner keeps its own whatever the tier (text rows, under the
+  // int8 row floor) -- split or not. For a test.
+  int int8_layouts(bool refiner) const;
+
+  // What an adapter FILE will cost before anything loads -- the plan's
+  // figure, off its header; lora_bytes() is the loaded model's. Every
+  // factor is held bf16 whatever the file stores. `whole`: all of them
+  // (a preloaded DiT). `streamed`: each main block's spilled to a file
+  // and the largest block's set held for the block being run, beside
+  // the rest (spill_lora_). `rank`: the widest the [rows, rank] scratch
+  // takes for this file, a block's q, k and v together as the bind fuses
+  // them. Main blocks at or past `n_layers` are not counted, as the bind
+  // skips them (0 counts every one). qkv bound BANDED, the default;
+  // VPIPE_H3_LORA_NO_BAND's block-diagonal B holds three of qkv's B.
+  struct LoraFootprint {
+    std::size_t whole    = 0;
+    std::size_t streamed = 0;
+    int         rank     = 0;
+  };
+  // `pruned`: the DiT's config when it is ComfyUI's pruned form. Its
+  // AdaLN modules are then held as f32 deltas [D * 9] (bind_pruned_
+  // adaln_) rather than as factors -- ComfyUI `.diff` / `.diff_b`
+  // patches too, which a released DiT does not read -- and take no
+  // [rows, rank] scratch; an adapter on the timestep MLP adds that MLP,
+  // read to the host from `pruned->time_mlp_dir`.
+  // `tp`: the share of a RANK (Config::tp), whose four split projections'
+  // factors are as tp_cut_lora_ cuts them -- q|k|v's and fc1's B to the
+  // share's rows, the out projection's and fc2's A to its columns -- and
+  // which streams them as any H3 does (its streamed set of cut factors).
+  static LoraFootprint lora_footprint(const std::string& path,
+                                      int n_layers = 0,
+                                      const Config* pruned = nullptr,
+                                      const TpShare* tp = nullptr);
+  // Whether an adapter FILE moves a pruned DiT's timestep embedding (it
+  // adapts the timestep MLP, or is a flow map), so the forward needs the
+  // off-curve tables bake_adaln builds (off_curve_bytes).
+  static bool moves_time_embedding(const std::string& path);
+  // What a pruned DiT holds to run such an adapter for `max_rows`
+  // schedule rows: the tables, one released AdaLN block read while they
+  // are built, and the released MLP on the host.
+  static std::size_t off_curve_bytes(const Config& c, int max_rows);
 
   // The adapter's strength, per FORWARD. Live because it can be: the
   // factors are the adapter's and the strength is the request's, so it
@@ -299,8 +579,137 @@ class MetalMiniMaxH3Transformer {
   // difference between a knob and a rebuild, and the reason to prefer
   // the runtime path when a strength has to be swept. 0 skips the two
   // GEMMs entirely, so "off" is exactly off.
-  void set_lora_scale(float s) { _lora_scale = s; }
-  float lora_scale() const { return _lora_scale; }
+  // Per SLOT, because two adapters are two requests: the distillation is
+  // pinned where it was trained and the style one is the knob. An index
+  // past what bound is ignored.
+  void set_lora_scale(int slot, float s);
+  float lora_scale(int slot) const;
+
+  // A FLOW-MAP adapter: one that conditions every step on the INTERVAL
+  // it integrates, (t, r), rather than on the point t. HyperFlow
+  // (videorebirth/hyperflow, after AnyFlow's two-time conditioning) is
+  // the one that exists: an 8-step self-distillation of this model.
+  //
+  // It is a LoRA plus exactly one architectural change, and that change
+  // is at the timestep MLP. Beside the checkpoint's own embedder it
+  // carries an ENDPOINT embedder -- a copy of the base one with its own
+  // adapter -- that embeds r, and the two are blended
+  //
+  //     temb = emb(t) + gate * (emb_r(r) - emb(t))
+  //
+  // before the silu every AdaLN applies. Each distinct timestep of a
+  // forward therefore needs its endpoint too (Step::endpoints); rows
+  // that do not move -- conditioning anchors, a reference soundtrack --
+  // carry r == t.
+  //
+  // WHAT THE FILE DECIDES. Its header names the raw sigma grid it was
+  // distilled on (9 points, 8 forwards) and the shifts it was distilled
+  // at; those are a property of the weights, the way a step count is
+  // for any distillation, and denoise() takes them from here unless the
+  // caller supplies a grid of its own.
+  struct FlowMap {
+    float gate = 0.0f;                 // `hyperflow_gate`
+    std::vector<float> sigmas;         // raw (UNshifted) grid, 1 -> 0
+    double video_shift = 0.0;          // trained shifts; 0 = unstated
+    double audio_shift = 0.0;
+    std::string version;               // `hyperflow_version`
+    int slot = -1;                     // which adapter slot carries it
+  };
+  // The model evaluations a flow-map adapter FILE's grid drives, read
+  // from its safetensors header alone -- 0 when the file is not one,
+  // has no grid, or cannot be read. For a caller sizing a run BEFORE
+  // the DiT exists, which is when the step count bounds the AdaLN
+  // bake's table and a graph's `steps` would understate it.
+  static int flow_map_steps(const std::string& adapter_file);
+  // Null when no slot carries a flow-map adapter.
+  const FlowMap* flow_map() const
+  {
+    return _flow.slot >= 0 ? &_flow : nullptr;
+  }
+  // Whether a forward NEEDS endpoints: a flow-map adapter is bound and
+  // its slot's strength is not 0. At 0 the adapter is off in both of
+  // its halves -- the LoRA and the blend move together, because one on
+  // without the other is a state it was never trained in -- and the
+  // model is exactly the base again.
+  bool two_time_active() const;
+
+  // A few-step adapter's SAMPLING CONTRACT, stated in a `manifest.json`
+  // BESIDE its file rather than in it -- Pika H3 Flex's (Pika-Labs/
+  // Pika-H3-Flex, `fl2va/` and `ref2va/`):
+  //
+  //   "trunk": "transformer" | "transformer_ref",
+  //   "numerics_policy": "bf16_conditioning_v1" | "fp32_conditioning_v1",
+  //   "sampling": {"knots": [1000, 750, 500, 250, 100, 40, 0],
+  //                "video_shift": 12.0, "audio_shift": 3.0,
+  //                "method": "renoise"}
+  //
+  // The knots over 1000 are a RAW grid each modality pushes through its
+  // own shift, in double and then rounded to float32 (diffusers'
+  // `shift_provided_sigmas`). "renoise" is the update the adapter was
+  // trained for: each step takes the clean estimate x0 = x + sigma v and
+  // puts it at the next sigma with FRESH noise, (1 - s') x0 + s' n --
+  // not an Euler step, which the release says outright is not
+  // equivalent. What the file decides, as a flow-map adapter's header
+  // does: denoise() runs it unless the caller names a grid of its own.
+  struct SamplingContract {
+    std::string release;               // `release_id`
+    std::string task;                  // "fl2va" / "ref2va"
+    std::string trunk;                 // "transformer" / "transformer_ref"
+    std::vector<double> sigmas;        // knots / 1000, raw, 1 -> 0
+    double video_shift = 0.0;          // 0 = unstated
+    double audio_shift = 0.0;
+    bool   renoise = false;            // method "renoise"
+    // `bf16_conditioning_v1`: the keyframe latents are rounded to bf16
+    // before they are noised and packed.
+    bool   bf16_conditioning = false;
+    int    slot = -1;                  // which adapter slot states it
+  };
+  // The contract an adapter FILE states, read from the `manifest.json`
+  // in its directory. False with `err` empty when there is none (no
+  // manifest, or one without `sampling`); false with a reason when one
+  // is there and does not parse -- a malformed contract is refused, not
+  // read as "no contract", since the run would then be the generic
+  // sampler the release warns against.
+  static bool sampling_contract_of(const std::string& adapter_file,
+                                   SamplingContract* out, std::string* err);
+  // The partition a contract's `trunk` names ("fl2va" / "ref2va"), or
+  // empty for a trunk this model does not know.
+  static std::string contract_partition(const SamplingContract& c);
+  // The contract of the slot that stated one while its strength is not
+  // 0; null otherwise. At 0 the adapter is off, and so is its sampler.
+  const SamplingContract* sampling_contract() const;
+
+  // The timestep MLP's output BEFORE the silu, in f32, for each
+  // `timesteps[i]` (and, when `endpoints` is given and a flow-map
+  // adapter is live, blended with the endpoint embedding of
+  // `endpoints[i]`). What the forward rounds to bf16 after its silu;
+  // public so a test can hold it against the reference's own module.
+  // PRUNED (Config::curve_grid), the point of `adaln_t_table` each
+  // timestep lands on (curve_coords, t clamped to [0, 1]), which the
+  // AdaLN projections read as it is: no MLP and no silu.
+  bool time_embedding(const std::vector<float>& timesteps,
+                      const std::vector<float>* endpoints,
+                      std::vector<float>* out) const;
+
+  // Where row `r` of part `pt` (0 = q, 1 = k, 2 = v) of a SPLIT adapter
+  // lands in the fused [3 * inner] qkv output.
+  //
+  // Public and static because it is the one piece of the diffusers
+  // conversion that has to agree with something else: the forward's own
+  // Q_OFF / K_OFF / V_OFF and QKV_HSTRIDE, which describe the same
+  // layout for the buffers it hands the attention. If those two ever
+  // disagree the adapter lands on the wrong channels and nothing fails
+  // -- see the test that pins them together.
+  //
+  //   flat     [ all q | all k | all v ]        -- Comfy-Org's repack
+  //   per head [ q0 k0 v0 | q1 k1 v1 | ... ]    -- MiniMaxAI's releases
+  static int qkv_fused_row(int pt, int r, int inner, int head_dim,
+                           bool per_head)
+  {
+    if (!per_head) { return pt * inner + r; }
+    const int h = r / head_dim, d = r % head_dim;
+    return h * 3 * head_dim + pt * head_dim + d;
+  }
 
   // Leading blocks pinned resident in streaming mode (0 = pure streaming,
   // or preloaded). For logging the RAM-for-speed decision.
@@ -308,6 +717,83 @@ class MetalMiniMaxH3Transformer {
   // in one commit. Remove once nothing asks.
   int pinned_blocks() const { return 0; }
   bool streaming() const { return _stream_blocks; }
+  // Whether the main blocks' projections run in the int8 layout
+  // (Config::i8_tier), and -- for a preloaded stack -- whether the first
+  // one holds a Draw Things checkpoint's own codes. What a test asserts
+  // before it compares anything.
+  bool i8_layout() const { return _i8_layout; }
+  bool i8x_native() const
+  {
+    return !_blocks.empty() && _blocks[0].qkv.i8x && _blocks[0].fc2.i8x;
+  }
+  // The token tiers' GEMM kernel it took ("blocked 128x64", ...; empty
+  // without int8).
+  std::string i8_token_kernel() const
+  {
+    return _i8 ? _i8->token_kernel() : std::string();
+  }
+
+  // Bytes the ANE feed-forward tier holds for a `seq`-row forward of this
+  // shape (and the qkv one's, when `c` asks for it); see
+  // AneFeedForward::runtime_bytes. Static because the PLAN asks before
+  // anything loads; a rank's (Config::tp) at its share's widths.
+  // ane_held_bytes() is what the ARMED modules hold -- the qkv tier may
+  // have declined where the plan asked for it.
+  static std::size_t ane_runtime_bytes(const Config& c, int seq) noexcept;
+  std::size_t ane_held_bytes() const noexcept;
+  // Rows per ANE predict: VPIPE_H3_ANE_CHUNK or the default (2048).
+  // MEASURED against 1024 (M4 Pro, int8 ConvRot, ffn + qkv, 9.4k rows, 4
+  // blocks, three interleaved rounds): a tie, 3977 against 3988 ms. The
+  // finer chunk took the GPU's idle from ~11% of the forward (waiting for
+  // the ANE's last chunk) to under 1% -- but the ANE runs ~6% slower a
+  // row there, so the balancer hands the GPU those rows instead.
+  static int ane_chunk_rows() noexcept;
+  // Whether the tier tried to arm, and whether it did: a plan that booked
+  // the module can release the booking when it did not.
+  bool ane_attempted() const noexcept { return _ane_tried; }
+  bool ane_armed() const noexcept { return _ane != nullptr; }
+  // Rows the feed-forward tier (`qkv`: the qkv tier) ran ON THE ANE, over
+  // the model's life -- whether it took any, which being armed does not
+  // say.
+  std::int64_t ane_rows_run(bool qkv = false) const noexcept
+  {
+    return qkv ? _ane_qkv_rows_run : _ane_rows_run;
+  }
+  // How many of the armed modules run int8 (Config::ane_int8, where the
+  // module and the OS could take it): rotated per token, or with `plain`
+  // unrotated (Config::ane_int8_plain).
+  int ane_int8_modules(bool plain = false) const noexcept
+  {
+    auto is = [plain](const AneFeedForward* a) {
+      return a != nullptr && a->int8() && a->int8_plain() == plain ? 1 : 0;
+    };
+    return is(_ane.get()) + is(_ane_qkv.get());
+  }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return _ane != nullptr && _ane->gpu_only();
+  }
+  bool ane_qkv_gpu_only() const noexcept
+  {
+    return _ane_qkv != nullptr && _ane_qkv->gpu_only();
+  }
+  // Take the ANE tiers off for this model before a forward that cannot
+  // afford them: modules released, config off, and the VPIPE_H3_ANE_QKV
+  // override ignored. The stage calls this when a clip fits only without
+  // the ANE's memory, rather than refusing the clip.
+  void disable_ane() noexcept
+  {
+    _cfg.ane_ffn  = false;
+    _cfg.ane_qkv  = false;
+    _ane_disabled = true;
+    _ane.reset();
+    _ane_qkv.reset();
+    _ane_tried     = true;
+    _ane_qkv_tried = true;
+  }
 
   ~MetalMiniMaxH3Transformer();   // out-of-line: _ws is fwd-declared
 
@@ -328,21 +814,222 @@ class MetalMiniMaxH3Transformer {
     // minimax_h3::build_row_timesteps.
     const std::vector<float>* timesteps         = nullptr;
     const std::vector<int>*   row_timestep_index = nullptr;
+    // Each distinct timestep's ENDPOINT, parallel to `timesteps` --
+    // required while a flow-map adapter is live (see FlowMap) and
+    // ignored otherwise. From minimax_h3::build_row_time_pairs, which
+    // makes the distinct entries PAIRS: two rows at the same t heading
+    // to different r are different entries.
+    const std::vector<float>* endpoints         = nullptr;
     // Which entry of a baked schedule this evaluation is, or -1 for
     // "not baked" (then `timesteps` drives the AdaLN projection as
     // before). See bake_adaln.
     int schedule_index = -1;
+    // The GENERATED video's latent grid. Only the hybrid VDN path reads
+    // it -- its window is over whole frames and its short conv is a
+    // (t, h, w) stencil, neither of which can be recovered from a row
+    // count. Left at zero the hybrid is off for this forward, which is
+    // what every non-VDN caller wants and gets by saying nothing.
+    int video_grid_h = 0;
+    int video_grid_w = 0;
+    // Run this forward's attention DENSE even when Sol-Attn is on. The
+    // routing is per forward and so is this: a sampler that wants its
+    // early, structure-deciding steps exact (HyperFlow's published Sol
+    // recipe keeps the first two of eight dense) says so step by step.
+    bool dense_attention = false;
+    // This forward's Sol-Attn ROUTING in place of the config's: its tau
+    // and threshold form, where `sol_routing` is set. Per forward like
+    // dense_attention -- a sampler that routes its steps differently
+    // says so step by step. Neither changes what Sol holds: the
+    // threshold's buffers are the call's own dead scratch.
+    bool  sol_routing = false;
+    float sol_tau     = 1.0f;
+    bool  sol_exact   = false;
+    // This forward's VDN REACH in place of set_vdn_radius()'s: the
+    // softmax half's window, the query's chunk and this many chunks
+    // either side (-1 the checkpoint's). Per forward like sol_tau -- a
+    // sampler that widens or narrows the window as the noise falls says
+    // so step by step; nothing is latched, the next forward without one
+    // is set_vdn_radius()'s again. kVdnRadiusUnset: not set.
+    static constexpr int kVdnRadiusUnset = -2;
+    int   vdn_radius  = kVdnRadiusUnset;
+    // Sage's int8 P*V (sage::Config::pv8) off for this forward -- the
+    // int8 QK alone -- as the loop's sage_pv8_from_step says.
+    bool sage_pv8_off = false;
+    // Which per-step output head projects the video rows (set_step_heads:
+    // MiniMax-H3-Image's step i runs head i), or -1 for the checkpoint's
+    // own `final_layer.video_out`.
+    int out_head = -1;
+    // TaoMate-H3's STREAMING attention (minimax-h3-stream-kv.h). Set, and
+    // every main block's attention splits in two:
+    //   text rows   -> the text rows alone
+    //   other rows  -> [text ; the cache's committed clean K/V ; this
+    //                   forward's media rows]
+    // non-causally, over a layout of [text | audio | video] rows. Sol,
+    // VDN, Sage and the fused-attention spellings are not used for such
+    // a forward -- each assumes one square self-attention.
+    minimax_h3::StreamKv* stream_kv = nullptr;
+    // ...and this is the chunk's CLEAN forward: after each block's
+    // attention has read the cache, the block's cache is rewritten as the
+    // rows that survive this commit plus this forward's media rows. The
+    // output heads do not run; the Velocity comes back ok and empty.
+    bool stream_commit = false;
   };
 
   struct Velocity {
     // [num_video_rows, 96] and [num_audio_rows, audio_channels] bf16, in
     // the same row order the inputs were given in.
     metal_compute::SharedBuffer video, audio;
-    bool empty() const { return video.empty(); }
+    // Success, stated rather than read off a buffer: an AUDIO-ONLY
+    // forward (no video rows) has no video velocity, and a streaming
+    // commit has neither.
+    bool ok = false;
+    bool empty() const { return !ok; }
   };
 
   // One denoiser evaluation. Empty on failure, with a reason in `err`.
   Velocity forward(const Step& in, std::string* err = nullptr);
+
+  // MiniMax-H3-Image's PER-STEP output heads (Parallel Decoding
+  // Distillation; minimax-h3-image.h): `video_out.weight` [steps,
+  // video_patch_elems, hidden] and `video_out.bias` [steps,
+  // video_patch_elems] out of `ws` (pdd_fused_heads.safetensors), one
+  // head a step in place of the checkpoint's own `final_layer.video_out`
+  // -- Step::out_head picks it. Each is held as that head is (bf16, a
+  // derived entry of `ws`, which is kept for their lifetime). False, with
+  // `err`, on a shape that is not this model's.
+  bool set_step_heads(std::shared_ptr<WeightSet> ws,
+                      std::string* err = nullptr);
+  int step_heads() const { return (int)_step_out.size(); }
+  // What the heads hold: derived entries of `ws`, whose manager sees
+  // them as it sees any cached tensor.
+  std::size_t step_heads_bytes() const;
+
+  // Size the activation scratch for at least `seq` rows and `n_text`
+  // text rows, and KEEP it for any forward that fits, rather than
+  // rebuilding on every change of length. A streaming run alternates
+  // four chunk lengths and a short audio-only teacher; rebuilt each time,
+  // that is several GB reallocated (and both sets briefly live) several
+  // times a request. Every buffer in the scratch is addressed with the
+  // forward's OWN length, so a larger one is a correct one. 0 restores
+  // the exact-fit policy every other caller relies on.
+  //
+  // `qkv_elems`: what the q|k|v scratch must hold for a stream forward's
+  // K/V staging (StreamKv::staging_bytes / 2), named up front so the
+  // first forward -- the audio-only teacher -- already builds it that
+  // wide. Raised later, it would REBUILD the scratch, and a rebuild holds
+  // both sets at once.
+  void set_scratch_floor(int seq, int n_text, std::size_t qkv_elems = 0)
+  {
+    _scratch_floor_seq  = seq > 0 ? seq : 0;
+    _scratch_floor_text = n_text > 0 ? n_text : 0;
+    _qkv_floor_elems    = _scratch_floor_seq > 0 ? qkv_elems : 0;
+  }
+
+  // Attach VDN-H3's linear branch, turning every main block's attention
+  // into the hybrid: a chunk-windowed softmax over the frames near the
+  // query, plus a bidirectional delta rule carrying everything the
+  // window cannot see. The two PARTITION the keys, so this is not an
+  // approximation bolted onto full attention -- running one half alone
+  // is wrong in a way that looks like a plausible video.
+  //
+  // `dir` is the VDN release root (the one holding `config.json` and
+  // `linear_branch/`). The branch SHARES this model's q/k/v projections
+  // -- that is why one LoRA on attn.orig.to_{q,k,v} feeds both halves --
+  // so it brings no projections of its own, and attaching it does not
+  // change what this checkpoint means.
+  //
+  // Off until this is called, and a forward that leaves Step's grid at
+  // zero still runs the stock stack.
+  bool attach_linear_branch(const std::string& dir, std::string* err);
+  bool has_linear_branch() const { return (bool)_vdn; }
+
+  // How far the softmax half of the hybrid reaches: the query's chunk
+  // and `r` whole chunks either side of it, the linear half carrying
+  // every frame beyond -- the checkpoint's `softmax_attention.radius`
+  // (1 in the released configs), or this in its place. The SHARE of the
+  // keys each half sees, and so where the cost and the exactness go: a
+  // wider window is more of the original attention and costs more of
+  // its time, a narrower one hands more to the linear branch. The two
+  // halves still PARTITION the keys at any radius -- the linear branch
+  // reads its complement off the same bounds -- but the gate and the
+  // branch were TRAINED at the checkpoint's, so another radius is a
+  // tuning outside it, not a setting of it. -1 (the default): the
+  // checkpoint's. Per request, read by the next plan and forward -- a
+  // forward's Step::vdn_radius, where set, in its place (a reach by
+  // step); the window's spans are rebuilt when it changes.
+  //
+  // AT MOST kVdnMaxRadius, and more reads as that: the window's bounds
+  // are (chunk +- r) * chunk_frames in an int, which wraps past ~4.3e8
+  // chunks (5 frames a chunk) into an EMPTY window -- garbage, not a
+  // wide one. 1024 chunks either side is 10,245 latent frames, past any
+  // clip the whole-sequence blocks VDN runs in can hold.
+  static constexpr int kVdnMaxRadius = 1024;
+  void set_vdn_radius(int r)
+  {
+    _vdn_radius = r < 0 ? -1 : std::min(r, kVdnMaxRadius);
+  }
+  int vdn_radius() const
+  {
+    return _vdn_radius >= 0 ? _vdn_radius : _vdn_cfg.radius;
+  }
+  int vdn_checkpoint_radius() const { return _vdn_cfg.radius; }
+  // The reach a forward runs at `r` -- a Step::vdn_radius: itself
+  // (capped), -1 the checkpoint's, kVdnRadiusUnset set_vdn_radius()'s.
+  int vdn_radius_of(int r) const
+  {
+    if (r >= 0) { return std::min(r, kVdnMaxRadius); }
+    if (r == -1) { return _vdn_cfg.radius; }
+    return vdn_radius();
+  }
+  int vdn_radius_of(const Step& s) const
+  {
+    return vdn_radius_of(s.vdn_radius);
+  }
+  // The attention-arena floor the LAST forward asked for the branch's
+  // carve (vdn_scratch_bytes at that forward's reach); 0 where the
+  // linear half did not run or no branch is attached.
+  std::size_t vdn_arena_floor_asked() const { return _vdn_arena_asked; }
+
+  // Non-zero if any of the branch's per-frame I + A was not positive
+  // definite on the last forward. READ IT: the solve returns a NaN
+  // there, and a NaN in the residual stream makes the frame it came
+  // from unrecoverable from the output rather than merely wrong.
+  unsigned linear_solve_failures() const
+  {
+    return _vdn ? _vdn->solve_failures() : 0u;
+  }
+
+  // How many blocks ran the LINEAR half on the last forward, and whether
+  // the window reached every frame.
+  //
+  // Reported because the two are the same fact seen twice and getting
+  // them out of step is silent: a window that covers the clip makes the
+  // hybrid the stock model plus the gate, and a linear branch left
+  // running under it contributes the text state to every video row --
+  // no crash, no NaN, just a term the reference does not have.
+  unsigned linear_blocks_run() const { return _vdn_blocks_run; }
+
+  // How much of the dense key-block grid the window actually visits:
+  // the block-sparse kernel's whole reason for existing, and the number
+  // that says whether it is worth taking at a given geometry. Both zero
+  // until a windowed forward has built the list.
+  std::size_t window_key_blocks() const { return _vdn_kb_sparse; }
+  std::size_t dense_key_blocks() const { return _vdn_kb_dense; }
+  bool linear_window_covers_all() const { return _vdn_full_cover; }
+  // What the forwards have encoded for perf-flops, credited to the GPU
+  // as each block retires (generative-models/shared/dit-flops.h).
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
+  // What the attached branch's blocks hold, plus the two per-forward
+  // buffers the hybrid adds. Reported apart from resident_block_bytes()
+  // because it is a SECOND checkpoint -- 4.28 GB over 50 blocks -- and a
+  // stage sizing this model has to count it.
+  std::size_t linear_branch_bytes() const
+  {
+    if (!_vdn) { return 0; }
+    return _vdn->resident_bytes() + _vdn_ro.byte_size()
+           + _vdn_proj.byte_size();
+  }
 
   // Precompute every step's modulation and drop the projections that
   // produce it. `schedule` is one entry per step: that step's distinct
@@ -372,8 +1059,14 @@ class MetalMiniMaxH3Transformer {
   // Idempotent per schedule; calling it with a different schedule
   // rebuilds. Requires the adaln weights to still be reachable, so it
   // must run before anything releases them.
+  //
+  // `endpoints`, when given, is the same shape as `schedule` and holds
+  // each entry's endpoint -- required under a live flow-map adapter,
+  // since the table IS the modulation and the modulation is a function
+  // of (t, r).
   bool bake_adaln(const std::vector<std::vector<float>>& schedule,
-                  std::string* err = nullptr);
+                  std::string* err = nullptr,
+                  const std::vector<std::vector<float>>* endpoints = nullptr);
   bool adaln_baked() const { return !_adaln_tab.empty(); }
 
   // Bytes the AdaLN bake will RETIRE, read from the checkpoint index
@@ -406,6 +1099,11 @@ class MetalMiniMaxH3Transformer {
   // so this answers with the WORST case, and a caller may subtract
   // adaln_retired_bytes() only when it is true.
   static bool adaln_bake_certain(const Config& cfg, int max_rows);
+  // ...and what its tables hold for that many rows: every block's
+  // [rows, adaln_out] and the final layer's [rows, 2 * hidden], bf16 --
+  // what a model that holds no AdaLN (a rank of a split DiT) holds for it
+  // once baked.
+  static std::size_t adaln_table_bytes_for(const Config& cfg, int max_rows);
   // What the tables cost, for the memory report. 0 when not baked.
   std::size_t adaln_table_bytes() const;
 
@@ -448,10 +1146,60 @@ class MetalMiniMaxH3Transformer {
   // wants left over. 0 disables growth entirely (pure streaming).
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
 
-  // Bytes currently held by promoted blocks, and how many there are.
-  // Reported so a run can say how much of the box it actually used.
+  // Bytes currently held by promoted blocks (the adapter factors kept
+  // with them included), and how many there are. Reported so a run can
+  // say how much of the box it actually used.
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // The streaming slot pair, while it exists.
+  std::size_t slot_bytes() const
+  {
+    return block_bytes_(_slot[0]) + block_bytes_(_slot[1]);
+  }
+  // What a STREAMING model holds beyond its weight set's cached entries
+  // (the trunk): the promoted blocks, the slot pair and the AdaLN tables
+  // the bake built -- not the adapter factors kept with promoted blocks,
+  // which the adapter file's own claim books. The figure a per-clip
+  // holding correction adds to the set's -- promoted blocks are this
+  // model's own buffers, which the set never sees; so, a RANK's, are its
+  // refiner's cut projections. 0 for a preloaded model, whose blocks are
+  // the set's.
+  std::size_t streamed_holding_bytes() const;
+  // EVERYTHING this model holds in WEIGHTS but the adapter factors
+  // (lora_bytes()): its weight set's entries and its own buffers -- a
+  // streaming model's promoted blocks, slot pair and AdaLN tables
+  // (streamed_holding_bytes()), a RANK's cut projections in the layout
+  // each took and its AdaLN tables. What a warm hold keeps; a rank's
+  // is what tp_held_bytes() books for it.
+  std::size_t held_bytes() const;
+  // What a RANK of `c` (Config::tp, with the tiers it loads with) holds
+  // with every block kept -- where stream, then retain converges on a box
+  // with room -- off the checkpoint's headers before anything loads: the
+  // plan's figure for held_bytes(). Every tensor of the trunk, the
+  // refiner and the first `c.n_layers` blocks as stored but the AdaLN
+  // projections (the bake reads them; the final layer's too), each
+  // block's four projections at its share -- tp_part_'s rows or columns
+  // -- in the layout the load leaves it: bf16, an affine pack's codes,
+  // scales and biases, or, on a MAIN block where the int8 tier engages
+  // (asked of an I8GemmContext made as load() makes it, on `mc`), its
+  // codes and scales -- a w4 pack's only where `c.i8_hold_w4` holds them,
+  // else its pack, converted per projection; and the bake's tables for
+  // `bake_rows` rows. 0 when `c` is not split. `c.ane_ffn` is the
+  // REQUEST: under it the share stays bf16, the larger figure, which is
+  // what holds if the grant comes. A stage deciding whether its rank
+  // holds the w4 layouts asks this twice, `i8_hold_w4` false and true:
+  // the difference is that layout's growth on this rank's share.
+  // `floor`: what the rank holds streaming at the least -- all of the
+  // above but the main blocks, and the two largest of those (the block a
+  // forward runs and the one read under it).
+  static std::size_t tp_held_bytes(const std::string& dit_dir,
+                                   const Config& c, int bake_rows,
+                                   metal_compute::MetalCompute* mc,
+                                   std::size_t* floor = nullptr);
+  // EVERY BLOCK KEPT: give the slot pair back -- two blocks a preload
+  // never held. Call with no forward running; the next streamed block
+  // (after an eviction) builds it again. Returns the bytes freed.
+  std::size_t release_idle_slots();
 
   // Give back at least `bytes` of promoted blocks, for a peer that needs
   // the room (the VAE decode is the case this exists for). Returns what
@@ -479,7 +1227,49 @@ class MetalMiniMaxH3Transformer {
   // image DiTs do; an empty function disables the check.
   void set_stream_stop(std::function<bool()> stop)
   {
+    // A rank's channel polls the same stop while it waits on the others
+    // (a plugin's: nothing it is handed may throw back into here).
+    if (_tp_ch) {
+      try {
+        _tp_ch->set_stop(stop);
+      } catch (...) {
+      }
+    }
     _stream_stop = std::move(stop);
+  }
+
+  // A RANK'S LINK FOR ONE GENERATION (Config::tp; tensor-parallel.h,
+  // TpChannel): the channel a stage opened for this clip, a worker of its
+  // own over it, and the exchange count from 0. Each clip begins afresh
+  // on every rank, whatever its last one did -- a forward that stopped
+  // part way abandons what it posted and fails its worker, and a peer
+  // that let go of its share between clips reopened a channel at 0 --
+  // so neither the weights' lifetime, which each host decides by its
+  // own memory, nor a stop can leave the ranks out of step. A forward on
+  // a rank with no generation open fails. False, with `err`, when this
+  // is not a rank or the worker could not start. One already open is
+  // ended first.
+  bool begin_tp_generation(std::shared_ptr<TpChannel> ch, std::string* err);
+  // ...and its end, on every way out (a stage's guard): anything still
+  // posted abandoned -- the channel first given a stop that is always
+  // true, so an exchange waiting on a peer returns -- the worker joined,
+  // every exchange buffer forgotten, the channel's stop cleared and the
+  // channel let go. Nothing when none is open.
+  void end_tp_generation();
+  bool tp_generation_open() const { return _tp_pipe != nullptr; }
+
+  // The model a RANK of a split DiT is (Config::tp): `c`'s heads and
+  // feed-forward rows narrowed to the share's, as load() narrows its own
+  // -- what a stage sizes a rank's scratch by, since its Config keeps the
+  // checkpoint's widths. `c` itself when not split.
+  static Config rank_config(const Config& c)
+  {
+    Config r = c;
+    if (c.tp.active()) {
+      r.n_heads = c.tp.heads();
+      r.ffn = c.tp.ffn();
+    }
+    return r;
   }
 
   // Bytes of per-forward SCRATCH this geometry needs, BEFORE anything is
@@ -499,9 +1289,110 @@ class MetalMiniMaxH3Transformer {
   // have fit costs a smaller canvas, and under-estimating one that does
   // not costs the machine. ff_scratch_narrow() answers it once a model
   // exists.
+  // `arena_floor` raises the attention arena to at least that many
+  // bytes, which is how the VDN branch's scratch is paid for: it does
+  // not get an allocation of its own, it is carved out of the arena
+  // (see vdn_scratch_bytes and MetalVdnBranch::set_arena), so the
+  // branch costs this model the amount by which its need exceeds an
+  // arena the attention was going to hold anyway -- nothing at all at
+  // both geometries measured.
+  // `widen` floors the dequant scratch at what an FP8 / int8 / W4A8
+  // checkpoint widens into it per GEMM (fp8_widen_bytes), on EVERY GPU
+  // and including projections the four above do not cover (a released
+  // AdaLN, 2,688 wide, at the bake).
   static std::size_t scratch_bytes(const Config& c, int seq, int n_text,
                                    int n_t, bool with_dequant,
-                                   bool narrow_ff = false);
+                                   bool narrow_ff = false,
+                                   std::size_t arena_floor = 0,
+                                   int band = 0, std::size_t widen = 0);
+
+  // The widest projection an FP8 / int8 / W4A8 checkpoint widens to bf16
+  // ahead of its GEMM (into the dequant scratch), N x K x 2 -- the fused
+  // q|k|v of a file that stores it split included; 0 for a checkpoint
+  // with none. Off the headers (`dit_dir` as config_from_json takes it),
+  // or, for a loaded model, off what it read.
+  static std::size_t fp8_widen_bytes(const std::string& dit_dir,
+                                     const Config& c);
+  std::size_t fp8_widen_bytes() const { return _f8_widen; }
+
+  // THE BANDED FORWARD. A long sequence's main blocks run a BAND of rows
+  // at a time: every row's residual and q / k / v are kept -- attention
+  // needs every key -- and one band of everything else (the normed rows,
+  // the qkv projection's output, the attention output, the feed-
+  // forward). 54 KB a row against 137 whole: at 2K x 121 frames (134k
+  // rows) 7.7 GiB of activations against 17. Each row's arithmetic is
+  // the whole forward's -- Sol, Sage and Sage's int8 P*V included: Sage
+  // quantizes K and V once a layer and each band's Q, Sol attends each
+  // band's queries over every key (a second Sol object for the last
+  // band). The rows a band takes for `seq` under `c` -- BALANCED: every
+  // band but the last that many, at most the configured band, the last
+  // long enough to clear every route's row floor -- or 0 for the whole
+  // sequence: under 2 bands' worth, and wherever a path needs the whole
+  // sequence's buffers -- the ANE tiers (and, at the forward, streaming
+  // attention, VDN's branch, the in-place q/k/v layout).
+  // VPIPE_H3_BAND_ROWS=<rows> sets the band (0: never). A RANK of a
+  // split DiT (Config::tp) bands for its exchanges, not its memory: a
+  // band about an eighth of the sequence (VPIPE_H3_TP_BANDS=<n>: an n-th,
+  // no floor), and no band but the last under 1,024 rows -- or the
+  // share's own tp_extra::kMinBandRows, a host's for both ranks -- fewer
+  // bands where an eighth is shorter; by seq alone: every rank must cut
+  // the same bands, so nothing measured on its own host goes in.
+  static int band_rows(const Config& c, int seq);
+  // ...and the rows a band of the PROMPT takes when the main blocks band
+  // at `band` and the prompt is longer than that (an in-context refine
+  // presents its whole draft clip as tokens: ~12k rows at 2K x 15 s): the
+  // text refiner then runs a band at a time as the main blocks do, and
+  // the prompt's rows lie in as many bands of theirs as they take. 0 --
+  // the refiner whole -- where the prompt fits a band. Balanced as
+  // band_rows' are, at most `band`.
+  static int text_band_rows(const Config& c, int n_text, int band);
+  // The band a forward over `seq` rows behind an `n_text`-row prompt
+  // runs its main blocks in under `c`: band_rows', except that a RANK not
+  // given tp_extra::kPromptBands keeps the older rule -- a prompt longer
+  // than its band runs every block whole -- so a pair of ranks cuts the
+  // same bands whichever release each runs. 0 for whole.
+  static int band_for(const Config& c, int seq, int n_text);
+  // The longest sequence the WHOLE-SEQUENCE block (no bands: the ANE
+  // tiers, VDN's branch when `vdn`, streaming attention, a rank told no
+  // prompt bands) runs under `c`; the forward refuses a longer one rather
+  // than write wrong rows. Set by the widest activation a pass still
+  // addresses in 32 bits -- VDN's branch reads the fused q|k|v (3 x inner
+  // a row) at unsigned 32-bit offsets -- and capped at 2^31 elements of
+  // the residual stream, past which no whole-sequence block has been run.
+  static int whole_rows_max(const Config& c, bool vdn);
+  // The rows one dispatch of a thread-an-element pass over a `width`-wide
+  // activation covers: the elementwise kernels count their elements in
+  // an int, so a longer activation goes in row bands of this many.
+  // VPIPE_H3_ELT_ROWS=<rows> caps it lower (tests: the bands' offsets).
+  static int elt_rows(int width);
+  static constexpr int kBandRows = 8192;
+  static constexpr int kTpMinBand = 1024;
+  // The band the last forward ran its main blocks in (0: whole), and its
+  // text refiner's (0: whole).
+  int last_band_rows() const { return _last_band; }
+  int last_text_band_rows() const { return _last_text_band; }
+  // What this model holds WIRED (its window onto the wired pool): a warm
+  // hold keeps it charged.
+  std::size_t wired_bytes() const { return _wire.wired_bytes(); }
+  // The forward's SCRATCH let go -- the activation set, a rank's
+  // exchange buffers (its generation ended first: the channel forgets
+  // them), Sage's and Sol's own buffers and the GEMMs' grow-only ones
+  // (the dequant matrix, a W4A8 weight's codes, the int8 context's) --
+  // before the model is kept warm: a few GB a video forward, built again
+  // at the next one's geometry. Returns what was freed (the int8
+  // context's not counted: it states no figure).
+  std::size_t release_forward_scratch();
+  // FOR TESTS: adapter slot `slot`'s delta on main block `block`'s
+  // projection `which` (0 q|k|v, 1 out, 2 fc1, 3 fc2) for ONE row `x` of
+  // its input as this model holds it -- a rank's share -- computed on
+  // the host from the bound factors, B (A x), banded or not, at
+  // strength 1. Empty where the slot has no factors there.
+  std::vector<float> lora_delta_for_test(int slot, int block, int which,
+                                         const std::vector<float>& x) const;
+  // ...and the one this model's forward takes at `seq` behind an
+  // `n_text`-row prompt (band_for under the load's kernels and branches;
+  // a request's streaming attention aside).
+  int forward_band(int seq, int n_text) const;
 
   // What the per-forward scratch buffers ACTUALLY hold right now, and
   // what the matrix-core dequant scratch holds, kept apart because they
@@ -512,6 +1403,97 @@ class MetalMiniMaxH3Transformer {
   // definition.
   std::size_t scratch_resident_bytes() const;
   std::size_t dequant_scratch_bytes() const;
+
+  // What the VDN branch will ALSO want, for this geometry, or 0 when no
+  // branch is attached.
+  //
+  // Kept apart from scratch_bytes() above because it is a SECOND
+  // allocation with a different shape: that one is sized by the packed
+  // sequence, this one mostly by [frames, heads, d, d] banks that grow
+  // with the clip -- 1.0 GB at the docs pipeline's 37 latent frames and
+  // 2.2 GB at 92. It is spent at the branch's first reserve(), which is
+  // inside the first forward and therefore AFTER every planning
+  // decision, so a caller that preflights the transformer's scratch and
+  // not this one sizes the box against half of what it is about to use.
+  // That was the gap: the DiT would keep blocks resident against a
+  // budget that had not heard of the branch, and the machine swapped.
+  //
+  // SPLIT THE WAY THE MEMORY ACTUALLY FALLS OUT, which is why there is
+  // an out-parameter. `*arena_floor` is the part the ATTENTION ARENA
+  // absorbs -- the branch runs in the gap between the previous block's
+  // FF and this block's attention, when nothing in that arena is live,
+  // so it carves its scratch there and the arena is merely sized to the
+  // wider of its two users. The RETURN VALUE is what is left over: the
+  // branch's two host-written constants, plus the readout, which is the
+  // one buffer that cannot share because it spans the attention it is
+  // waiting to be added to.
+  //
+  // Pass the floor to scratch_bytes() / the forward and add the return
+  // value on top; the sum is the same shape of answer as before, and
+  // smaller by however much the arena covers.
+  //
+  // `grid_h`/`grid_w` are the PATCH grid, the same numbers Step carries.
+  // `radius` is a Step::vdn_radius (vdn_radius_of): the reach decides
+  // whether the window covers the clip, and so whether any of this is
+  // owed -- a forward asks at its STEP's reach, not the request's.
+  std::size_t vdn_scratch_bytes(const minimax_h3::PackedLayout& L,
+                                int grid_h, int grid_w, int n_text,
+                                std::size_t* arena_floor = nullptr,
+                                int radius = Step::kVdnRadiusUnset) const;
+
+  // What SOL-ATTN will also want at this sequence length, or 0 when it
+  // is off. The same shape of question as vdn_scratch_bytes above and
+  // for the same reason: it is a second allocation, spent at the first
+  // routed block and therefore after every planning decision.
+  //
+  // MOST OF IT IS NOT AN ALLOCATION AT ALL. Sol's scratch lives for one
+  // call, and with it on the fused qkv projection and the arena's last
+  // attention window are both dead for exactly that stretch -- so what
+  // this returns is what is LEFT after that loan, which at production
+  // geometry is a few hundred bytes against 861 MB unlent. It is the
+  // real carve and not a subtraction; see
+  // MetalSolAttention::private_bytes.
+  std::size_t sol_scratch_bytes(int seq, int n_text) const;
+  // The share of key blocks Sol-Attn's routing kept exact over the LAST
+  // forward's routed layers: valid once forward() has returned, until
+  // the next one starts (which reports and resets it). -1 where nothing
+  // was routed.
+  double sol_kept_fraction() const;
+  // What the Sol objects hold of their own -- pinned, unlent scratch and
+  // the prepared keys -- which is what sol_scratch_bytes() books.
+  std::size_t sol_held_bytes() const;
+
+  // ...and SageAttention's, which a preflight needs for the same reason
+  // and did not have: its int8 twins of q and k are H * seq * head_dim
+  // BYTES each, which at video geometry is a gigabyte and a half that
+  // nothing sizing the box had heard of.
+  std::size_t sage_scratch_bytes(int seq, int n_text) const;
+
+  // ...and the INT8 CONTEXT's, the same shape of question again: the
+  // activation codes and scales of the widest GEMM at this sequence, the
+  // per-call weight scratch (the accurate tier requantizes every weight
+  // per call; a w4 pack on fast / token converts into it) and split-K's
+  // planes -- grown inside the first forward and kept. A bound
+  // (I8GemmContext::forward_bytes_bound), 0 when the context is off.
+  std::size_t i8_scratch_bytes(int seq, int n_text) const;
+
+  // How many times the activation scratch has been ALLOCATED.
+  //
+  // One per geometry is right; more than one within a denoise is the
+  // bug this counts: the set is built in full before the old one is
+  // dropped, so a rebuild peaks at both at once -- 13 GB twice at video
+  // geometry. See kTimestepSlots.
+  // Timestep slots the activation scratch is SIZED for, whatever a
+  // single forward presents. `n_t` moves within a denoise (1 on the
+  // first step, 2 once the video and audio schedules diverge) and three
+  // small buffers depend on it, so keying the scratch on the exact
+  // value rebuilt every activation buffer in the model to grow a few
+  // hundred KB. Must not exceed GenerateVideoStage's
+  // kTimestepsUpperBound, which is what the preflight sizes the box
+  // against.
+  static constexpr int kTimestepSlots = 4;
+
+  int scratch_rebuilds() const { return _scratch_rebuilds; }
 
   // Which kernel one block projection dispatches on.
   //
@@ -541,6 +1523,9 @@ class MetalMiniMaxH3Transformer {
   // 2 = +BM128. Same knob, and the same reason for it, as the Wan DiT:
   // the only way to compare two tiles without the thermal spread between
   // processes is to alternate them inside one.
+  int  quant_bits() const { return _quant_bits; }
+  int  quant_group() const { return _quant_group; }
+
   void set_qmm_tile(int cap);
   int qmm_tile() const { return _qmm_tile; }
 
@@ -564,11 +1549,80 @@ class MetalMiniMaxH3Transformer {
   // like the Qwen fast-path guard: a silent fallback to steel is 2-3x
   // slower but numerically fine, so no correctness test can see it.
   bool uses_matrix_cores() const { return _use_mma2; }
+  // Whether the dequant scratch (_w_deq) exists at all: the matrix-core
+  // path widens quantized weights into it, and an FP8 checkpoint widens
+  // every weight into it on EVERY machine. What scratch_bytes()'s
+  // `with_dequant` has to be told.
+  bool uses_dequant_scratch() const { return _use_mma2 || _f8.any(); }
   // True when every block runs the fused-SwiGLU FF, so the ff scratch is
   // the narrow one. Pair with scratch_bytes()'s `narrow_ff`.
   bool ff_scratch_narrow() const { return !_ff_needs_wide; }
   // Whether the DiT's flash attention is the matrix-core (NAX) kernel.
   bool uses_nax_attention() const { return _attn_nax; }
+  // What the streamed-weight prefetch did on the last forward: reads
+  // ISSUED and reads a block actually CONSUMED. A gap between them is
+  // work paid for and discarded -- and on the fallback destination it
+  // also leaves a block's worth of buffers live for the rest of the
+  // pass, which is the opposite of what a memory-tight run wants. Zero
+  // when nothing streamed.
+  int prefetch_started() const { return _pf_started; }
+  int prefetch_hits() const { return _pf_hit; }
+  // Blocks the last forward promoted UNDER THE NEXT BLOCK'S GPU WORK --
+  // copied out of their slot, kept and wired after that block's commit
+  // rather than between their own wait and its encode. Zero with
+  // VPIPE_H3_PROMOTE_INLINE=1 (the A/B), or when nothing was promoted.
+  int deferred_promotions() const { return _promote_deferred; }
+  // Of those, the ones copied out of the SPARE, so the slot's next read
+  // did not wait for the copy (VPIPE_H3_NO_PROMOTE_SPARE=1: none).
+  int spared_promotions() const { return _promote_spared; }
+  // Whether the last streamed forward ran with TWO reusable block slots.
+  // False means single-slot (the budget refused the second, or
+  // VPIPE_H3_SINGLE_SLOT asked for it) and is a distinct third path from
+  // slots-off.
+  bool slot_pair() const { return _slot_pair; }
+
+  // The row count a tuned GEMM answer is filed under.
+  //
+  // The tuner measures at min(M, ceiling) rows, so every geometry at or
+  // above the ceiling produces an IDENTICAL measurement -- same rows,
+  // same shapes, same candidates. Keying the cache on the caller's own
+  // row count therefore made a second video geometry pay again for an
+  // answer that could not differ, which at the production shapes was
+  // ~5 s of GPU per distinct sequence length. Below the ceiling the row
+  // count really is the caller's and the key is exact.
+  //
+  // Public because it is the property worth pinning: if the store and
+  // the lookup ever disagreed about this, every projection would fall
+  // silently back to the untuned rule and only a timing would show it.
+  int tune_row_ceiling() const { return _tune_ceiling; }
+  int tune_row_key(int M) const { return std::min(M, _tune_ceiling); }
+  // How many times the tuner has actually MEASURED, as against found its
+  // answer already cached. Test seam for the line above.
+  int qmm_tune_count() const { return _qmm_tune_count; }
+  // Which candidate indices survive the GEMM tuner's warm pass, given
+  // each one's warm time and how far behind the leader an arm may be and
+  // still be timed properly.
+  //
+  // Pure, and public, because it is a RULE rather than a measurement and
+  // the rule is what can silently go wrong: the two fastest must always
+  // survive, the leader must never be dropped, and a warm pass that
+  // failed to time must prune nothing. None of those is visible in a
+  // timing. See the note in tune_qmm_ for why the threshold is loose.
+  static std::vector<int> tune_prune_survivors(
+      const std::vector<double>& warm, double keep);
+  // Which of attention's four transposes are gone. The two halves are
+  // INDEPENDENT and, measured, they are not the same trade -- see the
+  // note on _fused_attn -- so they are separate bits rather than one
+  // switch.
+  //
+  // A path-SELECTION accessor: every combination is numerically
+  // identical, so only a timing can tell them apart. The setter is for
+  // the in-process A/B; bits the build cannot honour are refused, and
+  // fused_attention() then reports what actually runs.
+  static constexpr int kFusedAttnOut = 1;   // store O row-major
+  static constexpr int kFusedAttnQkv = 2;   // read q/k/v in place
+  int fused_attention() const { return _fused_attn; }
+  void set_fused_attention(int mask);
 
   // What the route autotune MEASURED for the sequence length last run,
   // e.g. "9382: qkv=mma128x256 o=bm64 fc1=mma128x256tn2 fc2=bm32". Empty
@@ -585,7 +1639,26 @@ class MetalMiniMaxH3Transformer {
  private:
   // Defined with the runtime-LoRA members below; declared here because
   // gemm_ and its dispatchers take one by pointer.
-  struct LoraFactors;
+  // The shared factor pair (generative-models/shared/runtime-lora.h):
+  // A [rank, K] and B [N, rank], both bf16 and both in the checkpoint's
+  // own orientation. An ALIAS rather than a second definition -- the
+  // reader of the adapter file and the forward that applies it have to
+  // agree about the layout, and two structs that merely look alike agree
+  // only until one of them moves.
+  using LoraFactors = lora::Factors;
+
+  // The adapters attached to ONE projection, in slot order. Shared with
+  // every other family that takes one (generative-models/shared/
+  // runtime-lora.h) -- an ALIAS rather than a second definition, for the
+  // same reason LoraFactors is one.
+  //
+  // Built per call rather than cached per block: it is three words a
+  // slot on the stack, and the alternative is five of these per block
+  // holding a strength that a config beat can change between forwards.
+  using LoraStack = lora::Stack;
+  static_assert(kMaxLoraSlots <= lora::Stack::kMax,
+                "a slot the shared Stack cannot hold would be dropped "
+                "silently at the projection rather than at load");
 
   MetalMiniMaxH3Transformer() = default;
 
@@ -604,7 +1677,59 @@ class MetalMiniMaxH3Transformer {
     // takes the split path, so the two can coexist within one forward --
     // which is what a streamed block that has not been promoted yet is.
     bool gu_inter = false;
-    bool empty() const { return quantized ? codes.empty() : w.empty(); }
+    // FP8 storage: `codes` holds the checkpoint's own [N, K] bytes,
+    // widened to bf16 on the GPU right before each GEMM (fp8_dense_).
+    // Deliberately NOT `quantized`: there are no group scales, and every
+    // path that reads an affine triple must not be handed one. A SCALED
+    // weight carries `f8_scale`, f32 -- one value, or one per row when
+    // `f8_per_row` (shared/fp8-expand.h). ComfyUI's INT8 rides here too
+    // (f8 kI8), `f8_rot` its ConvRot group, undone in the widening.
+    fp8::Format f8 = fp8::Format::kNone;
+    metal_compute::SharedBuffer f8_scale;
+    bool f8_per_row = false;
+    int f8_rot = 0;
+    // W4A8 (f8 kW4A8): `codes` the [N, K / 2] nibbles, `f8_scale` the
+    // row scale, these the E4M3 relative scales [N, K / f8_qgroup] and
+    // the codebook (16 f32; empty: code - 8).
+    metal_compute::SharedBuffer f8_srel, f8_cb;
+    int f8_qgroup = 0;
+    // NVFP4 (f8 kNVFP4): `codes` the [N, K / 2] nibbles, `f8_scale` the
+    // tensor's scale_2, `f8_srel` the E4M3 block scales; the spelling
+    // (fp8.h) and an AWQ pre_quant_scale, f32 [K] (empty: none).
+    bool f8_nhi = false, f8_swz = false;
+    metal_compute::SharedBuffer f8_pq;
+    // I8GemmContext's int8 LAYOUT (Config::i8_tier) when gc > 0: `codes`
+    // int8 [n, k] and `cscales` its scales at group gc (kTokenGroup: f32
+    // [n]) -- or, `pc`, a w4 pack's codes / scales / qbias as stored,
+    // converted per projection (gemm_). Deliberately NOT `quantized`,
+    // which means the affine pack every other route reads.
+    // `i8x`: Draw Things' own codes, refilled raw by name in a slot.
+    int gc = 0;
+    int n = 0, k = 0;
+    metal_compute::SharedBuffer cscales;
+    bool i8x = false;
+    // ComfyUI's int8 CONVROT codes run as stored on the token tier (gc ==
+    // kTokenGroup): `cr` their group (256), the activation rotated alike
+    // (I8GemmContext::quantize_token_convrot); `cscales` the row scale.
+    // `cr_w4`: a W4A8 weight's nibbles (`codes`, with f8_srel / f8_cb /
+    // f8_qgroup), decoded to those int8 codes per GEMM.
+    int cr = 0;
+    bool cr_w4 = false;
+    // The w4 pack kept as stored and converted per projection (gemm_);
+    // false for a layout held (Config::i8_hold_w4), w4 or w8.
+    bool pc = false;
+    // A STREAMED block's layout, rebuilt after every refill out of what
+    // the slot refills (refill_block_): `ds`, a dense weight -- `w` keeps
+    // its bf16, quantized into codes / cscales; `ps`, a w8 pack -- its
+    // codes / scales / qbias are refilled and the codes converted IN
+    // PLACE. A promotion keeps the layout alone (keep_block_), as the
+    // entry a preloaded block holds.
+    bool ds = false;
+    bool ps = false;
+    bool is_fp8() const { return f8 != fp8::Format::kNone; }
+    bool empty() const {
+      return (quantized || is_fp8() || gc > 0) ? codes.empty() : w.empty();
+    }
   };
 
   // Put `nm`'s tensors into `dst`, reusing its buffers when they already
@@ -693,6 +1818,11 @@ class MetalMiniMaxH3Transformer {
   // the next read -- so the residency set, its growth and its ratchet all
   // work exactly as before.
   Block _slot[2];
+  // A block a promotion is still to copy, swapped out of its slot so the
+  // slot's next read need not wait for the copy -- the slot takes this
+  // one's buffers. Lives for one forward (given back at its end), and
+  // only where a promotion is under way and the box takes one more block.
+  Block _slot_spare;
   // Which slot holds the block the forward is currently running. The
   // prefetch always targets the other one.
   int   _slot_cur = 0;
@@ -731,22 +1861,75 @@ class MetalMiniMaxH3Transformer {
   metal_compute::SharedBuffer weight_(WeightSet& ws, const std::string& nm,
                                       Retain r);
   Linear linear_(WeightSet& ws, const std::string& nm, bool bias, Retain r);
+  // A main block's projection in I8GemmContext's int8 layout (see
+  // Config::i8_tier), or an EMPTY Linear where it cannot be -- the caller
+  // then takes linear_(). Native for a Draw Things i8x weight; converted
+  // once into a derived entry otherwise, and then for a kept block only.
+  Linear i8_linear_(WeightSet& ws, const std::string& nm, Retain r);
+  // A layout weight widened into the dequant scratch for a shape the int8
+  // GEMM declines, from its layout operands (`l`'s own, or the scratch a
+  // w4 pack was converted into); `view` aliases the scratch, as
+  // fp8_dense_'s does.
+  const Linear* i8_dense_(metal_compute::ComputeEncoder& enc,
+                          const Linear& l,
+                          const metal_compute::SharedBuffer& codes,
+                          const metal_compute::SharedBuffer& cscales,
+                          Linear& view, int N, int K);
+  // A linear the checkpoint stores in PIECES (the diffusers layout's
+  // split qkv and swapped fc1 -- minimax-h3-diffusers-layout.h), built
+  // whole: FP8 codes when every piece is FP8 of one format, else bf16.
+  Linear assemble_(WeightSet& ws, const std::string& nm,
+                   const std::vector<minimax_h3::Part>& parts, bool bias,
+                   Retain r);
+  // Put `nm` into the Linear `l` already holds, in place, when its
+  // buffers fit -- FP8 and assembled linears; quantized and plain dense
+  // ones keep refill_block_'s per-tensor path. False when any piece
+  // cannot be placed, and the caller rebuilds the Linear.
+  bool refill_linear_(WeightSet& ws, const std::string& nm, Linear& l);
+  // The weight `l` holds as a dense bf16 operand for this GEMM: `l`
+  // itself, or -- for FP8 -- a `view` aliasing _w_deq, which the
+  // expansion has just been encoded into. Null (and _fp8_failed latched)
+  // when an FP8 weight cannot be expanded.
+  const Linear* fp8_dense_(metal_compute::ComputeEncoder& enc,
+                           const Linear& l, Linear& view, int N, int K);
+  // `main`: one of the 50 main blocks (the int8 layout may apply; the
+  // refiner's text rows sit under its row floor). `with_adaln`: read the
+  // AdaLN projection -- false for a refiner block and for a main block
+  // once the bake has replaced it. Two questions: a baked main block is
+  // still a main block.
   bool load_block_(WeightSet& ws, const std::string& prefix, Block& b,
-                   bool with_adaln, Retain r);
+                   bool main, bool with_adaln, Retain r);
+  // A streamed layout weight's conversion (Linear::ds / ps), encoded on
+  // `e`; true with nothing encoded for any other weight.
+  bool encode_fast_(metal_compute::ComputeEncoder& e, Linear& l) const;
+  // What a PROMOTION of `b` keeps: no dense source, no dead pack scales,
+  // a w4 pack whose layout is held (Config::i8_hold_w4) at the layout's
+  // size. Residency and the wired pool are asked for this.
+  std::size_t kept_block_bytes_(const Block& b) const;
+  // ...and makes the promoted block hold exactly that, whether it was
+  // cloned out of a slot or moved in from the per-block fallback.
+  // Idempotent.
+  bool keep_block_(Block& b) const;
+  // The refill's conversions, on a stream of the reader's (a fresh queue's
+  // first commit costs 1-2 ms; four projections a block added up).
+  mutable metal_compute::CommandStream _cvt_stream;
 
   // Offsets are in ELEMENTS, not bytes, and exist because every
   // modality writes into its own contiguous slice of the one packed
   // sequence -- the reference's index_copy scatters are destination
   // offsets here.
-  // `lora`, when given, is applied to this projection: the adapter's
-  // first GEMM is encoded BEFORE the base one (the fused tile consumes
-  // its output), and its second is folded into the base tile where the
-  // route allows and encoded separately where it does not.
+  // `lora`, when given, is every adapter attached to this projection.
+  // Each one's first GEMM is encoded BEFORE the base one (the fused tile
+  // consumes its output); ONE of their second GEMMs is folded into the
+  // base tile where the route allows, and the rest are encoded
+  // separately. The base weight is read once either way -- what a second
+  // adapter costs is its own pair of skinny GEMMs, ~1.5% of the
+  // projection at rank 64.
   void gemm_(metal_compute::ComputeEncoder& enc,
              const metal_compute::SharedBuffer& x, std::size_t x_off,
              const Linear& l, const metal_compute::SharedBuffer& y,
              std::size_t y_off, int M, int N, int K,
-             const LoraFactors* lora = nullptr);
+             const LoraStack* lora = nullptr);
 
   // The [seq, rot/2] f32 cos/sin tables for a packed layout's (t, h, w)
   // grid. Rebuilt whenever the layout changes, which in a denoise loop
@@ -761,23 +1944,171 @@ class MetalMiniMaxH3Transformer {
   // then accumulates coherently along the trajectory instead of
   // averaging out. Returns silu(temb) already cast to bf16, which is the
   // dtype the AdaLN projections consume.
+  // `endpoints` as in Step: consulted only while two_time_active(), and
+  // then required.
   bool time_embed_(const std::vector<float>& timesteps,
+                   const std::vector<float>* endpoints,
                    metal_compute::SharedBuffer& out) const;
+  // One row of the MLP: sinusoid(t) -> proj_in -> silu -> proj_out, with
+  // every live slot's host adapter on each projection. `endpoint` picks
+  // the ENDPOINT embedder's adapters (the base weights are shared);
+  // `base_only` takes none (the pruned curve's basis is fit to the base).
+  void time_mlp_row_(double t, bool endpoint, float* out,
+                     bool base_only = false) const;
+  // The released MLP's embedding before the silu, every live adapter on
+  // it and a flow map's blend: time_embedding() for a released DiT, and
+  // what a pruned one projects (and bakes the rest of) when an adapter
+  // moves it.
+  bool mlp_embedding_(const std::vector<float>& timesteps,
+                      const std::vector<float>* endpoints,
+                      std::vector<float>* out) const;
 
   struct Scratch {
     int seq = -1, n_text = -1, n_t = -1;
     metal_compute::SharedBuffer rcos, rsin;
-    metal_compute::SharedBuffer x, nm, qkv, qh, kh, vh, oh, ob, ff, proj;
+    metal_compute::SharedBuffer x, nm, qkv;
+    // ONE allocation backing qh|kh|vh|oh|ob, with `ff` aliased over the
+    // whole of it. The five attention buffers are dead by the time the
+    // FF runs -- attention has finished and `ob` has been folded into
+    // `nm` -- so the widest of the two uses is what has to be held, not
+    // their sum. At video sequence lengths that is the difference
+    // between 7.9 GB of scratch and 5.7 GB.
+    //
+    // `ff` cannot alias `qkv` instead, which is the obvious-looking
+    // choice: the UNFUSED SwiGLU reads s.ff and writes s.qkv, so those
+    // two are live at the same instant. (The fused path writes straight
+    // into s.qkv and never touches s.ff at all -- that reuse is already
+    // here, and it is why streaming, which forces the unfused path, is
+    // what makes this scratch its widest.)
+    metal_compute::SharedBuffer attn;
+    metal_compute::SharedBuffer qh, kh, vh, oh, ob, ff, proj;  // in `attn`
     metal_compute::SharedBuffer txt, temb, mod, fmod;
     metal_compute::SharedBuffer adaln_idx, tstep_idx;
     metal_compute::SharedBuffer lora;   // [seq, max rank], when attached
+    // The banded layout's band of queries gathered head-major for Sol
+    // ([H, band, D], beside ob and oh); empty in the whole layout.
+    metal_compute::SharedBuffer qb;
+    // > 0: the BANDED layout (band_rows) -- x, the rope tables, the
+    // timestep indices and qh | kh | vh are the whole sequence's; nm,
+    // qkv, lora and ob | ff are one band's; proj (the final layer's, when
+    // the blocks are done) lies over qh | kh.
+    int band = 0;
   };
-  bool ensure_scratch_(int seq, int n_text, int n_t);
+
+  // Choose the attention query tile for this model, ONCE, on the first
+  // forward long enough for the wide tile to matter and dense enough to
+  // use it (no spans / sage / Sol: those build block lists and int8
+  // scales for one tile size). Times both tiles over a truncated window
+  // -- the ranking is stable above the crossover, and probing at a real
+  // 100k-row sequence would itself cost ~25 s.
+  void tune_attn_tile_(int seq, bool dense);   // arms the probe; see above
+
+  bool ensure_scratch_(int seq, int n_text, int n_t,
+                       std::size_t arena_floor, int band = 0);
   Scratch _s;
+  int     _scratch_rebuilds = 0;
+
+  // ---- VDN-H3's hybrid attention -------------------------------------
+  //
+  // Null unless attach_linear_branch() succeeded. The branch owns its
+  // own weight set: the linear half is a separate checkpoint from the
+  // DiT and the manager has to see it as one.
+  std::unique_ptr<minimax_h3::MetalVdnBranch> _vdn;
+  minimax_h3::vdn::Config                     _vdn_cfg;
+  // The readout, bf16 [video_rows, inner], and its projection into the
+  // residual stream, bf16 [video_rows, hidden]. Both are per forward
+  // and reused across the 50 blocks.
+  //
+  // `_vdn_proj` IS A WINDOW INTO THE ATTENTION ARENA, over `ob` -- the
+  // attention output, which the out projection has already consumed by
+  // the time the branch's own projection is encoded, and which `proj`
+  // aliases for the final layer on the same argument. It fits by
+  // construction: video rows are at most the sequence and hidden is
+  // narrower than inner, so it is never wider than the window it sits
+  // in.
+  //
+  // `_vdn_ro` IS NOT, and it is the one buffer in the whole path that
+  // cannot be: it is written before qk_norm and read after the out
+  // projection, so it is live across the attention -- which is exactly
+  // when the arena belongs to somebody else.
+  metal_compute::SharedBuffer _vdn_ro, _vdn_proj;
+  // The window as CSR spans for sdpa_spans: group 0 is the global rows
+  // (prompt and soundtrack, dense in both directions) and group 1+f is
+  // video frame f. Rebuilt only when the geometry changes.
+  metal_compute::SharedBuffer _vdn_span_off, _vdn_span_lo, _vdn_span_hi;
+  // The same window for the BLOCK-SPARSE steel kernel: per query block,
+  // the key blocks it visits, plus the four numbers and the per-frame
+  // bounds the kernel masks a block's edges against. A second shape of
+  // one fact -- see vdn::build_block_spans for why it is not merely a
+  // coarser WindowSpans.
+  metal_compute::SharedBuffer _vdn_qb_off, _vdn_qb_blocks;
+  metal_compute::SharedBuffer _vdn_sp_params, _vdn_sp_bounds;
+  int _vdn_bspan_seq = -1, _vdn_bspan_bq = 0, _vdn_bspan_bk = 0;
+  std::size_t _vdn_kb_sparse = 0, _vdn_kb_dense = 0;
+  // Held because sdpa_spans_f16 is resolved out of it LATER, when a
+  // branch is attached, and a ComputeFunction does not keep its library
+  // alive.
+  metal_compute::ComputeLibrary   _lib_sdpa;
+  metal_compute::ComputeFunction  _fn_sdpa_spans;
+  // The block-sparse steel kernel, which is the SAME entry point as the
+  // dense one specialised on has_spans -- so it is cached beside it and
+  // rebuilt on the same terms.
+  metal_compute::ComputeFunction  _fn_attn_spans;
+  int _attn_spans_seq = -1;
+  // And which KERNEL it is, because both have the specialisation now:
+  // the block list, the param block and the dispatch grid are all built
+  // for one tile size, and a cached 64x32 pipeline addressed as 32x16 is
+  // a different window rather than a slower one.
+  int _attn_spans_nax = -1;
+  // Which tiling the cached dense pair was built for. The cached
+  // functions are tagged with the sequence length alone -- so without
+  // this a later forward would reuse a 64x32 pipeline while addressing
+  // it as 32x16.
+  int _attn_nax_built = -1;
+  // Whether the cached pair was built for Sage. A THIRD tag beside the
+  // sequence and the kernel, because turning Sage on changes the
+  // function and nothing else about the geometry does -- so without it
+  // an A/B in one process would measure the first arm twice.
+  int _attn_sage_built = -1;
+  int _attn_pv8_built = -1;   // ...and its int8 P*V (sage::Config::pv8)
+  int _vdn_frames = 0, _vdn_tpf = 0, _vdn_vstart = 0, _vdn_seq = 0;
+  // set_vdn_radius()'s value (-1: the checkpoint's), and the radius the
+  // cached window was built at -- a fifth tag beside the geometry's.
+  int _vdn_radius = -1, _vdn_built_radius = -1;
+  // The arena floor the last forward asked for (vdn_arena_floor_asked).
+  std::size_t _vdn_arena_asked = 0;
+  // A window wide enough to reach every frame IS the original attention,
+  // and then the linear half must NOT run: it carries the window's
+  // COMPLEMENT, and the complement of everything is nothing. Left on it
+  // adds the text state to every video row -- no crash, no NaN, a
+  // contribution the reference does not make. The reference calls this
+  // `full_cover` and takes the stock attention kernel for it too, so the
+  // full-cover path is exactly the unhybridised model plus the gate.
+  bool _vdn_full_cover = false;
+  unsigned _vdn_blocks_run = 0;
+  // The window per query frame, UNREBASED -- the anchor skip belongs to
+  // the branch, which applies it, because whether frames 0 and F-1 leave
+  // the linear input is a property of the configuration and not of the
+  // caller. The same bounds build the softmax side's spans, which is
+  // what makes the two halves a partition rather than two guesses.
+  std::vector<minimax_h3::vdn::Bound> _vdn_bounds;
+  // Sized for the geometry the span buffers describe.
+  // `bq`/`bk` are the tiles of the kernel that will READ the block list,
+  // which is why they are a parameter and not a constant: the ALU steel
+  // kernel is 32x16 and the matrix-core one 64x32, and a list built for
+  // one is a different window under the other.
+  bool ensure_vdn_(const Step& in, const minimax_h3::PackedLayout& L,
+                   int bq, int bk, std::string* err);
 
   // Every buffer of the scratch, so the wired pool can take them all
   // without a second list that drifts from the struct above.
   std::vector<metal_compute::SharedBuffer*> scratch_buffers_();
+  // How much of `_s.qkv` Sage may carve from at this geometry, or 0.
+  // ONE place, because the ESTIMATE and the LEND must not disagree
+  // about it -- and the conditions are not obvious: Sol takes that
+  // buffer whenever it is on, and the fused attention spellings read
+  // q/k/v out of it in place, so it is spare in exactly one case.
+  std::size_t sage_lend_bytes_(int seq) const;
 
   // Wire (or give back) the model's FIXED holdings -- the activation
   // scratch. Charged to the shared pool like everything else.
@@ -796,7 +2127,12 @@ class MetalMiniMaxH3Transformer {
   std::vector<QmmTuneSet> _qmm_tuned;
   std::string _qmm_tuning_desc;   // human-readable, for qmm_tuning()
   bool _qmm_manual = false;       // set_qmm_tile/route called: tuning off
+  int  _qmm_tune_count = 0;       // measurements taken, not cache hits
   GemmRoute _forced_route = GemmRoute::kAuto;
+  // The rows a GEMM's route is looked up at, when not its own: the
+  // banded forward's main blocks take the WHOLE sequence's routes (0:
+  // each GEMM its own M).
+  int _route_rows = 0;
   void tune_qmm_(int M);
   // The route for one projection: the forced one, else the tuned one,
   // else the fallback rule.
@@ -815,7 +2151,7 @@ class MetalMiniMaxH3Transformer {
                             std::size_t y_off, int M, int N, int K,
                             GemmRoute route, const LoraFactors* lora,
                             bool* lora_folded, std::size_t lora_off = 0);
-  // `route`, over rows banded by mma_row_band_ -- the base projection
+  // `route`, over rows banded by mma_row_band -- the base projection
   // only, which is what the autotune measures.
   void dispatch_row_bands_(metal_compute::ComputeEncoder& enc,
                            const metal_compute::SharedBuffer& x,
@@ -823,18 +2159,6 @@ class MetalMiniMaxH3Transformer {
                            const metal_compute::SharedBuffer& y,
                            std::size_t y_off, int M, int N, int K,
                            GemmRoute route);
-  // Rows one matmul2d dispatch may write into an N-wide destination.
-  //
-  // The mma tiles address through `dextents<int32_t, 2>`, so the tile
-  // whose base crosses 2^31 BYTES stops storing -- silently, leaving
-  // whatever was in the buffer. MEASURED at H3's fc1 shape
-  // ([38222, 28672] bf16 = 2.19 GB, the 1344x768 x 124-frame sequence):
-  // rows 37504..38221 came back exactly as they went in. Banding M
-  // rebases each dispatch, which keeps every offset the kernel computes
-  // small; below the line the band is the whole thing and nothing about
-  // the encoding changes. VPIPE_H3_MMA_ROW_BAND forces a band, which is
-  // how a small shape can be tested against its own unbanded self.
-  int mma_row_band_(int N) const;
   void qmm_dispatch_(metal_compute::ComputeEncoder& enc,
                      const metal_compute::SharedBuffer& x, std::size_t x_off,
                      const Linear& l, const metal_compute::SharedBuffer& y,
@@ -874,27 +2198,79 @@ class MetalMiniMaxH3Transformer {
   // set on demand in forward() and freed after use.
   std::vector<Block> _blocks;
   bool _stream_blocks = false;
-  // Wiring the resident set, and the ceiling on it. Wired pages cannot
-  // be reclaimed AT ALL, so this is bounded by a fraction of RAM rather
-  // than by the admission gate alone: admission spends `available_
-  // physical`, which counts file cache, and cache yields to an
-  // allocation -- wired memory yields to nothing.
   // Said once when a checkpoint needs per-tensor repair on the refill
   // path, so a pack that pays for it every forward is visible.
   bool        _refill_repaired = false;
-  bool        _wire_resident = false;
-  std::size_t _wired_bytes   = 0;
-  std::size_t _wire_budget   = 0;
-  // The box refused mid-forward; ask again at the next one. See the
-  // retry in forward() and GenerativeModelManager::reopen_wired_pool.
-  bool        _wire_retry    = false;
-  // available_physical when the box refused, so a retry can ask whether
-  // it has actually freed anything since rather than asking blind.
-  std::size_t _wire_retry_at = 0;
+  // This model's window onto the manager's wired pool (shared/wired-pool.h).
+  WiredPool   _wire;
   metal_compute::SharedBuffer _final_norm;
   Linear _final_adaln, _video_out, _audio_out;
+  // set_step_heads: one head a step, and the set they are derived in.
+  std::vector<Linear> _step_out;
+  std::shared_ptr<WeightSet> _step_ws;
 
   int _quant_bits = 0;
+  // Tensor parallel: a whole block's partial, copied out of the scratch
+  // (which is not an exchange buffer: ensure_scratch_ replaces it), and
+  // the other ranks' sum of it, [rows, H] bf16 each, grown to the longest
+  // -- the text refiner's rows, or a sequence too short to band; and the
+  // generation's exchange count, the same on every rank (TpChannel::
+  // exchange's `seq`). Every buffer handed to the channel is grown by
+  // tp_buffer_; kept across generations, handed to each new channel.
+  metal_compute::SharedBuffer _tp_send;
+  metal_compute::SharedBuffer _tp_others;
+  std::uint64_t _tp_seq = 0;
+  // ...and the banded block's, overlapped: the generation's channel, the
+  // worker that carries a band's partial over it while the GPU works on
+  // (both made by begin_tp_generation, let go by end_tp_generation), and
+  // the partials and sums in flight, [band, H] each -- two bands' out
+  // projections ([0], [1]) and two bands' fc2s ([2], [3]), a band's
+  // pair alive from its projection to its residual.
+  std::shared_ptr<TpChannel> _tp_ch;
+  std::unique_ptr<TpOverlap> _tp_pipe;
+  metal_compute::SharedBuffer _tp_part[4];
+  metal_compute::SharedBuffer _tp_recv[4];
+  // A share of one of a block's projections, cut from the checkpoint's
+  // whole one (load_block_ under Config::tp).
+  // `fast`: the share takes its int8 tier's layout (tp_fast_) -- a MAIN
+  // block's projections; the refiner's (text rows, under the int8 row
+  // floor) stay as cut, as the unsplit model keeps its own.
+  enum class TpCut { kQkv, kOut, kFc1, kFc2 };
+  Linear tp_linear_(WeightSet& ws, const std::string& nm, TpCut cut,
+                    bool fast, std::string* err);
+  // What a cut keeps of a projection of the checkpoint's widths: its
+  // output rows (`rows` of N) and its input columns [k0, k1) -- k1 0:
+  // all of them.
+  struct TpPart {
+    int N = 0;
+    std::vector<std::pair<int, int>> rows;
+    int k0 = 0, k1 = 0;
+  };
+  TpPart tp_part_(TpCut cut) const;
+  // The same for a config's share: what the plan's tp_held_bytes cuts.
+  static TpPart tp_part_of_(const Config& c, TpCut cut);
+  // A rank's dense or affine share in the int8 LAYOUT its tier holds
+  // (Config::i8_tier past accurate): converted from the cut, as a kept
+  // block's projection is from the checkpoint. A share whose width no
+  // group divides stays as it is, on the accurate tier.
+  bool tp_fast_(Linear& l, std::string* err);
+  bool tp_fast_affine_(Linear& l, std::string* err);
+  // The bytes of `v`'s four projections: a rank's cuts, its own buffers.
+  static std::size_t tp_cut_bytes_(const std::vector<Block>& v);
+  // The checkpoint's widths a rank's adapter is bound at.
+  int full_inner_() const
+  {
+    return _cfg.tp.active() ? _cfg.tp.n_heads * _cfg.head_dim
+                            : _cfg.inner();
+  }
+  int full_ffn_() const
+  {
+    return _cfg.tp.active() ? _cfg.tp.n_ffn : _cfg.ffn;
+  }
+  // An EXCHANGE BUFFER at least `bytes` long: one too short is forgotten
+  // by the channel (TpChannel::forget) before it is replaced. False when
+  // there is no room.
+  bool tp_buffer_(metal_compute::SharedBuffer& b, std::size_t bytes);
   int _quant_group = 64;
 
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_rope,
@@ -919,16 +2295,53 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_qmm_swiglu4, _fn_qmm_swiglu8;
   metal_compute::ComputeFunction _fn_qmm_swiglu4_bm64, _fn_qmm_swiglu8_bm64;
   bool _fuse_ff = false;
+  // The main blocks' projections take I8GemmContext's int8 layout
+  // (Config::i8_tier); decided before any block loads.
+  bool _i8_layout = false;
+
+  // ---- the ANE tier ------------------------------------------------
+  // Built LAZILY at the first forward, because the chunked module needs
+  // the row count to set the split and that is not known until then. A
+  // null module means every block keeps its GPU feed-forward, which is
+  // what every failure falls back to.
+  std::unique_ptr<AneFeedForward> _ane;
+  bool _ane_tried       = false;
+  bool _ane_skip_warned = false;   // one warning for ineligible blocks
+  bool _sage_off_noted  = false;   // one note when Sage fell back to dense
+  // The qkv tier: a matmul module of its own, split like the FF.
+  std::unique_ptr<AneFeedForward> _ane_qkv;
+  bool _ane_qkv_tried = false;
+  bool _ane_disabled  = false;   // disable_ane() was called
+  // `seq`: the rows a call takes (a band's, banded); `chunk`: the
+  // module's rows a predict (ane_chunk_for_).
+  bool ane_qkv_setup_(int seq, int chunk);
+  bool ane_qkv_eligible_(int L, const Block& b);
+  void ane_qkv_stage_(int L, const Block& b, const LoraStack& lora);
+  bool ane_setup_(int seq, int chunk);   // false == tier off
+  // The modules' chunk for blocks run `band` rows at a time (0: whole).
+  static int ane_chunk_for_(int band) noexcept;
+  // Rows each tier ran on the ANE, over the model's life.
+  std::int64_t _ane_rows_run = 0, _ane_qkv_rows_run = 0;
+  // A projection the ANE's staging reads: no bias, and dense bf16, FP8,
+  // ComfyUI's int8 (ConvRot or not), W4A8, or 4/8-bit affine.
+  static bool ane_stageable_(const Linear& l);
+  // Its source for the staging, before any stride, offset or adapter.
+  static AneFfnSource ane_source_(const Linear& l);
+  // Whether block L's feed-forward can go to the ANE: under the cap,
+  // fc1/fc2 stageable, and not an adapted fc1 in the interleaved layout
+  // (the adapter's rows are [gate; up]).
+  bool ane_eligible_(int L, const Block& b, bool adapted);
+  // Dispatch block L's gate/up/down into the module's slots and return at
+  // once, so the conversion runs under the block's attention. fc1 is
+  // [gate; up] halves, or interleaved pairs once fused (Linear::gu_inter).
+  // The live adapters on fc1/fc2 are merged into the staged rows.
+  void ane_stage_(int L, const Block& b, const LoraStack& fc1,
+                  const LoraStack& fc2);
 
   // ---- runtime LoRA ------------------------------------------------
   // One projection's factors. A [rank, K] and B [N, rank], both bf16 and
   // both in the checkpoint's own orientation, so the same transposed-W
   // GEMM serves them: t = x A^T, then y += t B^T.
-  struct LoraFactors {
-    metal_compute::SharedBuffer a, b;
-    int rank = 0;
-    bool empty() const { return rank <= 0 || a.empty() || b.empty(); }
-  };
   struct BlockLora {
     LoraFactors qkv, out, fc1, fc2, adaln;
     bool any() const
@@ -937,12 +2350,156 @@ class MetalMiniMaxH3Transformer {
              !adaln.empty();
     }
   };
-  std::vector<BlockLora> _lora_blocks;    // per main block
-  std::vector<BlockLora> _lora_refiner;   // per refiner block (no adaln)
-  LoraFactors            _lora_final;     // final_layer.adaln_proj.linear
-  int                    _lora_modules = 0;
-  float                  _lora_scale = 1.0f;
-  int                    _lora_max_rank = 0;
+  // An AdaLN CURVE BRANCH set -- LMS Sharp's, as Open-H3-Regenerate-2K
+  // ships it (`lora/sharp_curve_branches.safetensors`): per main block,
+  // `<block>.adaln_proj.linear.curve_A` [r, 8] and `.curve_B` [adaln_out,
+  // r], whose INPUT is not the projection's but an 8-D point c(t) read
+  // linearly off a 1025 x 8 table at the timestep (the table ComfyUI's
+  // pruned H3 replaces the AdaLN MLP with; `adaln_t_table`). The block's
+  // modulation gains slot.scale * B A c(t) for every distinct timestep of
+  // a forward. B A is formed once at bind, f32 [adaln_out, 8] -- 3.1 MB
+  // a block where B is 24.8 -- and stays resident when the blocks stream.
+  struct CurveSet {
+    std::vector<metal_compute::SharedBuffer> wc;   // per main block
+    std::vector<float> table;                      // [knots, 8]
+    int knots    = 0;
+    int branches = 0;
+    int rank     = 0;
+    // Blocks whose branch the file spells as LoRA factors -- an adapter
+    // trained on ComfyUI's pruned form, LMS Sharp's own file: there the
+    // AdaLN module IS this branch, so bind_lora_ leaves it alone (zero
+    // branches included, which bind nothing here).
+    std::vector<char> lora_layers;
+    bool empty() const { return branches == 0; }
+  };
+  // One attached adapter. Slots are independent all the way down: their
+  // own factors, their own live strength, and DISJOINT regions of the
+  // shared [rows, rank] scratch, so the second adapter's first GEMM does
+  // not have to wait on the first adapter's second.
+  struct LoraSlot {
+    std::vector<BlockLora> blocks;    // per main block
+    std::vector<BlockLora> refiner;   // per refiner block (no adaln)
+    LoraFactors            final_adaln;  // final_layer.adaln_proj.linear
+    // The timestep MLP runs on the host in f32, so its adapter does too:
+    // proj_in / proj_out of the checkpoint's own embedder, and of a
+    // flow-map adapter's ENDPOINT embedder (empty for any other file).
+    lora::HostFactors      time_in, time_out;
+    lora::HostFactors      end_in, end_out;
+    // Set when the FILE carries AdaLN curve branches (see CurveSet).
+    CurveSet curve;
+    // Set when the FILE is a flow-map adapter; load() then promotes it
+    // to `_flow` with this slot's index.
+    bool    two_time = false;
+    FlowMap flow;
+    // Set when a manifest beside the FILE states a sampling contract;
+    // load() then promotes it to `_contract` with this slot's index.
+    bool             has_contract = false;
+    SamplingContract contract;
+    // PRUNED: what this adapter adds to the AdaLN, per main block and
+    // the final layer, f32 [D * 8 + D] = (dW, db) at strength 1 --
+    // ComfyUI `.diff` / `.diff_b` patches as the file stores them, and a
+    // full-model adapter's AdaLN modules ported onto the curve basis.
+    // Empty buffer: nothing for that projection.
+    std::vector<metal_compute::SharedBuffer> pdelta;
+    metal_compute::SharedBuffer              pdelta_final;
+    int   modules  = 0;
+    int   banded   = 0;
+    int   max_rank = 0;
+    float scale    = 1.0f;
+    // Ranks of the slots BEFORE this one. The scratch is [seq, sum of
+    // ranks], so this slot's region starts at `rows * rank_prefix` --
+    // which needs the row count, and that is a forward-time number.
+    int   rank_prefix = 0;
+  };
+  std::vector<LoraSlot> _lora;
+  // The flow-map adapter's header facts; `slot` < 0 when there is none.
+  FlowMap _flow;
+  // The sampling contract an adapter's manifest states; `slot` < 0 when
+  // there is none.
+  SamplingContract _contract;
+  // Summed max ranks: what the [seq, rank] scratch has to hold for all
+  // of them at once, and the stride that turns a rank prefix into an
+  // offset.
+  int _lora_rank_total = 0;
+  // Rows the scratch was last allocated for. Set with it, read by
+  // lora_stack_ -- a stack built before any forward would have nowhere
+  // to point, and there is no forward without the scratch.
+  std::size_t _lora_scratch_rows = 0;
+
+  // ---- adapter factors STREAMED WITH THEIR BLOCK ----------------------
+  //
+  // A streamed DiT keeps about one main block resident, but its adapters'
+  // factors stayed resident for all 50: TaoMate-H3's rank-128 set (fused
+  // q|k|v, out, fc1, fc2 and the AdaLN projection) is ~50 MB a block,
+  // ~2.4 GB in all -- beside a block of ~1.3 GB (bf16) or ~0.65 GB (w8)
+  // and a box that is streaming precisely because it has no room.
+  //
+  // So, once the slots are bound -- every conversion done: alpha folded,
+  // q|k|v fused or banded, rows permuted -- a streamed DiT SPILLS each
+  // main block's factors to an unlinked temp file and frees them, keeping
+  // only their shape (rank, parts, group). A streamed block's iteration
+  // reads its factors back into ONE set of buffers per slot, refilled in
+  // place: the block's commit is waited for before the next block starts
+  // (see the promotion below the block), so nothing still reads them.
+  // A block PROMOTED to resident takes a resident copy of its factors,
+  // and an evicted one gives it back. File-backed pages are the cheapest
+  // memory the kernel can take back, unlike the anonymous GPU buffers
+  // they replace. VPIPE_H3_LORA_RESIDENT=1 keeps them all resident.
+  struct LoraSpillAt {
+    std::uint64_t a_off = 0, a_bytes = 0, b_off = 0, b_bytes = 0;
+  };
+  struct BlockSpill { LoraSpillAt qkv, out, fc1, fc2, adaln; };
+  // The five adapted projections of a main block, in one order for the
+  // spill, the fill and the copies.
+  static constexpr LoraFactors BlockLora::* kLoraMembers[] = {
+    &BlockLora::qkv, &BlockLora::out, &BlockLora::fc1, &BlockLora::fc2,
+    &BlockLora::adaln,
+  };
+  static constexpr LoraSpillAt BlockSpill::* kSpillMembers[] = {
+    &BlockSpill::qkv, &BlockSpill::out, &BlockSpill::fc1, &BlockSpill::fc2,
+    &BlockSpill::adaln,
+  };
+  struct SpillFile {
+    int fd = -1;
+    SpillFile() = default;
+    SpillFile(const SpillFile&) = delete;
+    SpillFile& operator=(const SpillFile&) = delete;
+    ~SpillFile();
+  };
+  SpillFile _lora_spill_file;
+  std::vector<std::vector<BlockSpill>> _lora_spill;   // [slot][main block]
+  // The streamed block's factors, per slot; and which block they hold.
+  std::vector<BlockLora> _lora_stream;
+  int _lora_stream_layer = -1;
+  // Spill every main block not resident now. False (nothing changed) when
+  // the file cannot be made.
+  bool spill_lora_();
+  // Read block `layer`'s factors into _lora_stream.
+  bool fill_lora_(int layer);
+  // A promoted block's factors made resident from _lora_stream; an
+  // evicted block's given back.
+  void keep_lora_(int layer);
+  void drop_lora_(int layer);
+  // What keeping block `layer` keeps of its spilled factors (0 where
+  // nothing spilled) -- booked with the block by residency, wired with
+  // it, given back with it.
+  std::size_t lora_layer_bytes_(int layer) const;
+  std::size_t wire_lora_(int layer, bool on);
+  // Factor bytes residency holds for kept blocks: inside _resid.bytes(),
+  // and out of streamed_holding_bytes() -- they are the adapter's own
+  // declaration's, which books every factor.
+  std::size_t _lora_kept = 0;
+
+  // The live adapters for one projection of one block, named by the
+  // member that holds it. `refiner` picks which stack of blocks.
+  LoraStack lora_stack_(bool refiner, int layer,
+                        LoraFactors BlockLora::* which) const;
+  // Whether every adapter's factors for that projection of main block
+  // `layer` are in memory now: false while any is SPILLED and read only
+  // with its block (fill_lora_) -- lora_stack_ drops it until then.
+  bool lora_resident_(int layer, LoraFactors BlockLora::* which) const;
+  // The same for final_layer.adaln_proj.linear, which is not in a block.
+  LoraStack lora_stack_final_() const;
   metal_compute::ComputeFunction _fn_gemm_acc;
   // The matrix-core twins of that pair. `_a64`/`_a128` scale on store and
   // serve the rank-wide first GEMM; `_b128`/`_b256` seed their register
@@ -954,6 +2511,17 @@ class MetalMiniMaxH3Transformer {
   // The base-projection tiles that also carry the adapter's second
   // factor, so `y = W x + B (A x)` is one store instead of three.
   metal_compute::ComputeFunction _fn_lora_fused128, _fn_lora_fused256;
+  // BANDED twins of the second-factor kernels, for a split q/k/v adapter
+  // fused WITHOUT a block-diagonal B (see lora::Factors::banded): each
+  // output tile contracts over its own part's window of t. Steel always;
+  // the matrix-core ones where the dense mma library is.
+  metal_compute::ComputeFunction _fn_gemm_acc_band;
+  metal_compute::ComputeFunction _fn_lora_b128_band, _fn_lora_b256_band;
+  metal_compute::ComputeFunction _fn_lora_fused128_band,
+                                 _fn_lora_fused256_band;
+  // VPIPE_H3_LORA_NO_BAND: bind split q/k/v the old way, block-diagonal.
+  // The A/B that says the banded form changes nothing but the zeros.
+  bool _lora_band_off = false;
   // ---- baked AdaLN (see bake_adaln) ---------------------------------
   // Per block, [total_rows, adaln_out] bf16; plus the final layer's
   // [total_rows, 2*hidden]. Empty = not baked.
@@ -963,7 +2531,13 @@ class MetalMiniMaxH3Transformer {
   // rows are CONTIGUOUS, which is what lets a block bind its slice
   // directly instead of gathering.
   std::vector<int> _adaln_row0, _adaln_nt;
+  // What the tables were baked for (bake_adaln): its timesteps, endpoints
+  // and the adapters' strengths -- the same again keeps them.
+  std::vector<float> _baked_t, _baked_r, _baked_scales;
   metal_compute::ComputeFunction _fn_copy;
+  // The per-head row copies, 64-bit: the streaming attention's K/V and
+  // the banded forward's Sol query gather.
+  minimax_h3::HeadRowCopy _head_rows;
 
   bool _lora_mma_off = false;    // VPIPE_H3_NO_LORA_MMA
   bool _lora_fuse_off = false;   // VPIPE_H3_NO_LORA_FUSE
@@ -973,7 +2547,104 @@ class MetalMiniMaxH3Transformer {
 
   // Read the adapter and bind its factors to the modules above. Called
   // from load() once the blocks exist.
-  bool bind_lora_(const LoraSpec& spec, std::string* err);
+  bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // A RANK's adapter (Config::tp): bound at the checkpoint's widths, its
+  // factors then cut as the weights are -- B's rows of q|k|v and fc1, A's
+  // columns of the out projection and fc2 -- so a rank adds its share of
+  // each delta and the two ranks' sum is the whole one.
+  bool tp_cut_lora_(LoraSlot& slot, std::string* err);
+  // A file of AdaLN curve branches into slot.curve (true, with `*took`
+  // set); `*took` false for a file that carries none.
+  bool bind_curves_(const std::string& path, LoraSlot& slot, bool* took,
+                    std::string* err);
+  // Add every live curve slot's delta to block L's modulation [n_t,
+  // adaln_out] in `mod`; false when none applies (nothing encoded).
+  bool curve_live_(int L) const;
+  void curve_apply_(metal_compute::ComputeEncoder& enc, int L,
+                    const metal_compute::SharedBuffer& mod, int n_t);
+  metal_compute::ComputeLibrary  _lib_regen;
+  metal_compute::ComputeFunction _fn_curve_add;
+  // The PRUNED form's AdaLN (Config::curve_grid): `adaln_t_table` on the
+  // host in f32, every projection AS STORED in the trunk -- [D, 8] and
+  // [D], `dtype` 0 F32 / 1 F16 / 2 BF16, widened exactly in the kernel
+  // -- and this forward's points, [n_t][8] f32, fresh every forward as
+  // `_curve_coords` is.
+  struct PrunedAdaln {
+    metal_compute::SharedBuffer w, b;
+    int dtype = 0;
+  };
+  std::vector<float>       _adaln_t_table;
+  std::vector<PrunedAdaln> _padaln;          // one a main block
+  PrunedAdaln              _final_padaln;
+  metal_compute::SharedBuffer    _pcoords;
+  metal_compute::ComputeFunction _fn_pruned_mod;
+  metal_compute::ComputeFunction _fn_pruned_patch;
+  // The projection's modulation into `out` [n_t, D]; `L` the main block,
+  // -1 the final layer, whose live slots' deltas are added to the
+  // weight in f32 first (into `_padaln_patch`).
+  // `res` (and `res_off`, bytes): the baked off-curve rows to add, when
+  // an adapter moves the embedding (bake_adaln).
+  void pruned_mod_(metal_compute::ComputeEncoder& enc,
+                   const PrunedAdaln& p, int L,
+                   const metal_compute::SharedBuffer& out, int n_t, int D,
+                   const metal_compute::SharedBuffer* res = nullptr,
+                   std::size_t res_off = 0);
+  metal_compute::ComputeFunction _fn_pruned_res;
+  // A native W4A8 weight's int8 codes for the GEMM running (gemm_), from
+  // w4a8_to_i8; and that kernel.
+  metal_compute::SharedBuffer    _cr_codes;
+  // fp8_widen_bytes() for what this model read.
+  std::size_t _f8_widen = 0;
+  metal_compute::SharedBuffer convrot_row_scales_(
+      const MetalLlamaWeights& src, const fp8::Weight& fw, int N);
+  std::uint64_t                  _cr_gemms = 0;
+  metal_compute::ComputeLibrary  _lib_dq;
+  metal_compute::ComputeFunction _fn_w4a8_i8;
+  metal_compute::SharedBuffer _padaln_patch;
+  // The pruned curve's affine basis in the RELEASED embedding, fit at
+  // the first need from Config::time_mlp_dir's MLP over the table:
+  //   silu(temb(t)) ~ U c(t) + m       (U [mlp, 8], m [mlp])
+  // `pinv` [8, mlp] = (U^T U)^-1 U^T takes an embedding back onto the
+  // curve's coordinates. `residual` is the fit's relative residual.
+  struct CurveBasis {
+    std::vector<float> u, m, pinv;
+    int    mlp = 0;
+    double residual = 0.0;
+    bool empty() const { return mlp == 0; }
+  };
+  CurveBasis _basis;
+  // Read the released MLP and fit the basis; false + *err when there is
+  // no time_mlp_dir, it cannot be read, or it does not span the table.
+  bool ensure_curve_basis_(std::string* err);
+  // The MLP's output width: the AdaLN input released, the basis's pruned.
+  int mlp_dim_() const { return _cfg.pruned() ? _basis.mlp : _cfg.time_dim; }
+  // Whether this forward's points come from the MLP projected onto the
+  // basis (a live adapter on the timestep MLP, or a flow map) rather
+  // than straight off the table.
+  bool pruned_projects_() const;
+  // A pruned adapter's AdaLN deltas: `.diff` / `.diff_b` read off the
+  // file, then the full-model AdaLN modules `ad` binds ported through
+  // the basis. Fills slot.pdelta / pdelta_final.
+  bool bind_pruned_adaln_(lora::Adapter* ad, const std::string& path,
+                          bool diffusers, LoraSlot& slot, std::string* err);
+  // bake_adaln for a pruned DiT whose embedding an adapter moves: the
+  // rows (`all`, and a flow map's endpoints) the curve cannot carry,
+  // through the released AdaLN, into _adaln_tab / _final_adaln_tab.
+  bool bake_pruned_off_curve_(const std::vector<float>& all,
+                              const std::vector<float>* all_r,
+                              std::string* err);
+  // This forward's c(t), [curve slot][n_t][8] f32, filled after the
+  // timestep embedding; `_curve_n_t` the n_t it holds.
+  metal_compute::SharedBuffer _curve_coords;
+  int _curve_n_t = 0;
+  // The timestep-MLP half of a bind, both branches: the base embedder's
+  // host factors for ANY adapter that carries them, then -- for a
+  // flow-map adapter -- the endpoint embedder's and the header facts
+  // (gate, grid, shifts). A file that is not one passes with only the
+  // first; a file that is HALF of one -- the header without the
+  // embedder, or the reverse -- is refused.
+  bool bind_flow_map_(lora::Adapter& ad, const std::string& path,
+                      LoraSlot& slot, std::string* err);
   // Which matrix-core tile serves each half of the adapter, or nullptr
   // for "stay on steel". Split in two because the two GEMMs are skinny in
   // different dimensions and do not flip together -- see the measured
@@ -986,19 +2657,21 @@ class MetalMiniMaxH3Transformer {
   // returns whether it APPLIED the strength -- only the matrix-core tile
   // can, and the answer decides both where the scale goes and whether the
   // fused base tile is legal at all (that tile has no scale of its own).
+  // `scale` is the SLOT's, passed rather than read off the object: with
+  // two adapters live there is no single current strength.
   bool lora_gemm_a_(metal_compute::ComputeEncoder& enc,
                     const metal_compute::SharedBuffer& x, std::size_t x_off,
-                    const LoraFactors& lf, int M, int K,
+                    const LoraFactors& lf, int M, int K, float scale,
                     std::size_t lora_off = 0);
   void lora_gemm_b_(metal_compute::ComputeEncoder& enc, const LoraFactors& lf,
                     const metal_compute::SharedBuffer& y, std::size_t y_off,
-                    int M, int N, bool scale_applied,
+                    int M, int N, bool scale_applied, float scale,
                     std::size_t lora_off = 0);
-  // Both halves back to back. The standalone form, for the modulation
-  // projections that do not go through gemm_.
+  // Every attached adapter, back to back. The standalone form, for the
+  // modulation projections that do not go through gemm_.
   void lora_apply_(metal_compute::ComputeEncoder& enc,
                    const metal_compute::SharedBuffer& x, std::size_t x_off,
-                   const LoraFactors& lf,
+                   const LoraStack& st,
                    const metal_compute::SharedBuffer& y, std::size_t y_off,
                    int M, int N, int K);
   // Whether the ff scratch still has to hold a [seq, 2*ffn] fc1 output.
@@ -1025,10 +2698,27 @@ class MetalMiniMaxH3Transformer {
   // released config), grown on demand and kept -- regrowing it per block
   // would be an allocation inside the denoise loop.
   metal_compute::SharedBuffer _w_deq;
+  // The checkpoint's FP8 weights (shared/fp8-layout.h) and the kernels
+  // that widen them per GEMM. The latch reports an expansion that could
+  // not run, which leaves a projection unwritten, as a failed forward.
+  fp8::Layout   _f8;
+  fp8::Expander _fp8x;
+  bool          _fp8_failed = false;
   // Dynamic-int8 accelerated GEMMs (Config::i8_gemm). Null unless enabled
   // AND available; the DiT runs bf16, so it holds the bf16 i8 kernels --
   // the f16 ones would misread these buffers into NaN.
   std::unique_ptr<I8GemmContext> _i8;
+  // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
+  // the kernels validated; see the attention dispatch.
+  std::unique_ptr<MetalSolAttention> _sol;
+  // perf-flops: GEMMs and attention counted as encoded, credited at
+  // retire; Sol's exact half at the keep ratio it realizes.
+  GpuFlopsTally _flops;
+  SolFlops _sol_flops;
+  // The int8 QK prologue and its operands. Null when the box has no
+  // matrix cores or the config did not ask -- and every use is guarded,
+  // because a box without them runs the same forward densely.
+  std::unique_ptr<MetalSageAttention> _sage;
   // Deep-K split for fc2 (K = ffn = 14336). Its own gate|up direction runs
   // ~11 TFLOP/s where the single-op reduction over ffn manages ~5.3, and the
   // chooser closes that; see mma-splitk.h. Self-gates on K, on rows, and on
@@ -1042,14 +2732,175 @@ class MetalMiniMaxH3Transformer {
   metal_compute::ComputeFunction _fn_gemm, _fn_rms, _fn_rms_heads, _fn_trope,
       _fn_modulate, _fn_gated, _fn_swiglu, _fn_transpose, _fn_residual,
       _fn_bias_add, _fn_sdpa;
+  // Rope written back over the fused projection, for the path that never
+  // transposes. See _fused_attn.
+  metal_compute::ComputeFunction _fn_rope_ip;
+  // The non-finite tripwire and its 8-word report. Runs in the stream, so
+  // finding the op that mints a NaN costs a pass over the tensor rather
+  // than a GPU drain -- and draining is what made this bug vanish.
+  metal_compute::ComputeFunction _fn_nan_trip;
+  metal_compute::SharedBuffer    _nan_report;
   metal_compute::SharedBuffer _attn_p_main, _attn_p_text;
+  // Sage's int8 P*V on the VIDEO rows only, unless pv8_all_rows: the
+  // prompt's and the soundtrack's query blocks on the int8 QK alone
+  // (`_fn_attn_main_i8_qk`, Q per token as the prologue made it), the
+  // rest from `_attn_band_nb` on, with params counting blocks from there
+  // (`_attn_p_band`).
+  metal_compute::ComputeFunction _fn_attn_main_i8_qk;
+  metal_compute::SharedBuffer _attn_p_band;
+  int _attn_band_nb = 0;
+  // The BANDED forward's (band_rows): its q / k / v written a band at a
+  // time into the whole-sequence head-major windows, and its attention a
+  // band of queries over every key -- one parameter block and pipeline
+  // for the full bands, one for the last; keyed by the sequence, the band
+  // and the kernel.
+  metal_compute::ComputeFunction _fn_trope_band;
+  // [full band | last band][0 dense, 1 int8 QK (per-block Q scales),
+  // 2 int8 QK (per-token Q: the prompt's, conditioning's and
+  // soundtrack's rows under the int8 P*V -- whole bands of them, and the
+  // band they end in up to its first video block), 3 int8 QK and P*V];
+  // that band's parameters past those rows (_attn_p_bandq_rest, as
+  // _attn_p_band is the whole sequence's), `_attn_bandq_nb` the query
+  // blocks before the video's, counted over the sequence.
+  metal_compute::ComputeFunction _fn_attn_bandv[2][4];
+  metal_compute::SharedBuffer _attn_p_bandq, _attn_p_bandq_tail;
+  metal_compute::SharedBuffer _attn_p_bandq_rest;
+  int _attn_bandq_seq = -1, _attn_bandq_rows = -1, _attn_bandq_nax = -1;
+  int _attn_bandq_sage = -1, _attn_bandq_nb = 0;
+  int _last_band = 0;
+  // The text refiner's bands (text_band_rows): a band of prompt queries
+  // over every prompt key, dense -- [full band | last band], keyed by the
+  // prompt's length, its band and the kernel.
+  metal_compute::ComputeFunction _fn_attn_tband[2];
+  metal_compute::SharedBuffer _attn_p_tband[2];
+  int _attn_tband_text = -1, _attn_tband_rows = -1, _attn_tband_nax = -1;
+  int _last_text_band = 0;
+  // Sol's last band: ONE band size per Sol object, whose parameter block
+  // and scratch are per object -- a narrower call on the same object
+  // would rewrite the parameters the full bands' encoded dispatches
+  // read, and rebuild the scratch they use.
+  std::unique_ptr<MetalSolAttention> _sol_tail;
+  // Sol's routed key blocks over the last forward's calls, for its
+  // report (a banded layer makes several calls).
+  long long _sol_routed_total = 0;
+  // The Sol config this forward routes with: the load's, or the Step's
+  // own tau and threshold (Step::sol_routing).
+  sol::Config _sol_fwd;
+  // The streaming attention's two parameter blocks (text over text, media
+  // over [cache ; text ; media]) and its pipelines, one per alignment
+  // pair -- qL and kL move every chunk, so they are built on demand and
+  // kept: [nax][align_Q][align_K].
+  metal_compute::SharedBuffer _sattn_p_text, _sattn_p_media;
+  metal_compute::ComputeFunction _fn_sattn[2][2][2];
+  // A floor under the activation scratch: kept rather than rebuilt while
+  // a forward fits it. See set_scratch_floor().
+  int _scratch_floor_seq = 0, _scratch_floor_text = 0;
+  // Elements the q|k|v scratch must hold beyond its own [seq, 3 * inner]:
+  // a stream forward's K/V staging lives in it (StreamKv::adopt_staging).
+  std::size_t _qkv_floor_elems = 0;
   metal_compute::ComputeFunction _fn_attn_main, _fn_attn_text;
+  // The int8-QK twin of _fn_attn_main. Two instantiations rather than
+  // one, because `sage.dense_layers` leaves the leading blocks on the
+  // f16 kernel and the two must coexist within one forward.
+  metal_compute::ComputeFunction _fn_attn_main_i8;
+  // THE WIDE QUERY TILE (BQ 128 = WM 8), and the probe that chooses it.
+  // The NAX attention streams the whole K/V once per query tile, so a
+  // wider tile halves that re-read -- which pays only once the K/V no
+  // longer fits in cache, and only on a GPU that is memory-bound rather
+  // than occupancy-bound there. MEASURED bd128 bf16, bit-identical
+  // output: an M5 Pro gains 1.13x at 19k rows and 1.22x at 100k (holding
+  // ~24 TFLOP/s where BQ 64 decays to 20); a 10-core M5 Air LOSES 5% at
+  // 9.4k and gains 8-13% at 19k-38k; a 48q/12kv GQA shape gains nothing
+  // on either, its K/V being 4x smaller. So it is probed, not assumed.
+  // Rows at or above which the wide tile is worth probing and using. Both
+  // machines measured crossed near 19k; the probe times the two tiles over
+  // the same window, which is all the ranking needs.
+  static constexpr int kAttnBqMinRows   = 16384;
+  static constexpr int kAttnBqProbeRows = 16384;
+  metal_compute::ComputeFunction _fn_attn_main_bq128;
+  metal_compute::SharedBuffer _attn_p_main_bq128;
+  int  _attn_bq        = 64;     // the tile in force (64 or 128)
+  int  _attn_bq128_seq = -1;     // sequence the BQ 128 pair was built for
+  int  _attn_wide_built = -1;    // whether the built pair is the wide one
+  // THE REAL-WORKLOAD PROBE, on the ANE tier's pattern (plan_block /
+  // note_probe): the streamed path already commits and waits per block, so a
+  // block's wall time is there for the taking. Warm on the incumbent, then
+  // alternate whole blocks between the two tiles and keep the median winner
+  // -- the real shape at the real length, no synthetic dispatch and no
+  // truncation. `_attn_tile_blocks` counts main blocks seen; the medians are
+  // small rings, one per tile.
+  static constexpr int kTileWarmBlocks  = 2;   // settle clocks/caches first
+  static constexpr int kTileProbeBlocks = 6;   // 3 per tile, alternating
+  static constexpr int kTileRing        = 3;
+  int    _attn_tile_blocks = 0;
+  int    _attn_tile_n[2]   = {0, 0};
+  double _attn_tile_ms[2][kTileRing] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+  bool   _attn_tile_latched = false;
+  int    _attn_tile_probing = -1;  // tile this block is measuring, -1 = none
+
+  // The tile the NEXT main block should run, and the block's measured wall
+  // time coming back. `probing` says whether that time is a probe sample.
+  int  plan_attn_tile_(bool wide_available, bool streaming);
+  void note_attn_tile_(double block_ms);
+  // The session key of the probe's verdict (tuned-answers.h), and the
+  // sequence the probe running now is measuring.
+  TuneKey attn_tile_key_(int seq) const;
+  int     _attn_tile_seq = -1;
+  // Rows the GEMM tuner measures at, and therefore the row count a tuned
+  // answer is filed under -- see tune_row_key(). Fixed at load from
+  // VPIPE_H3_TUNE_ROWS.
+  int _tune_ceiling = 4096;
+  int _pf_started = 0, _pf_hit = 0;
+  int _promote_deferred = 0, _promote_spared = 0;
   int _attn_seq = -1, _attn_text = -1;
+  // Which layout the cached AttnParams describe. Tracked apart from the
+  // sequence lengths so set_fused_attention() re-fills the params
+  // without rebuilding the pipeline states.
+  int _attn_fused = -1;
   bool _steel_ok = false;
   // The matrix-core (NAX) flash attention. Same param block and function
   // constants as the ALU steel kernel; only the tile sizes differ, so the
   // two are interchangeable at the call site.
   bool _attn_nax = false;
+  // Which of the four per-block [seq, inner] transposes attention no
+  // longer needs. Steel takes per-axis STRIDES for Q, K, V and O, so the
+  // head-major layout was never a requirement of the kernel -- only of
+  // the buffers we happened to hand it.
+  //
+  // The two bits are NOT the same trade, which is the whole reason they
+  // are separate. MEASURED on the M5 at 9382 rows, 2 blocks, the three
+  // masks interleaved inside one process:
+  //
+  //   kFusedAttnOut  the transpose after attention becomes a strided
+  //                  STORE. Free -- attention 482 ms either way -- and
+  //                  it is one fewer dispatch. Shipped.
+  //   kFusedAttnQkv  q/k/v become strided READS, and rope moves in
+  //                  place. Prep 26.7 -> 21.2 ms, and attention
+  //                  482 -> 505.8 ms: +23.8 to save 5.5, in every one of
+  //                  three measurements with no overlap between the arms.
+  //                  A net ~1% loss. NOT shipped.
+  //
+  // The asymmetry is K and V REUSE. Q is read once and O written once,
+  // so a stride costs them nothing; K and V are re-read by every query
+  // block. Head-major, one head's K is a contiguous 2.4 MB that stays
+  // cached across the whole Q loop. In the fused projection the same
+  // 2.4 MB is scattered one head_dim slice per 43 KB row, so each pass
+  // walks 400 MB of address space to touch it. That is a property of
+  // the layout, not of this GPU, and it is why the Qkv bit is kept as
+  // an A/B arm rather than as a tuning knob anyone should expect to
+  // flip.
+  //
+  // Worth knowing before attacking any of this again: at these shapes
+  // the four transposes are ~1.1 GB of traffic against ~9.7 TFLOP of
+  // arithmetic per block, and the DiT runs at ~10.6 TFLOP/s. The whole
+  // prize was under half a percent of the step. It was measured, not
+  // assumed, and the answer is that the transposes were never where the
+  // time is.
+  //
+  // Steel only: the scalar sdpa fallback has no strides. The head-major
+  // windows therefore stay allocated for it, so this saves traffic, not
+  // bytes. VPIPE_H3_FUSED_ATTN=<mask> overrides the default.
+  int _fused_attn = 0;
 };
 
 }  // namespace genai

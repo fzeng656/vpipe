@@ -1,6 +1,12 @@
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
 
+#include "common/vpipe-format.h"
+
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
+#include <string>
 
 namespace vpipe {
 namespace genai {
@@ -10,8 +16,13 @@ MiniMaxH3Scheduler::MiniMaxH3Scheduler(double shift) : _shift(shift) {}
 bool
 MiniMaxH3Scheduler::set_timesteps(int num_steps)
 {
+  // torch rounds `(shift - 1) * base` and then `1 + ...`; a fused
+  // multiply-add rounds once and lands an ulp away on some points.
+#pragma clang fp contract(off)
+  _sigmas_d.clear();
   _sigmas.clear();
   _timesteps.clear();
+  _endpoints.clear();
   if (num_steps < 2 || !(_shift > 0.0)) { return false; }
 
   // torch.linspace(1, 0, n) in float32, then the exponential shift.
@@ -31,15 +42,11 @@ MiniMaxH3Scheduler::set_timesteps(int num_steps)
   // above it are built DOWN from `end`, both with a float32 step. That
   // is also what makes the terminal point exactly zero rather than a
   // rounded near-zero, which the Euler ratio below depends on.
-  const float stepf = (float)(-1.0 / (double)(num_steps - 1));
   const float sh    = (float)_shift;
   const float sh1   = (float)(_shift - 1.0);
   std::vector<float> shifted;
   shifted.reserve((std::size_t)num_steps);
-  for (int i = 0; i < num_steps; ++i) {
-    const float base = (i < num_steps / 2)
-                           ? (1.0f + stepf * (float)i)
-                           : (0.0f - stepf * (float)(num_steps - 1 - i));
+  for (float base : linspace_grid(num_steps)) {
     shifted.push_back(sh * base / (1.0f + sh1 * base));
   }
   // unique_consecutive: the shift maps distinct base points onto the same
@@ -48,12 +55,315 @@ MiniMaxH3Scheduler::set_timesteps(int num_steps)
     if (_sigmas.empty() || _sigmas.back() != s) { _sigmas.push_back(s); }
   }
   if (_sigmas.size() < 2 || _sigmas.back() != 0.0f) { return false; }
+  derive_();
+  return true;
+}
 
-  _timesteps.reserve(_sigmas.size() - 1);
-  for (std::size_t i = 0; i + 1 < _sigmas.size(); ++i) {
-    _timesteps.push_back(1.0f - _sigmas[i]);
+std::vector<float>
+MiniMaxH3Scheduler::linspace_grid(int num_points)
+{
+#pragma clang fp contract(off)   // torch's start + step * i, two roundings
+  std::vector<float> g;
+  if (num_points < 2) { return g; }
+  const float stepf = (float)(-1.0 / (double)(num_points - 1));
+  g.reserve((std::size_t)num_points);
+  for (int i = 0; i < num_points; ++i) {
+    g.push_back((i < num_points / 2)
+                    ? (1.0f + stepf * (float)i)
+                    : (0.0f - stepf * (float)(num_points - 1 - i)));
+  }
+  return g;
+}
+
+bool
+MiniMaxH3Scheduler::set_sigmas(const std::vector<float>& raw)
+{
+#pragma clang fp contract(off)   // as in set_timesteps
+  _sigmas_d.clear();
+  _sigmas.clear();
+  _timesteps.clear();
+  _endpoints.clear();
+  if (!(_shift > 0.0) || raw.size() < 2) { return false; }
+  auto strictly_down = [](const std::vector<float>& g) {
+    for (std::size_t i = 1; i < g.size(); ++i) {
+      if (!(g[i] < g[i - 1])) { return false; }
+    }
+    return true;
+  };
+  if (raw.front() > 1.0f || raw.back() != 0.0f || !strictly_down(raw)) {
+    return false;
+  }
+  // Upstream's shift_sigmas: `shift * base / (1.0 + (shift - 1.0) * base)`
+  // over a float32 tensor with Python-float scalars -- every op rounds to
+  // float32, in this order. Same expression as set_timesteps' grid.
+  const float sh  = (float)_shift;
+  const float sh1 = (float)(_shift - 1.0);
+  std::vector<float> g;
+  g.reserve(raw.size());
+  for (float base : raw) { g.push_back(sh * base / (1.0f + sh1 * base)); }
+  if (g.back() != 0.0f || !strictly_down(g)) { return false; }
+  _sigmas = std::move(g);
+  derive_();
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::set_sigmas_shifted(const std::vector<double>& raw)
+{
+#pragma clang fp contract(off)   // torch's float64 ops, each rounded
+  _sigmas_d.clear();
+  _sigmas.clear();
+  _timesteps.clear();
+  _endpoints.clear();
+  if (!(_shift > 0.0) || raw.size() < 2) { return false; }
+  if (raw.front() > 1.0 || raw.back() != 0.0) { return false; }
+  // `shift * sigmas / (1 + (shift - 1) * sigmas)` over a float64 tensor
+  // with Python-float scalars, then `.to(torch.float32)`.
+  std::vector<float> g;
+  g.reserve(raw.size());
+  for (std::size_t i = 0; i < raw.size(); ++i) {
+    if (i > 0 && !(raw[i] < raw[i - 1])) { return false; }
+    const double s = _shift * raw[i] / (1.0 + (_shift - 1.0) * raw[i]);
+    g.push_back((float)s);
+  }
+  for (std::size_t i = 1; i < g.size(); ++i) {
+    if (!(g[i] < g[i - 1])) { return false; }
+  }
+  if (g.back() != 0.0f) { return false; }
+  _sigmas = std::move(g);
+  derive_();
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::step_renoise(const float* velocity, int step_index,
+                                 float* x, const float* noise,
+                                 std::size_t n) const
+{
+#pragma clang fp contract(off)   // torch's separate f32 ops
+  if (velocity == nullptr || x == nullptr) { return false; }
+  if (step_index < 0 || step_index >= (int)_timesteps.size()) { return false; }
+  const float sigma = _sigmas[(std::size_t)step_index];
+  const float sn = _sigmas[(std::size_t)step_index + 1];
+  if (noise == nullptr && sn != 0.0f) { return false; }
+  const float keep = 1.0f - sn;
+  for (std::size_t i = 0; i < n; ++i) {
+    const float sv = sigma * velocity[i];
+    const float x0 = x[i] + sv;
+    if (sn == 0.0f) {
+      x[i] = x0;
+      continue;
+    }
+    const float a = keep * x0;
+    const float b = sn * noise[i];
+    x[i] = a + b;
   }
   return true;
+}
+
+bool
+MiniMaxH3Scheduler::set_sigmas_mapped(const std::vector<double>& sigmas,
+                                      double given_shift)
+{
+#pragma clang fp contract(off)   // Python-float ops, each rounded
+  _sigmas_d.clear();
+  _sigmas.clear();
+  _timesteps.clear();
+  _endpoints.clear();
+  if (!(_shift > 0.0) || !(given_shift > 0.0) || sigmas.size() < 2) {
+    return false;
+  }
+  if (!(sigmas.front() <= 1.0) || sigmas.back() != 0.0) { return false; }
+  const bool same = given_shift == _shift;
+  std::vector<float> g;
+  g.reserve(sigmas.size());
+  for (std::size_t i = 0; i < sigmas.size(); ++i) {
+    const double s = sigmas[i];
+    if (!(s >= 0.0) || (i > 0 && !(s < sigmas[i - 1]))) { return false; }
+    if (same) {
+      g.push_back((float)s);
+      continue;
+    }
+    const double b = s / (given_shift + s * (1.0 - given_shift));
+    g.push_back((float)(_shift * b / (1.0 + (_shift - 1.0) * b)));
+  }
+  for (std::size_t i = 1; i < g.size(); ++i) {
+    if (!(g[i] < g[i - 1])) { return false; }
+  }
+  if (g.back() != 0.0f) { return false; }
+  _sigmas = std::move(g);
+  derive_();
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::sigmas_ok(const std::vector<double>& s, std::string* why)
+{
+  auto no = [&](std::string m) {
+    if (why != nullptr) { *why = std::move(m); }
+    return false;
+  };
+  if (s.size() < 2) {
+    return no(fmt("{} sigma(s): a schedule needs a start and the "
+                  "terminal 0", s.size())());
+  }
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    if (!std::isfinite(s[i]) || s[i] < 0.0) {
+      return no(fmt("sigma {} is {}", i, s[i])());
+    }
+    if (i > 0 && !(s[i] < s[i - 1])) {
+      return no(fmt("sigma {} ({}) is not below sigma {} ({}); the "
+                    "list must fall strictly", i, s[i], i - 1, s[i - 1])());
+    }
+  }
+  if (s.front() > 1.0) {
+    return no(fmt("the first sigma is {}; at most 1", s.front())());
+  }
+  if (s.back() != 0.0) {
+    return no(fmt("the last sigma is {}; a schedule ends at exactly 0",
+                  s.back())());
+  }
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::parse_sigmas(std::string_view text,
+                                 std::vector<double>* out, std::string* why)
+{
+  out->clear();
+  std::string t(text);
+  for (char& ch : t) {
+    if (ch == '[' || ch == ']' || ch == ',' || ch == ';') { ch = ' '; }
+  }
+  const char* p = t.c_str();
+  for (;;) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') { ++p; }
+    if (*p == '\0') { break; }
+    char* end = nullptr;
+    const double v = std::strtod(p, &end);
+    if (end == p) {
+      if (why != nullptr) {
+        *why = fmt("'{}' is not a number", std::string(p).substr(0, 16))();
+      }
+      out->clear();
+      return false;
+    }
+    out->push_back(v);
+    p = end;
+  }
+  if (!sigmas_ok(*out, why)) {
+    out->clear();
+    return false;
+  }
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::set_sigmas_as_run(const std::vector<double>& sigmas)
+{
+#pragma clang fp contract(off)
+  _sigmas.clear();
+  _timesteps.clear();
+  _endpoints.clear();
+  _sigmas_d.clear();
+  if (sigmas.size() < 2 || sigmas.front() > 1.0 || sigmas.back() != 0.0) {
+    return false;
+  }
+  for (std::size_t i = 1; i < sigmas.size(); ++i) {
+    if (!(sigmas[i] < sigmas[i - 1])) { return false; }
+  }
+  _sigmas_d = sigmas;
+  for (std::size_t i = 0; i < sigmas.size(); ++i) {
+    _sigmas.push_back((float)sigmas[i]);
+    if (i + 1 < sigmas.size()) {
+      _timesteps.push_back((float)(1.0 - sigmas[i]));
+      _endpoints.push_back((float)(1.0 - sigmas[i + 1]));
+    }
+  }
+  return true;
+}
+
+std::vector<double>
+MiniMaxH3Scheduler::refine_sigmas(int steps, double start, double shift)
+{
+#pragma clang fp contract(off)
+  if (steps < 1 || start > 1.0 || shift <= 0.0) { return {}; }
+  if (start < 0.0) {
+    if (steps == 3) {
+      return {0.909375, 0.8571428571428571, 0.6666666666666666, 0.0};
+    }
+    start = steps == 2 ? 0.7 : 0.909375;
+  }
+  if (start == 0.0) { return {}; }
+  const double raw = start / (shift - (shift - 1.0) * start);
+  std::vector<double> g{start};
+  for (int i = 1; i < steps; ++i) {
+    const double x = raw * (1.0 - (double)i / (double)steps);
+    g.push_back(shift * x / (1.0 + (shift - 1.0) * x));
+  }
+  g.push_back(0.0);
+  return g;
+}
+
+std::vector<double>
+MiniMaxH3Scheduler::grid_tail(const std::vector<float>& raw, double shift,
+                              int steps)
+{
+  MiniMaxH3Scheduler s(shift);
+  if (steps < 1 || !s.set_sigmas(raw)) { return {}; }
+  const std::vector<float>& g = s.sigmas();
+  const std::size_t n = std::min(g.size(), (std::size_t)steps + 1);
+  return std::vector<double>(g.end() - (std::ptrdiff_t)n, g.end());
+}
+
+bool
+MiniMaxH3Scheduler::step_plain(const float* velocity, int step_index,
+                               float* x, std::size_t n) const
+{
+#pragma clang fp contract(off)
+  if (velocity == nullptr || x == nullptr || step_index < 0 ||
+      step_index + 1 >= (int)_sigmas_d.size()) {
+    return false;
+  }
+  const float d = (float)(_sigmas_d[(std::size_t)step_index] -
+                          _sigmas_d[(std::size_t)step_index + 1]);
+  for (std::size_t i = 0; i < n; ++i) {
+    const float dv = d * velocity[i];
+    x[i] = x[i] + dv;
+  }
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::step_velocity(const float* velocity, int step_index,
+                                  float* x, std::size_t n) const
+{
+#pragma clang fp contract(off)
+  if (velocity == nullptr || x == nullptr || step_index < 0 ||
+      step_index + 1 >= (int)_sigmas.size()) {
+    return false;
+  }
+  const float d = _sigmas[(std::size_t)step_index] -
+                  _sigmas[(std::size_t)step_index + 1];
+  for (std::size_t i = 0; i < n; ++i) {
+    const float dv = d * velocity[i];
+    x[i] = x[i] + dv;
+  }
+  return true;
+}
+
+void
+MiniMaxH3Scheduler::derive_()
+{
+  _timesteps.clear();
+  _endpoints.clear();
+  _timesteps.reserve(_sigmas.size() - 1);
+  _endpoints.reserve(_sigmas.size() - 1);
+  for (std::size_t i = 0; i + 1 < _sigmas.size(); ++i) {
+    _timesteps.push_back(1.0f - _sigmas[i]);
+    // upstream endpoints_from_sigmas: 1.0 - sigmas[1:], float32.
+    _endpoints.push_back(1.0f - _sigmas[i + 1]);
+  }
 }
 
 bool
@@ -73,6 +383,20 @@ MiniMaxH3Scheduler::step(const float* velocity, int step_index, float* x,
     // reference term for term.
     const float x0 = x[i] + sigma_from_t * velocity[i];
     x[i] = ratio * x[i] + (1.0f - ratio) * x0;
+  }
+  return true;
+}
+
+bool
+MiniMaxH3Scheduler::estimate_x0(const float* velocity, int step_index,
+                                const float* x, float* out,
+                                std::size_t n) const
+{
+  if (velocity == nullptr || x == nullptr || out == nullptr) { return false; }
+  if (step_index < 0 || step_index >= (int)_timesteps.size()) { return false; }
+  const float sigma_from_t = 1.0f - _timesteps[(std::size_t)step_index];
+  for (std::size_t i = 0; i < n; ++i) {
+    out[i] = x[i] + sigma_from_t * velocity[i];
   }
   return true;
 }

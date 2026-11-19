@@ -17,10 +17,14 @@
 #ifdef VPIPE_BUILD_APPLE_SILICON
 
 #include "generative-models/minimax-h3/minimax-h3-reference-encoder.h"
+#include "generative-models/minimax-h3/minimax-h3-references.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -159,24 +163,36 @@ TEST(minimax_h3_refenc, condition_frames_match_the_reference)
   EXPECT_TRUE(checked == (int)(sizeof(kFrames) / sizeof(kFrames[0])));
 }
 
-TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_named)
+TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_one_group)
 {
-  // Qwen3-VL merges the sampled frames in PAIRS, so one sampled frame is
-  // not a vision block. Left to the tower it would be padded into one
-  // silently, which conditions the model on a still it was told is
-  // motion.
+  // Qwen3-VL merges the sampled frames in PAIRS. A clip that samples one
+  // -- under 13 frames at 24 -> 2 fps -- is one group of that frame
+  // twice at its own time, as ComfyUI's H3 text encoder repeat-pads it
+  // (its reference node takes clips from 5 frames; a RefMod's stored
+  // 3-frame latent decodes to 9). It was refused, and the refusal ended
+  // the graph with no clip.
   std::vector<int> idx;
   std::vector<float> blocks;
   std::string err;
-  EXPECT_FALSE(h3::condition_frame_indices(11, h3::kFps, 2.0, 2, &idx,
-                                           &blocks, &err));
-  EXPECT_TRUE(!err.empty());
+  for (int n : {1, 5, 9, 12}) {
+    EXPECT_TRUE(h3::condition_frame_indices(n, h3::kFps, 2.0, 2, &idx,
+                                            &blocks, &err));
+    EXPECT_TRUE(idx.size() == 1 && idx[0] == 0);
+    EXPECT_TRUE(blocks.size() == 1 && blocks[0] == 0.0f);
+  }
+  // The text encoder labels the padded group alike.
+  const std::vector<float> label =
+      vpipe::genai::MiniMaxH3TextEncoder::video_block_seconds(1, 2.0f, 2);
+  EXPECT_TRUE(label.size() == 1 && label[0] == 0.0f);
   // 13 frames is the first length that samples two: round(1 * 12) + 1.
   EXPECT_TRUE(h3::condition_frame_indices(13, h3::kFps, 2.0, 2, &idx,
                                           &blocks, &err));
   EXPECT_TRUE(idx.size() == 2 && blocks.size() == 1);
-  std::printf("[minimax_h3_refenc] a 11-frame clip is refused (\"%s\"), 13 "
-              "frames sample %zu\n", err.c_str(), idx.size());
+  // Only rates out of range are refused.
+  EXPECT_FALSE(h3::condition_frame_indices(0, h3::kFps, 2.0, 2, &idx,
+                                           &blocks, &err));
+  std::printf("[minimax_h3_refenc] 1-12 frames sample one group at 0.0 s, "
+              "13 frames sample %zu\n", idx.size());
 }
 
 // The progress contract, without a single model loaded.
@@ -192,27 +208,295 @@ TEST(minimax_h3_refenc, a_clip_too_short_to_merge_is_named)
 //
 // Checkable with every model pointer null: the per-reference work is all
 // guarded, so what is left is exactly the traversal and its reports.
-TEST(minimax_h3_refenc, progress_counts_the_presentation_as_a_step)
+//
+// The bar is weighed in WORK, planned before anything runs. With no VAE
+// attached a reference weighs one frame of its canvas, and that makes the
+// plan checkable against what the loop then did: each reference's share
+// has to equal the canvas the fit record says it was resized to. That is
+// the property that matters -- the plan reads the same geometry rule as
+// the resize, and a copy of the rule would drift.
+// The prompt-only form gets through the whole encode, not just the
+// limits check: a request with no references packs no rows and emits no
+// layout entries, which is what makes the stage's sideband say
+// `references: []` rather than something a consumer has to interpret.
+//
+// Driven with every model pointer null, as the progress test is, so it
+// needs no GPU; what the CONDITIONER makes of an empty presentation is
+// minimax_h3_text_enc.prompt_only_presentation_is_the_prompt.
+TEST(minimax_h3_refenc, an_empty_request_encodes_to_no_rows)
 {
   h3::ReferencePlan plan;
   plan.target_frames = 39;
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  std::vector<std::string> said;
+  models.progress = [&said](std::uint64_t, std::uint64_t,
+                            const std::string& detail) {
+    said.push_back(detail);
+  };
 
-  // Two stills, sized to what the loop checks (num_frames * 3 * h * w).
+  h3::EncodedReferences enc;
+  std::string err;
+  const bool ok = h3::encode_references({}, "a prompt", plan, models, &enc,
+                                        &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  EXPECT_TRUE(enc.layout.empty());
+  EXPECT_TRUE(enc.fits.empty());
+  EXPECT_TRUE(enc.video_rows.empty());
+  EXPECT_TRUE(enc.audio_rows.empty());
+  // Finished, and said so -- a bar left short of "done" reads as a hang.
+  EXPECT_TRUE(!said.empty() && said.back() == "done");
+}
+
+// A clip continued from its own LATENTS: the video rows carried, and
+// now its SOUNDTRACK too -- [2, channels, latents] as generate-video's
+// audio_latent oport writes it, laid channel-major as the audio VAE's
+// rows are, no VAE. Attached to the clip it is that clip's soundtrack,
+// its rows packed before the clip's video rows; alone it is an audio
+// reference. Every model pointer null: nothing here may need one.
+TEST(minimax_h3_refenc, a_carried_soundtrack_latent_packs_its_rows)
+{
+  const int z = 3, T = 2, Hh = 4, Ww = 6, AC = 4, n = 5, n2 = 3;
+  h3::MediaReference clip;
+  clip.kind = h3::MediaReference::Kind::kVideo;
+  clip.latent_z = z;
+  clip.latent_frames = T;
+  clip.latent_height = Hh;
+  clip.latent_width = Ww;
+  clip.video_latent.assign((std::size_t)z * T * Hh * Ww, 0.25f);
+  clip.audio_latent_channels = AC;
+  clip.audio_latent_frames = n;
+  clip.audio_latent.resize((std::size_t)2 * AC * n);
+  for (std::size_t i = 0; i < clip.audio_latent.size(); ++i) {
+    clip.audio_latent[i] = (float)i;
+  }
+  h3::MediaReference sound;
+  sound.kind = h3::MediaReference::Kind::kAudio;
+  sound.audio_latent_channels = AC;
+  sound.audio_latent_frames = n2;
+  sound.audio_latent.assign((std::size_t)2 * AC * n2, -1.0f);
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  plan.condition_noise_aug = 1.0;        // the rows exactly as carried
+  h3::ReferenceEncoders models;
+  h3::EncodedReferences enc;
+  std::string err;
+  const bool ok = h3::encode_references({clip, sound}, "a prompt", plan,
+                                        models, &enc, &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  ASSERT_TRUE(enc.layout.size() == 2);
+  EXPECT_TRUE(enc.layout[0].kind == h3::Reference::Kind::kVideo);
+  EXPECT_TRUE(enc.layout[0].num_latent_frames == T);
+  EXPECT_TRUE(enc.layout[0].num_audio_latents == n);
+  EXPECT_TRUE(enc.layout[1].kind == h3::Reference::Kind::kAudio);
+  EXPECT_TRUE(enc.layout[1].num_audio_latents == n2);
+  EXPECT_TRUE(enc.audio_row_elems == AC);
+  ASSERT_TRUE(enc.audio_rows.size() == (std::size_t)2 * AC * (n + n2));
+  // Row (ch * n + i) is the latent's column i of channel pair ch.
+  int bad = 0;
+  for (int ch = 0; ch < 2; ++ch) {
+    for (int i = 0; i < n; ++i) {
+      for (int k = 0; k < AC; ++k) {
+        const float want = clip.audio_latent[((std::size_t)ch * AC + k) *
+                                             n + i];
+        if (enc.audio_rows[((std::size_t)ch * n + i) * AC + k] != want) {
+          ++bad;
+        }
+      }
+    }
+  }
+  EXPECT_TRUE(bad == 0);
+  EXPECT_TRUE(enc.audio_rows.back() == -1.0f);
+  // And the layout takes them: the clip's soundtrack before its frames,
+  // the sound after, every row counted.
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      std::vector<int>(8, h3::kTextTag), enc.layout, 7, 4, 6, 12, 2, 2,
+      h3::kAudioChannels, &L));
+  EXPECT_TRUE(L.num_condition_audio_rows == 2 * (n + n2));
+  EXPECT_TRUE(L.audio_runs.size() == 3);
+  EXPECT_TRUE(L.audio_runs[0].start == 8 && L.audio_runs[0].count == 2 * n);
+  std::printf("[minimax_h3_refenc] carried soundtrack: %d of %d values "
+              "misplaced; %d reference audio rows\n", bad, 2 * AC * n,
+              L.num_condition_audio_rows);
+}
+
+// A request of ONE SOUNDTRACK and nothing else -- no picture, no clip.
+// It encodes to audio rows alone, and the layout packs them ahead of
+// the generated rows: [text | reference audio | target audio | target
+// video], the reference pinned to the TARGET width grid's two extremes
+// from where the text ends, and the generated rows exactly the
+// prompt-only layout's moved along the time axis by the soundtrack's
+// latents -- as ComfyUI's reference node places a standalone audio
+// block. A carried latent, so every model pointer is null.
+TEST(minimax_h3_refenc, a_soundtrack_alone_packs_ahead_of_the_generated_rows)
+{
+  const int AC = 4, n = 5, ntext = 8, lt = 7, lh = 4, lw = 6, alat = 12;
+  h3::MediaReference sound;
+  sound.kind = h3::MediaReference::Kind::kAudio;
+  sound.audio_latent_channels = AC;
+  sound.audio_latent_frames = n;
+  sound.audio_latent.resize((std::size_t)2 * AC * n);
+  for (std::size_t i = 0; i < sound.audio_latent.size(); ++i) {
+    sound.audio_latent[i] = 0.5f * (float)i;
+  }
+  h3::ReferenceLimits lim;
+  std::string err;
+  ASSERT_TRUE(h3::validate_reference_request({sound}, lim, &err));
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  h3::ReferenceEncoders models;
+  h3::EncodedReferences enc;
+  const bool ok = h3::encode_references({sound}, "a prompt", plan, models,
+                                        &enc, &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  ASSERT_TRUE(enc.layout.size() == 1);
+  EXPECT_TRUE(enc.layout[0].kind == h3::Reference::Kind::kAudio);
+  EXPECT_TRUE(enc.layout[0].num_audio_latents == n);
+  EXPECT_TRUE(enc.video_rows.empty());
+  EXPECT_TRUE(enc.audio_rows.size() == (std::size_t)2 * AC * n);
+
+  const std::vector<int> tags((std::size_t)ntext, h3::kTextTag);
+  h3::PackedLayout L, E;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      tags, enc.layout, lt, lh, lw, alat, 2, 2, h3::kAudioChannels, &L));
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      tags, {}, lt, lh, lw, alat, 2, 2, h3::kAudioChannels, &E));
+  const int ref_rows = h3::kAudioChannels * n;
+  EXPECT_TRUE(L.seq_len == E.seq_len + ref_rows);
+  EXPECT_TRUE(L.num_condition_video_rows == 0);
+  EXPECT_TRUE(L.num_condition_audio_rows == ref_rows);
+  EXPECT_TRUE(L.video_runs.size() == 1);
+  ASSERT_TRUE(L.audio_runs.size() == 2);
+  EXPECT_TRUE(L.audio_runs[0].start == ntext &&
+              L.audio_runs[0].count == ref_rows);
+  EXPECT_TRUE(L.audio_start == ntext + ref_rows);
+  auto at = [](const h3::PackedLayout& P, int row, int axis) {
+    return P.position_ids[(std::size_t)row * 3 + (std::size_t)axis];
+  };
+
+  // The reference's rows: time from where the text ends, no height, the
+  // width the generated soundtrack's own channel takes.
+  int off = 0;
+  for (int c = 0; c < h3::kAudioChannels; ++c) {
+    for (int i = 0; i < n; ++i) {
+      const int row = ntext + c * n + i;
+      const int gen = E.audio_start + c * alat;
+      if (at(L, row, 0) != (double)(ntext + i) || at(L, row, 1) != 0.0 ||
+          at(L, row, 2) != at(E, gen, 2) ||
+          L.token_tags[(std::size_t)row] != E.token_tags[(std::size_t)gen]) {
+        ++off;
+      }
+    }
+  }
+  EXPECT_TRUE(off == 0);
+
+  // The generated rows: the prompt-only layout's, `n` later in time --
+  // to an ulp, since a video frame's time is its origin plus the
+  // frames' 5/3 spans summed in double from there.
+  int moved = 0;
+  double worst = 0.0;
+  for (int r = 0; r < E.seq_len - ntext; ++r) {
+    const int a = E.audio_start + r, b = L.audio_start + r;
+    const double dt = std::fabs(at(L, b, 0) - (at(E, a, 0) + (double)n));
+    worst = std::max(worst, dt);
+    if (dt > 1e-12 * (1.0 + std::fabs(at(L, b, 0))) ||
+        at(L, b, 1) != at(E, a, 1) || at(L, b, 2) != at(E, a, 2) ||
+        L.token_tags[(std::size_t)b] != E.token_tags[(std::size_t)a]) {
+      ++moved;
+    }
+  }
+  EXPECT_TRUE(moved == 0);
+  EXPECT_TRUE(L.video_start - L.audio_start == E.video_start - E.audio_start);
+  std::printf("[minimax_h3_refenc] a soundtrack alone: %d reference audio "
+              "rows, %d of them misplaced; %d generated rows, %d off the "
+              "prompt-only layout's moved by %d (time %.1e at worst)\n",
+              ref_rows, off, E.seq_len - ntext, moved, n, worst);
+}
+
+// A stored still's latent given to the DiT ALONE (`presented` false):
+// no pixels, no tower, no VAE -- its rows packed as a picture's, one
+// slot on the clock, as ComfyUI's RefMod "Apply" hands one over.
+TEST(minimax_h3_refenc, a_latent_for_the_dit_alone_is_packed_unpresented)
+{
+  const int z = 3, Hh = 4, Ww = 6;
+  h3::MediaReference still;
+  still.kind = h3::MediaReference::Kind::kImage;
+  still.latent_z = z;
+  still.latent_frames = 1;
+  still.latent_height = Hh;
+  still.latent_width = Ww;
+  still.video_latent.assign((std::size_t)z * Hh * Ww, 0.5f);
+  still.presented = false;
+
+  h3::ReferencePlan plan;
+  plan.target_frames = 39;
+  plan.condition_noise_aug = 1.0;        // the rows exactly as carried
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  h3::EncodedReferences enc;
+  std::string err;
+  bool ok = h3::encode_references({still}, "a prompt", plan, models, &enc,
+                                  &err);
+  if (!ok) { std::printf("[minimax_h3_refenc] %s\n", err.c_str()); }
+  ASSERT_TRUE(ok);
+  if (!ok) { return; }
+  ASSERT_TRUE(enc.layout.size() == 1);
+  EXPECT_TRUE(enc.layout[0].kind == h3::Reference::Kind::kImage);
+  EXPECT_TRUE(enc.layout[0].num_latent_frames == 1);
+  EXPECT_TRUE(enc.video_rows.size() == (std::size_t)z * Hh * Ww);
+  h3::PackedLayout L;
+  ASSERT_TRUE(h3::build_ref2va_packed_sequence(
+      std::vector<int>(8, h3::kTextTag), enc.layout, 7, 4, 6, 12, 2, 2,
+      h3::kAudioChannels, &L));
+  EXPECT_TRUE(L.seq_len > 8 + (Hh / 2) * (Ww / 2));
+}
+
+TEST(minimax_h3_refenc, progress_is_weighed_by_work_planned_up_front)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;            // the clip's own size
+
   std::vector<h3::MediaReference> refs;
-  for (int k = 0; k < 2; ++k) {
+  {
+    // A still that asks for 128 on its short edge.
     h3::MediaReference m;
     m.kind       = h3::MediaReference::Kind::kImage;
     m.num_frames = 1;
     m.height     = 64;
     m.width      = 64;
-    m.rgb.assign((std::size_t)3 * 64 * 64, (std::uint8_t)(40 * k + 10));
+    m.short_edge = 128;
+    m.rgb.assign((std::size_t)3 * 64 * 64, 10);
+    refs.push_back(std::move(m));
+  }
+  {
+    // A 30 fps clip, longer than the target once on the 24 fps grid.
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 60;
+    m.height     = 96;
+    m.width      = 160;
+    m.fps        = 30.0;
+    m.rgb.assign((std::size_t)60 * 3 * 96 * 160, 20);
     refs.push_back(std::move(m));
   }
 
-  std::vector<std::pair<int, int>> seen;
+  struct Seen {
+    std::uint64_t done, total;
+    std::string detail;
+  };
+  std::vector<Seen> seen;
   h3::ReferenceEncoders models;          // every pointer null on purpose
-  models.progress = [&seen](int done, int total) {
-    seen.emplace_back(done, total);
+  models.progress = [&seen](std::uint64_t done, std::uint64_t total,
+                            const std::string& detail) {
+    seen.push_back({done, total, detail});
   };
 
   h3::EncodedReferences enc;
@@ -220,15 +504,295 @@ TEST(minimax_h3_refenc, progress_counts_the_presentation_as_a_step)
   const bool ok = h3::encode_references(refs, "a prompt", plan, models,
                                         &enc, &err);
   std::printf("[minimax_h3_refenc] progress:");
-  for (const auto& p : seen) { std::printf(" %d/%d", p.first, p.second); }
+  for (const auto& p : seen) {
+    std::printf(" %llu/%llu '%s'", (unsigned long long)p.done,
+                (unsigned long long)p.total, p.detail.c_str());
+  }
   std::printf("%s%s\n", err.empty() ? "" : "  err: ", err.c_str());
   ASSERT_TRUE(ok);
-  ASSERT_TRUE(seen.size() == 3);
-  // One per reference, then the presentation -- and every report carries
-  // the SAME total, or a bar rescales itself mid-phase.
-  EXPECT_TRUE(seen[0] == std::make_pair(1, 3));
-  EXPECT_TRUE(seen[1] == std::make_pair(2, 3));
-  EXPECT_TRUE(seen[2] == std::make_pair(3, 3));
+  ASSERT_TRUE(enc.fits.size() == 2);
+  ASSERT_TRUE(!seen.empty());
+  if (!ok || enc.fits.size() != 2 || seen.empty()) { return; }
+
+  const std::uint64_t w0 =
+      (std::uint64_t)enc.fits[0].canvas_h * enc.fits[0].canvas_w;
+  const std::uint64_t w1 =
+      (std::uint64_t)enc.fits[1].canvas_h * enc.fits[1].canvas_w;
+  EXPECT_TRUE(w0 == 128u * 128u);        // the still's own short edge won
+  const std::uint64_t total = w0 + w1;
+
+  // ONE total for the whole request, never rescaled, and the bar never
+  // runs backwards. (No conditioner is attached, so no report here is
+  // the indeterminate one.)
+  std::uint64_t last = 0;
+  bool steady = true, forward = true;
+  for (const auto& p : seen) {
+    steady = steady && p.total == total;
+    forward = forward && p.done >= last;
+    last = p.done;
+  }
+  EXPECT_TRUE(steady);
+  EXPECT_TRUE(forward);
+  EXPECT_TRUE(seen.front().done == 0);
+  EXPECT_TRUE(seen.back().done == total && seen.back().detail == "done");
+
+  // Each reference's share is its planned work: the bar stands at w0
+  // when the second one starts, which is where the fit record says the
+  // first one's canvas put it.
+  bool second_started_at_w0 = false, named_phase = false;
+  for (const auto& p : seen) {
+    if (p.detail == "reference 2/2 (video)") {
+      second_started_at_w0 = p.done == w0;
+    }
+    if (p.detail == "reference 1/2 (image): done") {
+      EXPECT_TRUE(p.done == w0);
+    }
+    if (p.detail == "reference 2/2 (video): resize") { named_phase = true; }
+  }
+  EXPECT_TRUE(second_started_at_w0);
+  EXPECT_TRUE(named_phase);
+}
+
+// A STOP REACHES THE REFERENCE ENCODE, and arrives as a stop.
+//
+// This is the longest stretch in an H3 graph that is not the denoise --
+// the conditioner is loaded and streamed and every reference is read
+// twice, so on a memory-bounded box it is minutes -- and it had no stop
+// check anywhere. A stop request was served whenever the whole request
+// happened to finish.
+//
+// TWO THINGS ARE UNDER TEST and the second is the one a caller depends
+// on. That it stops at all, and that it says so by returning false with
+// an EMPTY reason: the stage tells a stop from a failure by the absence
+// of a message, so that it must not fill one in. A stop reported as a
+// failure puts a warning in front of someone who pressed stop.
+//
+// Driven with every model pointer null, as the progress test is: that
+// runs the planning and the phase structure with no GPU behind it, so
+// the trigger can be placed exactly. The BOUND -- how long a stop
+// actually takes on real work -- is not a thing this harness can see,
+// and is measured end to end instead; it rests on the video VAE
+// checking between tiles, each of which commits and waits.
+TEST(minimax_h3_refenc, a_stop_is_honoured_and_is_not_a_failure)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;
+
+  std::vector<h3::MediaReference> refs;
+  {
+    h3::MediaReference m;
+    m.kind = h3::MediaReference::Kind::kImage;
+    m.num_frames = 1; m.height = 64; m.width = 64; m.short_edge = 128;
+    m.rgb.assign((std::size_t)3 * 64 * 64, 10);
+    refs.push_back(std::move(m));
+  }
+  {
+    h3::MediaReference m;
+    m.kind = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 60; m.height = 96; m.width = 160; m.fps = 30.0;
+    m.rgb.assign((std::size_t)60 * 3 * 96 * 160, 20);
+    refs.push_back(std::move(m));
+  }
+
+  // Fire once the FIRST reference is finished, so the stop lands at a
+  // boundary the encoder reaches mid-request rather than before it
+  // starts -- a predicate that is true from the outset would be
+  // answered by the first check and prove only that one check exists.
+  bool stop_now = false;
+  std::vector<std::string> seen;
+  h3::ReferenceEncoders models;
+  models.progress = [&](std::uint64_t, std::uint64_t,
+                        const std::string& detail) {
+    seen.push_back(detail);
+    if (detail == "reference 1/2 (image): done") { stop_now = true; }
+  };
+  models.stopping = [&]() { return stop_now; };
+
+  h3::EncodedReferences enc;
+  std::string err;
+  const bool ok = h3::encode_references(refs, "a prompt", plan, models,
+                                        &enc, &err);
+
+  EXPECT_FALSE(ok);
+  // THE CONTRACT THE STAGE READS. An empty reason is the signal.
+  EXPECT_TRUE(err.empty());
+  // And it really did stop early: the second reference never ran a
+  // phase, and the request never reported itself done.
+  bool second_phase_ran = false, said_done = false;
+  for (const std::string& d : seen) {
+    if (d.rfind("reference 2/2", 0) == 0 && d.find(':') != std::string::npos) {
+      second_phase_ran = true;
+    }
+    if (d == "done") { said_done = true; }
+  }
+  EXPECT_FALSE(second_phase_ran);
+  EXPECT_FALSE(said_done);
+  EXPECT_TRUE(enc.fits.size() < 2);
+  std::printf("[minimax_h3_refenc] stop after reference 1: ok=%d err='%s' "
+              "(%zu reports, second phase ran=%d, said done=%d)\n",
+              (int)ok, err.c_str(), seen.size(), (int)second_phase_ran,
+              (int)said_done);
+}
+
+// The plan's geometry IS the resize's: video_reference_geometry is what
+// normalize_video_reference asks, so the two agree on every input --
+// rate conversions that hold and drop, truncation, the never-upscale
+// short edge, the area cap.
+TEST(minimax_h3_refenc, planned_geometry_is_the_resize_geometry)
+{
+  struct Case {
+    int frames, h, w;
+    double fps;
+    int target, edge;
+    std::int64_t cap;
+  };
+  const Case cases[] = {
+      {60, 96, 160, 30.0, 39, 0, 768LL * 1344},    // drop to 24, truncate
+      {20, 96, 160, 12.0, 39, 0, 768LL * 1344},    // hold up to 24
+      {30, 90, 160, 24.0, 21, 128, 768LL * 1344},  // upscale to 128
+      {10, 720, 1280, 25.0, 39, 768, 256LL * 448}, // the cap binds
+  };
+  for (const Case& c : cases) {
+    std::vector<std::uint8_t> rgb((std::size_t)c.frames * 3 * c.h * c.w, 5);
+    std::vector<std::uint8_t> out;
+    int nf = 0, th = 0, tw = 0, pf = 0, ph = 0, pw = 0;
+    std::string e1, e2;
+    const bool a = h3::normalize_video_reference(
+        rgb.data(), c.frames, c.h, c.w, c.fps, c.target, 32, c.edge, c.cap,
+        &out, &nf, &th, &tw, h3::kFps, &e1);
+    const bool b = h3::video_reference_geometry(
+        c.frames, c.h, c.w, c.fps, c.target, 32, c.edge, c.cap, &pf, &ph,
+        &pw, h3::kFps, &e2);
+    std::printf("[minimax_h3_refenc] %dx%d %df@%.0f -> %dx%d %df "
+                "(planned %dx%d %df)\n", c.w, c.h, c.frames, c.fps, tw, th,
+                nf, pw, ph, pf);
+    EXPECT_TRUE(a && b);
+    EXPECT_TRUE(nf == pf && th == ph && tw == pw);
+    EXPECT_TRUE(out.size() == (std::size_t)nf * 3 * th * tw);
+  }
+}
+
+// The fit record: three temporal reductions counted APART, and the
+// per-reference short edge overriding the plan's.
+//
+// Kept separate because they have different remedies. A 30 fps clip
+// loses a fifth of its frames to the RATE resample whether or not it is
+// also too long; `frames` is what fixes the truncation and nothing fixes
+// the resample. One "kept 43%" would tell a user something was lost
+// without telling them which knob gets it back.
+TEST(minimax_h3_refenc, fit_reports_each_reduction_separately)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;            // never upsample
+
+  std::vector<h3::MediaReference> refs;
+  {
+    // 1920x1080 at 30 fps, 90 frames: over the area cap AND over length,
+    // and at a rate that does not divide 24.
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 90;
+    m.height     = 1080;
+    m.width      = 1920;
+    m.fps        = 30.0;
+    m.rgb.assign((std::size_t)90 * 3 * 1080 * 1920, 7);
+    refs.push_back(std::move(m));
+  }
+  {
+    // A still that states its own short edge, overriding the plan's.
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kImage;
+    m.num_frames = 1;
+    m.height     = 64;
+    m.width      = 64;
+    m.short_edge = 128;
+    m.rgb.assign((std::size_t)3 * 64 * 64, 9);
+    refs.push_back(std::move(m));
+  }
+
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  h3::EncodedReferences enc;
+  std::string err;
+  ASSERT_TRUE(h3::encode_references(refs, "p", plan, models, &enc, &err));
+  ASSERT_TRUE(enc.fits.size() == 2);
+
+  const auto& v = enc.fits[0];
+  std::printf("[minimax_h3_refenc] clip %dx%d -> %dx%d, %d -> %d -> %d "
+              "frames\n", v.src_w, v.src_h, v.canvas_w, v.canvas_h,
+              v.src_frames, v.rate_frames, v.used_frames);
+  // The cap binds, and never upward: both axes are below the source.
+  EXPECT_TRUE(v.rescaled());
+  EXPECT_FALSE(v.upscaled());
+  EXPECT_TRUE(v.canvas_h <= 1080 && v.canvas_w <= 1920);
+  EXPECT_TRUE((std::int64_t)v.canvas_h * v.canvas_w <= 768LL * 1344);
+  // 90 frames at 30 fps is 72 at 24 -- the rate resample alone, before
+  // any truncation. Then `target_frames` cuts 72 to 39.
+  EXPECT_TRUE(v.rate_frames == 72);
+  EXPECT_TRUE(v.used_frames == 39);
+  EXPECT_TRUE(v.src_frames == 90);
+
+  const auto& i = enc.fits[1];
+  // The reference's own 128 won, not the plan's 2048 default.
+  EXPECT_TRUE(i.canvas_h == 128 && i.canvas_w == 128);
+  EXPECT_TRUE(i.upscaled());
+  std::printf("[minimax_h3_refenc] still 64x64 -> %dx%d on its own short "
+              "edge\n", i.canvas_w, i.canvas_h);
+}
+
+// A reference kept WHOLE is not cut to the generated length: its frames
+// all go on (here a clip of 90 at 24 fps against 39 generated), where
+// the same clip otherwise keeps the generated 39.
+TEST(minimax_h3_refenc, a_reference_kept_whole_is_not_truncated)
+{
+  h3::ReferencePlan plan;
+  plan.target_frames     = 39;
+  plan.canvas_short_edge = 0;
+  std::vector<h3::MediaReference> refs;
+  for (bool whole : {false, true}) {
+    h3::MediaReference m;
+    m.kind       = h3::MediaReference::Kind::kVideo;
+    m.num_frames = 90;
+    m.height     = 64;
+    m.width      = 64;
+    m.fps        = 24.0;
+    m.whole      = whole;
+    m.rgb.assign((std::size_t)90 * 3 * 64 * 64, 5);
+    refs.push_back(std::move(m));
+  }
+  h3::ReferenceEncoders models;          // every pointer null on purpose
+  h3::EncodedReferences enc;
+  std::string err;
+  ASSERT_TRUE(h3::encode_references(refs, "p", plan, models, &enc, &err));
+  ASSERT_TRUE(enc.fits.size() == 2);
+  std::printf("[minimax_h3_refenc] cut %d -> %d frames, whole %d -> %d\n",
+              enc.fits[0].rate_frames, enc.fits[0].used_frames,
+              enc.fits[1].rate_frames, enc.fits[1].used_frames);
+  EXPECT_TRUE(enc.fits[0].used_frames == 39);
+  EXPECT_TRUE(enc.fits[1].used_frames == 90);
+
+  // A soundtrack's cut, at its source rate, by the rule encode_references
+  // asks (audio_reference_seconds): 362 frames at 24 fps keep
+  // int(362 / 24 * 32000) samples; kept whole, every one, whatever the
+  // rounding.
+  const int n = 482667, sr = 32000;
+  for (bool whole : {false, true}) {
+    h3::MediaReference a;
+    a.kind        = h3::MediaReference::Kind::kAudio;
+    a.channels    = 2;
+    a.sample_rate = sr;
+    a.whole       = whole;
+    a.pcm.assign((std::size_t)2 * n, 0.25f);
+    std::vector<float> out;
+    int kept = 0;
+    ASSERT_TRUE(h3::normalize_audio_reference(
+        a.pcm.data(), 2, n, sr, h3::audio_reference_seconds(a, 362.0 / 24.0),
+        &out, &kept));
+    std::printf("[minimax_h3_refenc] a %d-sample soundtrack, %s: %d kept\n",
+                n, whole ? "kept whole" : "cut", kept);
+    EXPECT_TRUE(kept == (whole ? n : 482666));
+  }
 }
 
 TEST(minimax_h3_refenc, request_limits)
@@ -236,17 +800,23 @@ TEST(minimax_h3_refenc, request_limits)
   h3::ReferenceLimits lim;
   std::string err;
 
-  // Empty is not a degenerate ref2va, it is a t2va request.
-  EXPECT_FALSE(h3::validate_reference_request({}, lim, &err));
+  // Empty is the prompt-only form, and passes. Whether the caller MEANT
+  // it is the stage's question.
+  EXPECT_TRUE(h3::validate_reference_request({}, lim, &err));
 
-  // Audio alone never reaches the conditioner, so a request of nothing
-  // but audio packs text rows describing references the model cannot
-  // see.
-  EXPECT_FALSE(h3::validate_reference_request({audio_ref_()}, lim, &err));
-  EXPECT_FALSE(h3::validate_reference_request(
+  // Audio alone passes: its label precedes the prompt and the DiT reads
+  // its rows (soundtracks_alone_pack_ahead_of_the_generated_rows). Only
+  // the count binds it.
+  EXPECT_TRUE(h3::validate_reference_request({audio_ref_()}, lim, &err));
+  EXPECT_TRUE(h3::validate_reference_request(
       {audio_ref_(), audio_ref_()}, lim, &err));
   EXPECT_TRUE(h3::validate_reference_request(
       {audio_ref_(), image_ref_()}, lim, &err));
+  std::vector<h3::MediaReference> sounds;
+  for (int i = 0; i < lim.max_audios; ++i) { sounds.push_back(audio_ref_()); }
+  EXPECT_TRUE(h3::validate_reference_request(sounds, lim, &err));
+  sounds.push_back(audio_ref_());
+  EXPECT_FALSE(h3::validate_reference_request(sounds, lim, &err));
 
   // The per-modality caps.
   std::vector<h3::MediaReference> many;
@@ -270,8 +840,79 @@ TEST(minimax_h3_refenc, request_limits)
   mixed.push_back(audio_ref_());
   EXPECT_FALSE(h3::validate_reference_request(mixed, lim, &err));
   std::printf("[minimax_h3_refenc] limits: %d images / %d videos / %d "
-              "audios / %d total, audio never alone\n", lim.max_images,
+              "audios / %d total, audio alone allowed\n", lim.max_images,
               lim.max_videos, lim.max_audios, lim.max_references);
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON
+
+// A CARRIED latent and a VAE-encoded one become DiT rows by two separate
+// loops over the same layout: pack_latent_rows_ over an f32 latent that
+// is already whitened, pack_condition_rows_ over the VAE's bf16 moments
+// (mean half first) that it whitens on the way. The carried-latent route
+// is only right if the two place every value identically, and two loops
+// over one layout are exactly the shape of thing that drifts apart.
+//
+// Pinned two ways. With identity whitening and bf16-exact values the two
+// must agree BIT FOR BIT, which is the layout claim with nothing else in
+// it. With a real mean and std they must agree to the bf16 rounding of
+// the moments -- which says the whitening runs in the direction a
+// carried latent assumes ((m - mean) / std), not its inverse.
+TEST(minimax_h3_refenc, carried_latent_rows_match_the_vae_rows)
+{
+  const int z = 3, T = 2, Hh = 4, Ww = 6, ph = 2, pw = 2;
+  const std::size_t vox = (std::size_t)T * Hh * Ww;
+  auto to_bf16 = [](float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  // A latent whose every value is distinct and bf16-exact, so a swapped
+  // index cannot hide behind two equal values.
+  std::vector<float> lat((std::size_t)z * vox);
+  for (std::size_t i = 0; i < lat.size(); ++i) {
+    lat[i] = (float)((int)(i % 97) - 48) * 0.0625f;
+  }
+  // Moments are [2z, T, H, W], MEAN half first; the logvar half is noise
+  // the packer must not read.
+  std::vector<std::uint16_t> mom((std::size_t)2 * z * vox);
+  for (std::size_t i = 0; i < lat.size(); ++i) { mom[i] = to_bf16(lat[i]); }
+  for (std::size_t i = lat.size(); i < mom.size(); ++i) {
+    mom[i] = to_bf16(1000.0f + (float)i);
+  }
+
+  std::vector<float> a, b;
+  h3::pack_latent_rows_for_test(lat.data(), z, T, Hh, Ww, ph, pw, &a);
+  h3::pack_condition_rows_for_test(mom.data(), z, T, Hh, Ww, ph, pw,
+                                   {0.0f, 0.0f, 0.0f}, {1.0f, 1.0f, 1.0f},
+                                   &b);
+  // T * (H/ph) * (W/pw) rows of z*ph*pw.
+  EXPECT_TRUE(a.size() == (std::size_t)T * (Hh / ph) * (Ww / pw) * z * ph *
+                              pw);
+  EXPECT_TRUE(a == b);
+
+  // A real whitening: the moments hold latent * std + mean, so the
+  // moments packer has to undo exactly that to land on the latent.
+  const std::vector<float> mean = {0.5f, -1.25f, 2.0f};
+  const std::vector<float> sd = {0.75f, 1.5f, 3.0f};
+  for (int c = 0; c < z; ++c) {
+    for (std::size_t v = 0; v < vox; ++v) {
+      const std::size_t k = (std::size_t)c * vox + v;
+      mom[k] = to_bf16(lat[k] * sd[(std::size_t)c] + mean[(std::size_t)c]);
+    }
+  }
+  std::vector<float> w;
+  h3::pack_condition_rows_for_test(mom.data(), z, T, Hh, Ww, ph, pw, mean,
+                                   sd, &w);
+  double worst = 0.0;
+  for (std::size_t i = 0; i < a.size() && i < w.size(); ++i) {
+    worst = std::max(worst, (double)std::fabs(a[i] - w[i]));
+  }
+  // bf16 keeps 8 bits: |m| here is at most ~11, so one ulp is 0.0625,
+  // and dividing by std >= 0.75 grows it to ~0.083 at the worst.
+  std::printf("[minimax_h3_refenc] carried vs VAE rows: identity whitening "
+              "%s; real whitening max |diff| %.4f\n",
+              a == b ? "bit-identical" : "DIFFERS", worst);
+  EXPECT_TRUE(w.size() == a.size());
+  EXPECT_TRUE(worst < 0.1);
+}

@@ -25,16 +25,21 @@
 // AUTO-APPLY. `opts.onCommit` is called the moment a field fully
 // determines its own value -- a blur after an edit, a tri-state flip, a
 // picked path or model -- so an edit reaches the stage without a trip to
-// the Apply button, exactly as on the desktop. The JSON textareas
-// (array/object/any) are the one exclusion: a half-typed blob would
-// throw on every blur, so those commit only via Apply. Free-text and
-// number boxes wait for `change`, which fires on blur-AFTER-EDIT, so
-// tabbing past an untouched field costs nothing.
+// the Apply button, exactly as on the desktop. Free-text and number
+// boxes wait for `change`, which fires on blur-AFTER-EDIT, so tabbing
+// past an untouched field costs nothing. The JSON textareas
+// (array/object/any) wait for it too and then PARSE: they commit when
+// the box is valid and mark themselves when it is not, which is the one
+// thing that cannot be left to Apply -- readConfig reads every field, so
+// an uncommitted edit does not wait, it rides out on whatever commits
+// next.
 
 import { el, clear, openModal } from '../dom.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
 import { t, tOr } from '../i18n.js';
 import { openFsSheet, dirOf, baseOf } from './phone-fs.js';
+import { extsForFilter } from '../path-categories.js';
+import { compatibleModels } from '../model-filter.js';
 
 const NUMERIC = new Set(['int', 'uint', 'real']);
 const JSONISH = new Set(['array', 'object', 'any']);
@@ -115,10 +120,38 @@ export function configField(f, opts = {}) {
     ta.value = present ? fmtDefault(f.current) : '';
     row.append(ta);
     valueEl = ta;
-    // No blur-commit here: a JSON box is half-typed for most of the time
-    // it is focused, and committing on every blur would just throw. A
-    // PICKED path still commits -- it writes a complete array itself.
-    pick = { el: ta, multi: true, mark: () => {}, before: null };
+    // BLUR-COMMITS, once the box parses -- the same rule the desktop
+    // form uses, and it has to be the same or a value typed on one shell
+    // applies and on the other does not.
+    //
+    // It used not to, on the reading that a JSON box is half-typed for
+    // most of the time it is focused. True, and it does not follow that
+    // waiting is free: readConfig reads EVERY field, so a hand-edit here
+    // was not held back, it rode out on whatever committed next -- a
+    // neighbouring box losing focus, or a path pick. What was
+    // unpredictable was not that the edit waited but WHEN it landed.
+    // Parse first and commit only on success; a box that does not parse
+    // says so rather than failing silently. The desktop twin is
+    // configField in views/pipeline-manager.js -- change both.
+    // phone-config.test.mjs pins this copy.
+    const markBad = (bad) => wrap.classList.toggle('bad-json', bad);
+    if (!ro) {
+      ta.addEventListener('input', () => markBad(false));
+      ta.addEventListener('change', () => {
+        // Gated on read(), not on a second JSON.parse of its own: the
+        // test for "will this commit" has to be the very call that
+        // commits it, or a reader that grows stricter leaves the gate
+        // behind waving a value through that readConfig then rejects.
+        try { read(); }
+        catch (e) { markBad(true); return; }
+        markBad(false);
+        commit();
+      });
+    }
+    // `mark` is what a programmatic set calls, and setting .value fires
+    // no `input` -- so a pick into a box wearing the warning has to drop
+    // it here or it stays on a value that has since parsed.
+    pick = { el: ta, multi: true, mark: () => markBad(false), before: null };
     read = () => {
       const s = ta.value.trim();
       if (!s) { return undefined; }
@@ -236,21 +269,31 @@ export function configField(f, opts = {}) {
       // array path fields, which have no blur-commit of their own.
       commit();
     };
+    // BOTH pickers when a field carries both hints -- a LoRA is as often
+    // a downloaded file as a catalogued model, and the stage resolves
+    // either. The desktop twin is configField in views/pipeline-manager.js.
+    const isModel = f.suggest_db === MODEL_REGISTRY_DB;
+    if (isModel) {
+      addBtn('⌄', () => openModelPicker(f, setPath, opts.peerValues));
+    }
     if (f.is_path) {
       const kind = f.path_kind || '';
       addBtn('…', () => {
+        // A registry key is no directory in the sandbox; do not seed the
+        // sheet from one (it would open on an error).
+        const last = lastPath();
+        const pathish = !isModel || last.startsWith('/') ||
+            /\.safetensors$/i.test(last);
         openFsSheet({
           title: t('phone.pick_path'),
-          start: dirOf(lastPath()) || '',
+          start: (pathish ? dirOf(last) : '') || '',
           pickDirs: kind === 'dir' || kind === 'directory',
-          exts: extsFromFilter(f.path_filter),
+          exts: extsForFilter(f.path_filter),
           nameField: !!f.path_write && kind !== 'dir',
-          defaultName: f.path_write ? baseOf(lastPath()) : '',
+          defaultName: f.path_write ? baseOf(last) : '',
           onPick: setPath,
         });
       });
-    } else if (f.suggest_db === MODEL_REGISTRY_DB) {
-      addBtn('⌄', () => openModelPicker(f, setPath, opts.peerValues));
     }
   }
 
@@ -260,19 +303,6 @@ export function configField(f, opts = {}) {
     key: f.key,
     value: () => (valueEl ? String(valueEl.value ?? '').trim() : ''),
   };
-}
-
-// A stage's `path_filter` is a display string like "*.png;*.jpg"; the
-// listing API wants dot-led extensions. An unparseable filter yields no
-// restriction, which shows too much rather than too little.
-function extsFromFilter(filter) {
-  if (!filter) { return null; }
-  const out = [];
-  for (const part of String(filter).split(/[;,\s]+/)) {
-    const m = /\.([A-Za-z0-9_]+)$/.exec(part.trim());
-    if (m) { out.push('.' + m[1].toLowerCase()); }
-  }
-  return out.length ? out : null;
 }
 
 // Installed models for a model-registry `suggest_db` field, filtered by
@@ -313,39 +343,13 @@ async function openModelPicker(f, onPick, peerValues) {
     return;
   }
   const all = (data && data.models) || [];
-  const csv = (s) => String(s || '').split(',')
-    .map((x) => x.trim()).filter(Boolean);
 
-  // (a) + (b): what this STAGE FIELD will accept.
-  const allowed = csv(f.suggest_db_type);
-  const needIn  = csv(f.need_inputs);
-  const needOut = csv(f.need_outputs);
-  const ioOk = (m) =>
-    needIn.every((x) => (m.inputs || []).includes(x))
-    && needOut.every((x) => (m.outputs || []).includes(x));
-  const stageOk = (m) => (allowed.length
-    ? allowed.includes(m.model_type)
-    : (m.category || 'model') === 'model') && ioOk(m);
-
-  // (c): the installed models named by the OTHER fields of this form are
-  // the candidate parents. A supplement with no parent, or a form where
-  // nothing has been chosen yet, is not filtered out -- the rule hides
-  // what is known to be incompatible, never what is merely unconfirmed.
-  const chosen = new Set(peerValues ? peerValues() : []);
-  const parents = all.filter(
-    (m) => chosen.has(m.key) || chosen.has(m.hf_path));
-  const parentOk = (m) => {
-    if (!m.parent_model_type) { return true; }   // not a supplement
-    if (!parents.length) { return true; }        // no parent chosen yet
-    return parents.some((p) => p.model_type === m.parent_model_type
-      && (!m.parent_param_class
-          // Case-insensitive: a registry record written before the
-          // catalog switched "e4b" -> "E4B" still matches the tower's.
-          || m.parent_param_class.toLowerCase()
-               === (p.param_class || '').toLowerCase()));
-  };
-
-  const models = all.filter((m) => stageOk(m) && parentOk(m));
+  // WHAT THIS STAGE FIELD WILL ACCEPT: its suggest_db_type allow-list,
+  // its required I/O modalities, and parent compatibility against the
+  // installed models the form's OTHER fields already name. Shared with
+  // the desktop browser -- see model-filter.js, where a copy of this
+  // rule drifted into hiding a supplement's own siblings.
+  const models = compatibleModels(all, f, peerValues ? peerValues() : []);
   clear(list);
   if (!models.length) {
     list.append(el('div', { class: 'ph-sheet-hint' },

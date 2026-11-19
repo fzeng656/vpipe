@@ -1,4 +1,6 @@
 #include "stages/model-catalog.h"
+
+#include "generative-models/detect-profile.h"
 #include "common/flex-data.h"
 
 #include <algorithm>
@@ -12,6 +14,16 @@ namespace vpipe {
 
 namespace {
 
+// An `extra` holding `local_subdir` (see ModelCatalogEntry::extra).
+FlexData
+local_subdir_extra_(const char* sub)
+{
+  FlexData extra = FlexData::make_object();
+  extra.as_object().insert_or_assign(catalog_extra::kLocalSubdir,
+                                     FlexData::make_string(sub));
+  return extra;
+}
+
 // The models that ship WITH vpipe. `model_catalog()` below returns this
 // followed by whatever plugins contributed; see register_catalog_entries.
 const std::vector<ModelCatalogEntry>&
@@ -21,28 +33,6 @@ builtin_catalog_()
   // MODEL CATALOGUE -- single edit point. Append an entry to add a
   // model; the selection menu rebuilds itself from this table.
   // ==================================================================
-  // The 18 non-asset files every Mage-Flow repo ships. All six repos share
-  // ONE layout, so the list is named once here and reused by each entry
-  // below; pinning it skips the ~20 sample images under assets/.
-  static const std::vector<std::string> kMageFlowFiles = {
-      "model_index.json",
-      "transformer/config.json",
-      "transformer/diffusion_pytorch_model.safetensors",
-      "vae/config.json",
-      "vae/diffusion_pytorch_model.safetensors",
-      "text_encoder/config.json",
-      "text_encoder/generation_config.json",
-      "text_encoder/model.safetensors.index.json",
-      "text_encoder/model-00001-of-00002.safetensors",
-      "text_encoder/model-00002-of-00002.safetensors",
-      "text_encoder/tokenizer.json",
-      "text_encoder/tokenizer_config.json",
-      "text_encoder/vocab.json",
-      "text_encoder/merges.txt",
-      "text_encoder/chat_template.json",
-      "text_encoder/preprocessor_config.json",
-      "text_encoder/video_preprocessor_config.json",
-      "scheduler/scheduler_config.json"};
 
   // The Wan2.2-I2V-A14B (diffusers) files. `assets/` is the README's
   // showcase art and is skipped; everything else is load-bearing, and the
@@ -298,6 +288,17 @@ builtin_catalog_()
      .variant = "MLX 4-bit (lmstudio-community)",
      .hf_path = "lmstudio-community/Qwen3.8-27B-MLX-4bit",
      .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // The same 27B pre-quantized OptiQ, as the 3.6 OptiQ pack below:
+    // mixed 4/8-bit per linear over a group-64 affine base, 4 shards
+    // (19.4 GB) plus the OptiQ companions in optiq/ -- mtp.safetensors,
+    // the MTP draft head text-chat decodes with (its `mtp`, on by
+    // default), and optiq_vision.safetensors, the vision tower. A
+    // whole-repo fetch (no `files`), so the recursive tree walk brings
+    // the subdir along. 20.7 GB in all.
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "MLX OptiQ 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-27B-OptiQ-4bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
     // GGUF. The repo ships ~23 quantization points plus two projectors,
     // so the entry pins ONE quant and the projector rather than pulling
     // all of them.
@@ -312,33 +313,111 @@ builtin_catalog_()
     // costs one register conversion at LOAD and then runs at 16-bit
     // width; nothing widens to f32.
     //
-    // Two quantization points, one row each. Q4_K_M is all k-quant
-    // (Q4_K 294 / Q5_K 48 / Q6_K 67) and passes through raw; Q8_0 is
-    // repacked to affine 8-bit group 64, the only affine shape the metal
-    // Qwen accepts (see GgufQwen35Converter). Both share the projector.
+    // ONE quantization point: Q8_0, repacked to affine 8-bit group 64,
+    // the only affine shape the metal Qwen accepts (see
+    // GgufQwen35Converter). There was a Q4_K_M row too, all k-quant
+    // (Q4_K 294 / Q5_K 48 / Q6_K 67, passed through raw); unsloth deleted
+    // that file on 2026-08-19 (commit e1d8a267) and every fetch of the
+    // row failed. Its successor, UD-Q4_K_M, mixes in IQ4_XS, IQ4_NL and
+    // IQ3_S, which the loader refuses, so nothing replaced it.
     //
-    // Both land in the SAME directory (<base>/unsloth/Qwen3.8-27B-GGUF),
-    // so a caller that fetches both and then points hf_dir at the
-    // directory gets whichever sorts first -- Q4_K_M. Name the .gguf to
-    // pick: hf_dir accepts a file.
-    //
-    // MEASURED, both against the same 27B quantized from the bf16
-    // original to w8g64, layer-0 residual / final-layer residual:
-    // Q8_0 4.3e-03 / 3.9e-02, Q4_K_M 1.1e-02 / 5.2e-02 at layer 32.
-    // Q8_0 costs 29 GB against Q4_K_M's 17 GB, and its requant to
-    // group 64 (Q8_0's own block is 32) puts it ~1.4x above the Q8_0
-    // floor -- so it is the accuracy option, not the free one.
-    {.family = "Qwen", .version = "3.8", .param_class = "27B",
-     .variant = "Q4_K_M GGUF +mmproj (unsloth)",
-     .hf_path = "unsloth/Qwen3.8-27B-GGUF", .model_type = "qwen3.5",
-     .files = {"Qwen3.8-27B-Q4_K_M.gguf",  // main quant
-               "mmproj-F16.gguf"},         // F16 multimodal projector
-     .needs_tokenizer_json = false},
+    // MEASURED against the same 27B quantized from the bf16 original to
+    // w8g64, layer-0 residual / final-layer residual: Q8_0 4.3e-03 /
+    // 3.9e-02 (the old Q4_K_M 1.1e-02 / 5.2e-02 at layer 32). Q8_0 is
+    // 29 GB, and its requant to group 64 (Q8_0's own block is 32) puts
+    // it ~1.4x above the Q8_0 floor.
     {.family = "Qwen", .version = "3.8", .param_class = "27B",
      .variant = "Q8_0 GGUF +mmproj (unsloth)",
      .hf_path = "unsloth/Qwen3.8-27B-GGUF", .model_type = "qwen3.5",
      .files = {"Qwen3.8-27B-Q8_0.gguf",    // main quant
                "mmproj-F16.gguf"},         // F16 multimodal projector
+     .needs_tokenizer_json = false},
+    // ---- LFM3-VL (Liquid AI, LFM Open License v1.0) ---------------------
+    //
+    // A 1.73B LFM3 language model -- 13 gated short convolutions, 5
+    // sliding-window and 6 global attention layers -- under a 164M vision
+    // tower of gated 3x3 convolutions and bidirectional attention, a token
+    // a 32 x 32 pixel block (generative-models/lfm3/). BF16, run at F16.
+    // The repo's Python (trust_remote_code) is not fetched: nothing here
+    // runs it. 3.8 GB.
+    {.family = "LFM", .version = "3-VL", .param_class = "2B",
+     .variant = "BF16 (Liquid AI)",
+     .hf_path = "LiquidAI/LFM3-VL-2B", .model_type = "lfm3-vl",
+     .files = {"config.json", "generation_config.json",
+               "chat_template.jinja", "processor_config.json",
+               "tokenizer.json", "tokenizer_config.json",
+               "model.safetensors", "LICENSE"},
+     .needs_tokenizer_json = true},
+    // ---- Ternary-Bonsai (Prism ML, Apache-2.0) --------------------------
+    //
+    // Ternary trainings of the Qwen hybrids: every language projection,
+    // the table and the head {-1, 0, +1} x an F16 scale per 128, run on
+    // the 2-bit group-128 affine kernels (a trit is code q - 1: scale s,
+    // bias -s). Bonsai 1 (Qwen3.6-27B) is an MLX pack, its tower dense in
+    // the file. Bonsai 2 (Qwen3.8-27B) is a GGUF in two packings of the
+    // SAME values (every tensor dequantizes identically): PTQ1_0, dense
+    // trits (5.9 GB), and PQ2_0, a trit a 2-bit slot (7.2 GB) -- both held
+    // at 2.25 bits a weight once loaded, so PTQ1_0 is the smaller fetch
+    // for the same model. Its projections were trained on a Hadamard-
+    // ROTATED input (the file's prism.hadamard metadata; GgufQwen35
+    // Converter checks it, MetalQwenModel rotates). The tower is the
+    // mmproj beside it, BF16 pinned (Q8_0 also reads). Run at f16: the
+    // scales are F16 (docs/BONSAI.md).
+    {.family = "Ternary-Bonsai", .version = "1", .param_class = "27B",
+     .variant = "MLX 2-bit ternary (prism-ml)",
+     .hf_path = "prism-ml/Ternary-Bonsai-27B-mlx-2bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    {.family = "Ternary-Bonsai", .version = "2", .param_class = "27B",
+     .variant = "PTQ1_0 GGUF +mmproj (prism-ml)",
+     .hf_path = "prism-ml/Ternary-Bonsai-2-27B-gguf", .model_type = "qwen3.5",
+     .files = {"Ternary-Bonsai-2-27B-PTQ1_0.gguf",
+               "Ternary-Bonsai-2-27B-mmproj-BF16.gguf"},
+     .needs_tokenizer_json = false},
+    {.family = "Ternary-Bonsai", .version = "2", .param_class = "27B",
+     .variant = "PQ2_0 GGUF +mmproj (prism-ml)",
+     .hf_path = "prism-ml/Ternary-Bonsai-2-27B-gguf", .model_type = "qwen3.5",
+     .files = {"Ternary-Bonsai-2-27B-PQ2_0.gguf",
+               "Ternary-Bonsai-2-27B-mmproj-BF16.gguf"},
+     .needs_tokenizer_json = false},
+    // mlx-community's plain 4-bit conversion: uniform group-affine like the
+    // lmstudio one above (no MTP head; the tower in the shards). It is the
+    // target the DFlash 2 drafter below was published against.
+    {.family = "Qwen", .version = "3.8", .param_class = "27B",
+     .variant = "MLX 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-27B-4bit",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // ---- DFlash block drafters (speculative decoding) -------------------
+    //
+    // Not models of their own: a drafter has no embedding and no head; it
+    // borrows both from its target and conditions on the target's hidden
+    // states (shared/dflash-drafter.h). text-chat's `draft_model` names
+    // one. Each is trained for ONE target -- the parent row below -- and
+    // attaching it elsewhere is refused at load (layer count, width,
+    // vocabulary are checked).
+    //
+    // DFlash 2 (Inco AI): five layers, a 2B-parameter bf16 checkpoint
+    // (3.8 GB; held at w8 or w4 in memory by default), drafting 7 tokens a
+    // block along one candidate path. z-lab/Qwen3.8-27B-DFlash2 is the same
+    // checkpoint mirrored.
+    {.family = "DFlash", .version = "2", .param_class = "27B",
+     .variant = "drafter for Qwen3.8-27B (incoai)",
+     .hf_path = "incoai/Qwen3.8-27B-DFlash2", .model_type = "dflash2",
+     .parent_model_type = "qwen3.5", .parent_param_class = "27B",
+     .needs_tokenizer_json = false},
+    // DFlash 2 for Qwen3.8-Flash-Next (Inco AI): the same five-layer shape
+    // at the target's width (2560), every layer a 2048-token window,
+    // block 8 -- 1.2 GB bf16. It conditions on the target's layers 5 / 15
+    // / 25 / 35 / 45, each averaged over the four hyper-connection streams.
+    {.family = "DFlash", .version = "2", .param_class = "Flash-Next",
+     .variant = "drafter for Qwen3.8-Flash-Next (incoai)",
+     .hf_path = "incoai/Qwen3.8-Flash-Next-DFlash2", .model_type = "dflash2",
+     .parent_model_type = "qwen3.8-flash", .parent_param_class = "Flash-Next",
+     .needs_tokenizer_json = false},
+    // DFlash (z-lab): six layers, block 16, for Qwen3.5-4B.
+    {.family = "DFlash", .version = "1", .param_class = "4B",
+     .variant = "drafter for Qwen3.5-4B (z-lab)",
+     .hf_path = "z-lab/Qwen3.5-4B-DFlash", .model_type = "dflash",
+     .parent_model_type = "qwen3.5", .parent_param_class = "4B",
      .needs_tokenizer_json = false},
     // Qwen3.6-27B: a Qwen3.5-family hybrid VLM (model_type "qwen3_5",
     // full-attn + gated-DeltaNet, 64 layers, hidden 5120). bf16 source
@@ -361,6 +440,105 @@ builtin_catalog_()
      .variant = "MLX OptiQ 4-bit (mlx-community)",
      .hf_path = "mlx-community/Qwen3.6-27B-OptiQ-4bit",
      .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // Qwen3.8-Flash-Next (model_type qwen4_exp, ~180B stored, ~6B active):
+    // the Qwen3.5-MoE backbone (36 gated-DeltaNet + 12 gated full-
+    // attention layers, 512 routed experts top-10) under HYPER-CONNECTIONS
+    // (4 residual streams), with a hashed 2/3-gram embedding (a 51B-
+    // parameter table, read by row) on one layer and a token indexer on
+    // the full layers (metal-qwen-hc.cc). The MLX oQ5e pack: experts w5,
+    // the rest 5/6/8-bit (re-encoded to w8 at load), 128.5 GB. On a box
+    // smaller than that the routed experts run from a cache and the n-gram
+    // table from disk. Abliterated; Qwen Community License 1.0.
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX oQ5e uncensored, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-Uncensored-oQ5e-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // The same model in mlx-community's other packs. The loader reads any
+    // MLX affine layout of it: projections re-encoded to w8 at group 64, or
+    // 32 where a pack uses 32 (the plain 4-bit packs, ~1.8x their bytes on
+    // disk once held, which the plan books); routers dense or quantized;
+    // experts 4 / 5 / 6 / 8-bit at group 32 or 64; modules a pack left
+    // unquantized run dense. Not the 2- / 3-bit-expert packs (OptiQ-2bit,
+    // third parties' 3-bit), which the load refuses by name. 4-bit, group
+    // 32, its MTP head grafted in bf16 (113 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX 4-bit, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-4bit-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // ...without the MTP head (111.5 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-4bit",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // oQ at 6 bits: experts w6 g64, the rest 6 / 8-bit (150.5 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX oQ6e, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-oQ6e-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // oQ at 8 bits: experts w8 g64 (194.9 GB):
+    {.family = "Qwen", .version = "3.8", .param_class = "Flash-Next",
+     .variant = "MLX oQ8e, MTP (mlx-community)",
+     .hf_path = "mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp",
+     .model_type = "qwen3.8-flash", .needs_tokenizer_json = false},
+    // DeepSeek-V4.1-Flash (model_type deepseek_v41; 552B backbone, 8B / 16B
+    // active in prefill / decode): hyper-connections, compressed sparse
+    // attention with a two-level indexer, engram n-gram tables (read by
+    // row), 384 FP4 experts a layer (289 GB, run from a cache on any box
+    // smaller than the model), the FP8 projections held as stored. MIT.
+    // oMLX's oQ4e pack of the 1017 update first (432 GB): that release's
+    // FP4 experts and FP8 projections (MXFP4 / MXFP8, the same codes), the
+    // n-gram tables affine at 4 bits (123 GB against 203).
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ4e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    // oQ below 4 bits: the backbone's experts requantized to MLX's affine
+    // codes in groups of 64 -- 2 bits (oQ2e: 170 GB of experts, every one
+    // resident on a 256 GB box), 2 and 3 by layer (oQ2.5e: 199 GB), 3
+    // (oQ3e: 238 GB) -- and its FP8 projections to affine 4-8 bits; the
+    // DSpark head as oQ4e's. 313 / 343 / 380 GB.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2.5e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ3e, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ3e-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    // Each pack's -ngram twin: the n-gram tables in the release's FP8 (203
+    // GB against 123; read by row, never resident): 393 / 423 / 460 / 512
+    // GB.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ2.5e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ3e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ3e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, MLX oQ4e, FP8 n-gram, MTP (mlx-community)",
+     .hf_path = "mlx-community/DeepSeek-V4.1-Flash-1017-oQ4e-ngram-mtp",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    // The releases as DeepSeek published them (FP8 n-gram tables): 510 GB
+    // each. 1017 is a minor update of the weights alone -- its code,
+    // config and tokenizer are the first release's, byte for byte.
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "1017, FP8 / FP4 (deepseek-ai)",
+     .hf_path = "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
+    {.family = "DeepSeek", .version = "4.1", .param_class = "Flash",
+     .variant = "FP8 / FP4 (deepseek-ai)",
+     .hf_path = "deepseek-ai/DeepSeek-V4.1-Flash",
+     .model_type = "deepseek-v4.1", .needs_tokenizer_json = false},
     // Qwen3.6-35B-A3B: a Qwen3.5-family MoE (SparseMoeBlock: routed experts +
     // shared expert, model_type "qwen3_5"). bf16 source (~70 GB) -- whole-repo
     // fetch; quantize with model-quantize (4-bit AWQ + on-device auto-calib;
@@ -470,6 +648,15 @@ builtin_catalog_()
      .variant = "ASR MLX 8-bit (mlx-community)",
      .hf_path = "mlx-community/Qwen3-ASR-0.6B-8bit",
      .model_type = "qwen3-asr", .needs_tokenizer_json = true},
+    // Ministral-3 14B Instruct (Mistral, Apache-2.0): a dense 40-layer
+    // decoder with YaRN RoPE and the Pixtral vision tower, run on the
+    // metal Qwen dense path. The repo's model.safetensors.index.json is
+    // the FP8 upstream's (four shards that are not there); the loader
+    // reads the two 4-bit shards it does carry. 8.4 GB.
+    {.family = "Ministral", .version = "3", .param_class = "14B",
+     .variant = "MLX 4-bit (mlx-community)",
+     .hf_path = "mlx-community/Ministral-3-14B-Instruct-2512-4bit",
+     .model_type = "mistral3", .needs_tokenizer_json = false},
     {.family = "Gemma", .version = "4", .param_class = "E4B",
      .variant = "MLX 4-bit (mlx-community)",
      .hf_path = "mlx-community/gemma-4-e4b-it-4bit",
@@ -539,13 +726,31 @@ builtin_catalog_()
      .variant = "MLX 8-bit (mlx-community)",
      .hf_path = "mlx-community/MOSS-TTS-8B-8bit",
      .model_type = "moss-tts", .needs_tokenizer_json = false},
+    // MOSS-TTS-v1.5: the same delay-pattern 8B, continued from MOSS-TTS
+    // 1.0 -- stronger multilingual synthesis when the language is named
+    // (the stage's `language`), steadier voice cloning, inline
+    // "[pause 3.2s]" markers, and a text normalizer its processor runs on
+    // every input (the stage detects the script and runs the same). Runs
+    // as published: the stage holds the bf16 backbone as w8 in memory by
+    // default and streams its layers on a box that cannot hold even that.
+    // prepare-moss-tts-v1.5 also writes a w8 pack (model-quantize, bits 8),
+    // byte-identical to that in-memory build and streamed at half the
+    // bytes -- the one to point a 16 GB box at.
+    // Uses the 24 kHz MOSS-Audio-Tokenizer below. A whole-repo fetch: the
+    // normalizer script is how the stage knows to normalize, and nothing
+    // else in the repo is large.
+    {.family = "MOSS", .version = "TTS", .param_class = "v1.5 8B",
+     .variant = "bf16 (OpenMOSS-Team)",
+     .hf_path = "OpenMOSS-Team/MOSS-TTS-v1.5",
+     .model_type = "moss-tts", .needs_tokenizer_json = false},
     {.family = "MOSS", .version = "Audio-Tokenizer", .param_class = "codec",
      .variant = "F32 (OpenMOSS-Team)",
      .hf_path = "OpenMOSS-Team/MOSS-Audio-Tokenizer",
      .model_type = "moss-codec", .needs_tokenizer_json = false},
-    // MOSS-TTS-Local-v1.5: the text-to-speech stage's v1.5 LM (hf_dir,
-    // model_type "moss-tts-local"; quantize it with model-quantize before
-    // use) + its 48 kHz stereo codec (codec_dir, "moss-codec-v2"). The
+    // MOSS-TTS-Local-v1.5: the text-to-speech stage's Local LM (hf_dir,
+    // model_type "moss-tts-local"; runs as published -- the stage holds
+    // the bf16 backbone as w8 in memory -- or after model-quantize) + its
+    // 48 kHz stereo codec (codec_dir, "moss-codec-v2"). The
     // text-to-speech stage auto-detects this variant from config.json.
     {.family = "MOSS", .version = "TTS-Local", .param_class = "v1.5",
      .variant = "bf16 (OpenMOSS-Team)",
@@ -568,6 +773,178 @@ builtin_catalog_()
      .variant = "bf16 (OpenMOSS-Team)",
      .hf_path = "OpenMOSS-Team/MOSS-TTS-Realtime",
      .model_type = "moss-tts-realtime", .needs_tokenizer_json = false},
+    // ---- Fish Audio Drama 3 (text-to-speech: speech LM + its codec) ---
+    // The text-to-speech stage's hf_dir (model_type "fish-drama3"; the
+    // stage reads config.json's "fish_omni"). ONE repo: a Qwen3.5-35B-A3B
+    // backbone (routed experts block-FP8, the rest bf16; run as published,
+    // ~36 GB held -- a 64 GB box), a 13-layer codebook tower, and the
+    // 44.1 kHz modded-DAC codec as codec.pth beside them, so no codec_dir.
+    // Speaker tags <|speaker:N|> and inline cues in the text; voice cloning
+    // from a reference clip + its transcript. FISH AUDIO COMMUNITY LICENSE:
+    // research / non-commercial use, commercial only under USD 500k annual
+    // revenue, and no hosted TTS service without Fish Audio's licence.
+    // PINNED to the files the stage reads. RE-SHARDED upstream on
+    // 2026-10-29 (commit 256faf59, the eight shards removed in 0a52d99b):
+    // fifteen shards of the same 62,245 tensors, 39,594,895,616 bytes and
+    // config -- the pins followed. A copy fetched before keeps its eight,
+    // read through its own index; fetched again over it, the eight stay
+    // beside the fifteen, and the plan weighs only what the index names
+    // (dir_weights_bytes).
+    {.family = "Fish Audio", .version = "Drama 3", .param_class = "35B-A3B",
+     .variant = "FP8 experts + bf16 (fishaudio)",
+     .hf_path = "fishaudio/drama-3",
+     .model_type = "fish-drama3",
+     .files = {"config.json", "model.safetensors.index.json",
+               "model-00001-of-00015.safetensors",
+               "model-00002-of-00015.safetensors",
+               "model-00003-of-00015.safetensors",
+               "model-00004-of-00015.safetensors",
+               "model-00005-of-00015.safetensors",
+               "model-00006-of-00015.safetensors",
+               "model-00007-of-00015.safetensors",
+               "model-00008-of-00015.safetensors",
+               "model-00009-of-00015.safetensors",
+               "model-00010-of-00015.safetensors",
+               "model-00011-of-00015.safetensors",
+               "model-00012-of-00015.safetensors",
+               "model-00013-of-00015.safetensors",
+               "model-00014-of-00015.safetensors",
+               "model-00015-of-00015.safetensors",
+               "tokenizer.json", "tokenizer_config.json",
+               "special_tokens_map.json", "chat_template.jinja",
+               "codec.pth", "LICENSE", "README.md"},
+     .needs_tokenizer_json = false},
+    // The same model at int4 (Fish Audio's repo, quantized by a community
+    // contributor: GPTQ format, symmetric, group 128, RTN + clip search):
+    // the routed experts and the attention / gated-DeltaNet projections
+    // int4, the rest bf16. ~22 GB held -- the one to point a 32 GB box at.
+    // The stage reads it natively: the experts become its affine w4 MoE
+    // slabs, exactly; the int4 projections are dequantized to bf16. Same
+    // licence. PINNED: the repo also carries its evaluation clips, a demo
+    // video and its quantization scripts.
+    {.family = "Fish Audio", .version = "Drama 3", .param_class = "35B-A3B",
+     .variant = "GPTQ int4 (fishaudio)",
+     .hf_path = "fishaudio/drama-3-int4",
+     .model_type = "fish-drama3",
+     .files = {"config.json", "model.safetensors.index.json",
+               "model-00001-of-00012.safetensors",
+               "model-00002-of-00012.safetensors",
+               "model-00003-of-00012.safetensors",
+               "model-00004-of-00012.safetensors",
+               "model-00005-of-00012.safetensors",
+               "model-00006-of-00012.safetensors",
+               "model-00007-of-00012.safetensors",
+               "model-00008-of-00012.safetensors",
+               "model-00009-of-00012.safetensors",
+               "model-00010-of-00012.safetensors",
+               "model-00011-of-00012.safetensors",
+               "model-00012-of-00012.safetensors",
+               "tokenizer.json", "tokenizer_config.json",
+               "special_tokens_map.json", "chat_template.jinja",
+               "codec.pth", "LICENSE", "README.md"},
+     .needs_tokenizer_json = false},
+    // ---- YuE2 (text-to-music: AR-NAR LM + Oobleck VAE) ---------------
+    // The generate-audio stage's hf_dir (model_type "yue2"): one 3.6B bf16
+    // checkpoint that plans an ABC score, writes a semantic token per 25 Hz
+    // frame and flow-matches them to 64-wide VAE latents. Weights are
+    // CC BY-NC 4.0. PINNED: the repo also carries demo audio, figures and
+    // the reference's Python wheels, none of which runs here.
+    {.family = "YuE", .version = "2", .param_class = "3B",
+     .variant = "bf16 (m-a-p)",
+     .hf_path = "m-a-p/YuE2-3B",
+     .model_type = "yue2",
+     .files = {"config.json", "generation_config.json",
+               "yue2_generation_config.json", "model.safetensors",
+               "qwen.tiktoken", "examples/tonight-awake.json", "LICENSE"},
+     .needs_tokenizer_json = false},
+    // Its two 48 kHz stereo decoders, for audio-vae-decode: the standard
+    // one (better perceptual quality, the release default) and the legacy
+    // one the paper's benchmarks used. One latent space; either serves.
+    {.family = "YuE", .version = "2-Vae", .param_class = "VAE",
+     .variant = "F32 standard (m-a-p)",
+     .hf_path = "m-a-p/YuE2-Vae",
+     .model_type = "yue2-vae",
+     .files = {"config.json", "model.safetensors", "LICENSE"},
+     .needs_tokenizer_json = false},
+    {.family = "YuE", .version = "2-Vae", .param_class = "VAE",
+     .variant = "F32 legacy (m-a-p)",
+     .hf_path = "m-a-p/YuE2-Vae-legacy",
+     .model_type = "yue2-vae",
+     .files = {"config.json", "model.safetensors", "LICENSE"},
+     .needs_tokenizer_json = false},
+    // ---- MiniMax-Music3 (text-to-music: LM + depth decoder + DiT) ----
+    // The generate-audio stage's hf_dir (model_type "minimax-music3"): a
+    // Qwen3-8B LM and a 0.6B depth decoder pick a frame's eight RVQ codes
+    // at 25 Hz, a 2.4B DiT flow-matches 128-wide latents from their hidden
+    // states, and the repo's own DAC vocoder (audio-vae-decode, the same
+    // hf_dir) decodes them to 44.1 kHz stereo. PINNED to the diffusers
+    // layout (28.6 GB): the repo also carries the original layout's files
+    // (qwen_7B/, dav.pth, flowmatching_vae.pth -- the same weights again),
+    // demo audio and figures. MiniMax-Music3 Community License: commercial
+    // use must display "MiniMax-Music3"; past USD 20M a year, MiniMax's
+    // written authorization.
+    {.family = "MiniMax", .version = "Music3", .param_class = "11B",
+     .variant = "diffusers (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-Music3",
+     .model_type = "minimax-music3",
+     .files = {"config.json", "modular_model_index.json", "LICENSE",
+               "README.md",
+               "condition_encoder/config.json",
+               "condition_encoder/diffusion_pytorch_model.safetensors",
+               "language_model/config.json",
+               "language_model/generation_config.json",
+               "language_model/model.safetensors.index.json",
+               "language_model/model-00001-of-00004.safetensors",
+               "language_model/model-00002-of-00004.safetensors",
+               "language_model/model-00003-of-00004.safetensors",
+               "language_model/model-00004-of-00004.safetensors",
+               "rvq_depth_decoder/config.json",
+               "rvq_depth_decoder/diffusion_pytorch_model.safetensors",
+               "scheduler/scheduler_config.json",
+               "tokenizer/chat_template.jinja", "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "vocoder/config.json",
+               "vocoder/diffusion_pytorch_model.safetensors"},
+     .needs_tokenizer_json = false},
+    // ---- BS-RoFormer (music source separation) -----------------------
+    // The audio-separate stage's hf_dir (model_type "bs-roformer"): an
+    // MSST checkpoint -- a torch .ckpt beside the YAML describing it.
+    // pcunwa publishes the "Resurrection" pair from ONE repository, a
+    // vocals model and an instrumental one side by side, so each entry
+    // pins its own two files and registers under its own key: the
+    // download directory is shared and the record says which model it
+    // is. 51M parameters, f32 on disk (204 MB), held f16.
+    //
+    // NO LICENSE: the repository carries no model card and no license
+    // tag (checked 2025-07-31 / 2026-10-15). It is catalogued so it can
+    // be fetched; nothing of it ships with vpipe.
+    {.family = "BS-RoFormer", .version = "Resurrection",
+     .param_class = "51M", .variant = "vocals (pcunwa, no license)",
+     .hf_path = "pcunwa/BS-Roformer-Resurrection",
+     .model_type = "bs-roformer",
+     .files = {"BS-Roformer-Resurrection.ckpt",
+               "BS-Roformer-Resurrection-Config.yaml"},
+     .needs_tokenizer_json = false,
+     .name = "pcunwa/BS-Roformer-Resurrection-vocals"},
+    // The instrumental twin: its target is the accompaniment ("other"),
+    // at hop 441 and 1700-frame chunks where the vocals model has 512
+    // and 1536 -- so its `stem` port is the instrumental and its
+    // `residual` the vocals.
+    {.family = "BS-RoFormer", .version = "Resurrection",
+     .param_class = "51M",
+     .variant = "instrumental (pcunwa, no license)",
+     .hf_path = "pcunwa/BS-Roformer-Resurrection",
+     .model_type = "bs-roformer",
+     .files = {"BS-Roformer-Resurrection-Inst.ckpt",
+               "BS-Roformer-Resurrection-Inst-Config.yaml"},
+     .needs_tokenizer_json = false,
+     .name = "pcunwa/BS-Roformer-Resurrection-inst"},
     // ---- Krea (text-to-image diffusion) ------------------------------
     // Krea-2-Turbo: a flow-matching (rectified-flow) text-to-image model,
     // model_type "krea2". Diffusers-layout repo with per-component
@@ -691,6 +1068,84 @@ builtin_catalog_()
                "krea2_identity_edit_v1_2_r128.safetensors",
                "krea2_identity_edit_v1_2_r64.safetensors"},
      .needs_tokenizer_json = false},
+    // A tiny autoencoder for LIVE PREVIEWS on generate-image's `preview`
+    // port (named on krea2-model-config's `preview_vae`). madebyollin's
+    // `taew2_1` is trained on the Wan 2.1 latent space, which is Krea-2's:
+    // its Qwen-Image VAE keeps Wan 2.1's ENCODER (and its latents_mean /
+    // latents_std) and retrained only the decoder. The taehv README names
+    // it as Qwen-Image's TAE. Published in a GitHub repo, so fetched by URL
+    // into the same `madebyollin/taehv/` directory as `taeh3`; the pinned
+    // file is what tells the two apart there.
+    {.family = "Krea", .version = "2", .param_class = "TAE",
+     .variant = "taew2_1 temporal preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taehv",
+     .model_type = "krea2-tae",
+     .parent_model_type = "krea2",
+     .files = {"taew2_1.safetensors"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/madebyollin/taehv/main/"
+           "safetensors/taew2_1.safetensors",
+           "taew2_1.safetensors"}}),
+     .name = "madebyollin/taew2_1"},
+    // Krea2-HD VAE (wikeeyang): the Qwen-Image VAE fine-tuned alongside a
+    // Krea-2-Turbo HD fine-tune of the DiT, and published as a
+    // STANDALONE VAE -- one 507 MB safetensors carrying the full
+    // autoencoder (decoder, encoder and both quant convs). It is a drop-in
+    // for the stock `vae/` of any model on this latent space (the
+    // publisher names Qwen-Image and Wan 2.1); the DiT beside it in the
+    // repo is a separate model and is NOT pinned here.
+    //
+    // MEASURED against krea/Krea-2-Turbo's own VAE, tensor for tensor:
+    // the DECODER is heavily retrained (median rel-L2 0.83) while the
+    // ENCODER is barely touched (median 0.010, cosine 0.999999 on all 84
+    // tensors). So it is a decoder fine-tune that ships its encoder along
+    // -- worth selecting for vae-decode, ~neutral for vae-encode.
+    //
+    // TWO THINGS THIS ENTRY HAS TO CARRY. The weights are NATIVELY named
+    // (decoder.upsamples.4.residual.2 rather than
+    // decoder.up_blocks.1.resnets.0.conv1); the VAE loader maps them,
+    // see generative-models/shared/wan-vae-names.h. And the repo ships no
+    // config.json at all, so the per-channel `latents_mean`/`latents_std`
+    // that un-whiten a latent come from a companion -- which is the right
+    // source rather than a convenience: a drop-in replacement is a claim
+    // about a LATENT SPACE, and guessing those numbers here would decode
+    // plausible, wrongly-graded pixels.
+    //
+    // THE COMPANION IS THE FALLBACK, NOT THE PRIMARY ROUTE. A box that
+    // already holds the model this VAE serves already holds the file:
+    // resolve_vae_config_path borrows that model's vae/config.json in
+    // place, and nothing is downloaded or copied. The companion is for
+    // the other case -- somebody fetching the VAE on its own.
+    //
+    // AND IT COMES FROM Qwen/Qwen-Image, NOT FROM KREA-2, BECAUSE OF THE
+    // GATE. This VAE is ungated, so nobody fetching it has
+    // any reason to hold a Krea-2 licence token -- and krea/Krea-2-Turbo
+    // answers an anonymous request with 401. Pointing an ungated 507 MB
+    // download at a gated repo makes it fail for everyone who has not
+    // separately accepted a licence for a model they are not fetching,
+    // and it fails LATE: the weights land, the companion warns, and the
+    // decode stage goes inert with a message about latents_mean.
+    //
+    // Qwen-Image is also the better authority on its own terms. The
+    // publisher's claim is that this VAE serves "any model that used
+    // Qwen-Image / Wan 2.1 VAE", so the latent space is Qwen-Image's;
+    // Krea-2's own vae/config.json records `_name_or_path:
+    // "Qwen/Qwen-Image"` and is a copy of it. VERIFIED byte for byte on
+    // every field this tree reads -- _class_name, z_dim, base_dim,
+    // num_res_blocks and all 16 entries of latents_mean / latents_std
+    // are identical; the two differ only in _diffusers_version, an
+    // unread `input_channels`, and that _name_or_path.
+    {.family = "Krea", .version = "2", .param_class = "VAE",
+     .variant = "HD fine-tuned VAE (wikeeyang)",
+     .hf_path = "wikeeyang/Krea2-Turbo-HD-V1",
+     .model_type = "krea2-vae",
+     .parent_model_type = "krea2",   // any model on the Qwen-Image latent
+     .files = {"Krea2-HD-vae.safetensors"},
+     .companion_files = {{.repo = "Qwen/Qwen-Image",
+                          .file = "vae/config.json",
+                          .dest = "config.json"}},
+     .needs_tokenizer_json = false},
     // ---- Qwen-Image (text+image -> image editing diffusion) -----------
     // Qwen-Image-Edit-2511 (Qwen): a flow-matching multi-reference IMAGE
     // EDIT model, model_type "qwen-image-edit". Same diffusers split-stage
@@ -743,6 +1198,410 @@ builtin_catalog_()
                "processor/preprocessor_config.json",
                "processor/chat_template.jinja",
                "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // Qwen-Image-2512 (Qwen): the TEXT-TO-IMAGE sibling of Edit-2511 and
+    // architecturally the same model. VERIFIED against it tensor by
+    // tensor over HTTP Range, not inferred from the config: the DiT is
+    // 1933 tensors with identical names, dtypes and shapes (40.86 GB) and
+    // the text encoder 729 (16.58 GB); text_encoder/, vae/ and scheduler/
+    // configs are identical files. The transformer config differs in ONE
+    // key, and it differs correctly -- Edit-2511 sets `zero_cond_t` true,
+    // 2512 omits it, and that flag modulates REFERENCE tokens at timestep
+    // 0, which a model with no references does not have. So the DiT, the
+    // VAE and the encoder load it with nothing new.
+    //
+    // WHAT IS NOT SHARED IS THE RECIPE, which is why this carries its own
+    // model_type instead of joining "qwen-image-edit". The two are
+    // separate diffusers pipelines -- QwenImagePipeline here against
+    // QwenImageEditPlusPipeline there -- and they condition through
+    // DIFFERENT system prompts: the plain "Describe the image by
+    // detailing ..." template (the one kPrefix / kDropPrefix already hold
+    // for Krea-2) against the edit template that opens
+    // "Describe the key features of the input image". Typing this as the
+    // edit model would load and run and quietly condition it on the wrong
+    // prompt, which is the failure nothing downstream can see.
+    //
+    // The conditioner reads that recipe from the registry's model_type
+    // (this field) or, for an unregistered directory, from the pipeline
+    // model_index.json declares -- never from whether a reference image
+    // is wired, which would have flipped the EDIT model's own text-only
+    // conditioning and the golden that pins it.
+    //
+    // `needs_tokenizer_json` is TRUE because the repo ships no
+    // consolidated tokenizer.json, only tokenizer/{vocab.json,
+    // merges.txt, tokenizer_config.json}. The synthesis step now runs in
+    // whichever directory holds vocab.json, so it writes
+    // tokenizer/tokenizer.json here and the repo root for the ASR repos
+    // it was built for.
+    //
+    // No processor/ subdir here, unlike Edit-2511: a model that takes no
+    // reference image needs no image preprocessor, and the chat template
+    // sits in tokenizer/ instead. ~58 GB (20B DiT + 7B VL encoder, bf16).
+    {.family = "Qwen-Image", .version = "2512", .param_class = "20B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen-Image-2512",
+     .model_type = "qwen-image",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00004-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00005-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00006-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00007-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00008-of-00009.safetensors",
+               "transformer/diffusion_pytorch_model-00009-of-00009.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json",
+               "tokenizer/merges.txt",
+               "tokenizer/special_tokens_map.json",
+               "tokenizer/added_tokens.json",
+               "tokenizer/chat_template.jinja",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = true},
+    // Qwen-Image-2.1 (Qwen): one checkpoint that does BOTH text-to-image
+    // and reference editing, and the first model here whose VAE is
+    // natively RGBA. Despite the family name it shares almost nothing
+    // with Edit-2511 / 2512 above -- read the three sub-models before
+    // assuming any of that code applies.
+    //   transformer/  = QwenImage21Transformer2DModel, a 7B SINGLE-stream
+    //     DiT: 32 blocks, 32 heads x head_dim 128 = 4096 hidden, in/out
+    //     channels 64, patch_size 1 (latents are consumed UNPATCHED),
+    //     mlp_ratio 3 -> SwiGLU inner 12288, 3D-RoPE axes [16,56,56],
+    //     causal_condition true. 297 tensors, every one a `.weight`:
+    //     there is no bias anywhere in the model. Modulation is NOT per
+    //     block -- a single shared 4096->16384 projection produces four
+    //     4096-wide vectors (scale/gate for attention, scale/gate for
+    //     the feed-forward) that all 32 blocks slice, and the gates go
+    //     through tanh. Two mechanisms have no precedent in this tree:
+    //     attention is BLOCK-CAUSAL (the joint text/image sequence is
+    //     causal while each image block stays internally bidirectional),
+    //     and the text + condition-image prefix is KV-CACHED across
+    //     denoise steps -- which is only sound because causal_condition
+    //     modulates that prefix from t=0, making it step-independent.
+    //   text_encoder/ = Qwen3-VL 8B (Qwen3VLForConditionalGeneration, 36
+    //     layers, hidden 4096, 32 q-heads GQA kv=8, head_dim 128, ffn
+    //     12288, rope theta 5e6, UNTIED embeddings) wrapped as
+    //     `model.language_model.` / `model.visual.`, with a 27-layer
+    //     tower and deepstack taps [8,16,24]. That is the same encoder
+    //     Boogu-Image drives, in the same layout. Reference images are
+    //     fed to the tower and the DiT substitutes their VAE latents
+    //     into the vision slots the encoder reserved, so editing rides
+    //     the PROMPT sequence rather than appending tokens to the DiT
+    //     stream the way Edit-2511 does. Up to 10 references.
+    //   vae/          = AutoencoderKLQwenImage21: z_dim 64, 16x spatial
+    //     (dim_mult [1,2,4,8,8], five levels), in_channels AND
+    //     out_channels 4 -- RGBA -- and asymmetric, base_dim 96 for the
+    //     encoder against decoder_base_dim 144. is_residual adds a
+    //     parameter-free shortcut (group-average down, channel-repeat
+    //     up) around each block; it carries no weights of its own.
+    //     Stored F32.
+    // Transparency is prompt-driven, not a mode: the card's recommended
+    // wording ("This is an RGBA image with transparency ... the
+    // background is transparent") is what produces a populated alpha
+    // channel, and the VAE emits four channels either way.
+    // Native resolution is 2048x2048 and the size grid is 32, not 16 --
+    // the pipeline rounds the LATENT grid even, so a 16-multiple that is
+    // not a 32-multiple is silently re-rounded.
+    // `files` PINS the diffusers subfolders and processor/ (which holds
+    // the consolidated tokenizer.json, hence needs_tokenizer_json false
+    // and no tokenizer/ subdir at all), skipping only README/LICENSE.
+    // ~33 GB (7B DiT + 8B VL encoder, bf16; 1.35 GB VAE).
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "7B",
+     .variant = "bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen-Image-2.1",
+     .model_type = "qwen-image-21",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "processor/vocab.json",
+               "processor/merges.txt",
+               "processor/added_tokens.json",
+               "processor/special_tokens_map.json",
+               "processor/chat_template.jinja",
+               "processor/preprocessor_config.json",
+               "processor/video_preprocessor_config.json",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // Qwen-Image-2.1-Turbo (Qwen): the same 7B DiT, 8B VL encoder and RGBA
+    // VAE as the row above -- byte-identical configs, so the same family,
+    // the same code path and the same model_type -- with weights
+    // distilled to EIGHT denoising steps, text-to-image and editing both.
+    // What differs is all in the files, and each one changes behaviour:
+    //   model_index.json carries `sample_sigmas`, the 8 raw sigma nodes
+    //     (excluding the terminal 0) the distillation was trained on.
+    //     They ARE the schedule and the step count; diffusers'
+    //     QwenImage21Pipeline uses them unless a call passes `sigmas`, and
+    //     ignores num_inference_steps (diffusers PR #14950).
+    //   scheduler_config.json turns dynamic shifting OFF (shift 1.0,
+    //     shift_terminal null), so those nodes are used exactly as written:
+    //     no per-resolution mu, no terminal stretch. Running them through
+    //     the base model's shifted, stretched grid is a different sampler.
+    //   Guidance is CFG 1 (the pipeline default), and the prefix KV cache
+    //     is on, as for the base model.
+    //   Packing: the text encoder is ONE 17.5 GB model.safetensors (no
+    //     index), the VAE is stored bf16 (675 MB against the base's F32
+    //     1.35 GB), and processor/ is the transformers-5 layout --
+    //     tokenizer.json, tokenizer_config.json, chat_template.jinja and a
+    //     consolidated processor_config.json, with no vocab/merges or
+    //     separate (video_)preprocessor_config.json.
+    // Qwen Research License, like the base. `files` pins the diffusers
+    // subfolders and processor/, skipping README/LICENSE and the 40 MB of
+    // showcase assets. ~32 GB.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "7B",
+     .variant = "Turbo 8-step bf16 (Qwen)",
+     .hf_path = "Qwen/Qwen-Image-2.1-Turbo",
+     .model_type = "qwen-image-21",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = false},
+    // A tiny autoencoder for LIVE PREVIEWS of Qwen-Image-2.1
+    // (qwen-image-21-model-config's `preview_vae`): madebyollin's
+    // `taeqi2_1`, TAESD's 16x variant with a 2x2 pixel-shuffled head and
+    // RGBA out, like the model's own VAE. It reads the DiT's 64-channel
+    // latent as it stands, still whitened. Published only as a torch .pth
+    // in the taesd GitHub repo, so fetched by URL; the preview's resolver
+    // takes a .pth where an adapter field would not.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "TAE",
+     .variant = "taeqi2_1 RGBA preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taesd",
+     .model_type = "qwen-image-21-tae",
+     .parent_model_type = "qwen-image-21",
+     .files = {"taeqi2_1_decoder.pth"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/madebyollin/taesd/main/"
+           "taeqi2_1_decoder.pth",
+           "taeqi2_1_decoder.pth"}}),
+     .name = "madebyollin/taeqi2_1"},
+    // TAEQI2.1-Tinier: the same latent space and RGBA head at about a
+    // quarter of the parameters (2.0M in the decoder against 7.6M) -- its
+    // 256- and 128-wide stages are ConvNeXt-style SuperBlocks, a
+    // depthwise 7x7 and a 1x1 bottleneck. Published on the Hub beside the
+    // full TAE's .safetensors; the repo calls it slightly faster and
+    // slightly lower in quality. Named apart: the key above is the full
+    // TAE's.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "TAE",
+     .variant = "taeqi2_1_tinier RGBA preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taeqi2_1",
+     .model_type = "qwen-image-21-tae",
+     .parent_model_type = "qwen-image-21",
+     .files = {"taeqi2_1_tinier.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "madebyollin/taeqi2_1_tinier"},
+    // Qwen-Image-2.1's PROMPT REWRITERS: QwenLM's own instructions for
+    // turning a request into a prompt (text-to-image) or an edit
+    // instruction, for an assistant model to follow -- text, not weights,
+    // used by a host's prompt enhancer. Under the Qwen Research
+    // License: NON-COMMERCIAL use only, so a host fetches them on the
+    // user's request instead of shipping them; the LICENSE comes along.
+    // Published in the model's GitHub repo, so fetched by URL, PINNED to
+    // a commit: an instruction set that changed underneath would change
+    // every prompt written with it.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "prompt",
+     .variant = "prompt rewriters (QwenLM, non-commercial)",
+     .hf_path = "QwenLM/Qwen-Image-2.1",
+     .model_type = "qwen-image-21-rewriter",
+     .files = {"system_prompt_t2i.txt", "system_prompt_edit.txt",
+               "LICENSE"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/QwenLM/Qwen-Image-2.1/"
+           "7307809d2c9d582be700a1b9b04d393fc9cdf865/prompt_rewrite/"
+           "prompts/system_prompt_t2i.txt",
+           "system_prompt_t2i.txt"},
+          {"https://raw.githubusercontent.com/QwenLM/Qwen-Image-2.1/"
+           "7307809d2c9d582be700a1b9b04d393fc9cdf865/prompt_rewrite/"
+           "prompts/system_prompt_edit.txt",
+           "system_prompt_edit.txt"},
+          {"https://raw.githubusercontent.com/QwenLM/Qwen-Image-2.1/"
+           "7307809d2c9d582be700a1b9b04d393fc9cdf865/LICENSE",
+           "LICENSE"}}),
+     .name = "QwenLM/Qwen-Image-2.1-rewriters"},
+    // Viggle's few-step distillation of Qwen-Image-2.1, applied as a
+    // RUNTIME LoRA (qwen-image-21-model-config `lora`), with no CFG.
+    // The adapter reaches past the blocks -- the shared modulation and
+    // both timestep-embedder Linears carry factors too -- and the file
+    // is diffusers-keyed (`transformer.` prefix, `lora_A.weight`) with
+    // its alpha only in the `lora_adapter_metadata` JSON.
+    //
+    // SCHEDULE, and it is part of the adapter, not a preference: six
+    // steps on the RAW sigma nodes [1.0, 0.9375, 0.875, 0.75, 0.5,
+    // 0.25] -- the 4-step training grid with its first segment cut in
+    // three -- time-shifted per resolution like the default grid, and
+    // shift_terminal 0 where the base checkpoint's is 0.02. Put both
+    // (`sigmas`, `shift_terminal`) in the same model-config beat as the
+    // adapter, and guidance_scale 1. The low-noise nodes are the ones
+    // the student lands on; to change the step count, add or remove
+    // nodes at the high-noise end only.
+    //
+    // Both ranks are one adapter: r128 is r256 truncated, half the
+    // size, and what upstream's ComfyUI workflows load. The older v0.2
+    // and v0.1 files in the same repo are superseded and not listed.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "LoRA",
+     .variant = "viggle-turbo 6-step v0.2.1 r256 (Viggle)",
+     .hf_path = "Viggle/Qwen-Image-2.1-viggle-turbo",
+     .model_type = "qwen-image-21-lora",
+     .parent_model_type = "qwen-image-21",
+     .files = {"Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r256"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     // Two entries pin one file each out of one repo, so each needs its
+     // own registration key -- see the H3 Turbo entries.
+     .name = "Viggle/Qwen-Image-2.1-viggle-turbo-v0.2.1-r256"},
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "LoRA",
+     .variant = "viggle-turbo 6-step v0.2.1 r128 (Viggle)",
+     .hf_path = "Viggle/Qwen-Image-2.1-viggle-turbo",
+     .model_type = "qwen-image-21-lora",
+     .parent_model_type = "qwen-image-21",
+     .files = {"Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-lora-r128"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "Viggle/Qwen-Image-2.1-viggle-turbo-v0.2.1-r128"},
+    // A style adapter on the default 40-step schedule: natural,
+    // balanced exposure. peft-keyed (`lora_A.default.weight`), rank 16
+    // on the seven block projections only. The repo's ckpts/ holds the
+    // intermediate steps; the top-level file is the final one.
+    {.family = "Qwen-Image", .version = "2.1", .param_class = "LoRA",
+     .variant = "Natural Exposure (prithivMLmods)",
+     .hf_path = "prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA",
+     .model_type = "qwen-image-21-lora",
+     .parent_model_type = "qwen-image-21",
+     .files = {"Qwen-Image-2.1-Natural-Exposure-LoRA-4000.safetensors"},
+     .needs_tokenizer_json = false},
+    // Z-Image (Tongyi-MAI): a 6B single-stream DiT in the Lumina/NextDiT
+    // lineage, and the cheapest first-class image family in this tree --
+    // two of its three sub-models are already supported code.
+    //   transformer/  = ZImageTransformer2DModel. dim 3840, 30 heads x
+    //     head_dim 128 (MHA, n_kv_heads == n_heads), 30 main layers PLUS
+    //     two 2-layer REFINER stacks that run before the join, so 34
+    //     blocks of identical shape. SwiGLU inner 10240 (dim/3*8), 3D
+    //     RoPE axes [32,48,48] at theta 256 (not 10000), norm_eps 1e-5.
+    //     Every norm is an RMSNorm and the block is SANDWICH-normed --
+    //     attention_norm1 before the attention and attention_norm2 on
+    //     its OUTPUT, inside the residual. Modulation is four chunks
+    //     (scale_msa, gate_msa, scale_mlp, gate_mlp) off a per-block
+    //     Linear(256 -> 4*dim) with NO activation in front of it, while
+    //     the final layer's adaLN has a SiLU in front -- a difference
+    //     visible only as the tensor index (.0 against .1).
+    //   text_encoder/ = Qwen3-4B DENSE (Qwen3Model: 36 layers, hidden
+    //     2560, 32 q-heads GQA kv=8, head_dim 128, ffn 9728, rope theta
+    //     1e6, TIED embeddings) under a bare `model.` wrapper -- the
+    //     same encoder FLUX.2-klein drives, and text-ONLY: there is no
+    //     vision tower in this family. Conditioning taps HF's
+    //     hidden_states[-2], i.e. the un-normed output of layer 34.
+    //   vae/          = the plain diffusers AutoencoderKL that FLUX.1
+    //     and Boogu-Image use, unchanged: 16 latent channels, 8x
+    //     spatial, block_out [128,256,512,512], no quant/post-quant 1x1
+    //     convs, scalar whitening (shift 0.1159, scale 0.3611).
+    // The prompt is rendered through Qwen3's own chat template with a
+    // generation turn and NO system message, and truncated at 512
+    // tokens; there is no family system prompt to get wrong.
+    // TWO CHECKPOINTS, ONE model_type, because their transformer
+    // configs are byte-identical apart from a default: what differs is
+    // the SCHEDULER shift (3.0 Turbo / 6.0 base) and whether CFG is
+    // wanted, and both of those are read rather than inferred. Turbo is
+    // distilled to ~8 steps at guidance 0; the base model wants 28-50
+    // steps at guidance 3-5 and answers a negative prompt.
+    // NOTE the Turbo transformer ships F32 (24.6 GB on disk against the
+    // base's 12.3 GB bf16) -- same 6B of parameters, twice the bytes to
+    // stream.
+    {.family = "Z-Image", .version = "1", .param_class = "6B",
+     .variant = "Turbo, 8-step distilled (Tongyi-MAI)",
+     .hf_path = "Tongyi-MAI/Z-Image-Turbo",
+     .model_type = "z-image",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00003.safetensors",
+               "text_encoder/model-00002-of-00003.safetensors",
+               "text_encoder/model-00003-of-00003.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json",
+               "tokenizer/merges.txt",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = true},
+    // Z-Image (base) -- the undistilled foundation model behind Turbo.
+    // Same architecture, same text encoder, same VAE; scheduler shift
+    // 6.0 rather than 3.0, and it is the variant that USES classifier-
+    // free guidance and negative prompts. bf16 on disk.
+    {.family = "Z-Image", .version = "1", .param_class = "6B",
+     .variant = "base, CFG + negative prompt (Tongyi-MAI)",
+     .hf_path = "Tongyi-MAI/Z-Image",
+     .model_type = "z-image",
+     .files = {"model_index.json",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00003.safetensors",
+               "text_encoder/model-00002-of-00003.safetensors",
+               "text_encoder/model-00003-of-00003.safetensors",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json",
+               "tokenizer/merges.txt",
+               "scheduler/scheduler_config.json"},
+     .needs_tokenizer_json = true},
+    // A tiny autoencoder for LIVE PREVIEWS of either Z-Image checkpoint
+    // (z-image-model-config's `preview_vae`). Z-Image decodes with the
+    // FLUX.1 autoencoder, so its TAE is madebyollin's TAESD for FLUX.1,
+    // fed the DiT's own latent: the AE's scale and shift are the real
+    // decode's to undo, and this was distilled without them. Diffusers'
+    // AutoencoderTiny layout.
+    {.family = "Z-Image", .version = "1", .param_class = "TAE",
+     .variant = "taef1 preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taef1",
+     .model_type = "z-image-tae",
+     .parent_model_type = "z-image",
+     .files = {"config.json", "diffusion_pytorch_model.safetensors"},
      .needs_tokenizer_json = false},
     // FLUX.2-klein-4B (black-forest-labs) -- a diffusers text-to-image
     // pipeline in the SAME split-stage shape as Krea-2 (encoder->DiT stage +
@@ -869,80 +1728,251 @@ builtin_catalog_()
                "tokenizer/chat_template.jinja",
                "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
-    // ---- Mage-Flow (microsoft) -- native-resolution t2i + image edit --
-    // A 4B flow-matching family in the SAME split-stage diffusers shape as
-    // Krea-2 / FLUX.2 (encoder -> DiT stage + separate VAE stages). Two
-    // instantiations share ONE architecture and one code path: Mage-Flow
-    // (text-to-image, model_type "mage-flow") and Mage-Flow-Edit
-    // (instruction editing, "mage-flow-edit"); each ships Base, RL-aligned
-    // and 4-step Turbo weights. All six repos are byte-identical in layout
-    // (~17.5 GB bf16). Sub-models:
-    //   text_encoder/ = Qwen3VLForConditionalGeneration (Qwen3-VL 4B: 36L,
-    //     hidden 2560, 32q/8kv GQA head_dim 128, interleaved mrope
-    //     [24,20,20] theta 5e6, tied embeds; plus a 24-layer ViT, patch 16,
-    //     out_hidden 2560, deepstack taps [5,11,17]). The pipeline takes the
-    //     LAST hidden state (a single tap, NOT a multi-layer concat like
-    //     FLUX.2) and DROPS the templated system prefix -- 34 tokens for
-    //     t2i, 64 for edit. Reference images ride the VL tower (long edge
-    //     capped at 384) so the instruction is image-grounded.
-    //   transformer/  = MageFlow, a 4B NR-MMDiT: 12 DUAL-STREAM joint
-    //     blocks (no single-stream tail), 24 heads x head_dim 128 = 3072
-    //     hidden, mlp_ratio 4 (GELU), in/out_channels 128 at patch_size 1
-    //     (one token per latent pixel -- no 2x2 packing), context_in_dim
-    //     2560, 3-axis RoPE [16,56,56] theta 10000 (frame/height/width,
-    //     scale_rope) with the TEXT stream left UNROTATED. Distilled
-    //     (guidance_embed=false). Edit conditioning matches Qwen-Image-Edit:
-    //     each reference occupies its own RoPE frame band (frame = index+1)
-    //     and stays clean while only the target tokens are stepped.
-    //   vae/          = MageVAE -- NOT an AutoencoderKL, but a symmetric
-    //     one-step diffusion codec (128 latent channels, 16x downsample, so
-    //     the same bytes/pixel as FLUX.2-VAE's 32ch/8x). Encoder and decoder
-    //     are DiCo conv trunks (1x1 + depthwise 3x3 + channel attention,
-    //     adaLN) evaluated at a FIXED t=0, so every adaLN modulation is a
-    //     constant that folds at load; the decoder ends in a per-pixel
-    //     32-dim MLP head. ~0.35 GB.
-    // Scheduler: FlowMatchEulerDiscreteScheduler, static shift 6.0. Turbo
-    // runs 4 steps at cfg 1.0 (a single forward, no negative branch);
-    // Base/RL run 30 / 20 steps at cfg 5.0.
-    {.family = "Mage-Flow", .version = "Gen", .param_class = "4B",
-     .variant = "base bf16 (microsoft)",
-     .hf_path = "microsoft/Mage-Flow-Base",
-     .model_type = "mage-flow",
-     .files = kMageFlowFiles,
+    // A tiny autoencoder for LIVE PREVIEWS of any FLUX.2 checkpoint
+    // (flux2-model-config's `preview_vae`): madebyollin's TAEF2, whose
+    // first blocks carry a GroupNorm over the whole picture. It reads the
+    // DiT's latent unpatchified to 32 channels and NOT un-normalized --
+    // the batch-norm inverse the real VAE applies is what it was
+    // distilled without.
+    {.family = "FLUX", .version = "2", .param_class = "TAE",
+     .variant = "taef2 preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taef2",
+     .model_type = "flux2-tae",
+     .parent_model_type = "flux2",
+     .files = {"taef2.safetensors"},
      .needs_tokenizer_json = false},
-    {.family = "Mage-Flow", .version = "Gen", .param_class = "4B",
-     .variant = "RL-aligned bf16 (microsoft)",
-     .hf_path = "microsoft/Mage-Flow",
-     .model_type = "mage-flow",
-     .files = kMageFlowFiles,
+    // ---- FLUX.3 Image Klein (text + up to 10 references -> image) -------
+    // black-forest-labs/flux-3-image-klein: a 5.6B flow-map DiT (16 steps,
+    // no CFG) in three token modes -- image, reference images, text --
+    // each with its own 5 blocks, then 28 joint blocks. Sub-models:
+    //   text_encoder/ = Qwen3-VL-4B-Instruct, used for text only; 8 hidden
+    //     states (layers 4, 8, .., 32) concatenated -> 20480 per token.
+    //   transformer/  = Flux3Transformer2DModel (bf16, 11.1 GB).
+    //   vae/          = FLUX.2's AutoencoderKLFlux2, stored F32.
+    // `files` pins the diffusers subfolders plus the ROOT config.json,
+    // which carries what no transformer config says: the sampler's alpha
+    // and step count and the prompt's token cap. SKIPPED: the root
+    // model.safetensors and ae.safetensors (BFL's own copies of the same
+    // transformer and VAE, ~11.4 GB) and variants/ (an FP8 transformer and
+    // a Blackwell-only NVFP4 one). GATED: accept the FLUX Kommunity
+    // License on the repo page, then give model-fetch a token.
+    {.family = "FLUX", .version = "3 Image Klein", .param_class = "5.6B",
+     .variant = "distilled bf16 (black-forest-labs, gated)",
+     .hf_path = "black-forest-labs/flux-3-image-klein",
+     .model_type = "flux3",
+     .inputs = {"text", "image"},
+     .outputs = {"image"},
+     .files = {"config.json",
+               "modular_model_index.json",
+               "LICENSE.md",
+               "NOTICE.md",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00002.safetensors",
+               "text_encoder/model-00002-of-00002.safetensors",
+               "text_encoder/tokenizer.json",
+               "text_encoder/tokenizer_config.json",
+               "text_encoder/chat_template.json",
+               "text_encoder/vocab.json",
+               "text_encoder/merges.txt",
+               "text_encoder/preprocessor_config.json",
+               "text_encoder/video_preprocessor_config.json",
+               "text_encoder/LICENSE",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors"},
      .needs_tokenizer_json = false},
-    {.family = "Mage-Flow", .version = "Gen", .param_class = "4B",
-     .variant = "Turbo 4-step distilled bf16 (microsoft)",
-     .hf_path = "microsoft/Mage-Flow-Turbo",
-     .model_type = "mage-flow",
-     .files = kMageFlowFiles,
+    // ---- Fibo 2.0 Edit Turbo (image editing, Bria) -----------------------
+    // briaai/Fibo-2.0-edit-turbo: an 8B DiT distilled to edit in 4 steps
+    // with no guidance. Sub-models:
+    //   transformer/  = BriaFibo2Transformer2DModel (bf16, 16.3 GB):
+    //     Z-Image's block, a Perceiver squeezing the text into 256..512
+    //     gist tokens, five blocks cross-attending their own text bundle.
+    //   text_encoder/ = Qwen3-VL-4B-Instruct (bf16, 8.9 GB), text AND the
+    //     pictures to edit; 15 hidden states in six bundles.
+    //   processor/    = its tokenizer and image processor.
+    //   vae/          = FLUX.2's AutoencoderKLFlux2.
+    //   fonts/        = the faces its pipeline draws a caption's text with.
+    // GATED, and CC BY-NC 4.0 (non-commercial): accept the terms on the
+    // repo page, then give model-fetch a token.
+    {.family = "Fibo", .version = "2.0", .param_class = "8B",
+     .variant = "Edit Turbo, bf16 (briaai, gated, non-commercial)",
+     .hf_path = "briaai/Fibo-2.0-edit-turbo",
+     .model_type = "fibo2",
+     .inputs = {"text", "image"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "README.md",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json",
+               "processor/tokenizer_config.json",
+               "processor/tokenizer.json",
+               "scheduler/scheduler_config.json",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "fonts/Aileron-Regular.otf",
+               "fonts/DejaVuSans.ttf",
+               "fonts/LICENSE-Aileron.txt",
+               "fonts/LICENSE-DejaVu.txt",
+               "fonts/README.md"},
      .needs_tokenizer_json = false},
-    {.family = "Mage-Flow", .version = "Edit", .param_class = "4B",
-     .variant = "base bf16 (microsoft)",
-     .hf_path = "microsoft/Mage-Flow-Edit-Base",
-     .model_type = "mage-flow-edit",
-     .files = kMageFlowFiles,
+    // ---- Fibo 2.0 Dev (text -> image and editing, Bria) -----------------
+    // briaai/Fibo-2.0-dev: the full, non-distilled base model Edit Turbo
+    // is distilled from -- the SAME architecture, its configs
+    // byte-identical to Turbo's -- run with classifier-free guidance: 50
+    // steps at guidance 5 by its model card, against the null caption it
+    // was trained with (an edit) or a negative caption (text-to-image).
+    // Its files cannot say which model they are, so the GRAPH does:
+    // fibo2-model-config `guidance_scale` and the conditioner's oport1
+    // wired to generate-image's iport1. styles/ holds five photographic
+    // looks -- a system and user prompt for a caption writer, and the
+    // negative to render with.
+    // GATED, and CC BY-NC 4.0 (non-commercial): accept the terms on the
+    // repo page, then give model-fetch a token.
+    {.family = "Fibo", .version = "2.0", .param_class = "8B",
+     .variant = "Dev, bf16 (briaai, gated, non-commercial)",
+     .hf_path = "briaai/Fibo-2.0-dev",
+     .model_type = "fibo2",
+     .inputs = {"text", "image"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "README.md",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00002"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00002"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json",
+               "processor/tokenizer_config.json",
+               "processor/tokenizer.json",
+               "scheduler/scheduler_config.json",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "fonts/Aileron-Regular.otf",
+               "fonts/DejaVuSans.ttf",
+               "fonts/LICENSE-Aileron.txt",
+               "fonts/LICENSE-DejaVu.txt",
+               "fonts/README.md",
+               "styles/boring_reality/negative_prompt.json",
+               "styles/boring_reality/system_prompt.txt",
+               "styles/boring_reality/user_prompt.txt",
+               "styles/hard_flash/negative_prompt.json",
+               "styles/hard_flash/system_prompt.txt",
+               "styles/hard_flash/user_prompt.txt",
+               "styles/hazy_dreamy/negative_prompt.json",
+               "styles/hazy_dreamy/system_prompt.txt",
+               "styles/hazy_dreamy/user_prompt.txt",
+               "styles/kodak_film/negative_prompt.json",
+               "styles/kodak_film/system_prompt.txt",
+               "styles/kodak_film/user_prompt.txt",
+               "styles/lens_distortion/negative_prompt.json",
+               "styles/lens_distortion/system_prompt.txt",
+               "styles/lens_distortion/user_prompt.txt"},
      .needs_tokenizer_json = false},
-    {.family = "Mage-Flow", .version = "Edit", .param_class = "4B",
-     .variant = "RL-aligned bf16 (microsoft)",
-     .hf_path = "microsoft/Mage-Flow-Edit",
-     .model_type = "mage-flow-edit",
-     .files = kMageFlowFiles,
+    // ---- MOSS-Image (text -> image, OpenMOSS) ----------------------------
+    // A 5B single-stream flow-matching DiT. Sub-models:
+    //   transformer/  = MOSSImageTransformer (bf16, 9.5 GB): two
+    //     unmodulated text blocks refine the prompt, then 42 blocks over
+    //     [image | text] share ONE modulation; SITU feed-forward, a
+    //     four-axis half-split rotary.
+    //   text_encoder/ = Qwen3.5-9B (`Qwen3_5Model`, the hybrid: GDN +
+    //     gated attention), its final-normed last hidden state over a
+    //     templated user turn ending in an open <think>. The vision
+    //     tower ships beside it and is not read.
+    //   vae/          = FLUX.2's AutoencoderKLFlux2 with its SMALL
+    //     decoder (decoder widths [96, 192, 384, 384]).
+    // Sampling (the reference's): 50 steps, CFG 3 against the EMPTY
+    // prompt with block 22 skipped in the negative branch, shift 5 on a
+    // grid snapped to the training grid. Two checkpoints, one
+    // model_type: Base and SFT share every config and differ in weights.
+    // Apache-2.0, not gated. SKIPPED: the bundled pipeline code and assets.
+    {.family = "MOSS-Image", .version = "1", .param_class = "5B",
+     .variant = "Base (OpenMOSS)",
+     .hf_path = "OpenMOSS-Team/MOSS-Image-Base",
+     .model_type = "moss-image",
+     .inputs = {"text"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "LICENSE",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
-    {.family = "Mage-Flow", .version = "Edit", .param_class = "4B",
-     .variant = "Turbo 4-step distilled bf16 (microsoft)",
-     .hf_path = "microsoft/Mage-Flow-Edit-Turbo",
-     .model_type = "mage-flow-edit",
-     .files = kMageFlowFiles,
+    // MOSS-Image-SFT: the same network fine-tuned for clearer text
+    // grouping and layout; everything but the weights is Base's.
+    {.family = "MOSS-Image", .version = "1", .param_class = "5B",
+     .variant = "SFT (OpenMOSS)",
+     .hf_path = "OpenMOSS-Team/MOSS-Image-SFT",
+     .model_type = "moss-image",
+     .inputs = {"text"},
+     .outputs = {"image"},
+     .files = {"model_index.json",
+               "LICENSE",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00003"
+               ".safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00003"
+               ".safetensors",
+               "text_encoder/config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00004.safetensors",
+               "text_encoder/model-00002-of-00004.safetensors",
+               "text_encoder/model-00003-of-00004.safetensors",
+               "text_encoder/model-00004-of-00004.safetensors",
+               "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "tokenizer/chat_template.jinja",
+               "vae/config.json",
+               "vae/diffusion_pytorch_model.safetensors",
+               "scheduler/scheduler_config.json"},
      .needs_tokenizer_json = false},
+    // A model whose CODE is out of tree has its catalogue rows out of
+    // tree too -- its plugin registers them with register_catalog_entries
+    // -- or the browser offers a checkpoint nothing in the process can
+    // load.
     // ---- Boogu-Image (text+image -> image, NextDiT lineage) -----------
     // Boogu-Image-0.1 (Boogu Team): a 10B flow-matching family in the same
-    // diffusers split-stage shape as Krea-2 / FLUX.2 / Mage-Flow (encoder ->
+    // diffusers split-stage shape as Krea-2 / FLUX.2 (encoder ->
     // DiT stage + separate VAE stages), but a NextDiT / Lumina-Image-2.0
     // topology rather than an MMDiT. Four repos share one architecture and one
     // code path: Base + Turbo are text-to-image ("boogu-image"), Edit +
@@ -999,6 +2029,154 @@ builtin_catalog_()
      .model_type = "boogu-image-edit",
      .inputs = {"text", "image"}, .outputs = {"image"},
      .files = kBooguFiles,
+     .needs_tokenizer_json = false},
+    // ---- VOSR (image -> image, RESTORATION rather than generation) -----
+    // VOSR 2.0 (PolyU / OPPO, CVPR 2026): a one-step, VISION-ONLY image
+    // super-resolution model. It is the first entry here that conditions
+    // on no text at all -- there is no prompt, no tokenizer and no text
+    // encoder anywhere in it. What the DiT cross-attends to is a DINOv2
+    // feature grid over the low-quality picture itself, which is why the
+    // `diffusion-conditioner` on this family loads a vision tower and
+    // nothing else. Sub-models:
+    //   VOSR2/checkpoints/ = LightningDiT, 1.4B: 36 blocks at 1536 wide,
+    //     24 heads x head_dim 64, patch 2, RMSNorm + qk-norm + SwiGLU,
+    //     2D EVA-style RoPE whose positions are RESCALED into the 32x32
+    //     grid it trained on rather than extrapolated. The patch
+    //     projection reads 32 channels: the low-quality latent
+    //     concatenated with the noise. Distilled to ONE flow step.
+    //   Qwen-Image-vae-2d/ = the Qwen-Image VAE with its temporal axis
+    //     removed (`AutoencoderKLQwenImage2D`) -- same 16 latent
+    //     channels, same 8x spatial, same whitening statistics, one
+    //     axis fewer on every conv. The stock 3D checkpoint decodes a
+    //     single frame to the same numbers; this one just does not pay
+    //     for the axis. Served by the same code either way.
+    // The DINOv2 tower is NOT in this repo in a form anything here can
+    // read (the release ships torch.hub's pickle); fetch the entry below.
+    {.family = "VOSR", .version = "2.0", .param_class = "1.4B",
+     .variant = "one-step fp32 (PolyU/OPPO)",
+     .hf_path = "CSWRY/VOSR",
+     .model_type = "vosr",
+     .inputs = {"image"}, .outputs = {"image"},
+     .files = {"VOSR2/args.json",
+               "VOSR2/checkpoints/ema_model.safetensors",
+               "Qwen-Image-vae-2d/config.json",
+               "Qwen-Image-vae-2d/diffusion_pytorch_model.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "VOSR-2.0"},
+    // DINOv2 ViT-L/14 (Meta), the conditioner VOSR cross-attends to. A
+    // SUPPLEMENT, not a model: it generates nothing on its own, and it
+    // is listed apart from VOSR because the restorer's own repo ships it
+    // only as a torch.hub pickle. These are the same weights in
+    // safetensors, published by Meta.
+    {.family = "DINOv2", .version = "1", .param_class = "L/14",
+     .variant = "ViT-L/14 (Meta)",
+     .hf_path = "facebook/dinov2-large",
+     .model_type = "dinov2",
+     .inputs = {"image"}, .outputs = {},
+     .parent_model_type = "vosr",
+     .files = {"config.json", "model.safetensors",
+               "preprocessor_config.json"},
+     .needs_tokenizer_json = false},
+    // ---- FlashVSR (video -> video, streaming RESTORATION) -------------
+    // FlashVSR-v1.1 (OpenImagingLab, arXiv 2510.12747): one-step streaming
+    // 4x video super-resolution. Like VOSR it conditions on no text -- its
+    // context is a constant the checkpoint carries -- and unlike VOSR it
+    // runs on VIDEO, a chunk at a time against a key/value window.
+    //   diffusion_pytorch_model_streaming_dmd.safetensors = the denoiser,
+    //     Wan 2.1-T2V-1.3B tensor for tensor (30 blocks at 1536, 12 x 128
+    //     heads), with block-sparse attention over (2,8,8) windows.
+    //   LQ_proj_in.ckpt = the learned causal source projection, which
+    //     reads the upscaled clip in PIXELS (the flashvsr-src-encoder
+    //     stage runs it).
+    //   Wan2.1_VAE.pth  = the Wan 2.1 VAE, natively named, no config.
+    //   TCDecoder.ckpt  = the reference's TINY decoder, a TAEHV decoder
+    //     that reads the source beside the latent (189 MB); vae-decode
+    //     runs it where the source encoder's `decoder` asks.
+    // Four of those are torch.save() files, READ IN PLACE: they map as
+    // shards (shared/torch-zip.h), so nothing is converted.
+    //
+    // THE CONTEXT IS NOT ON THE MODEL PAGE. The reference keeps it in its
+    // GitHub repo (examples/WanVSR/prompt_tensor/posi_prompt.pth), and a
+    // companion can only name a HuggingFace repo -- so it comes from
+    // deAPI-ai's copy of v1.1, which is BYTE-IDENTICAL to GitHub's
+    // (sha256 4601107a11e4e11a...) as of 2026-09-12. 4 MB.
+    {.family = "FlashVSR", .version = "1.1", .param_class = "1.3B",
+     .variant = "one-step streaming 4x (OpenImagingLab)",
+     .hf_path = "JunhaoZhuang/FlashVSR-v1.1",
+     .model_type = "flashvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"config.json", "model_index.json",
+               "diffusion_pytorch_model_streaming_dmd.safetensors",
+               "LQ_proj_in.ckpt", "Wan2.1_VAE.pth", "TCDecoder.ckpt"},
+     .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
+                          .file = "posi_prompt.pth",
+                          .dest = "posi_prompt.pth"}},
+     .needs_tokenizer_json = false},
+    // FlashVSR+ (OpenImagingLab, arXiv 2610.17552; Apache-2.0): v1.1's
+    // successor, the SAME Wan 2.1-T2V-1.3B transformer and source
+    // projection retrained (RY-DMD), streamed four latent frames a chunk.
+    // One repository publishes two variants as FOLDERS -- turbo/ and
+    // base/, each a dit.safetensors and an lq_proj_in.safetensors, F32 --
+    // around the Wan2.1_VAE.pth they share (byte-identical to v1.1's).
+    // They are the same tensors and differ only in how the stack is
+    // driven: Turbo's "hybrid attention" runs 25 of its 30 layers on a
+    // 3x3 band with one window kept, which is the variant's whole point
+    // and something no tensor says. So each entry registers the FOLDER
+    // (`local_subdir`): the folder is the model, and the family reads the
+    // variant off its name.
+    //
+    // The context is not in this repository either: the reference keeps
+    // it in its GitHub repo (prompt_tensor/posi_prompt.pth), and it is
+    // BYTE-IDENTICAL to v1.1's (sha256 4601107a11e4e11a..., checked
+    // 2026-10-15), so it comes from the same companion. TCDecoder.ckpt,
+    // the reference's DEFAULT decoder (the Wan VAE is its documented
+    // alternative), sits at the root beside the VAE, byte-identical to
+    // v1.1's (sha256 e224bdcf2f52745c..., checked 2026-10-16).
+    {.family = "FlashVSR+", .version = "1.0", .param_class = "1.3B",
+     .variant = "Turbo, hybrid attention (OpenImagingLab)",
+     .hf_path = "ruchangyao/FlashVSR_plus",
+     .model_type = "flashvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"config.json", "turbo/dit.safetensors",
+               "turbo/lq_proj_in.safetensors", "Wan2.1_VAE.pth",
+               "TCDecoder.ckpt"},
+     .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
+                          .file = "posi_prompt.pth",
+                          .dest = "posi_prompt.pth"}},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("turbo"),
+     .name = "ruchangyao/FlashVSR_plus-turbo"},
+    {.family = "FlashVSR+", .version = "1.0", .param_class = "1.3B",
+     .variant = "Base, sparse attention (OpenImagingLab)",
+     .hf_path = "ruchangyao/FlashVSR_plus",
+     .model_type = "flashvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"config.json", "base/dit.safetensors",
+               "base/lq_proj_in.safetensors", "Wan2.1_VAE.pth",
+               "TCDecoder.ckpt"},
+     .companion_files = {{.repo = "deAPI-ai/flashvsr-v1-1",
+                          .file = "posi_prompt.pth",
+                          .dest = "posi_prompt.pth"}},
+     .needs_tokenizer_json = false,
+     .extra = local_subdir_extra_("base"),
+     .name = "ruchangyao/FlashVSR_plus-base"},
+    // RelayVSR (kopperx, "Large-Small Model Collaboration for Efficient
+    // Real-World Video Super-Resolution", arXiv 2609.37850; Apache-2.0):
+    // streaming 4x video super-resolution by two models in relay -- a
+    // Wan2.2-TI2V-5B-shaped DiT retrained to write a KEYFRAME latent in
+    // one step every 15 frames (wan.safetensors, 10.1 GB bf16, its fixed
+    // T5 context inside), and a 32M-parameter decoder turning every frame
+    // into its 4x RGB frame between the two keyframes around it
+    // (flash.safetensors, F32). No VAE, no text encoder. Each file carries
+    // its architecture in its safetensors metadata (format refvsr-wan-v1
+    // / refvsr-flash-v1). Run by the relayvsr-upscale stage.
+    {.family = "RelayVSR", .version = "1.0", .param_class = "5B",
+     .variant = "keyframe DiT + S decoder, EMA (kopperx)",
+     .hf_path = "kopper/RelayVSR",
+     .model_type = "relayvsr",
+     .inputs = {"video"}, .outputs = {"video"},
+     .files = {"wan.safetensors", "flash.safetensors", "LICENSE",
+               "README.md"},
      .needs_tokenizer_json = false},
     // ---- Wan (text+image -> VIDEO diffusion) --------------------------
     // Wan2.2-I2V-A14B (Wan-AI): the first VIDEO model here, and the first
@@ -1247,10 +2425,89 @@ builtin_catalog_()
     // already means here.
     //
     // It is trained against Comfy-Org's repack, so it assumes the FLAT
-    // qkv grouping. Fusing it into MiniMaxAI's released weights would
-    // add the delta of one head's q to another head's k in every block,
-    // silently. That is why the entry pins the Comfy-Org parent rather
-    // than the family.
+    // qkv grouping. On MiniMaxAI's released weights the fused
+    // `attn.qkv_proj` delta lands on the wrong channels -- one head's q
+    // onto another head's k -- in every block, silently. The other four
+    // adapted projections (out_proj, mlp.fc1/fc2, adaln_proj.linear)
+    // carry no grouping, so ~207 of its 259 modules apply correctly
+    // either way, which is why the mismatch reads as "Turbo, but not
+    // quite" rather than as a broken model.
+    //
+    // The EVIDENCE is the repo, not the file: its README frontmatter is
+    // `base_model: Comfy-Org/MiniMax-H3` with a `comfyui` tag, where
+    // the safetensors' own `__metadata__.base_model` says only
+    // "MiniMax-H3" -- the family, not the publisher. Reading the second
+    // as the first is a mistake this note has already made once.
+    //
+    // lightx2v's ComfyUI copies are flat too, and there it was settled
+    // WITHOUT trusting metadata: their B is exactly block-diagonal in
+    // the [all q | all k | all v] sense. That is a property of a
+    // CONVERTED fusion only; this adapter is trained directly on the
+    // fused projection (rank 64, dense B), so nothing in its bytes
+    // states a layout and only the repo does.
+    // VDN-H3 (OpenVDN): NOT a LoRA, and the difference is the whole
+    // point of listing it apart from the three above. A LoRA adds a
+    // low-rank correction to weights the DiT already has; this adds a
+    // SECOND PATHWAY -- a bidirectional delta-rule recurrence over
+    // frames -- and narrows the softmax to a window of whole frames so
+    // that the two PARTITION the keys. Attention is a different
+    // function afterwards, which is why the branch ships its own 4.28 GB
+    // checkpoint and why running the DiT without it, or it without the
+    // window, is wrong rather than merely unadapted.
+    //
+    // It brings no projections of its own: the branch reads the
+    // backbone's raw pre-QK-norm q/k/v, which is why one adapter on
+    // attn.orig.to_{q,k,v} feeds both halves and why this attaches to
+    // any MiniMax-H3 DiT rather than replacing one.
+    //
+    // TWO STAGES, and the choice between them is real. `stage-b` is the
+    // 50-step model; `stage-dmd` is an 8-step distillation and ships an
+    // extra `turbo` adapter -- the only adapter in this tree that
+    // touches the ADALN projections, at rank 16 where the rest is 64.
+    // Each pins its own subtree of one repo, so they need distinct
+    // registration keys for the reason the two Turbo entries above do.
+    //
+    // Wired through the `linear_branch` key on the
+    // `minimax-h3-model-config` source, not through a LoRA slot: it is
+    // a checkpoint beside the DiT, not a correction to it.
+    //
+    // Pinned against the repo at 50744d80 (2026-09-19). Since the
+    // first release it has grown an `h3-base/` (the full 72 GB
+    // MiniMax-H3 diffusers release) and per-stage `diffusers/` remote
+    // code; neither is pinned, because the branch attaches to whichever
+    // H3 DiT the graph already loads. `adapter_spec.json` was
+    // `adapter_config.json` until 2026-09-09, with identical bytes --
+    // vdn::load_adapter() reads either -- and every safetensors is
+    // unchanged, so a download from before the rename stays valid.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "VDN",
+     .variant = "VDN hybrid attention, stage-B 50-step (OpenVDN)",
+     .hf_path = "OpenVDN/vdn-minimax-h3",
+     .model_type = "minimax-h3-vdn",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"stage-b-step-2000/linear_branch/config.json",
+               "stage-b-step-2000/linear_branch/model.safetensors",
+               "stage-b-step-2000/adapters/default/adapter_spec.json",
+               "stage-b-step-2000/adapters/default/adapter_model.safetensors",
+               "stage-b-step-2000/model_spec.json",
+               "stage-b-step-2000/metadata.json"},
+     .needs_tokenizer_json = false,
+     .name = "OpenVDN/vdn-minimax-h3-stage-b"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "VDN",
+     .variant = "VDN hybrid attention, stage-DMD 8-step (OpenVDN)",
+     .hf_path = "OpenVDN/vdn-minimax-h3",
+     .model_type = "minimax-h3-vdn",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"stage-dmd-step-250/linear_branch/config.json",
+               "stage-dmd-step-250/linear_branch/model.safetensors",
+               "stage-dmd-step-250/adapters/default/adapter_spec.json",
+               "stage-dmd-step-250/adapters/default/"
+               "adapter_model.safetensors",
+               "stage-dmd-step-250/adapters/turbo/adapter_spec.json",
+               "stage-dmd-step-250/adapters/turbo/adapter_model.safetensors",
+               "stage-dmd-step-250/model_spec.json",
+               "stage-dmd-step-250/metadata.json"},
+     .needs_tokenizer_json = false,
+     .name = "OpenVDN/vdn-minimax-h3-stage-dmd"},
     {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
      .variant = "Turbo few-step v4-600 EMA (larryvrh)",
      .hf_path = "larryvrh/MiniMax-H3-Turbo-Lora",
@@ -1279,17 +2536,170 @@ builtin_catalog_()
      .files = {"minimax_h3_turbo_4step_ema_ckpt850.safetensors"},
      .needs_tokenizer_json = false,
      .name = "larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema"},
-    // lightx2v's Turbo line, the OTHER few-step distillation of FL2VA.
+    // Open-H3-Regenerate-2K (NVIDIA, Efficient-Large-Model): a REFINE of
+    // an existing clip rather than a generation -- a 768P draft encoded,
+    // its latent enlarged by the H3 latent upscaler and re-noised to
+    // sigma 0.909, then three Euler steps of the FL2VA DiT under ONE
+    // merged adapter (their refiner + lightx2v's FL2VA Turbo v1.2 + LMS
+    // Sharp v1.0, rank 576 on every projection, alpha == rank) with the
+    // soundtrack held at an encoded silence. generate-video's init_latent
+    // iport is the refine; latent-upscale is the enlargement.
     //
-    // Only the `_comfyui_` spellings are catalogued, and the omission is
-    // deliberate rather than an oversight: the repo publishes each
-    // adapter twice, and the diffusers copy is not a renaming but a
-    // different DECOMPOSITION -- separate to_q/to_k/to_v that would have
-    // to be stacked block-diagonally into this model's fused qkv_proj,
-    // and an ff.net.0.proj in diffusers' value-first order whose halves
-    // would need swapping. Both transforms produce a well-shaped WRONG
-    // model if guessed at, so the files that would need them are not
-    // offered.
+    // Three records over ONE repo, each pinning what it is: the adapter,
+    // the upscaler, and `vae_fast/` -- StreamRender-H3's FAST decoder
+    // (non-causal, 24 layers, LOSSY; vae-decode's `fast_decoder`), its own
+    // record because it is 6.5 GB that the release's default decode does
+    // not use. NOT fetched: `base_model/` (MiniMax-H3's own diffusers
+    // components, which the MiniMaxAI entries above already hold) and
+    // `lora/sharp_curve_branches` -- LMS Sharp's AdaLN curve branches,
+    // which the release installs and which are exactly zero (every
+    // curve_B), so they add nothing.
+    // MiniMax H3 Community License for the refiner and base; the
+    // upscaler is MIT, Turbo and Sharp their own.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Open-H3-Regenerate-2K refine, rank 576 merged (NVIDIA)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"lora/open_h3_regenerate_2k_lora.safetensors",
+               "lora/lora_config.json", "lora/module_ranks.json",
+               "lora/MERGE_VERIFY.json", "README.md", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-lora"},
+    {.family = "MiniMax", .version = "H3-FL2VA",
+     .param_class = "latent upscaler",
+     .variant = "H3 latent upscaler 3D-conv v1 (Open-H3-Regenerate-2K)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K",
+     .model_type = "minimax-h3-latent-upscaler",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"latent_upsampler/"
+               "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+               "latent_upsampler/LICENSE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-upscaler"},
+    {.family = "MiniMax", .version = "H3-FL2VA",
+     .param_class = "video decoder",
+     .variant = "fast H3 VAE decoder, non-causal 24-layer (StreamRender-H3, "
+                "lossy)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K",
+     .model_type = "minimax-h3-fast-vae",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"vae_fast/fast_h3_vae_noncausal_24l.safetensors",
+               "README.md", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-fast-vae"},
+    // Open-H3-Regenerate-2K-IC (NVIDIA): the IN-CONTEXT refine. The draft
+    // stays CLEAN in MiniMax-H3's Ref2VA DiT (transformer_ref) as a
+    // reference video, and the clip is regenerated beside it from the
+    // upscaled draft at sigma 0.835 -- the last 3 steps of HyperFlow's
+    // 8-step grid, CFG 1 -- under three runtime adapters: HyperFlow
+    // 8-step, LMS Sharp v1.0 and the IC LoRA (rank 384 on all 312
+    // linears, alpha == rank). Faces, lip sync, lettering and layout
+    // stay the draft's.
+    //
+    // Five records over ONE repo, each pinning what it is: the three
+    // adapters (one file each, as a slot names one), the upscaler (the
+    // base release's file, byte-identical) and the fast decoder v2 --
+    // the release's DEFAULT decode, StreamRender-H3's architecture with
+    // new weights. HyperFlow here is VideoRebirthAI's file, byte for
+    // byte. NOT fetched: `base_model/` (MiniMax-H3's diffusers
+    // components, which the MiniMaxAI entries hold), `infer/` (the
+    // release's runner) and `assets/` (an encoded silence, which
+    // generate-video makes itself from the audio VAE). LMS Sharp's 50
+    // AdaLN curve branches are all zero, so no curve table either.
+    // MiniMax H3 Community License; the upscaler MIT; Sharp its own.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Open-H3-Regenerate-2K-IC in-context refine, rank 384 "
+                "(NVIDIA)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"lora/open_h3_regenerate_2k_ic_lora.safetensors",
+               "lora/lora_config.json", "config.json", "README.md",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-lora"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "HyperFlow 8-step flow map v1.0, as Open-H3-Regenerate-2K-"
+                "IC ships it",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"lora/minimax_h3_hyperflow_8step_v1.0.safetensors",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-hyperflow"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "LMS Sharp v1.0 r64 (Alissonerdx), as Open-H3-Regenerate-"
+                "2K-IC ships it",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"lora/minimax_h3_lms_v1.0_r64.safetensors", "LICENSE",
+               "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-sharp"},
+    {.family = "MiniMax", .version = "H3-Ref2VA",
+     .param_class = "latent upscaler",
+     .variant = "H3 latent upscaler 3D-conv v1 (Open-H3-Regenerate-2K-IC)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-latent-upscaler",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"latent_upsampler/"
+               "minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors",
+               "latent_upsampler/LICENSE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-upscaler"},
+    {.family = "MiniMax", .version = "H3-Ref2VA",
+     .param_class = "video decoder",
+     .variant = "fast H3 VAE decoder v2, non-causal 24-layer "
+                "(Open-H3-Regenerate-2K-IC, lossy)",
+     .hf_path = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC",
+     .model_type = "minimax-h3-fast-vae",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"vae_fast/fast_h3_vae_v2_24l.safetensors", "README.md",
+               "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Efficient-Large-Model/Open-H3-Regenerate-2K-IC-fast-vae"},
+    // TaoLiveAIGC's TaoMate-H3: a 3-step adapter for a STREAMING method,
+    // not a few-step LoRA for the ordinary denoise. generate-video knows
+    // it by its tensors and runs that method -- the base model's
+    // soundtrack, then the video in chunks against a cache of the clean
+    // ones before it (generative-models/minimax-h3/minimax-h3-taomate.h).
+    // Its rank and alpha (128 / 128) are stated only in config.json, which
+    // is why that file is fetched beside the weights.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "TaoMate 3-step streaming T2AV (TaoLiveAIGC)",
+     .hf_path = "TaoLiveAIGC/TaoMate-H3",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"adapter_model.safetensors", "config.json",
+               "adapter_config.json"},
+     .needs_tokenizer_json = false},
+    // lightx2v's Turbo line, the OTHER few-step distillation of this
+    // model -- and the only one that covers BOTH partitions.
+    //
+    // The repo publishes each adapter TWICE and both spellings are
+    // catalogued, because the difference is not cosmetic and the two
+    // are not equally good.
+    //
+    // The diffusers copy is the original peft export: separate
+    // to_q/to_k/to_v, an ff.net.0.proj in value-first order, factors
+    // named `.lora_A.default.weight` and one alpha in `__metadata__`.
+    // The ComfyUI copy is that file CONVERTED -- q/k/v stacked
+    // block-diagonally into this model's fused qkv_proj, fc1's halves
+    // swapped to gate-first, a per-module alpha written out. Both load
+    // (see MetalMiniMaxH3Transformer::bind_lora_, whose conversion is
+    // verified tensor-for-tensor against upstream's).
+    //
+    // PREFER THE DIFFUSERS COPY. A published fusion is built for ONE
+    // qkv column grouping and is silently wrong on the other; fusing
+    // from the split file happens against the DiT actually loaded, so
+    // it is right on both publishers' weights. It is also the smaller
+    // DOWNLOAD, 1.38 GB against 1.96 -- the difference being the two
+    // thirds of a block-diagonal B that is zero -- and the smaller
+    // model: split q/k/v bind BANDED (lora::Factors::banded), without
+    // those zeros, where a published fusion holds them in RAM too.
     //
     // The ComfyUI copies key on `diffusion_model.<module>`, which both
     // the fuse and the runtime path resolve, and carry per-module alpha
@@ -1325,6 +2735,436 @@ builtin_catalog_()
      .files = {"minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors"},
      .needs_tokenizer_json = false,
      .name = "lightx2v/Minimax-h3-Turbo-8step"},
+    // The 8-step at 768p: the same distillation as the entry above run
+    // at 1344x768 on the 4-step 768p's shifts (6 / 3), and upstream's
+    // own default -- LightX2V Studio serves this one. Recommended at 8
+    // steps, where the 544p 8-step is also usable at 4.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6 (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_8step_v1.0_768p_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-8step-768p"},
+    // The FIRST adapter here for the OTHER partition. Ref2VA's DiT is
+    // the same architecture as FL2VA down to the tensor names, so the
+    // adapter has the same 50+2 blocks and the same shapes -- and it is
+    // trained for the other task, so the parent link is what keeps it
+    // out of an FL2VA graph. Distilled at 544p on the checkpoint's own
+    // 12 / 3 shifts, 4 steps.
+    //
+    // Its metadata names the FL2VA repack as `base_model`, which is a
+    // stale string in upstream's conversion script rather than a claim
+    // about the weights: the file's own module list is the Ref2VA
+    // partition's, and the two partitions are byte-identical in shape.
+    // What the string DOES get right is the publisher -- see the qkv
+    // grouping note above, which applies to this file too.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v0.1 (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-4step"},
+    // The DIFFUSERS copies of the two entries above -- the same
+    // adapters, split rather than fused, and the ones to reach for.
+    // See the qkv-grouping paragraph at the head of this section.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_8step_v1.0_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-8step-768p-split"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v0.1, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-4step-split"},
+    // v1.2 of the 4-step 768p line, both copies. The SPLIT one is
+    // catalogued first because it is the one to reach for, and it is
+    // named without a suffix for the same reason -- `-comfyui` marks the
+    // fused copy here rather than `-split` marking the good one, which
+    // is the naming the older entries above would have had if the
+    // grouping trap had been understood when they were written.
+    //
+    // WHAT UPSTREAM SAYS ABOUT v1.1 AND v1.2 IS NOTHING. The model card
+    // documents only the 8-step v1.0 it deploys, so everything below is
+    // read off the FILENAME: fl2v, 4 steps, 768p, bf16. That is enough
+    // for the fields here, and the one number it does not carry is the
+    // SHIFT -- inherited from the rest of the 768p line at 6, because a
+    // distillation is fit to the sigma grid it was trained on and every
+    // 768p checkpoint in this repo was trained on that one. If a later
+    // release breaks that pattern it will do so silently, so the shift
+    // is the thing to re-check against upstream, not the step count.
+    //
+    // v1.1 is NOT catalogued. It is the same shape as v1.2 and nothing
+    // published says what changed between them, so registering both
+    // would offer a user a choice this file cannot describe -- and the
+    // later one is the one a version number is for.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.2 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p-v1.2"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Turbo 4-step v1.2 768p, shift 6, fused qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-4step-768p-v1.2-comfyui"},
+    // The Ref2VA 8-step at 768p, both copies -- the SECOND adapter for
+    // the reference partition, where there was one.
+    //
+    // It is also the first Ref2VA adapter that does NOT run on the
+    // checkpoint's own shifts. Every other reference-partition option
+    // here was distilled at 544p on 12 / 3; this one is 768p, so it
+    // takes the 6 that the whole 768p line takes -- and a Ref2VA graph
+    // is exactly where that is easiest to miss, because the partition's
+    // own documentation never had to mention a shift before.
+    //
+    // Same reading as the v1.2 pair above: the fields come off the
+    // filename and the shift is inherited, because upstream's card
+    // describes only the FL2VA 8-step it deploys.
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6, split qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Turbo 8-step v1.0 768p, shift 6, fused qkv (lightx2v)",
+     .hf_path = "lightx2v/Minimax-h3-Turbo",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui"},
+    // Pika H3 Flex (Pika Labs / Mellis, Inc.): a six-step post-training
+    // of both DiTs, published as two rank-128 FP32 adapters in the
+    // diffusers decomposition (fused here for the DiT actually loaded),
+    // each with a `manifest.json` beside it stating its SAMPLING
+    // CONTRACT -- the knots 1000/750/500/250/100/40/0 shifted 12 / 3,
+    // and a re-noising update (x0, then fresh noise to the next sigma),
+    // which the release says a generic six-step Euler is not. The
+    // manifest is what the DiT reads that from
+    // (MetalMiniMaxH3Transformer::SamplingContract), so it is fetched
+    // with the adapter; a record per partition, each pinning its folder,
+    // and each refused on the other DiT. NOT fetched: the bundled
+    // MiniMax-H3 base (~210 GB; the MiniMaxAI entries above hold the
+    // same weights) and `comfy/loras/` (bf16 copies converted for the
+    // flat q|k|v layout; carry no contract). MiniMax H3 Community
+    // License.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "Pika H3 Flex 6-step FL2VA (t2va / i2va / l2va / fl2va), "
+                "rank 128 (Pika Labs)",
+     .hf_path = "Pika-Labs/Pika-H3-Flex",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"fl2va/adapter.safetensors", "fl2va/manifest.json",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Pika-Labs/Pika-H3-Flex-fl2va"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "Pika H3 Flex 6-step Ref2VA (omni-reference), rank 128 "
+                "(Pika Labs)",
+     .hf_path = "Pika-Labs/Pika-H3-Flex",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"ref2va/adapter.safetensors", "ref2va/manifest.json",
+               "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "Pika-Labs/Pika-H3-Flex-ref2va"},
+    // Video Rebirth's HyperFlow: an 8-step FLOW-MAP self-distillation,
+    // and not a Turbo adapter in the sense of the entries above. Beside
+    // the ordinary per-block factors it carries an ENDPOINT timestep
+    // embedder, so every step is conditioned on the interval it
+    // integrates, (t, r), rather than on t -- see
+    // MetalMiniMaxH3Transformer::FlowMap. That is detected from the
+    // file's own header, and so is the rest of what it needs: the 9-point
+    // sigma grid it was distilled on (the graph's `steps` is not used
+    // while it is live) and the 12 / 3 shifts it was trained at, which
+    // are this model's defaults.
+    //
+    // ONE FILE FOR BOTH PARTITIONS. Its header lists `transformer` and
+    // `transformer_ref` as compatible and upstream loads the same file
+    // onto both, so it is catalogued twice -- once per parent -- over
+    // the same download.
+    //
+    // Split q/k/v (diffusers decomposition, fused here for the DiT
+    // actually loaded), rank 256 / alpha 256 everywhere, 2.8 GB. The
+    // timestep-MLP factors are f32 on purpose and stay f32 on the host.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "HyperFlow 8-step flow map v1.0 (Video Rebirth)",
+     .hf_path = "videorebirth/hyperflow",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"minimax_h3_hyperflow_8step_v1.0.safetensors",
+               "hyperflow.json", "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "videorebirth/hyperflow"},
+    {.family = "MiniMax", .version = "H3-Ref2VA", .param_class = "LoRA",
+     .variant = "HyperFlow 8-step flow map v1.0 (Video Rebirth)",
+     .hf_path = "videorebirth/hyperflow",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-ref2va",
+     .files = {"minimax_h3_hyperflow_8step_v1.0.safetensors",
+               "hyperflow.json", "LICENSE", "NOTICE"},
+     .needs_tokenizer_json = false,
+     .name = "videorebirth/hyperflow-ref2va"},
+    // The single-image VAE -- the one piece that lets an H3 latent
+    // become a PICTURE.
+    //
+    // WHY IT IS NEEDED, and it is not a convenience. H3's encoder turns
+    // a still into exactly 1 latent frame, and the chunked video decoder
+    // cannot read that back: it spends `token_drop` latent frames
+    // priming its temporal window, so it needs 7 before it emits
+    // anything and refuses 1 outright. So the released model can encode
+    // a picture it is unable to decode. This checkpoint's decoder was
+    // fine-tuned to read one token on its own.
+    //
+    // VERIFIED against the released video VAE rather than taken from the
+    // card: all 116 encoder tensors, `quant_conv` and both whitening
+    // vectors are BYTE-IDENTICAL, while 439 of 440 decoder tensors and
+    // `post_quant_conv` differ. The LATENT SPACE is therefore unchanged
+    // and any H3 latent decodes here -- which is also why this attaches
+    // to either partition and pins no parent: the same file serves
+    // FL2VA and Ref2VA, and duplicating the entry to say so would
+    // fetch 5.2 GB twice under two names.
+    //
+    // DO NOT PUT IT IN A VIDEO GRAPH. Upstream reports that its decoder
+    // materially regresses multi-frame reconstruction -- patch-grid
+    // ghosting and cross-frame mixing. Nothing about the weights
+    // distinguishes the two files (same 562 names, same shapes), so the
+    // two guards are the FILENAME, which loses to a `video_vae` one in
+    // the component resolver's preference order, and the `h3_t1_direct`
+    // flag in its metadata, which is what the decoder checks.
+    {.family = "MiniMax", .version = "H3-Image-VAE", .param_class = "2.4B",
+     .variant = "fp16 single-latent-frame decoder (Mamad8)",
+     .hf_path = "Mamad8/MiniMax-H3-Image-VAE",
+     .model_type = "minimax-h3-image-vae",
+     .inputs = {"image"}, .outputs = {"image"},
+     .files = {"minimax_h3_t1_image_vae_step1597.safetensors"},
+     .weight_format = "comfyui",
+     .needs_tokenizer_json = false,
+     .name = "Mamad8/MiniMax-H3-Image-VAE"},
+    // P-H3-Image (PrunaAI): an IMAGE model on MiniMax-H3 -- text-to-image
+    // and instruction editing with up to 8 pictures, 8 steps, no CFG
+    // (generative-models/minimax-h3/p-h3-image.h). Its DiT is FL2VA's
+    // with a rank-128 adapter merged in; its text encoder a Qwen3-VL-4B
+    // conditioning through a connector; its VAE H3's encoder with a
+    // single-frame decoder. Three records over two repos:
+    //   * the whole diffusers pipeline, the merged DiT included;
+    //   * the same repo WITHOUT its DiT -- for a box that already holds
+    //     MiniMax-H3's FL2VA, which runs P-H3-Image under PrunaAI's
+    //     adapter (next) where the merged DiT would be 66 GB more;
+    //   * that adapter (the Comfy repo's), on FL2VA.
+    // The prompt upsampler (a Qwen3.5-9B) is its own record below.
+    // MiniMax H3 Community License; the Qwen3-VL parts Apache-2.0.
+    {.family = "P-H3", .version = "Image", .param_class = "33B",
+     .variant = "diffusers, bf16 (PrunaAI)",
+     .hf_path = "PrunaAI/P-H3-Image",
+     .model_type = "p-h3-image",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = {"LICENSE", "LICENSE-APACHE", "NOTICE", "README.md",
+               "modular_model_index.json",
+               "scheduler/scheduler_config.json",
+               "audio_scheduler/scheduler_config.json",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json", "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "tokenizer/chat_template.jinja", "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "text_connector/config.json",
+               "text_connector/diffusion_pytorch_model.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00002.safetensors",
+               "text_encoder/model-00002-of-00002.safetensors",
+               "vae/config.json", "vae/diffusion_pytorch_model.safetensors",
+               "transformer/config.json",
+               "transformer/diffusion_pytorch_model.safetensors.index.json",
+               "transformer/diffusion_pytorch_model-00001-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00002-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00003-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00004-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00005-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00006-of-00007.safetensors",
+               "transformer/diffusion_pytorch_model-00007-of-00007"
+               ".safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "PrunaAI/P-H3-Image"},
+    {.family = "P-H3", .version = "Image", .param_class = "4B",
+     .variant = "encoder, connector and VAE -- the DiT is MiniMax-H3's "
+                "FL2VA under PrunaAI's adapter (PrunaAI)",
+     .hf_path = "PrunaAI/P-H3-Image",
+     .model_type = "p-h3-image",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = {"LICENSE", "LICENSE-APACHE", "NOTICE", "README.md",
+               "modular_model_index.json",
+               "scheduler/scheduler_config.json",
+               "audio_scheduler/scheduler_config.json",
+               "processor/chat_template.jinja",
+               "processor/processor_config.json", "processor/tokenizer.json",
+               "processor/tokenizer_config.json",
+               "tokenizer/chat_template.jinja", "tokenizer/tokenizer.json",
+               "tokenizer/tokenizer_config.json",
+               "text_connector/config.json",
+               "text_connector/diffusion_pytorch_model.safetensors",
+               "text_encoder/config.json",
+               "text_encoder/generation_config.json",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/model-00001-of-00002.safetensors",
+               "text_encoder/model-00002-of-00002.safetensors",
+               "vae/config.json", "vae/diffusion_pytorch_model.safetensors"},
+     .needs_tokenizer_json = false,
+     .name = "PrunaAI/P-H3-Image-no-dit"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "LoRA",
+     .variant = "P-H3-Image on FL2VA, rank 128 (PrunaAI)",
+     .hf_path = "PrunaAI/P-H3-Image-Comfy",
+     .model_type = "minimax-h3-lora",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"loras/p-h3-image_lora_bf16.safetensors", "LICENSE",
+               "LICENSE-APACHE", "NOTICE", "README.md"},
+     .needs_tokenizer_json = false,
+     .name = "PrunaAI/P-H3-Image-lora"},
+    // MiniMax-H3-Image (MiniMaxAI): the H3 family's IMAGE model --
+    // text-to-image and editing with up to 16 pictures at about 16
+    // megapixels, 6 steps, no guidance (generative-models/minimax-h3/
+    // minimax-h3-image.h). Its DiT is H3's stack without the audio
+    // branch, with one output head per step beside it
+    // (pdd_fused_heads.safetensors); its VAE H3's encoder with a 2D ViT
+    // decoder. It does NOT carry its text encoder: model_index.json
+    // names MiniMax-H3's `text_encoder/` (Qwen3-VL-32B, hidden state 50),
+    // the second record -- the same files every MiniMax-H3 partition
+    // carries, so a box holding FL2VA or Ref2VA needs neither download.
+    // MiniMax-H3-Image Community License.
+    {.family = "MiniMax", .version = "H3-Image", .param_class = "33B",
+     .variant = "bf16 image generation and editing (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-H3-Image",
+     .model_type = "minimax-h3-image",
+     .inputs = {"text", "image"}, .outputs = {"image"},
+     .files = {"LICENSE", "README.md", "model_index.json", "pdd_config.json",
+               "pdd_fused_heads.safetensors", "processor/chat_template.json",
+               "processor/merges.txt", "processor/preprocessor_config.json",
+               "processor/tokenizer.json", "processor/tokenizer_config.json",
+               "processor/video_preprocessor_config.json",
+               "processor/vocab.json", "tokenizer/merges.txt",
+               "tokenizer/tokenizer.json", "tokenizer/tokenizer_config.json",
+               "tokenizer/vocab.json", "transformer/config.json",
+               "transformer/model.safetensors.index.json",
+               "transformer/model-00001-of-00012.safetensors",
+               "transformer/model-00002-of-00012.safetensors",
+               "transformer/model-00003-of-00012.safetensors",
+               "transformer/model-00004-of-00012.safetensors",
+               "transformer/model-00005-of-00012.safetensors",
+               "transformer/model-00006-of-00012.safetensors",
+               "transformer/model-00007-of-00012.safetensors",
+               "transformer/model-00008-of-00012.safetensors",
+               "transformer/model-00009-of-00012.safetensors",
+               "transformer/model-00010-of-00012.safetensors",
+               "transformer/model-00011-of-00012.safetensors",
+               "transformer/model-00012-of-00012.safetensors",
+               "vae/config.json", "vae/diffusion_pytorch_model.safetensors",
+               "examples/reference1.png", "examples/prompt.edit.txt",
+               "examples/request.t2i.json"},
+     .needs_tokenizer_json = false,
+     .name = "MiniMaxAI/MiniMax-H3-Image"},
+    {.family = "MiniMax", .version = "H3-Image", .param_class = "32B",
+     .variant = "text encoder alone, MiniMax-H3's Qwen3-VL-32B (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-H3",
+     .model_type = "minimax-h3-text-encoder",
+     .parent_model_type = "minimax-h3-image",
+     .files = {"text_encoder/chat_template.json", "text_encoder/config.json",
+               "text_encoder/merges.txt",
+               "text_encoder/model-00001-of-00014.safetensors",
+               "text_encoder/model-00002-of-00014.safetensors",
+               "text_encoder/model-00003-of-00014.safetensors",
+               "text_encoder/model-00004-of-00014.safetensors",
+               "text_encoder/model-00005-of-00014.safetensors",
+               "text_encoder/model-00006-of-00014.safetensors",
+               "text_encoder/model-00007-of-00014.safetensors",
+               "text_encoder/model-00008-of-00014.safetensors",
+               "text_encoder/model-00009-of-00014.safetensors",
+               "text_encoder/model-00010-of-00014.safetensors",
+               "text_encoder/model-00011-of-00014.safetensors",
+               "text_encoder/model-00012-of-00014.safetensors",
+               "text_encoder/model-00013-of-00014.safetensors",
+               "text_encoder/model-00014-of-00014.safetensors",
+               "text_encoder/model.safetensors.index.json",
+               "text_encoder/preprocessor_config.json",
+               "text_encoder/tokenizer.json",
+               "text_encoder/tokenizer_config.json",
+               "text_encoder/video_preprocessor_config.json",
+               "text_encoder/vocab.json"},
+     .needs_tokenizer_json = false,
+     .name = "MiniMaxAI/MiniMax-H3-text-encoder"},
+    // MiniMax-H3-Image-PE, MiniMax-H3-Image's PROMPT EXPANDER: a Qwen3.8-27B
+    // fine-tune that reasons, then answers one JSON object -- a long caption
+    // of the whole picture (`expanded_caption`) and a ratio -- for a short
+    // request (its system and task prompts in prompt/, as its release's
+    // scripts/expand_prompt.py sends them). Published only in ModelOpt
+    // NVFP4 (generative-models/shared/nvfp4.h): every projection and the
+    // head, the token table and the vision tower bf16. The qwen3.5 path
+    // runs it natively on the k-quant route (KQ::kNVFP4). MiniMax-H3-Image
+    // Community License, as the model it writes for.
+    {.family = "MiniMax", .version = "H3-Image-PE", .param_class = "27B",
+     .variant = "NVFP4 prompt expander (MiniMaxAI)",
+     .hf_path = "MiniMaxAI/MiniMax-H3-Image-PE",
+     .model_type = "qwen3.5", .needs_tokenizer_json = false},
+    // A tiny autoencoder for LIVE PREVIEWS: it decodes a denoise step's
+    // clean estimate onto generate-video's `preview` port at a small
+    // fraction of the video VAE's cost. Named on minimax-h3-model-config's
+    // `preview_vae`; see stages/latent-preview.h.
+    //
+    // madebyollin's `taeh3` first: it is TEMPORAL, so it decodes the
+    // clip's real frame count and keeps the motion, and against the real
+    // VAE it MEASURED 25.3 dB where Kijai's scored 23.3 on the same
+    // latent. It is published in a GitHub repo, not on the Hub, so it is
+    // fetched by URL (`url_files`) into `madebyollin/taehv/`.
+    //
+    // Kijai's is a 2D decoder -- one frame per latent frame, no temporal
+    // structure -- so its preview plays a quarter of the clip's frames,
+    // slowed to the same duration; each reproduces the LAST pixel frame
+    // its latent frame covers. Both read the same latent space, so the
+    // parent is nominal: both partitions take either.
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "TAE",
+     .variant = "taeh3 temporal preview decoder (madebyollin)",
+     .hf_path = "madebyollin/taehv",
+     .model_type = "minimax-h3-tae",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"taeh3.safetensors"},
+     .needs_tokenizer_json = false,
+     .extra = catalog_url_files_extra(
+         {{"https://raw.githubusercontent.com/madebyollin/taehv/main/"
+           "safetensors/taeh3.safetensors",
+           "taeh3.safetensors"}}),
+     .name = "madebyollin/taeh3"},
+    {.family = "MiniMax", .version = "H3-FL2VA", .param_class = "TAE",
+     .variant = "2D tiny preview decoder (Kijai)",
+     .hf_path = "Kijai/MiniMax-H3-TAE",
+     .model_type = "minimax-h3-tae",
+     .parent_model_type = "minimax-h3-fl2va",
+     .files = {"vae_approx/taeh3.safetensors"},
+     .needs_tokenizer_json = false},
     // ---- Supplementary CoreML models (vpipe-supplement) --------------
     // One pre-converted *.mlpackage per .tar; all share ONE repo, so each
     // entry pins its archive + a distinct `name` (= registration key /
@@ -1510,8 +3350,23 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   };
   if (mt == "qwen3.5" || mt == "qwen3.6") {
     set({"text", "image", "video"}, {"text"});
+  } else if (mt == "qwen3.8-flash") {
+    // Its vision tower is not wired yet: text in, text out.
+    set({"text"}, {"text"});
+  } else if (mt == "deepseek-v4.1") {
+    // Its vision tower is not wired yet: text in, text out.
+    set({"text"}, {"text"});
   } else if (mt == "qwen3-asr") {
     set({"audio"}, {"text"});
+  } else if (mt == "lfm3-vl") {
+    // LFM3-VL: text and images in (its own tower), text out; video as
+    // frames.
+    set({"text", "image", "video"}, {"text"});
+  } else if (mt == "lfm3") {
+    set({"text"}, {"text"});
+  } else if (mt == "mistral3") {
+    // Ministral-3: text and images in (the Pixtral tower), text out.
+    set({"text", "image"}, {"text"});
   } else if (mt == "gemma4" || mt == "gemma4_unified") {
     // Both the effective (e4b) and the unified (12B/31B/26B-A4B) Gemma-4
     // models are multimodal-in / text-out.
@@ -1521,15 +3376,61 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     set({"text"}, {"audio"});
   } else if (mt == "moss-codec" || mt == "moss-codec-v2") {
     set({"audio"}, {"audio"});
+  } else if (mt == "yue2" || mt == "fish-drama3" ||
+             mt == "minimax-music3") {
+    set({"text"}, {"audio"});
+  } else if (mt == "yue2-vae") {
+    set({"audio"}, {"audio"});
+  } else if (mt == "bs-roformer") {
+    // A source separator: music in, one source and its complement out.
+    set({"audio"}, {"audio"});
+  } else if (mt == "rife") {
+    // A frame interpolator: frames in, more (or retimed) frames out.
+    set({"video"}, {"video"});
   } else if (mt == "krea2" || mt == "flux2" || mt == "qwen-image-edit"
-             || mt == "mage-flow-edit") {
+             || mt == "flux3" || mt == "fibo2") {
     set({"text", "image"}, {"image"});
+  } else if (mt == "moss-image") {
+    // Text to image only: no reference path in this family.
+    set({"text"}, {"image"});
+  } else if (mt == "qwen-image") {
+    // The text-to-image half of the Qwen-Image family: no reference
+    // image, which is the whole difference between it and the edit
+    // model it is otherwise architecturally identical to. Saying
+    // {"text", "image"} here would offer it to a stage that needs an
+    // image input and hand that stage a checkpoint with nowhere to put
+    // one.
+    set({"text"}, {"image"});
+  } else if (mt == "qwen-image-21") {
+    // 2.1 is the case the split above does not have: ONE checkpoint
+    // that answers both tasks, because a reference image occupies
+    // vision slots the text encoder reserved rather than a separate
+    // conditioning path. So it belongs in {"text", "image"} even though
+    // it generates from a bare prompt too -- the image input is
+    // optional, not absent, and splitting it into two model_types the
+    // way qwen-image / qwen-image-edit are split would describe two
+    // checkpoints where there is one.
+    set({"text", "image"}, {"image"});
+  } else if (mt == "z-image") {
+    // Text-to-image ONLY. The family's editing checkpoint
+    // (Z-Image-Edit) and its omni base are not released, and this
+    // model has no vision tower and no reference path at all -- so
+    // {"text", "image"} would offer it to a stage that needs an image
+    // input and hand it a checkpoint with nowhere to put one.
+    set({"text"}, {"image"});
   } else if (mt == "wan-i2v") {
     // The one family here that OUTPUTS video: a prompt plus a first-frame
     // image in, a clip out.
     set({"text", "image"}, {"video"});
   } else if (mt == "wan-t2v") {
     set({"text"}, {"video"});
+  } else if (mt == "flashvsr") {
+    // RESTORATION: a low-quality clip in, the same clip at 4x out. No
+    // prompt -- the conditioning is a constant the checkpoint ships.
+    set({"video"}, {"video"});
+  } else if (mt == "relayvsr") {
+    // RelayVSR: frames in, the same frames at 4x out (relayvsr-upscale).
+    set({"video"}, {"video"});
   } else if (mt == "minimax-h3-fl2va") {
     // The only entry whose OUTPUT is two modalities: one denoise loop
     // over one packed sequence emits the clip and its soundtrack
@@ -1546,15 +3447,19 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
     // modalities at all, and a picker that filters on need_inputs hid
     // it from exactly the stages that would use it.
     set({"text", "image", "video", "audio"}, {"video", "audio"});
+  } else if (mt == "minimax-h3-image-vae") {
+    // A VAE and nothing else: pixels in, pixels out, with no prompt and
+    // no denoise anywhere in it. It is listed as its own model rather
+    // than as a supplement because it is a COMPLETE autoencoder -- the
+    // frozen H3 encoder plus a decoder retrained to read one latent
+    // frame -- so it round-trips a picture on its own, and because the
+    // same file serves both H3 partitions.
+    set({"image"}, {"image"});
   } else if (mt == "boogu-image-edit") {
     set({"text", "image"}, {"image"});
   } else if (mt == "boogu-image") {
     // The t2i instantiation takes no reference image (the edit
     // checkpoints, "boogu-image-edit", are the image-conditioned ones).
-    set({"text"}, {"image"});
-  } else if (mt == "mage-flow") {
-    // The t2i instantiation takes no reference image (the edit checkpoints,
-    // "mage-flow-edit", are the image-conditioned ones).
     set({"text"}, {"image"});
   } else if (mt == "yolo") {
     set({"image"}, {});
@@ -1563,6 +3468,17 @@ default_io_(const std::string& mt, std::vector<std::string>& in,
   } else if (mt == "qwen3.5-vision-encoder"
              || mt == "gemma4-vision-encoder") {
     set({"image", "video"}, {});
+  } else if (const FlexData* p = genai::detect::for_model_type(mt)) {
+    // A REGISTERED family's own modalities. A CATALOGUED model carries
+    // its own on the entry; this is the other half -- a model detected
+    // on disk, whose type is all there is to go on.
+    for (std::string& s : genai::detect::strings(p, genai::detect::kInputs)) {
+      in.push_back(std::move(s));
+    }
+    for (std::string& s :
+         genai::detect::strings(p, genai::detect::kOutputs)) {
+      out.push_back(std::move(s));
+    }
   }
   // Datasets (eval-*) and unknown types keep empty I/O.
 }
@@ -1652,6 +3568,45 @@ catalog_all_by_path(const std::string& hf_path)
 }
 
 const ModelCatalogEntry*
+catalog_pick_variant(const std::vector<const ModelCatalogEntry*>& cands,
+                     const std::string& variant,
+                     std::vector<const ModelCatalogEntry*>* matched)
+{
+  if (matched != nullptr) { matched->clear(); }
+  if (cands.empty()) { return nullptr; }
+  if (variant.empty()) {
+    // Nothing to match on: only a single candidate is unambiguous.
+    if (cands.size() != 1) { return nullptr; }
+    if (matched != nullptr) { matched->push_back(cands.front()); }
+    return cands.front();
+  }
+  auto lower = [](std::string v) {
+    for (char& c : v) { c = (char)tolower((unsigned char)c); }
+    return v;
+  };
+  const std::string w = lower(variant);
+  std::vector<const ModelCatalogEntry*> exact, part;
+  for (const ModelCatalogEntry* e : cands) {
+    const std::string fields[] = {lower(e->version), lower(e->variant),
+                                  lower(e->name), lower(e->model_type)};
+    bool is_exact = false, is_part = false;
+    for (const std::string& f : fields) {
+      if (f.empty()) { continue; }
+      if (f == w) { is_exact = true; }
+      else if (f.find(w) != std::string::npos) { is_part = true; }
+    }
+    if (is_exact)     { exact.push_back(e); }
+    else if (is_part) { part.push_back(e); }
+  }
+  // An exact hit anywhere outranks every substring hit; only within one
+  // tier does a tie mean ambiguity.
+  const std::vector<const ModelCatalogEntry*>& hits =
+      exact.empty() ? part : exact;
+  if (matched != nullptr) { *matched = hits; }
+  return hits.size() == 1 ? hits.front() : nullptr;
+}
+
+const ModelCatalogEntry*
 catalog_by_name(const std::string& name)
 {
   if (name.empty()) {
@@ -1663,6 +3618,47 @@ catalog_by_name(const std::string& name)
     }
   }
   return nullptr;
+}
+
+std::vector<std::pair<std::string, std::string>>
+catalog_url_files(const ModelCatalogEntry& e)
+{
+  std::vector<std::pair<std::string, std::string>> out;
+  if (!e.extra.is_object()) { return out; }
+  FlexData extra = e.extra;
+  auto o = extra.as_object();
+  if (!o.contains(catalog_extra::kUrlFiles)) { return out; }
+  FlexData list = o.at(catalog_extra::kUrlFiles);
+  if (!list.is_array()) { return out; }
+  auto a = list.as_array();
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    FlexData pair = a.at(i);
+    if (!pair.is_array()) { continue; }
+    auto pa = pair.as_array();
+    if (pa.size() != 2) { continue; }
+    std::string url(pa.at(0).as_string(""));
+    std::string dest(pa.at(1).as_string(""));
+    if (!url.empty() && !dest.empty()) {
+      out.emplace_back(std::move(url), std::move(dest));
+    }
+  }
+  return out;
+}
+
+FlexData
+catalog_url_files_extra(
+    std::vector<std::pair<std::string, std::string>> files)
+{
+  FlexData list = FlexData::make_array();
+  for (auto& [url, dest] : files) {
+    FlexData pair = FlexData::make_array();
+    pair.as_array().push_back(FlexData::make_string(url));
+    pair.as_array().push_back(FlexData::make_string(dest));
+    list.as_array().push_back(std::move(pair));
+  }
+  FlexData extra = FlexData::make_object();
+  extra.as_object().insert_or_assign(catalog_extra::kUrlFiles, std::move(list));
+  return extra;
 }
 
 std::string

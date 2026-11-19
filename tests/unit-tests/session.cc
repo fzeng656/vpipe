@@ -10,6 +10,11 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/generative-model-manager.h"
+#include <sys/sysctl.h>
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
@@ -303,27 +308,273 @@ TEST(session, wired_pool_shrinks_only_while_idle) {
   filesystem::current_path(saved_cwd, ec);
 }
 
+// The swap allowance moves in BOTH directions at any time, and the
+// contrast with the wired pool above is the point of the test rather
+// than an incidental difference.
+//
+// The pool refuses a shrink mid-run because its bytes are already
+// mlock'd: making a lower limit true means unwiring buffers a model is
+// still reading. The allowance reserves nothing -- it only widens the
+// arithmetic of the next preflight -- so there is nothing to give back
+// and no state a lower figure could invalidate. A Status{3} here would
+// mean someone had copied the pool's rule without its reason.
+TEST(session, swap_allowance_moves_both_ways_while_running) {
+  SessionTempDir dir;
+  error_code ec;
+  filesystem::path saved_cwd = filesystem::current_path(ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  filesystem::current_path(dir.path, ec);
+
+  vpipe::Session sess;
+  if (sess.generative_model_manager() == nullptr) {
+    filesystem::current_path(saved_cwd, ec);
+    return;                       // no manager in this build
+  }
+  // The SHIPPED default, asserted so a change to it is a deliberate
+  // edit to this line rather than a silent drift.
+  EXPECT_TRUE(sess.swap_allowance_mb() == 4096u);
+
+  auto handle = sess.create_pipeline("swap");
+  auto* pl    = vpipe::HandleAccess::impl(handle)->pipeline();
+  pl->insert_stage(std::make_unique<NoopSourceStage>(
+      &sess, "src", std::vector<vpipe::InEdge>{}));
+  EXPECT_TRUE(sess.launch_pipeline(handle).code == 0u);
+
+  // DOWN while running -- accepted, where the wired pool returns 3.
+  EXPECT_TRUE(sess.set_swap_allowance_mb(1024).code == 0u);
+  EXPECT_TRUE(sess.swap_allowance_mb() == 1024u);
+  // ...and up again.
+  EXPECT_TRUE(sess.set_swap_allowance_mb(8192).code == 0u);
+  EXPECT_TRUE(sess.swap_allowance_mb() == 8192u);
+
+  // 0 is a REAL setting -- size a forward against reclaimable RAM alone
+  // -- and not a request for the default. A getter reporting 4096 here
+  // would mean the sentinel had leaked into the value.
+  EXPECT_TRUE(sess.set_swap_allowance_mb(0).code == 0u);
+  EXPECT_TRUE(sess.swap_allowance_mb() == 0u);
+
+  EXPECT_TRUE(sess.stop_pipeline(handle).code == 0u);
+  EXPECT_TRUE(sess.unload_pipeline(handle).code == 0u);
+
+  filesystem::current_path(saved_cwd, ec);
+}
+
+// THE CONFIG PATH, which the setter test above does not touch: a
+// figure typed into a session config (or forwarded from --swap-
+// allowance-mb through the environment) has to reach the manager at
+// construction, and an UNSET key has to leave the shipped default
+// alone rather than overwriting it with zero.
+//
+// That last case is the one worth a test. The parser uses a sentinel to
+// tell "not configured" from an explicit 0, because 0 is a real setting
+// meaning "size against reclaimable RAM alone" -- collapsing the two
+// would silently disable the allowance for every session that never
+// mentions it.
+TEST(session, swap_allowance_comes_from_config) {
+  {
+    vpipe::Session sess(R"({"swap_allowance_mb": 1234})");
+    if (sess.generative_model_manager() == nullptr) { return; }
+    EXPECT_TRUE(sess.swap_allowance_mb() == 1234u);
+  }
+  // An explicit 0 is honoured, not read as "unset".
+  {
+    vpipe::Session sess(R"({"swap_allowance_mb": 0})");
+    EXPECT_TRUE(sess.swap_allowance_mb() == 0u);
+  }
+  // No key at all -> the manager's own default stands.
+  {
+    vpipe::Session sess(R"({"log_level": "info"})");
+    EXPECT_TRUE(sess.swap_allowance_mb() == 4096u);
+  }
+  // The environment overrides the config, the way the other memory
+  // knobs do -- this is how both apps forward their flag.
+  {
+    ::setenv("VPIPE_SWAP_ALLOWANCE_MB", "2048", 1);
+    vpipe::Session sess(R"({"swap_allowance_mb": 1234})");
+    EXPECT_TRUE(sess.swap_allowance_mb() == 2048u);
+    ::unsetenv("VPIPE_SWAP_ALLOWANCE_MB");
+  }
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// The supply side. Deliberately a WEAK assertion: this reads the live
+// machine, so the only thing true on every box is that the figure is
+// sane -- it cannot exceed physical RAM, and it must not come back as a
+// wrapped-around huge number when the subtractions overshoot (which is
+// the arithmetic bug worth catching, since every term is unsigned).
+TEST(session, swappable_other_bytes_is_bounded) {
+  const size_t spare =
+      vpipe::genai::GenerativeModelManager::swappable_other_bytes();
+  size_t ram = 0;
+  uint64_t mem = 0; size_t len = sizeof(mem);
+  if (::sysctlbyname("hw.memsize", &mem, &len, nullptr, 0) == 0) {
+    ram = (size_t)mem;
+  }
+  if (ram > 0) { EXPECT_TRUE(spare < ram); }
+}
+#endif
+
+// Chdir into `dir` for the duration, then restore -- the db-path tests
+// all decide from the CWD, and a test that left the process somewhere
+// else would move the ones after it.
+struct ScopedCwd {
+  filesystem::path saved;
+  bool             ok = false;
+  explicit ScopedCwd(const filesystem::path& to) {
+    error_code ec;
+    saved = filesystem::current_path(ec);
+    if (ec) { return; }
+    filesystem::current_path(to, ec);
+    ok = !ec;
+  }
+  ~ScopedCwd() {
+    if (saved.empty()) { return; }
+    error_code ec;
+    filesystem::current_path(saved, ec);
+  }
+};
+
+// Materialise data.mdb / lock.mdb in `dir` by opening an env there.
+bool
+make_db_(const filesystem::path& dir)
+{
+  vpipe::Session sess(R"({"db":{"path":")" + dir.string() + R"("}})");
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  error_code ec;
+  return env != nullptr && env->valid() &&
+         filesystem::exists(dir / "data.mdb", ec);
+}
+
 TEST(session, lmdb_env_defaults_to_cwd_without_db_path) {
   // No db.path in config => lmdb_env() opens "." (the process
   // CWD). To avoid sprinkling data.mdb / lock.mdb files into the
   // build directory we chdir into a fresh tmpdir, exercise the
   // accessor, then restore the original CWD before the tmpdir is
   // removed.
+  //
+  // TWO levels down, and the intermediate is left empty on purpose: the
+  // default is "." only while the parent has no database of its own (see
+  // the sandbox test below), and one level down would make that depend on
+  // whatever happens to sit in the system temp directory.
   SessionTempDir dir;
   error_code ec;
-  filesystem::path saved_cwd = filesystem::current_path(ec);
+  const filesystem::path cwd = filesystem::path(dir.path) / "empty" / "run";
+  filesystem::create_directories(cwd, ec);
   ASSERT_FALSE(static_cast<bool>(ec));
-  filesystem::current_path(dir.path, ec);
-  ASSERT_FALSE(static_cast<bool>(ec));
-  {
-    vpipe::Session sess;
-    vpipe::LmdbEnv* env = sess.lmdb_env();
-    EXPECT_TRUE(env != nullptr);
-    if (env) {
-      EXPECT_TRUE(env->valid());
-    }
+  ScopedCwd chdir_(cwd);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) {
+    EXPECT_TRUE(env->valid());
+    EXPECT_TRUE(env->path() == ".");
   }
-  filesystem::current_path(saved_cwd, ec);
+}
+
+TEST(session, lmdb_env_adopts_the_database_beside_a_sandbox_cwd) {
+  // The web-ui's layout: the database sits in its starting directory and
+  // the pipelines it writes live in `sandbox` beneath it. A CLI run from
+  // inside `sandbox` finds no database in the CWD and must adopt the one
+  // beside it rather than create a second, empty one -- otherwise every
+  // registered model misses.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path sandbox = parent / "sandbox";
+  error_code ec;
+  filesystem::create_directories(sandbox, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  ASSERT_TRUE(make_db_(parent));
+
+  ScopedCwd chdir_(sandbox);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) {
+    EXPECT_TRUE(env->valid());
+    // Canonical on both sides: the adopted path comes from
+    // current_path(), which resolves symlinks, while temp_directory_path()
+    // does not -- on macOS that is /private/var against /var for the same
+    // directory.
+    error_code e1, e2;
+    EXPECT_TRUE(filesystem::canonical(filesystem::path(string(env->path())),
+                                      e1) ==
+                filesystem::canonical(parent, e2));
+    EXPECT_FALSE(static_cast<bool>(e1));
+    EXPECT_FALSE(static_cast<bool>(e2));
+  }
+  // ...and nothing was created in the sandbox itself.
+  EXPECT_FALSE(filesystem::exists(sandbox / "data.mdb", ec));
+}
+
+TEST(session, lmdb_env_keeps_a_database_that_is_in_the_cwd) {
+  // The CWD's own database WINS over the parent's, so a nested working
+  // directory that has been used before keeps using what it has. Both
+  // directories hold one here, which is the only arrangement that can
+  // tell the two rules apart.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path child = parent / "child";
+  error_code ec;
+  filesystem::create_directories(child, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  ASSERT_TRUE(make_db_(parent));
+  ASSERT_TRUE(make_db_(child));
+
+  ScopedCwd chdir_(child);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) { EXPECT_TRUE(env->path() == "."); }
+}
+
+TEST(session, lmdb_env_ignores_a_parent_holding_only_a_lock_file) {
+  // A stray lock.mdb is not a database: adopting a directory on the
+  // strength of one would point the run at an empty env that LMDB then
+  // creates beside the lock. The DATA file is what says a database is
+  // there.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path child = parent / "child";
+  error_code ec;
+  filesystem::create_directories(child, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  { ofstream(parent / "lock.mdb") << "not a database"; }
+
+  ScopedCwd chdir_(child);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess;
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) { EXPECT_TRUE(env->path() == "."); }
+}
+
+TEST(session, configured_db_path_beats_the_sandbox_rule) {
+  // An explicit db.path is used as given, whatever the CWD looks like.
+  SessionTempDir dir;
+  const filesystem::path parent(dir.path);
+  const filesystem::path sandbox = parent / "sandbox";
+  const filesystem::path elsewhere = parent / "elsewhere";
+  error_code ec;
+  filesystem::create_directories(sandbox, ec);
+  filesystem::create_directories(elsewhere, ec);
+  ASSERT_FALSE(static_cast<bool>(ec));
+  ASSERT_TRUE(make_db_(parent));
+
+  ScopedCwd chdir_(sandbox);
+  ASSERT_TRUE(chdir_.ok);
+  if (!chdir_.ok) { return; }
+  vpipe::Session sess(R"({"db":{"path":")" + elsewhere.string() +
+                      R"("}})");
+  vpipe::LmdbEnv* env = sess.lmdb_env();
+  ASSERT_TRUE(env != nullptr);
+  if (env) { EXPECT_TRUE(env->path() == elsewhere.string()); }
 }
 
 TEST(session, lmdb_env_lazily_opens_when_db_path_configured) {

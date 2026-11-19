@@ -1,8 +1,20 @@
 #include "pipeline/stage-spec.h"
 
+#include "common/abi-struct.h"
+
 #include <vector>
 
 namespace vpipe {
+
+std::string_view
+spec_extra(std::span<const SpecExtra> extra, std::string_view key) noexcept
+{
+  for (const SpecExtra& e : extra) {
+    if (e.key == key) { return e.value; }
+  }
+  return {};
+}
+
 
 namespace {
 
@@ -79,6 +91,22 @@ stage_category_name(StageCategory c) noexcept
     case StageCategory::ModelSpecificConfig: return "model-specific-config";
   }
   return "generic";
+}
+
+const CommandSpec*
+find_command(const StageSpec& spec, std::string_view name) noexcept
+{
+  for (const CommandSpec& c : spec_commands(spec)) {
+    if (c.name == name) { return &c; }
+  }
+  return nullptr;
+}
+
+std::span<const CommandSpec>
+spec_commands(const StageSpec& spec) noexcept
+{
+  if (!abi_has(spec, &StageSpec::commands)) { return {}; }
+  return spec.commands;
 }
 
 }

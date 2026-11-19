@@ -16,12 +16,18 @@
 #ifndef VPIPE_STAGES_MODEL_MEMORY_H
 #define VPIPE_STAGES_MODEL_MEMORY_H
 
+#include "common/flex-data.h"
 #include "pipeline/resource-plan.h"
 
 #include <cstddef>
+#include <cstdlib>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class SessionContextIntf;
@@ -130,6 +136,14 @@ int phase_order(std::string_view phase);
 // How many phases there are, for a caller walking all of them.
 int phase_count();
 
+// The phase at `index` in the running order, or "" when out of range.
+// The inverse of phase_order(), and the half that was missing: a caller
+// told how MANY phases there are had no way to name them, so anything
+// walking them had to re-list the constants and could then disagree
+// with kPhasesInOrder -- which is exactly how the planner's decide()
+// came to reject `decode-audio`.
+std::string_view phase_name(int index);
+
 // Claims for weights this stage holds only during `phase`.
 //
 // TWO CONDITIONS, both required, and neither is checkable by the
@@ -194,6 +208,62 @@ inline constexpr std::size_t kUnknownArena = 4096;
 std::vector<ResourceClaim>
 scratch_claims(std::string label, std::size_t bytes, std::string_view phase);
 
+// ---- CoreML / ANE residency -------------------------------------------
+//
+// Bytes a CoreML model holds that NOTHING ELSE in this process can see.
+// A weight set knows what it cached and a SharedBuffer knows what it
+// allocated; a CoreML model's weights are neither. They are handed to
+// CoreML at load and the file they came from is deleted, so they are
+// invisible to weight_footprint(), to revise_declaration(), to the
+// wired pool, and -- because they are not Metal resources -- to
+// MetalCompute::memory_budget().headroom as well. Only the physical-RAM
+// reading sees them, which is the backstop, not the plan.
+//
+// That was tolerable while the only CoreML models here were small
+// towers. It stopped being tolerable with the ANE feed-forward tier,
+// where the hold is per DiT BLOCK and scales with depth: measured at
+// ~1.2 GB a block on Krea-2, so a 28-block model asks for ~34 GB, more
+// than the checkpoint, against a declared streaming floor of 3.5 GB.
+// A floor is a promise (see the weights section above), and an
+// unaccounted hold of that size breaks it silently -- the revised-down
+// number reads as ROOM to whoever sizes next.
+//
+// So the claim is UNITS, not bytes: `unit_bytes` each, `units` of them,
+// and the planner grants as many as the box has room for -- possibly
+// zero, which means the accelerator stays off. That shape is what makes
+// this plannable at all. An accelerator is the one resource where
+// taking less is a real option: it costs proportional speed and nothing
+// else, so the planner never REFUSES a launch over it the way the
+// weight planner does. A model that cannot bear a partial grant should
+// claim one unit.
+inline constexpr std::string_view kCoreMLKind = "coreml-resident";
+
+// `label` names the holder for the log and is the key coreml_grant()
+// reads back, so it must be stable across the two calls and unique
+// within a graph (two stages sharing one label share its grant).
+std::vector<ResourceClaim>
+coreml_claims(std::string label, std::size_t unit_bytes, int units,
+              std::string_view phase = {});
+
+// How many units the plan granted `label`. Call it where the decision is
+// TAKEN -- at load, after the init barrier -- not at claim time: the
+// grant is not computed until every stage has claimed.
+//
+// `requested` is what the caller would take if the box were empty, and
+// the answer is never more than it. With no plan on record (a test, a
+// tool, anything not launched through PipelineRuntime) the same budget
+// arithmetic runs inline, so an unplanned caller is bounded too rather
+// than silently taking everything.
+int coreml_grant(const SessionContextIntf* session, std::string_view label,
+                 std::size_t unit_bytes, int requested);
+
+// The inverse of coreml_claims(), for a stage that books a claim it did not
+// make -- a plugin family's -- under a label of its own: the family cannot
+// know the stage's id, and two stages sharing one label share one grant.
+// False for anything that is not a well-formed CoreML claim.
+bool parse_coreml_claim(const ResourceClaim& c, std::string* label,
+                        std::size_t* unit_bytes, int* units);
+
 // A PAYLOAD: bytes that outlive the phase producing them.
 //
 // Same machinery as an arena -- a label, a size, a lifetime -- and a
@@ -250,6 +320,17 @@ std::size_t vae_decode_scratch_bytes(const std::string& root,
 // config geometry first is what gives peers something to size against
 // before the first clip exists.
 std::size_t video_decode_scratch_bytes(int width, int height, int frames);
+
+// What the VAE that decodes such a clip holds BESIDE the clip, when that
+// is not small. Today that is the Wan video VAE: its causal carries are
+// held for the whole clip and its chunk pool is at full resolution, and
+// at FlashVSR's 1920x1152 the two are several times the clip itself. The
+// figure is MetalWanVae::decode_peak_bytes(), the one its own preflight
+// refuses on. 0 for every other VAE, whose video decode stays booked by
+// video_decode_scratch_bytes() alone. Reads the VAE's config (or, for a
+// natively-named checkpoint, its header) -- no model load.
+std::size_t video_vae_working_bytes(const std::string& root, int width,
+                                    int height);
 
 // Should a stage drop its weights between beats, given what this beat
 // actually needs?
@@ -314,12 +395,14 @@ std::size_t dir_weights_bytes(const std::string& dir);
 // matches nothing yields 0, and a prefix match from position 0 cannot
 // confuse "blocks." with "transformer_blocks.".
 //
-// Returns 0 when no stem matches, which means nothing here streams and
-// the checkpoint has no smaller form. A model with TWO stacks (FLUX.2's
-// double and single) is measured against whichever stem is tried first
-// and counts the other stack as trunk -- an OVER-estimate of the floor,
-// which is the safe direction: it claims the model can be reduced less
-// than it can.
+// Returns 0 when NO stem matches, which means nothing here streams and
+// the checkpoint has no smaller form.
+//
+// A model with TWO stacks (an image DiT's double and single) is measured
+// against BOTH: it streams both and keeps a slot pair for each, so the
+// floor is the trunk plus a pair per stack. Stems are tried in order and
+// the first prefix match wins, so a list holding one stem that is a
+// prefix of another must put the longer first.
 std::size_t streaming_floor_bytes(const std::string&                   dir,
                                   const std::vector<std::string_view>& stems,
                                   std::string_view exclude = {});
@@ -386,22 +469,42 @@ bool bounded(const SessionContextIntf*       session,
 // resident BESIDES the DiT, which is what the prefix has to coexist
 // with. Both are 0/false when RAM is unknown.
 struct StreamPlan {
-  bool        stream    = false;
-  // LM LAYER pinning ONLY. Every DiT that used this is retired: the five
-  // block-streaming families grow a resident set by measuring instead
-  // (BlockResidency), which is what a fraction of total RAM decided
-  // before the run could never do.
+  // THE DiT'S ANSWER. A prefill-only TEXT ENCODER ignores it and streams
+  // unconditionally -- see the three call sites in
+  // diffusion-conditioner-stage.cc and video-ref-encoder-stage.cc.
   //
-  // The language models are not retired because they have nothing to
-  // grow into -- metal-qwen-model and metal-gemma-model pin a prefix of
-  // layers and have no residency policy behind it, so removing this
-  // would leave the text encoders streaming everything with no way back.
-  // Give them BlockResidency and this field goes too.
+  // The two are not the same question. A DiT re-reads its stack once per
+  // STEP, so preloading is worth a real decision; `backbone_only` means
+  // no lm_head, MetalQwenModel::load refuses the combination otherwise,
+  // and such an encoder prefills ONCE per prompt and is then dropped.
+  // Streaming it costs one pass over the checkpoint per prompt and
+  // removes an irreversible guess taken from an on-disk size that is
+  // wrong whenever the loader converts (an F32 checkpoint narrowed to
+  // bf16, MiniMax-H3's AdaLN bake). It also starts the GPU after the
+  // first LAYER rather than after the whole read.
+  bool        stream    = false;
+  // LM LAYER pinning ONLY, and only where nothing better serves. Every
+  // DiT that used this is retired: the block-streaming families grow a
+  // resident set by measuring instead (BlockResidency), which is what a
+  // fraction of total RAM decided before the run could never do. So do
+  // the text encoders whose backbone the raw-source path streams
+  // (MetalQwenModel::Config::stream_decode): every Qwen3 / Qwen3-VL
+  // conditioner, MiniMax-H3's included, and the Qwen3.5 hybrid.
+  //
+  // Still read by a prefill-only encoder with no residency policy
+  // behind it -- one the raw-source path does not build (Qwen2.5-VL's
+  // attention biases, a pack of another width), and
+  // a plug-in's hidden-state encoder (HiddenStateEncoderArgs::pin_frac,
+  // the Gemma backbone) -- where removing it would leave the encoder
+  // streaming everything with no way back.
   double      pin_frac  = 0.0;
   std::size_t footprint = 0;   // DiT + encoder + everything resident
   std::size_t others    = 0;   // the same, minus the DiT's own bytes
   std::size_t retires   = 0;   // what `dit_retires` took off the footprint
   std::size_t transient = 0;   // peers that let go before this model runs
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // `dit_retires` is what the DiT will RELEASE after load and before the
@@ -416,11 +519,72 @@ struct StreamPlan {
 // direction is the expensive one: a model that declines to stream and
 // then holds more than predicted thrashes, and nothing later can undo
 // the decision. Zero -- the default -- is always safe.
+//
+// `phase` is THE CALLER'S OWN phase, and it is the one argument here
+// that is easy to leave wrong. The footprint is narrowed to it -- the
+// question being asked is "what else is resident while I run", so a
+// peer that has let go by then is correctly absent.
+//
+// A DiT runs in `denoise`, which is why that is the default and why
+// MiniMax-H3's verdict is not distorted by an encoder that stops
+// existing before the first step. A TEXT ENCODER does not: it runs in
+// `condition` and is gone by `denoise`. Asked with the default it
+// therefore sizes itself against a phase it is not in -- and because
+// weight_footprint()'s dedup is phase-blind while its total is not, its
+// own bytes are then dropped from BOTH terms rather than counted once.
+// MEASURED on the M5 16 GB with Qwen-Image-2.1: a 16722 MB encoder
+// judged itself against 1288 MB, preloaded, and put 9 GB into swap.
+// Qwen-Image-2.1's sibling families escaped the same bug only because
+// their DiT floors happen to clear the threshold.
+//
+// So: pass the phase the CALLER is resident in, not the phase the
+// component it is reasoning about runs in.
 StreamPlan plan_streaming(const SessionContextIntf* session,
                           const std::string&        dit_dir,
                           const std::string&        enc_dir,
                           std::size_t               headroom,
-                          std::size_t               dit_retires = 0);
+                          std::size_t               dit_retires = 0,
+                          std::string_view          phase = kPhaseDenoise);
+
+// Whether a model `plan` PRELOADS still passes plan_streaming's own rule
+// with `extra` bytes more -- the question a choice that trades memory for
+// speed asks before taking it (a w4 pack's int8 copy on the int8 tiers).
+// False for a plan that streams. Inline: it composes what the header
+// already exports, so it adds no symbol a plugin could miss on an older
+// host.
+inline bool
+preload_fits_extra(const StreamPlan& plan, std::size_t extra,
+                   std::size_t headroom)
+{
+  const std::size_t ram = phys_ram();
+  if (plan.stream || ram == 0) { return false; }
+  // plan_streaming's rule, verbatim, on the larger figure.
+  const std::size_t f = plan.footprint + extra;
+  return f <= ram / 3 && ram >= f + headroom;
+}
+
+// STREAM, THEN RETAIN: whether a DiT that can stream its blocks does,
+// apart from plan.stream's verdict on the box.
+//
+// The two answers used to be one. `plan.stream` says the box is TIGHT --
+// peers act on it (note_streaming), and so do the behaviours only a
+// bounded box wants: deferring the load past the conditioning, revising
+// the declaration down to the trunk, releasing the forward's scratch.
+// The MECHANISM is a separate choice, and on a box with room it is now
+// streaming too: the first forward reads each block as it needs it and
+// residency KEEPS it (every block on the first pass when the wired pool
+// is on -- BlockResidency::set_schedule), so the run converges on what a
+// preload holds, one pass in, by measuring the box rather than trusting
+// an estimate taken before the run. A 64 GB box never preloaded the
+// large checkpoints; a 256 GB one preloads them all, and this retires
+// that second path. VPIPE_PRELOAD=1 restores it, for the A/B.
+inline bool
+stream_blocks_by_default(const StreamPlan& plan)
+{
+  if (plan.stream) { return true; }
+  const char* e = std::getenv("VPIPE_PRELOAD");
+  return e == nullptr || *e == '\0' || *e == '0';
+}
 
 // The `unload_when_idle` config value shared by the model-holding stages.
 // THREE things can happen to idle weights, not two:
@@ -470,5 +634,7 @@ const char* unload_policy_name(UnloadPolicy p);
 
 }  // namespace model_memory
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

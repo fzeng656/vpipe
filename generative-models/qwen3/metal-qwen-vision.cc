@@ -8,6 +8,7 @@
 #include "apple-silicon/metal-compute/compute-encoder.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/flex-bag.h"
 #include "common/perf-event.h"
 #include "common/perf-scope.h"
 
@@ -92,11 +93,11 @@ smart_resize_(int h, int w, int factor, int min_px, int max_px,
 {
   int hb = std::max(factor, (int)std::round((double)h / factor) * factor);
   int wb = std::max(factor, (int)std::round((double)w / factor) * factor);
-  if (hb * wb > max_px) {
+  if ((std::int64_t)hb * wb > max_px) {
     double beta = std::sqrt(((double)h * w) / max_px);
     hb = std::max(factor, (int)std::floor(h / beta / factor) * factor);
     wb = std::max(factor, (int)std::floor(w / beta / factor) * factor);
-  } else if (hb * wb < min_px) {
+  } else if ((std::int64_t)hb * wb < min_px) {
     double beta = std::sqrt((double)min_px / ((double)h * w));
     hb = (int)std::ceil(h * beta / factor) * factor;
     wb = (int)std::ceil(w * beta / factor) * factor;
@@ -360,7 +361,11 @@ MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
         }
       }
     } else {
-      return {};
+      // A quantized projector (Q8_0 and the file's other block types):
+      // widened by the file's own dequantizer, then narrowed once.
+      std::vector<float> f(n);
+      if (!gg->dequant_all_f32(*t, f.data())) { return {}; }
+      for (std::size_t i = 0; i < n; ++i) { o[i] = enc_elt_(f[i], bf16); }
     }
     return out;
   };
@@ -444,11 +449,15 @@ MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
       // downstream widens, so an F16 projector in a bf16 run costs one
       // per-element register conversion at LOAD and then runs at
       // 16-bit width exactly like a BF16 one.
+      // Any other type (a quantized projector) is widened whole first.
+      std::vector<float> wide;
       if (tn->type != GgufFile::kF32 && tn->type != GgufFile::kF16
           && tn->type != GgufFile::kBF16) {
-        return {};
+        wide.resize((std::size_t)tn->numel());
+        if (!gg->dequant_all_f32(*tn, wide.data())) { return {}; }
       }
       auto elem = [&](std::size_t i) -> float {
+        if (!wide.empty()) { return wide[i]; }
         if (tn->type == GgufFile::kF32) {
           return reinterpret_cast<const float*>(tn->data)[i];
         }
@@ -472,7 +481,21 @@ MetalQwenVisionEncoder::load(std::shared_ptr<WeightSet> ws_in,
     return w;
   };
 
-  const std::string r = cfg.weight_prefix;   // "vision_tower." or "visual."
+  // The prefix the caller names -- else, when the checkpoint holds no
+  // tower under it, the first known layout that does: MLX's
+  // "vision_tower.", HF's Qwen3_5ForConditionalGeneration "model.visual."
+  // (what a ModelOpt export keeps), a bare Qwen3-VL "visual.".
+  std::string r = cfg.weight_prefix;
+  if (!gguf && wts->src().info(r + "patch_embed.proj.weight") == nullptr) {
+    for (const char* p : {"vision_tower.", "model.visual.", "visual."}) {
+      if (wts->src().info(std::string(p) + "patch_embed.proj.weight") !=
+          nullptr) {
+        r = p;
+        break;
+      }
+    }
+  }
+  m->_cfg.weight_prefix = r;
   m->_pe_w = gguf ? patch_embed_gguf() : to_f16(r + "patch_embed.proj.weight");
   if (!gguf && !m->_pe_w.empty()) {
     // The host patchify above emits each patch's features CHANNELS-LAST
@@ -604,13 +627,105 @@ MetalQwenVisionEncoder::config_from(const ModelConfig& c)
     m.image_mean[i] = v.image_mean[i];
     m.image_std[i]  = v.image_std[i];
   }
+  // The checkpoint's own resize bounds (its processor's), where it states
+  // them -- a still picture up to 16.7 MP on a Qwen3-VL repo.
+  namespace mk = model_config;
+  m.min_pixels = (int)bag::integer(c.extra, mk::kVisionMinPixels,
+                                   m.min_pixels);
+  m.max_pixels = (int)std::min<long long>(
+      bag::integer(c.extra, mk::kVisionMaxPixels, m.max_pixels), INT32_MAX);
+  m.video_min_pixels = bag::integer(c.extra, mk::kVisionVideoMinPixels,
+                                    m.video_min_pixels);
+  m.video_max_pixels = bag::integer(c.extra, mk::kVisionVideoMaxPixels,
+                                    m.video_max_pixels);
   return m;
+}
+
+namespace {
+
+// encode_()'s allocations for `n` patches whose pixels, resized, number
+// `host_px` on the host.
+std::size_t
+encode_bytes_(const MetalQwenVisionEncoder::Config& c, std::size_t n,
+              std::int64_t host_px)
+{
+  const int P = std::max(1, c.patch_size), S = std::max(1, c.spatial_merge);
+  const std::size_t n_im = n / ((std::size_t)S * S);
+  const std::size_t hidden = (std::size_t)c.hidden;
+  const std::size_t hd = (std::size_t)std::max(1, c.head_dim());
+  const std::size_t ahd = hd != 64 && hd < 128 ? 128 : hd;   // the pad
+  const std::size_t feat =
+      (std::size_t)c.temporal_patch * P * P * 3;
+  const std::size_t mdim = (std::size_t)S * S * hidden;
+  const std::size_t per_patch =
+      feat + hidden + 2 * hd                    // features, pos, cos/sin
+      + 2 * hidden + 3 * hidden + 3 * hidden    // x, n1, qkv, q / k / v
+      + 2 * hidden                              // roped q / k
+      + 4 * (std::size_t)c.n_heads * ahd        // head-major q / k / v / out
+      + 3 * hidden                              // att, proj, out2
+      + 2 * (std::size_t)c.intermediate;        // the MLP
+  std::size_t per_tok = mdim + (std::size_t)c.out_hidden;
+  if (!c.deepstack_indexes.empty()) {
+    per_tok += c.deepstack_indexes.size() * (std::size_t)c.out_hidden +
+               2 * mdim;
+  }
+  const std::size_t gpu = (n * per_patch + n_im * per_tok) * 2;
+  // Host: the resized and the normalized pixels (f32), the patches,
+  // positions and RoPE. MEASURED with the real tower (Qwen3.5-4B's): the
+  // GPU term within 1% of the device's allocated size at its peak, the
+  // host term within 10% of the resident size's growth (2048^2 and 4096^2).
+  const std::size_t host = (std::size_t)host_px * 3 * 4 * 2 +
+                           n * (feat + hidden + 2 * hd) * 2;
+  return gpu + host;
+}
+
+}  // namespace
+
+std::size_t
+MetalQwenVisionEncoder::encode_scratch_bytes(const Config& c,
+                                             std::int64_t max_pixels)
+{
+  // encode_()'s allocations at the largest grid: a picture of at most
+  // `px` pixels is at most px / P^2 patches (smart_resize keeps the area
+  // under the bound).
+  const std::int64_t px =
+      max_pixels > 0 ? std::min<std::int64_t>(max_pixels, c.max_pixels)
+                     : (std::int64_t)c.max_pixels;
+  const int P = std::max(1, c.patch_size);
+  const std::size_t n = (std::size_t)std::max<std::int64_t>(px, 0) /
+                        ((std::size_t)P * P);
+  return encode_bytes_(c, n, px);
+}
+
+std::size_t
+MetalQwenVisionEncoder::encode_video_scratch_bytes(const Config& c,
+                                                   int n_frames, int H, int W)
+{
+  if (n_frames <= 0 || H <= 0 || W <= 0) { return 0; }
+  const int P = std::max(1, c.patch_size), S = std::max(1, c.spatial_merge);
+  const int T = std::max(1, c.temporal_patch);
+  int th = 0, tw = 0;
+  smart_resize_video_(n_frames, H, W, P * S, T, c.video_min_pixels,
+                      c.video_max_pixels, &th, &tw);
+  // encode_()'s grid: a cell of the resized frame per T frames, every
+  // frame's pixels resized on the host.
+  const std::size_t cells = (std::size_t)((n_frames + T - 1) / T);
+  const std::size_t n =
+      cells * (std::size_t)(th / P) * (std::size_t)(tw / P);
+  return encode_bytes_(c, n, (std::int64_t)n_frames * th * tw);
 }
 
 MetalQwenVisionEncoder::Result
 MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W)
 {
   return encode_(rgb, 1, H, W, false);
+}
+
+MetalQwenVisionEncoder::Result
+MetalQwenVisionEncoder::encode(const std::uint8_t* rgb, int H, int W,
+                               std::int64_t max_pixels)
+{
+  return encode_(rgb, 1, H, W, false, max_pixels);
 }
 
 MetalQwenVisionEncoder::Result
@@ -623,7 +738,7 @@ MetalQwenVisionEncoder::encode_video(const std::uint8_t* rgb, int n_frames,
 
 MetalQwenVisionEncoder::Result
 MetalQwenVisionEncoder::encode_(const std::uint8_t* rgb, int n_frames, int H,
-                                int W, bool video)
+                                int W, bool video, std::int64_t max_pixels)
 {
   // Record this GPU ViT pass on the profiler's LLM lane (vision-tower
   // category) so it's categorized like the MLX and CoreML towers. When
@@ -654,7 +769,13 @@ MetalQwenVisionEncoder::encode_(const std::uint8_t* rgb, int n_frames, int H,
     smart_resize_video_(n_frames, H, W, factor, T, c.video_min_pixels,
                         c.video_max_pixels, &th, &tw);
   } else {
-    smart_resize_(H, W, factor, c.min_pixels, c.max_pixels, &th, &tw);
+    // A caller's budget tightens the checkpoint's bound, never loosens it,
+    // and never below the smallest picture the bound admits.
+    const int hi = max_pixels > 0
+        ? (int)std::max<std::int64_t>(
+              c.min_pixels, std::min<std::int64_t>(max_pixels, c.max_pixels))
+        : c.max_pixels;
+    smart_resize_(H, W, factor, c.min_pixels, hi, &th, &tw);
   }
   const int grid_h = th / P, grid_w = tw / P;
   const int mw = grid_w / S;

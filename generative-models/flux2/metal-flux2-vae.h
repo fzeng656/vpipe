@@ -3,6 +3,7 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/kernel-sets/vae-conv3x3-tune.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
@@ -48,7 +49,15 @@ class MetalFlux2Vae {
   struct Config {
     int in_channels     = 3;
     int latent_channels = 32;
+    // Whether its kernel tuners MEASURE (the 3x3 conv route, the mid-block
+    // attention, the int8 split): false takes the choice believed fastest
+    // on this GPU, timing nothing -- the accel key `autotune`.
+    bool autotune = true;
     int block_out[4]    = {128, 256, 512, 512};
+    // The DECODER's widths, when they differ from the encoder's:
+    // `decoder_block_out_channels`, the FLUX.2 "small decoder" MOSS-Image
+    // ships ([96, 192, 384, 384]). Absent, it is block_out.
+    int dec_block_out[4] = {128, 256, 512, 512};
     int layers_per_block = 2;
     int norm_groups     = 32;
     int patch           = 2;        // patch_size (per spatial dim); 1 = plain
@@ -103,10 +112,80 @@ class MetalFlux2Vae {
   encode(const metal_compute::SharedBuffer& img, int H, int W);
   bool has_encoder() const { return _has_encoder; }
 
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every 3x3 conv, 1x1
+  // conv and the mid-block attention, counted as encoded and credited
+  // as each command buffer retires. For a test to hold against shapes.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
+  // 3x3 convs the hardware conv has run on a 32- or 16-channel
+  // destination tile (a width that is not a multiple of 64), counted as
+  // encoded. For a test to assert the narrow tile actually engaged.
+  int narrow_hw_convs() const noexcept { return _narrow_hw_convs; }
+
+  // How the last decode() ran, for a test to assert the path it meant to
+  // exercise actually ran (a budget that fits takes the whole decode and
+  // proves nothing about tiling).
+  struct DecodeReport {
+    bool exact = false;          // decode_exact_ drew the picture
+    int whole_stages = 0;        // up-path stages it ran whole
+    int passes = 0;              // tiled passes (statistics + the picture)
+    int tiles = 0;               // tiles over all passes
+    int kept = 0;                // planes kept whole as a later source
+    double work = 0.0;           // up-path work over a whole decode's
+  };
+  const DecodeReport& last_decode() const noexcept { return _report; }
+
   const Config& config() const { return _cfg; }
+
+  // ACCELERATED MODE (LOSSY), the stages' `i8_gemm` / `i8_gemm_tier`: the
+  // 3x3 convs on the hardware int8 convolution (conv2d_hw_3x3_*_i8), as
+  // MetalKrea2Vae runs them and on the same kernels -- an activation
+  // channel at a step of its own (a 3x3 window sums nine pixels in one
+  // pass, so no finer scale is possible there), folded into a per-call
+  // int8 copy of the weight by SmoothQuant's migration (alpha 0.25,
+  // VPIPE_VAE_I8_ALPHA), the scales and bias in the conv's epilogue. A
+  // resnet's conv reads GroupNorm -> SiLU, its pixels' magnitude already
+  // evened by the norm, and its SiLU goes into the quantizer.
+  //
+  //   THE TIER (0 accurate, 1 fast, 2 token, 3 token_plain -- the DiTs'
+  //   vocabulary): accurate takes the resnet convs alone; every other
+  //   tier also takes the 3x3s that read the unnormalized residual
+  //   stream (the up / downsamples, conv_in where it is wide enough).
+  //   The tiers differ in the convs they take, not in how: a conv's
+  //   quantization is per channel at every tier.
+  //
+  // Not the mid-block attention: on matrix cores its tuner picks a flash
+  // kernel, whose products are not GEMMs this route can take.
+  //
+  // THE EXACT TILED DECODE keeps its tiles f16: a per-call activation
+  // scale is a statistic of the plane the conv sees, so a tile would
+  // quantize by its own and the decode would stop being the whole one.
+  // Its head, which runs whole, takes the route.
+  //
+  // Off by default and for the reason vae-decode-stage gives: a codec is
+  // the last step before the pixels, with nothing after it to absorb an
+  // approximation. Set before decode() / encode(); cheap (flags only --
+  // the int8 weight is folded per call), and a GPU without matrix cores
+  // or the kernels quietly keeps f16.
+  struct Accel {
+    bool i8_gemm = false;
+    int  i8_tier = 0;
+  };
+  void set_accel(const Accel& a);
+  // What set_accel turned on, for the stage's log line ("" for nothing).
+  std::string accel_note() const;
+  // 3x3 convs the int8 route has run, counted as encoded. For a test to
+  // assert the route engaged.
+  int i8_convs() const noexcept { return _i8_convs; }
 
  private:
   MetalFlux2Vae() = default;
+
+  using PoolAlloc =
+      std::function<metal_compute::SharedBuffer&(std::size_t)>;
+  using PoolRelease =
+      std::function<void(const metal_compute::SharedBuffer&)>;
 
   // A conv weight stored as dense-gemm W[Cout, K]: 1x1 -> K=Cin; 3x3 -> K=9*Cin
   // flattened (ky,kx,cin) to pair with im2col_hwc_3x3. When the NAX hardware
@@ -179,6 +258,8 @@ class MetalFlux2Vae {
 
   // Encoder path (loaded only when with_encoder).
   bool _has_encoder = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
+  DecodeReport _report;   // see last_decode()
   Conv _enc_conv_in;                // 3 -> block_out[0]
   std::vector<DownStage> _enc_down;
   ResBlock _enc_mid_res0, _enc_mid_res1;
@@ -364,13 +445,17 @@ class MetalFlux2Vae {
   // the full NHWC activation itself (zero-filled pad-1 halo included) -- no
   // im2col scratch, no DRAM round-trip; ~2-3x the im2col+matmul2d path at
   // decoder shapes, bit-identical. Gated on matrix cores; needs whole 8x8
-  // dest tiles + 64-channel tiles (others keep im2col). Bias folds via
+  // dest tiles and a destination channel tile the width divides by (64,
+  // else 32, else 16 -- see hw_tile_); others keep im2col. Bias folds via
   // bias_add_rows like the mma path. VPIPE_VAE_NO_HWCONV=1 opts out (A/B).
   // conv3x3_hw_ returns false -- nothing encoded -- when not applicable.
   bool conv3x3_hw_(metal_compute::ComputeEncoder& enc,
                    const metal_compute::SharedBuffer& in, const Conv& c,
                    const metal_compute::SharedBuffer& out, int H, int W,
                    int stride);
+  // The widest destination channel tile the hardware conv has for this
+  // width (64, 32, 16), or 0 when it has none.
+  int hw_tile_(int cout, int stride) const noexcept;
   // Simdgroup-MMA dense GEMM for the non-matrix-core conv path (see
   // conv_gemm_bias_). Best-effort: invalid leaves the scalar fallback.
   metal_compute::ComputeFunction _fn_gemm_t_bm64, _fn_gemm_t_bm64bn64;
@@ -405,25 +490,115 @@ class MetalFlux2Vae {
   // bounds the peak at one window regardless of output size.
   //
   // This is NOT numerically identical to a whole-image decode: the mid-block
-  // attention is GLOBAL, so per-window attention sees only its own window, and
-  // the convolutions see zero padding at window edges rather than real
-  // neighbours. The overlap cross-fade hides the conv seam; the attention
-  // difference is real and is why tiling stays a FALLBACK, entered only when
-  // the whole-image decode does not fit (or VPIPE_VAE_TILE forces it).
-  // VPIPE_VAE_NO_TILE restores the old hard failure.
+  // attention is GLOBAL, so per-window attention sees only its own window,
+  // every GroupNorm normalizes by the window's statistics, and the
+  // convolutions see zero padding at window edges rather than real
+  // neighbours. The overlap cross-fade hides the conv seam; the rest shifts
+  // each window's tone -- MEASURED at 4096^2 against a 128-cell window,
+  // 12-cell windows read 26.7 dB with R +3.0 / B -1.9 levels. So a decode
+  // that does not fit takes decode_exact_ below; this is the A/B
+  // (VPIPE_VAE_TILE=<cells>, VPIPE_VAE_WINDOWED=1) and the last resort when
+  // not even the exact decode's floor fits. VPIPE_VAE_NO_TILE turns both off
+  // (a decode that does not fit fails).
   static constexpr int kTileMin16 = 8;      // smallest useful latent window
   static constexpr int kTileOvNum = 1;      // overlap = 1/4 of the window
   static constexpr int kTileOvDen = 4;
   // Largest square latent window whose decode peak fits `budget` (0 if none).
   int decode_tile_side_(std::size_t budget) const noexcept;
+  // Bytes of im2col band scratch a decode at this latent size allocates.
+  // CAPPED, and the cap is the whole point -- see the definition.
+  std::size_t decode_band_bytes_(int h16, int w16) const noexcept;
+  // The cap. A band is a GEMM M-dimension and nothing else, so it needs to
+  // be big enough to keep the GEMM efficient and not one byte more. Same
+  // figure as MetalKrea2Vae::kDecodeBandMax, for the same reason.
+  static constexpr std::size_t kDecodeBandMax = 128ull << 20;
   metal_compute::SharedBuffer decode_tiled_(
       const metal_compute::SharedBuffer& z, int h16, int w16, int tile16,
       std::string* err);
   metal_compute::ComputeFunction _fn_softmax_rows, _fn_transpose;
 
+  // The decoder's ops over one compute encoder and a pool of reusable
+  // buffers, shared by the whole decode and the exact tiled one so the two
+  // cannot route an op differently. Defined in the .cc.
+  struct Ops;
+
+  // EXACT TILED decode: the same arithmetic as a whole-image decode, in
+  // bounded memory. Only two things in the decoder are global -- the mid
+  // block's attention and every GroupNorm's statistics -- and everything
+  // else is local (3x3 convs, 1x1s, pointwise ops, a nearest upsample).
+  // So the mid block runs WHOLE at the latent's size (64x smaller than the
+  // picture at patch 2), and each up-path GroupNorm whose input is too big
+  // to hold is given its whole-plane statistics by a pass over tiles that
+  // only sums; with every statistic known ahead of time, the rest is a
+  // local operator, and a tile with enough halo is exactly the whole
+  // image's. A plane that fits is kept whole and becomes the next pass's
+  // source, so a pass recomputes only back to it; plan_exact_ picks which
+  // planes to keep, for the least recompute inside `budget`. Differs from
+  // decode() only in f32 summation order inside the statistics.
+  // `latent` is the unpatchified, un-whitened [h8*w8, latent] map.
+  // Empty with *err set when even its floor does not fit.
+  metal_compute::SharedBuffer decode_exact_(
+      const metal_compute::SharedBuffer& latent, int h8, int w8,
+      std::size_t budget, std::string* err);
+  // One stage of the up path: a resnet, an upsampler (nearest 2x + its
+  // 3x3), or the output head (GroupNorm, SiLU, conv_out). Plane p is
+  // stage p's input, H x W x cin.
+  struct UpStage {
+    enum Kind { kRes, kUp, kOut };
+    Kind kind = kRes;
+    const ResBlock* rb = nullptr;   // kRes
+    const Conv* up = nullptr;       // kUp
+    int H = 0, W = 0, cin = 0, cout = 0;
+  };
+  std::vector<UpStage> up_stages_(int h8, int w8) const;
+  // Rect copy with 64-bit offsets; per-rect GroupNorm channel sums.
+  metal_compute::ComputeFunction _fn_copy_rect_wide, _fn_gn_stats_rect;
+  // A rect copy between channel-last planes of widths sw / dw (pixels).
+  void copy_rect_(metal_compute::ComputeEncoder& enc,
+                  const metal_compute::SharedBuffer& src, int sw, int sy,
+                  int sx, const metal_compute::SharedBuffer& dst, int dw,
+                  int dy, int dx, int rh, int rw, int C);
+
   metal_compute::ComputeLibrary _lib_convhw;
   metal_compute::ComputeFunction _fn_conv_hw_s1, _fn_conv_hw_s2;
+  // The 32- and 16-channel destination tiles, for a width that is not a
+  // multiple of 64: MOSS-Image's small decoder is 96 wide at full
+  // resolution, so without them its most expensive level is the one on
+  // im2col. VPIPE_VAE_NO_C32 / VPIPE_VAE_NO_C16 decline each (the A/B).
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c32, _fn_conv_hw_s2_c32;
+  metal_compute::ComputeFunction _fn_conv_hw_s1_c16, _fn_conv_hw_s2_c16;
   bool _use_hwconv = false;
+  int _narrow_hw_convs = 0;   // see narrow_hw_convs()
+
+  // The int8 route (set_accel): the hardware int8 conv at each
+  // destination tile, and its four quantizers (conv2d_mma.metal).
+  metal_compute::ComputeFunction _fn_conv_i8_s1, _fn_conv_i8_s1_c32,
+      _fn_conv_i8_s1_c16, _fn_conv_i8_s2, _fn_conv_i8_s2_c32,
+      _fn_conv_i8_s2_c16;
+  metal_compute::ComputeFunction _fn_i8_zero, _fn_i8_amax, _fn_i8_steps,
+      _fn_i8_quant, _fn_i8_fold;
+  bool _i8_conv = false;         // the route is on
+  bool _i8_all_convs = false;    // ...for the residual stream's convs too
+  float _i8_alpha = 0.25f;       // SmoothQuant's migration
+  int _i8_convs = 0;             // see i8_convs()
+  // The int8 tile for this width (64, 32, 16), or 0 when it has none.
+  int i8_tile_(int cout, int stride) const noexcept;
+  // Whether conv3x3_i8_ takes this conv at this geometry -- the one
+  // predicate the real run and a dry run (Ops) both ask, so a plan sizes
+  // the scratch the run allocates.
+  bool i8_conv_takes_(const Conv& c, int H, int W, int stride) const noexcept;
+  // The scratch the route asks of the pool, in its order (f16 elements):
+  // the int8 activation, the int8 weight, the steps, the weight scales.
+  static void i8_conv_scratch_(const Conv& c, std::size_t rows,
+                               std::size_t out[4]) noexcept;
+  // One 3x3 conv on the int8 route; false (nothing encoded) when it does
+  // not take the conv. `silu`: the input is a norm's output, SiLU'd in
+  // the quantizer.
+  bool conv3x3_i8_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& in, const Conv& c,
+                   const metal_compute::SharedBuffer& out, int H, int W,
+                   int stride, bool silu, const PoolAlloc& alloc,
+                   const PoolRelease& release);
 };
 
 }  // namespace genai

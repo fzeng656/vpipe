@@ -13,6 +13,7 @@
 // generation runs on the metal-compute backend when MLX is off.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/chat-template.h"
+#include "generative-models/lm-run-memory.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/sampler.h"
 #endif
@@ -56,12 +57,80 @@ namespace vpipe {
 // loaded model does not provide (no tower / no pad token) warns and
 // drops that attachment, keeping the surrounding text.
 //
+// A CONVERSATION beat. A host that runs a graph per turn -- an agent
+// that asks the model, acts on its answer, then asks again -- sends the
+// whole conversation as a FlexData OBJECT instead of a line:
+//   messages   (array, required) -- {role: system | user | assistant |
+//                                  tool, content, name?}, oldest first;
+//                                  the last is the user's or a tool's
+//                                  (the reply comes after it). A
+//                                  `system` message first is the system
+//                                  turn; tool messages in a row are one
+//                                  tool-results turn. Media markers are
+//                                  read in the LAST user message only.
+//   tools      (array)           -- the HOST's tools, {name, description,
+//                                  parameters (JSON Schema)}, advertised
+//                                  in the system turn in the family's
+//                                  own form (Qwen3.5 / 3.6 / 3.8: the
+//                                  XML `<function=NAME>` calls their
+//                                  template teaches, each value read
+//                                  back by its parameter's type here).
+//                                  A call is read from the reply's
+//                                  answer, never its reasoning (a call
+//                                  only drafted there is not one made).
+//                                  Never run here: a
+//                                  reply calling them ENDS the turn, the
+//                                  calls going out on out-port 0, and the
+//                                  host sends their results as the next
+//                                  beat's tool messages.
+//   context    (string)          -- a KEY: the context the turn ends on
+//                                  is parked under it with the model
+//                                  (GenerativeModelManager::park_context)
+//                                  for the next graph naming it, which
+//                                  then prefills only the messages after
+//                                  what it holds. Without one the stage
+//                                  keeps it for its own next beat.
+//   context_dir (string)         -- where the keyed context is SAVED when
+//                                  the model goes (its warm hold ends, or
+//                                  a launch needs the room) and read back
+//                                  from by the next turn: the host's
+//                                  folder, the host's to remove.
+//   max_new_tokens (int)         -- this turn's budget, in place of the
+//                                  stage's.
+// What a kept context holds is matched message by message: an assistant
+// message matches the reply decoded here only when the host sends it
+// back exactly as out-port 0's `text` was. Messages that do not begin
+// with what it holds start a new context, and so does a beat whose
+// `tools` -- or the stage's own rendering of the system and generation
+// turns (its thinking mode, the reasoning instruction) -- differ from
+// the ones the context was made under. ChatML / Qwen families only;
+// another's chat template refuses the beat by name.
+//
 // Per assistant turn the stage emits a FlexData object on out-port 0
 // with keys:
 //   text        (string) -- the full assistant response text
 //   prefill_ms  (int)    -- prefill wall time in milliseconds
 //   decode_ms   (int)    -- decode wall time in milliseconds
+//   decoded     (int)    -- tokens decoded in it (a drafter's accepted
+//                           ones included): decode_ms's tokens a second
+//   prefilled   (int)    -- tokens prefilled this turn: prefill_ms's
 //   ctx_pos     (int)    -- K/V context length after this turn
+// where a drafter decoded (MTP, DFlash):
+//   drafter     (string) -- which
+//   rounds      (int)    -- its verify forwards: decoded / rounds the
+//                           tokens a forward bought
+//   drafted     (int)    -- draft tokens offered to the verifier
+//   accepted    (int)    -- of those, kept
+// and, for a conversation beat:
+//   content     (string) -- the reply less its tool-call blocks
+//   tool_calls  (array)  -- {name, arguments (JSON text)}, in order
+//   finish      (string) -- tool_calls | stop | length | interrupted |
+//                           stopped | error
+//   reused      (int)    -- tokens of the kept context reused
+//   restored    (string) -- where the context came from: memory (kept
+//                           with the model), disk (read back), stage (the
+//                           stage's own), new
+//   ctx_bytes   (int)    -- the model's K/V held now, every context's
 // The oport is unconditional; downstream consumers are optional --
 // the runtime drops writes when no cursor is attached. The intended
 // consumer is a feedback-rx + feedback-tx pair driving the input
@@ -74,7 +143,9 @@ namespace vpipe {
 // A chunk is flushed roughly every ~20 words at a sentence/clause
 // punctuation boundary (English + Chinese; see common/text-stream-chunk.h),
 // so a streaming consumer -- notably text-to-speech, whose barge-in
-// respects end_of_response -- can start before the turn finishes. Like
+// respects end_of_response -- can start before the turn finishes.
+// `stream_words` sets that target; 0 flushes each decoded piece as it
+// comes, for a reader watching the reply being written. Like
 // out-port 0 it is unconditional and downstream-optional. When
 // `stream_answer_only` is set the reasoning (<think>) and tool-call blocks
 // are folded OUT of this port so a speaking consumer voices only the
@@ -118,6 +189,12 @@ namespace vpipe {
 //                                                OFF; Qwen3-VL: ON;
 //                                                Llama-3 / ChatML
 //                                                ignore this flag).
+//   stream_words     (int,    default 20)      -- out-port 1's chunk:
+//                                                flushed at punctuation
+//                                                past this many words
+//                                                (hard cap 3x, at least
+//                                                60); 0 = every decoded
+//                                                piece as it comes.
 //   mtp              (bool,   default true)    -- use the MTP speculative-
 //                                                decode head when the
 //                                                loaded model carries one
@@ -126,6 +203,24 @@ namespace vpipe {
 //                                                Token-exact, so perf-only;
 //                                                false forces the standard
 //                                                pdecode loop.
+//   mtp_model        (string, default "")      -- a SEPARATE MTP drafter
+//                                                (models-DB key or dir:
+//                                                mlx-community's *-MTP-4bit,
+//                                                whose model ships without
+//                                                its head) to decode with.
+//   draft_model      (string, default "")      -- a DFlash / DFlash 2 block
+//                                                drafter (models-DB key or
+//                                                dir: incoai's Qwen3.8-27B-
+//                                                DFlash2 for mlx-community's
+//                                                Qwen3.8-27B-4bit). Takes
+//                                                over from MTP when set.
+//   draft_block_size (int,    default 0)       -- tokens a DFlash round
+//                                                verifies; 0 adapts it to
+//                                                the measured cost of a
+//                                                round on this machine.
+//   draft_bits       (int,    default 8)       -- the drafter's in-memory
+//                                                precision: 8 / 4 affine,
+//                                                0 as stored (bf16).
 //
 // Available on VPIPE_BUILD_APPLE_SILICON builds (both the MLX and the
 // no-MLX metal path, which is the default). On other builds the
@@ -165,6 +260,7 @@ public:
   bool web_tools_enabled() const noexcept { return _enable_web_tools; }
   bool allow_system_temp() const noexcept { return _allow_system_temp; }
   bool stream_answer_only() const noexcept { return _stream_answer_only; }
+  int stream_words() const noexcept { return _stream_words; }
   const std::string& file_sandbox_mode() const noexcept
   { return _file_sandbox_mode; }
   const std::string& file_sandbox_root() const noexcept
@@ -180,9 +276,42 @@ public:
 #endif
 
 private:
+  // keep_loaded: the model kept warm from now (end of a reply).
+  void renew_warm_();
+  // The speculative verify's pooled scratch (declare_resources): its
+  // arena's name for the model in `dir`, and what it grows to when a
+  // drafter will run (0 when none will).
+  static std::string spec_scratch_label_(const std::string& dir);
+  std::size_t spec_scratch_bytes_(const std::string& dir) const;
+  // Whether `mtp` asks for a draft head the model carries but loads only
+  // when asked (DeepSeek-V4.1's DSpark).
+  // How this stage runs its LM, for the plan's figure of what it runs in
+  // (genai::lm_run_bytes).
+  genai::LmRunShape run_shape_(const std::string& dir) const;
+  bool own_draft_head_(const std::string& dir) const;
   // Config attributes; defaults live in kSpec.attrs and are read in the
   // constructor via attr_*. Declarations carry no non-zero default.
   std::string _hf_dir;
+  // A separate MTP drafter (config "mtp_model"); "" none.
+  std::string _mtp_model;
+  // A DFlash block drafter (config "draft_model"); "" none. Its round
+  // length (0 = adaptive) and in-memory precision.
+  std::string _draft_model;
+  int         _draft_block{};
+  int         _draft_bits{};
+  // Seconds the model stays loaded after the graph (config
+  // "keep_loaded"); 0 none.
+  double      _keep_loaded{};
+  // Its buffers wired as they are allocated (config "wire_weights").
+  bool        _wire_weights{};
+  // The most the model may hold, MB (load_spec::kMemoryLimitMb); 0 none.
+  std::int64_t _memory_limit_mb{};
+  // Its routed experts' cache, MB (load_spec::kExpertCacheMb); 0 the
+  // model's own sizing.
+  std::int64_t _expert_cache_mb{};
+  // Its n-gram table held in memory where it fits (load_spec::
+  // kNgramResident; config "ngram_resident").
+  bool        _ngram_resident{};
   std::string _compute_dtype;
   int         _page_tokens{};
   std::uint32_t _max_pages{};
@@ -232,6 +361,14 @@ private:
   // (config "stream_answer_only", default false). Out-port 0 always
   // carries the full text.
   bool        _stream_answer_only{};
+  // Out-port 1's chunk target in words (config "stream_words", default
+  // 20); 0 flushes every decoded piece -- a reader, not a speaker.
+  int         _stream_words{20};
+  // Out-port 1's beats carry the reply's live speed (config
+  // "stream_speed", default false): the last prefill piece's tokens a
+  // second, and the decode's over its last 128 tokens -- with beats of no
+  // text while a prompt is read.
+  bool        _stream_speed{};
   // The locally-dispatchable tool registry, seeded in initialize() when
   // tools are enabled and supported. Empty otherwise.
   McpToolRegistry _tools;
@@ -256,6 +393,9 @@ private:
   // prefill_multimodal_metal.
   genai::MetalQwenVisionEncoder*   _mvis     = nullptr;
   genai::MetalGemma4VisionEncoder* _mgvis    = nullptr;
+  genai::MetalPixtralVisionEncoder* _mpix    = nullptr;
+  genai::MetalDeepseekV41Vision*    _mds     = nullptr;
+  genai::MetalLfm3VisionEncoder*    _mlfm    = nullptr;
   genai::Gemma4UnifiedEmbedder*    _mguni    = nullptr;
   genai::MetalAudioEncoder*        _m_audio  = nullptr;
   genai::MetalGemma4AudioEncoder*  _mg_audio = nullptr;
@@ -283,6 +423,12 @@ private:
   // subsequent turns skip it because the cache already starts with
   // BOS. `/clear` flips this back to false.
   bool _seeded = false;
+  // What _chat_ctx holds as a CONVERSATION (an unkeyed conversation
+  // beat's): its setup's digest, then its messages', one by one. The
+  // next such beat reuses it when its own begin with these. False once
+  // a plain line has been added.
+  std::vector<std::uint64_t> _conv_digests;
+  bool                       _conv_valid = false;
 
   // ---- user interrupt (Ctrl-C / the web UI's Interrupt button) -----
   //

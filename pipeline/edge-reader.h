@@ -8,6 +8,10 @@
 #include <cstdint>
 #include <memory>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 // Per-consumer-iport cursor handle into an OportBuffer. One
@@ -26,6 +30,7 @@ namespace vpipe {
 //     this cursor is not the slowest (caller falls back to peek).
 //   * release_read(n) -- non-blocking advance.
 class EdgeReader {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   EdgeReader(OportBuffer* parent, unsigned cursor_idx);
 
@@ -117,6 +122,11 @@ public:
   // Drop `w` from this cursor's pending multi-waiter slot iff still set.
   void deregister_multi(const std::shared_ptr<MultiReadWaiter>& w);
 
+  // This reader reads no more -- its stage has ended: its cursor
+  // leaves the buffer (OportBuffer::leave_cursor), so the producer is
+  // not held back by it. No-op on a parent-less (EOS) reader.
+  void leave();
+
   OportBuffer* parent() const noexcept { return _parent; }
   unsigned     cursor_idx() const noexcept { return _cursor_idx; }
 
@@ -129,5 +139,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

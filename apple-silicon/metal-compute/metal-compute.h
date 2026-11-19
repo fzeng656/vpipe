@@ -1,6 +1,7 @@
 #ifndef VPIPE_APPLE_SILICON_METAL_COMPUTE_METAL_COMPUTE_H
 #define VPIPE_APPLE_SILICON_METAL_COMPUTE_METAL_COMPUTE_H
 
+#include "common/flex-data.h"
 #include "apple-silicon/metal-compute/command-stream.h"
 #include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/event.h"
@@ -9,9 +10,15 @@
 #include "apple-silicon/metal-compute/texture.h"
 #include "common/session-member.h"
 
+#include <chrono>
 #include <cstddef>
 #include <memory>
 #include <string_view>
+#include <thread>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace MTL {
 class ComputePipelineState;
@@ -35,6 +42,7 @@ namespace vpipe::metal_compute {
 // added in subsequent steps; step 1 only exposes the bare facade so
 // Session can hand out a non-null pointer.
 class MetalCompute final : public SessionMember {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   explicit MetalCompute(const SessionContextIntf* session);
   ~MetalCompute() override;
@@ -81,6 +89,19 @@ public:
     std::size_t buffers_from_device = 0;
   };
   AllocStats alloc_stats() const noexcept;
+
+  // What the process-wide kernel caches are holding. Both are keyed by
+  // name and NEVER evicted -- a compiled library and its pipeline states
+  // are the same for every pipeline that ever runs, so they outlive any
+  // one of them by design. Reported because "by design" and "invisible"
+  // are different things: after a heavy graph is unloaded these are a
+  // large part of what a fresh-versus-after comparison shows, and
+  // without a count there is no way to tell them from a leak.
+  struct CacheStats {
+    std::size_t libraries = 0;
+    std::size_t pipelines = 0;
+  };
+  CacheStats cache_stats() const noexcept;
 
   // Bind an on-disk MTL::BinaryArchive to the PSO build path.
   // Subsequent compute pipeline builds register their compiled
@@ -191,6 +212,24 @@ public:
     std::size_t self_compressed = 0;
     // This process's physical footprint, for the same query.
     std::size_t self_footprint = 0;
+    // Of that footprint, what the GPU driver charges this process for
+    // graphics memory (task_vm_info ledger_tag_graphics_footprint). For a
+    // short while it includes buffers already FREED: once the GPU has used
+    // a buffer, the driver drops it from `allocated` at once but returns
+    // its pages ASYNCHRONOUSLY. MEASURED on an M5
+    // (metal_compute_residency.freed_buffer_pages_probe): 24-61 ms for one
+    // 1-4 GB buffer, ~50 ms for the ~2.5 GB a 960x576 Wan decode frees
+    // across hundreds of buffers; on an M5 Pro 30-167 ms for 1-4 GB, and
+    // under 200 ms for the ~8.5 GB of a 1920x1152 decode (8788 MB held at
+    // +0, 1092 at +50 ms, back to the live 282 by +200). Submitting other
+    // GPU work does not hasten it; a buffer the GPU never touched goes
+    // back at once.
+    // Inside that window a new allocation reuses those pages, so graphics
+    // minus the live SharedBuffer bytes is room it takes without asking
+    // the OS -- room available_physical cannot see yet. A sample taken
+    // just as a large free completes reads them as held. 0 when the kernel
+    // does not report the ledger.
+    std::size_t self_graphics = 0;
     // SYSTEM-WIDE wired (unswappable) memory -- vm_statistics64's
     // wire_count. Everything mlock'd by every process plus the kernel's
     // own, so it is not this process's pool: it is the ceiling that pool
@@ -260,8 +299,65 @@ public:
       if (available_physical == 0) { return true; }
       return (double)need <= (double)available_physical * (1.0 - margin);
     }
+
+    // Anything this struct has no field for: see common/flex-bag.h. A
+    // plugin receives this BY VALUE and also value-initialises one
+    // itself, so its size is compiled into every plugin in the support
+    // window: a new figure is a key here, never a new member (one added
+    // mid-struct once moved every field after it).
+    FlexData extra;
   };
   MemoryBudget memory_budget() const noexcept;
+  // memory_budget() once the GPU memory this process has just FREED is
+  // back. macOS returns a released buffer's pages asynchronously: the
+  // device's allocated size drops at once, this process's graphics
+  // footprint tens to hundreds of milliseconds later, and the system's
+  // free and wired counts after that. MEASURED on a 16 GB M5: 2 GB back
+  // in ~45 ms, 8 GB in ~1.1 s -- so a decision taken straight after a
+  // large free (a DiT dropped to make room for its VAE decode) saw none of
+  // it, and planned a 4096^2 decode into 284 MB. Waits only while the
+  // footprint says something is still on its way back, at most
+  // `timeout_ms`; otherwise this is memory_budget().
+  //
+  // INLINE, deliberately: it is a loop over memory_budget(), and defined
+  // here it adds no host symbol, so a plugin that calls it still loads on
+  // every ABI-8 host (an out-of-line method would fail its dlopen on a
+  // host built before it, ahead of any feature check).
+  MemoryBudget memory_budget_settled(int timeout_ms = 3000) const noexcept
+  {
+    MemoryBudget b = memory_budget();
+    // What this process still has in its graphics footprint beyond the
+    // device's allocated size is memory released and not yet returned --
+    // or graphics memory that is not a Metal buffer at all (a CoreML
+    // model, a video frame's IOSurface), which never "returns". So wait
+    // for the footprint to STOP FALLING, not to reach the allocated size,
+    // and then for the system's wired count to fall by what it gave back.
+    constexpr std::size_t kSlack = (std::size_t)256 << 20;
+    constexpr std::size_t kStep = (std::size_t)16 << 20;
+    if (b.self_graphics == 0 || b.self_graphics <= b.allocated + kSlack) {
+      return b;
+    }
+    const std::size_t g0 = b.self_graphics, wired0 = b.wired;
+    std::size_t g_prev = g0;
+    int still = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - t0 <
+           std::chrono::milliseconds(timeout_ms)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      b = memory_budget();
+      const bool ledger_done =
+          b.self_graphics <= b.allocated + kSlack ||
+          (b.self_graphics + kStep >= g_prev && ++still >= 5);
+      if (b.self_graphics + kStep < g_prev) { still = 0; }
+      g_prev = b.self_graphics;
+      if (!ledger_done) { continue; }
+      // The ledger is through; the system's counts follow it.
+      const std::size_t back =
+          g0 > b.self_graphics ? g0 - b.self_graphics : 0;
+      if (back < kSlack || b.wired + back / 10 * 9 <= wired0) { break; }
+    }
+    return b;
+  }
 
   // Allocate a `byte_size`-byte MTL::Buffer in Shared storage mode
   // (CPU and GPU share the same UMA address). Returns an empty
@@ -288,6 +384,23 @@ public:
   // Returns empty if the runtime is invalid, `ptr` is null / not page-aligned,
   // or Metal rejects the wrap.
   SharedBuffer make_no_copy_buffer(void* ptr, std::size_t byte_size) const;
+
+  // The largest buffer this device will create, from
+  // MTLDevice.maxBufferLength. Cached after the first query; 0 when
+  // there is no valid device.
+  //
+  // It is a fraction of installed RAM, so it is SMALLER on the boxes
+  // that need mapping most -- measured 38.88 GiB on a 64 GB M4 Pro, and
+  // proportionally less below that. A checkpoint shard can therefore be
+  // larger than any buffer that can describe it, which is not an error
+  // and not a thing a caller can retry: it is a size to check BEFORE
+  // asking, so the fallback can be chosen deliberately rather than read
+  // off a nil return.
+  //
+  // `VPIPE_MAX_BUFFER_MB` lowers the answer (never raises it), so the
+  // over-the-limit path can be exercised on a machine whose device does
+  // not force it. Same idea as VPIPE_RAM_LIMIT_MB.
+  std::size_t max_buffer_length() const noexcept;
 
   // Load a `.metallib` whose bytes were embedded into libvpipe by an
   // add_vpipe_metal_kernel(KERNEL_NAME ...) call in CMake. `name`
@@ -387,5 +500,7 @@ private:
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

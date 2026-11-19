@@ -1,13 +1,21 @@
 set(LOCAL_TEST_SOURCES
+  accel-settings.cc
+  image-model-registry.cc
+  image-references.cc
+  video-generation-inputs.cc
   buffer-stage.cc
   byte-track-stage.cc
   call-stage.cc
   chrono-shell-stages.cc
   save-text-stage.cc
+  shipped-pipelines.cc
   clock-domain.cc
   console-writer.cc
   credential-store.cc
   denoise-progress.cc
+  diagnostic-capture.cc
+  gpu-thermal.cc
+  soc-energy-channel.cc
   detection-overlay-stage.cc
   feedback-pair.cc
   stage-relaunch-sweep.cc
@@ -19,17 +27,21 @@ set(LOCAL_TEST_SOURCES
   oport-buffer-wrap.cc
   ffmpeg-libraries.cc
   ffmpeg-log-tap.cc
+  flex-bag.cc
   flex-data.cc
   graph-move-iport.cc
   load-image-stage.cc
   text-source-stages.cc
+  output-path.cc
   save-image-stage.cc
+  tae-conv-route.cc
   host-identity.cc
   i18n.cc
   library-handle.cc
   lmdb-wrapper.cc
   lmdb.cc
   log-delegate.cc
+  av-filter-graph.cc
   media-decode.cc
   media-line.cc
   text-stream-chunk.cc
@@ -39,7 +51,13 @@ set(LOCAL_TEST_SOURCES
   path-sandbox.cc
   session-sandbox.cc
   model-catalog.cc
+  vosr.cc
+  vosr-reference.cc
+  vosr-color-fix.cc
+  model-source.cc
+  model-source-live.cc
   block-residency.cc
+  block-slots.cc
   memory-plan.cc
   model-memory.cc
   model-register-stage.cc
@@ -67,6 +85,9 @@ set(LOCAL_TEST_SOURCES
   segment-writer.cc
   session-config.cc
   session.cc
+  stage-command.cc
+  host-flex-api.cc
+  system-monitor.cc
   stage-config.cc
   stage-spec.cc
   stdout-log-delegate-async.cc
@@ -92,14 +113,21 @@ if(APPLE)
 endif()
 if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
     list(APPEND LOCAL_TEST_SOURCES
+        apple-media.cc
+        apple-media-stages.cc
+        kernel-contract.cc
         save-audio-stage.cc
         audio-segment-stage.cc
         audio-tagging-stage.cc
         coreml-cpp.cc
         coreml-inference-stage.cc
         coreml-model-manager.cc
+        ane-boundary.cc
+        ane-module.cc
+        ane-emitter.cc
         metal-compute.cc
         metal-compute-gemm-mma.cc
+        kernel-tuning-cache.cc
         optiq-block-perf.cc
         mlp-fuse-ab.cc
         metal-compute-sdpa-mma.cc
@@ -117,6 +145,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-compute-saxpy.cc
         metal-compute-shared-buffer.cc
         metal-compute-stream.cc
+        tensor-parallel.cc
         metal-compute-tensor-beat-bridge.cc
         metal-compute-texture.cc
         audio-transcribe-stage.cc
@@ -128,7 +157,10 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-lm/gemma-gguf.cc
         metal-lm/gemma-text.cc
         metal-lm/kquant.cc
+        metal-lm/nvfp4.cc
         metal-lm/manager.cc
+        metal-lm/lfm3.cc
+        metal-lm/ministral3.cc
         metal-lm/moss.cc
         metal-lm/multimodal-vqa.cc
         metal-lm/pdecode.cc
@@ -136,6 +168,7 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         metal-lm/quant-gemv.cc
         metal-lm/qwen-text.cc
         metal-lm/speculative-mtp.cc
+        metal-lm/speculative-dflash.cc
         model-quantize-roundtrip.cc
         model-quantize-stage.cc
         model-eval-stage.cc
@@ -149,10 +182,31 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         moss-rt-driver.cc
         quant-arch-detect.cc
         moss-tts-local.cc
+        moss-tts-delay.cc
         krea2-encoder.cc
         krea2-dit.cc
         krea2-vae.cc
+        krea2-hd-vae.cc
+        sage-attention.cc
+        metal-sage-attention.cc
+        sol-attention.cc
+        sol-attention-h3.cc
+        sol-attention-mma.cc
+        motion-cache.cc
+        flashvsr-lq-proj.cc
+        flashvsr-dit-load.cc
+        flashvsr-vae.cc
+        flashvsr-family.cc
+        flashvsr-accel.cc
+        flashvsr-kv.cc
+        flashvsr-stream.cc
+        flashvsr-plus.cc
+        perf-flops.cc
+        torch-zip.cc
+        drawthings-store.cc
         wan-vae.cc
+        tae-decoder.cc
+        latent-preview.cc
         wan-umt5.cc
         wan-unipc.cc
         wan-dit.cc
@@ -160,27 +214,74 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         minimax-h3-blocks.cc
         minimax-h3-lora.cc
         minimax-h3-comfy.cc
+        minimax-h3-diffusers-root.cc
+        minimax-h3-diffusers-vae.cc
+        p-h3-image.cc
+        minimax-h3-image.cc
         minimax-h3-layout.cc
+        minimax-h3-taomate.cc
+        minimax-h3-regenerate.cc
+        minimax-h3-guide.cc
+        pika-h3-flex.cc
+        minimax-h3-sampler.cc
+        minimax-h3-pruned.cc
+        minimax-h3-whole.cc
+        vdn-geometry.cc
+        vdn-delta-solve.cc
+        vdn-linear-features.cc
+        vdn-linear-branch.cc
+        vdn-window-softmax.cc
+        vdn-span-attention.cc
+        vdn-config.cc
+        metal-vdn-branch.cc
         minimax-h3-dit.cc
+        minimax-h3-vdn-hybrid.cc
         minimax-h3-vvae.cc
         minimax-h3-avae.cc
         audio-vae-encode.cc
         load-audio-stage.cc
+        load-video-stage.cc
+        vae-decode-clip.cc
+        runtime-lora.cc
+        train-ops.cc
+        qwen-image-21-train.cc
+        train-lora-stage.cc
         minimax-h3-text-encoder.cc
         minimax-h3-refenc.cc
-        mage-vae.cc
-        mage-dit.cc
-        mage-cond.cc
-        mage-watermark.cc
-        mage-t2i.cc
-        mage-screen.cc
+        content-refusal.cc
+        unclaimed-checkpoint.cc
         krea2-t2i.cc
         krea2-dit-quant.cc
+        krea2-native-checkpoint.cc
+        fp8-layouts.cc
         krea2-lora.cc
         lora-fuse-stage.cc
         krea2-sampler.cc
         qwen-image-edit-sched.cc
         qwen-image-edit-vae.cc
+        qwen-image-21-vae.cc
+        vae-i8-conv.cc
+        qwen-image-21-layout.cc
+        qwen-image-21-cond.cc
+        qwen-image-21-negative.cc
+        qwen-image-21-dit.cc
+        z-image-dit.cc
+        fibo2-dit.cc
+        fibo2-pipeline.cc
+        moss-image-dit.cc
+        moss-image-pipeline.cc
+        yue2.cc
+        minimax-music3.cc
+        bonsai.cc
+        bs-roformer.cc
+        rife.cc
+        relayvsr.cc
+        drama3.cc
+        deepseek-v41.cc
+        lm-run-memory.cc
+        qwen4-exp-kernels.cc
+        moe-grouped-nax.cc
+        moe-expert-cache.cc
         qwen-image-edit-text.cc
         qwen-image-edit-dit.cc
         qwen-image-edit-vision.cc
@@ -188,6 +289,10 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         qwen-image-edit-t2i.cc
         qwen-image-edit-awq.cc
         flux2-smoke.cc
+        encoder-residency.cc
+        flux3-dit.cc
+        flux3-pipeline.cc
+        image-memory-plan.cc
         boogu-smoke.cc
         llm-chat-template.cc
         llm-sampler.cc
@@ -202,6 +307,20 @@ if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
         realtime-vqa-stage.cc
         temporal-decimation-stage.cc
         image-resample-stage.cc
+        image-levels-stage.cc
+        alpha-mix-stage.cc
+        tensor-io-stage.cc
+        temporal-slice-stage.cc
+        vae-encode-range.cc
+        vae-encode-plugin.cc
+        vae-encode-memory.cc
+        vae-flops.cc
+        content-aware-continuation-stage.cc
+        temporal-stack-stage.cc
+        tensor-list-stage.cc
+        temporal-resample-stage.cc
+        audio-temporal-resample-stage.cc
+        beat-track.cc
         text-chat-stage.cc
         text-to-speech-stage.cc
         visual-qa-stage.cc

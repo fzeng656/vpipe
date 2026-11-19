@@ -13,10 +13,17 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 #include "stages/load-image-stage.h"
+#include "stages/model-provenance.h"
 #include "stages/save-image-stage.h"
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "apple-silicon/media/color-tags.h"
+#include "apple-silicon/media/image-io.h"
+#endif
 
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -28,6 +35,11 @@
 
 using namespace std;
 using namespace vpipe;
+
+// minitest's ASSERT_TRUE does NOT abort, so a test that would go on to
+// index a string it just failed to produce guards itself.
+#define REQUIRE_(cond) do { if (!(cond)) { EXPECT_TRUE(cond); return; } } \
+                       while (0)
 
 namespace {
 
@@ -52,6 +64,10 @@ public:
 
   int     w = 4, h = 3, n = 1;
   uint8_t r = 0xFF, g = 0x80, b = 0x40;
+  // -1 emits three channels. Anything else emits FOUR, with this as
+  // the alpha -- what an RGBA VAE decodes and what load-image hands
+  // back under `alpha: keep`.
+  int     a = -1;
   bool    noisy = false;   // high-frequency fill (JPEG quality has teeth)
   // When set, stamped onto each beat's sideband exactly as vae-decode does,
   // so save-image sees a GENERATED image.
@@ -73,12 +89,18 @@ public:
   process(RuntimeContext& ctx) override
   {
     if (_emitted >= n) { ctx.signal_done(); co_return; }
+    const int ch = a < 0 ? 3 : 4;
     auto out = make_unique<TensorBeatPayload>();
     out->dtype = TensorBeat::DType::U8;
-    out->shape = {3, h, w};
-    out->resize_contiguous(static_cast<size_t>(3) * h * w);
+    out->shape = {ch, h, w};
+    out->resize_contiguous(static_cast<size_t>(ch) * h * w);
     uint8_t* d = out->as_u8();
     const size_t plane = static_cast<size_t>(h) * w;
+    if (ch == 4) {
+      for (size_t i = 0; i < plane; ++i) {
+        d[3 * plane + i] = (uint8_t)a;
+      }
+    }
     for (int y = 0; y < h; ++y) {
       for (int x = 0; x < w; ++x) {
         const size_t i = static_cast<size_t>(y) * w + x;
@@ -359,6 +381,142 @@ TEST(save_image_stage, indexed_stream_paths) {
   EXPECT_TRUE(has1);
 }
 
+// `no_overwrite` is what issue #38 asked for: run the graph again and
+// keep what the last run wrote, without retyping the name. The default
+// is the OPPOSITE (rewrite the same file), and both halves are checked
+// here because only the pair proves the flag is what moved.
+TEST(save_image_stage, no_overwrite_keeps_what_the_previous_run_wrote) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-save-image-nov-")
+                   + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+  const string tmpl = dir + "/f-%02d.png";
+
+  // Two launches with the flag OFF: the second rewrites f-00.png.
+  for (int run = 0; run < 2; ++run) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(tmpl));
+    SolidSource* s = nullptr;
+    run_store_(sess, s, std::move(cfg), 1, 1, 2, 3);
+  }
+  const bool off_reused = file_size_(dir + "/f-00.png") > 0
+                       && file_size_(dir + "/f-01.png") == 0;
+
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  // Two launches with it ON: the second lands beside the first.
+  for (int run = 0; run < 2; ++run) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(tmpl));
+    cfg.as_object().insert("no_overwrite", FlexData::make_bool(true));
+    SolidSource* s = nullptr;
+    run_store_(sess, s, std::move(cfg), 1, 1, 2, 3);
+  }
+  const bool on_kept = file_size_(dir + "/f-00.png") > 0
+                    && file_size_(dir + "/f-01.png") > 0;
+  filesystem::remove_all(dir, ec);
+
+  EXPECT_TRUE(off_reused);
+  EXPECT_TRUE(on_kept);
+}
+
+// Within ONE run, no_overwrite still numbers the stream -- and starts
+// past a file somebody left in the directory.
+TEST(save_image_stage, no_overwrite_starts_past_a_file_already_there) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-save-image-nov2-")
+                   + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+  { ofstream(dir + "/f-00.png", ios::binary) << "squatter"; }
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string(dir + "/f-%02d.png"));
+  cfg.as_object().insert("no_overwrite", FlexData::make_bool(true));
+  SolidSource* s = nullptr;
+  run_store_(sess, s, std::move(cfg), 2, 0x10, 0x20, 0x30);
+
+  // The squatter is untouched, and both images went after it.
+  const string kept = head_bytes_(dir + "/f-00.png", 8);
+  const bool one = file_size_(dir + "/f-01.png") > 0;
+  const bool two = file_size_(dir + "/f-02.png") > 0;
+  filesystem::remove_all(dir, ec);
+  EXPECT_TRUE(kept == "squatter");
+  EXPECT_TRUE(one);
+  EXPECT_TRUE(two);
+}
+
+// %t names the file after the local wall clock. The test cannot pin the
+// clock, so it asserts the SHAPE the stage produced and that the token
+// is gone -- a template copied through verbatim would fail both.
+TEST(save_image_stage, a_timestamp_token_names_the_file) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-save-image-t-")
+                   + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string(dir + "/shot-%t.png"));
+  SolidSource* s = nullptr;
+  run_store_(sess, s, std::move(cfg), 1, 4, 5, 6);
+
+  string name;
+  int n = 0;
+  for (const auto& e : filesystem::directory_iterator(dir, ec)) {
+    name = e.path().filename().string();
+    ++n;
+  }
+  filesystem::remove_all(dir, ec);
+  REQUIRE_(n == 1);
+  // "shot-YYYYmmdd-HHMMSS.png"
+  EXPECT_TRUE(name.rfind("shot-", 0) == 0);
+  EXPECT_TRUE(name.size() == string("shot-20260924-111530.png").size());
+  EXPECT_TRUE(name.find("%t") == string::npos);
+  EXPECT_TRUE(name[13] == '-');            // the date/time separator
+  EXPECT_TRUE(name.substr(name.size() - 4) == ".png");
+  for (size_t i = 5; i < 13; ++i) {
+    EXPECT_TRUE(isdigit((unsigned char)name[i]) != 0);
+  }
+}
+
+// A template the expander cannot parse is a CONFIG error, reported
+// where it can still be fixed rather than at the first write.
+TEST(save_image_stage, a_broken_timestamp_format_is_deferred_config) {
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string("/tmp/f-%t{%Y.png"));
+  SaveImageStage st(&sess, "st", vector<InEdge>{}, std::move(cfg));
+  // The message must be ABOUT the template: a stage has other reasons
+  // to fail its config, and "non-empty" would accept any of them.
+  EXPECT_FALSE(st.config_error().empty());
+  EXPECT_TRUE(st.config_error().find("%t{%Y.png") != string::npos);
+}
+
+TEST(save_image_stage, a_separator_in_a_timestamp_format_is_refused) {
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path",
+                         FlexData::make_string("/tmp/%t{%Y/%m}.png"));
+  SaveImageStage st(&sess, "st", vector<InEdge>{}, std::move(cfg));
+  EXPECT_FALSE(st.config_error().empty());
+  EXPECT_TRUE(st.config_error().find("separator") != string::npos);
+}
+
 // The metadata iport is OPTIONAL: the stage still constructs (and stays a
 // sink) with only the image edge wired, which is how every pre-existing
 // graph is shaped.
@@ -366,7 +524,8 @@ TEST(save_image_stage, metadata_iport_is_declared_and_optional) {
   const StageSpec* si = StageRegistry::get().spec("save-image");
   const StageSpec* li = StageRegistry::get().spec("load-image");
   ASSERT_TRUE(si != nullptr && li != nullptr);
-  ASSERT_TRUE(si->iports.size() == 2 && li->oports.size() == 2);
+  // load-image: image, metadata, then the `images` list.
+  ASSERT_TRUE(si->iports.size() == 2 && li->oports.size() == 3);
   // save-image's metadata iport must accept exactly what load-image's
   // metadata oport emits, or the two cannot be wired together.
   EXPECT_TRUE(si->iports[1].type == li->oports[1].type);
@@ -411,6 +570,49 @@ TEST(save_image_stage, generated_image_records_the_model_in_exif_software) {
   remove(path.c_str());
 }
 
+// A host that ran the graph names itself first; vpipe's line follows in
+// brackets. A model given as a local absolute path is recorded as
+// <org>/<repo> only: the file must not carry the user's home directory.
+TEST(save_image_stage, software_host_comes_first_and_brackets_vpipe) {
+  Session sess;
+  CerrSilencer hush;
+  const string path = tmp_path_(".png");
+  remove(path.c_str());
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  cfg.as_object().insert("software_host",
+                         FlexData::make_string("ExampleApp 1.0"));
+  SolidSource* src = nullptr;
+  run_store_(sess, src, std::move(cfg), 1, 0x12, 0xAB, 0xF0,
+             false, 4, 3, "/Users/someone/models/Qwen/Qwen-Image-2.1/");
+  ASSERT_TRUE(src != nullptr);
+
+  const auto blob = imgmeta::read_exif_blob(path);
+  ASSERT_TRUE(!blob.empty());
+  FlexData d = imgmeta::parse_exif(blob);
+  ASSERT_TRUE(d.is_object());
+  auto o = d.as_object();
+  ASSERT_TRUE(o.contains("Software"));
+  const string sw(o.at("Software").as_string(""));
+  std::printf("[save_image_stage] Software = %s\n", sw.c_str());
+  EXPECT_TRUE(sw.rfind("ExampleApp 1.0 (Vpipe ", 0) == 0);
+  EXPECT_TRUE(sw.find(" with Qwen/Qwen-Image-2.1)") != string::npos);
+  EXPECT_TRUE(sw.back() == ')');
+  EXPECT_TRUE(sw.find("/Users/") == string::npos);
+  remove(path.c_str());
+}
+
+TEST(save_image_stage, public_model_name_keeps_org_and_repo) {
+  using provenance::public_model_name;
+  EXPECT_TRUE(public_model_name("local/Model-4bit") == "local/Model-4bit");
+  EXPECT_TRUE(public_model_name("/a/b/org/Repo") == "org/Repo");
+  EXPECT_TRUE(public_model_name("/a/b/org/Repo//") == "org/Repo");
+  EXPECT_TRUE(public_model_name("/org/Repo") == "org/Repo");
+  EXPECT_TRUE(public_model_name("/Repo") == "Repo");
+  EXPECT_TRUE(public_model_name("") == "");
+}
+
 // ...and an image with NO model on its sideband (a plain load -> save copy)
 // must get no Software tag at all: vpipe did not author it.
 TEST(save_image_stage, unmarked_image_gets_no_software_tag) {
@@ -427,3 +629,251 @@ TEST(save_image_stage, unmarked_image_gets_no_software_tag) {
   EXPECT_TRUE(imgmeta::read_exif_blob(path).empty());
   remove(path.c_str());
 }
+
+// ---- RGBA ------------------------------------------------------------
+//
+// Qwen-Image-2.1 decodes FOUR channels and transparency is its headline
+// feature, so the beat that carries it has to reach a file with its
+// alpha intact. Both halves are pinned here: a format that HAS an alpha
+// channel keeps it exactly, and one that does not COMPOSITES OVER WHITE
+// rather than truncating.
+//
+// The composite is the half worth a test. Truncating would keep
+// whatever colour sits under a transparent pixel, and on a generated
+// RGBA image that is usually black -- so the failure is not a missing
+// alpha, it is black fringing around everything, which reads as a bad
+// model rather than a lost channel.
+TEST(save_image_stage, png_keeps_alpha_and_roundtrips) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string path = tmp_path_(".png");
+  remove(path.c_str());
+  const uint8_t R = 0x12, G = 0xAB, B = 0xF0, A = 0x40;
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  // run_store_ does not carry alpha, so build the graph directly.
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SolidSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->n = 1; src_u->r = R; src_u->g = G; src_u->b = B; src_u->a = A;
+  auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
+  pl->insert_stage(make_unique<SaveImageStage>(
+      &sess, "store", vector<InEdge>{{src, 0}}, std::move(cfg)));
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+
+  // PNG colour type 6 is RGBA; 2 is RGB. Read it from the IHDR rather
+  // than trusting the decoder to tell us, because a decoder that
+  // invents an opaque alpha would hide exactly the bug this catches.
+  const string ihdr = head_bytes_(path, 26);
+  EXPECT_TRUE(ihdr.size() == 26);
+  if (ihdr.size() == 26) {
+    EXPECT_TRUE((uint8_t)ihdr[25] == 6);
+  }
+
+  // ...and back through load-image, which needs telling to keep it.
+  auto p2 = make_unique<Pipeline>("p2", &sess);
+  FlexData licfg = FlexData::make_object();
+  licfg.as_object().insert("url", FlexData::make_string(path));
+  licfg.as_object().insert("alpha", FlexData::make_string("keep"));
+  auto li_u = make_unique<LoadImageStage>(
+      &sess, "li", vector<InEdge>{}, std::move(licfg));
+  auto* li = static_cast<LoadImageStage*>(p2->insert_stage(std::move(li_u)));
+  auto cap_u = make_unique<CaptureSink>(
+      &sess, "cap", vector<InEdge>{{li, 0}}, FlexData::make_object());
+  auto* cap = static_cast<CaptureSink*>(p2->insert_stage(std::move(cap_u)));
+  {
+    PipelineRuntime rt(p2.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  remove(path.c_str());
+
+  EXPECT_TRUE(cap->got.size() == 1);
+  if (cap->got.empty()) { return; }
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(cap->got[0].get());
+  EXPECT_TRUE(tb != nullptr);
+  if (!tb) { return; }
+  EXPECT_TRUE(tb->shape.size() == 3 && tb->shape[0] == 4);
+  if (tb->shape[0] != 4) { return; }
+  const auto bytes = tb->materialize_contiguous();
+  const size_t plane = static_cast<size_t>(tb->shape[1]) * tb->shape[2];
+  EXPECT_TRUE(bytes.size() == 4 * plane);
+  if (bytes.size() != 4 * plane) { return; }
+  // EXACT -- png is lossless and neither end resamples.
+  EXPECT_TRUE(bytes[0] == R);
+  EXPECT_TRUE(bytes[plane] == G);
+  EXPECT_TRUE(bytes[2 * plane] == B);
+  EXPECT_TRUE(bytes[3 * plane] == A);
+}
+
+TEST(save_image_stage, a_format_without_alpha_composites_over_white) {
+  Session sess;
+  CerrSilencer hush;
+
+  // JPEG, which has no alpha channel in any profile -- BMP and TIFF
+  // both do, so picking one of those would have made this assert
+  // nothing at all.
+  const string path = tmp_path_(".jpg");
+  remove(path.c_str());
+  // Fully TRANSPARENT black: truncating gives 0, compositing gives
+  // 255. The two answers could not be further apart, which is the
+  // point -- on a generated RGBA image the colour under a transparent
+  // pixel really is usually black, so a truncation shows up as black
+  // where the picture is meant to be empty.
+  const uint8_t R = 0x00, G = 0x00, B = 0x00, A = 0x00;
+
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("path", FlexData::make_string(path));
+  cfg.as_object().insert("format", FlexData::make_string("jpeg"));
+  cfg.as_object().insert("quality", FlexData::make_int(100));
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SolidSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->n = 1; src_u->r = R; src_u->g = G; src_u->b = B; src_u->a = A;
+  auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
+  pl->insert_stage(make_unique<SaveImageStage>(
+      &sess, "store", vector<InEdge>{{src, 0}}, std::move(cfg)));
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+
+  auto p2 = make_unique<Pipeline>("p2", &sess);
+  FlexData licfg = FlexData::make_object();
+  licfg.as_object().insert("url", FlexData::make_string(path));
+  auto li_u = make_unique<LoadImageStage>(
+      &sess, "li", vector<InEdge>{}, std::move(licfg));
+  auto* li = static_cast<LoadImageStage*>(p2->insert_stage(std::move(li_u)));
+  auto cap_u = make_unique<CaptureSink>(
+      &sess, "cap", vector<InEdge>{{li, 0}}, FlexData::make_object());
+  auto* cap = static_cast<CaptureSink*>(p2->insert_stage(std::move(cap_u)));
+  {
+    PipelineRuntime rt(p2.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  remove(path.c_str());
+
+  EXPECT_TRUE(cap->got.size() == 1);
+  if (cap->got.empty()) { return; }
+  const auto* tb =
+      dynamic_cast<const TensorBeatPayload*>(cap->got[0].get());
+  EXPECT_TRUE(tb != nullptr);
+  if (!tb) { return; }
+  EXPECT_TRUE(tb->shape.size() == 3 && tb->shape[0] == 3);
+  const auto bytes = tb->materialize_contiguous();
+  if (bytes.size() < 3) { return; }
+  const size_t plane = static_cast<size_t>(tb->shape[1]) * tb->shape[2];
+  // WHITE, not black. Lossy, so a band rather than equality -- but the
+  // two candidate answers are 0 and 255, so the band decides it.
+  EXPECT_TRUE(bytes[0] > 240);
+  EXPECT_TRUE(bytes[plane] > 240);
+  EXPECT_TRUE(bytes[2 * plane] > 240);
+}
+
+#ifdef VPIPE_BUILD_APPLE_SILICON
+// Where FFmpeg cannot be loaded -- VPIPE_NO_FFMPEG=1, as on a Mac with
+// none -- ImageIO writes the picture: PNG, BMP and TIFF as they are, a
+// JPEG of a transparent picture composited over white. WebP alone is
+// refused, at construction, by name. (An application that ships no
+// FFmpeg had every picture's graph refused: the stage would not build.)
+TEST(save_image_stage, without_ffmpeg_imageio_writes_the_picture) {
+  struct NoFfmpeg {
+    NoFfmpeg()  { setenv("VPIPE_NO_FFMPEG", "1", 1); }
+    ~NoFfmpeg() { unsetenv("VPIPE_NO_FFMPEG"); }
+  } no_ffmpeg;
+  Session sess;
+  CerrSilencer hush;
+  auto read_back = [](const string& path) {
+    apple_media::ColorTags tags;
+    string err;
+    return apple_media::read_still(path, TensorBeat::DType::U8, false,
+                                   &tags, &err);
+  };
+  auto near = [](int a, int b) { return a - b <= 1 && b - a <= 1; };
+
+  const uint8_t R = 0x12, G = 0xAB, B = 0xF0;
+  for (const char* ext : {".png", ".bmp", ".tiff"}) {
+    const string path = tmp_path_(string("-noff") + ext);
+    remove(path.c_str());
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(path));
+    {
+      SaveImageStage probe(&sess, "probe", vector<InEdge>{},
+                           FlexData::from_json(
+                               "{\"path\":\"" + path + "\"}"));
+      EXPECT_TRUE(probe.config_error().empty());
+    }
+    SolidSource* src = nullptr;
+    run_store_(sess, src, std::move(cfg), 1, R, G, B);
+    auto pic = read_back(path);
+    remove(path.c_str());
+    std::printf("[no-ffmpeg] %s: %s\n", ext, pic ? "read back" : "MISSING");
+    EXPECT_TRUE(pic != nullptr);
+    if (!pic) { continue; }
+    EXPECT_TRUE(pic->shape.size() == 3 && pic->shape[1] == 3 &&
+                pic->shape[2] == 4);
+    const auto bytes = pic->materialize_contiguous();
+    const size_t plane = 3 * 4;
+    if (bytes.size() < 3 * plane) { EXPECT_TRUE(false); continue; }
+    EXPECT_TRUE(near(bytes[0], R));
+    EXPECT_TRUE(near(bytes[plane], G));
+    EXPECT_TRUE(near(bytes[2 * plane], B));
+  }
+
+  // A transparent black picture as a JPEG: white, not black.
+  {
+    const string path = tmp_path_("-noff.jpg");
+    remove(path.c_str());
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("path", FlexData::make_string(path));
+    cfg.as_object().insert("quality", FlexData::make_int(100));
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<SolidSource>(
+        &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->r = 0; src_u->g = 0; src_u->b = 0; src_u->a = 0;
+    auto* src = static_cast<SolidSource*>(pl->insert_stage(std::move(src_u)));
+    pl->insert_stage(make_unique<SaveImageStage>(
+        &sess, "store", vector<InEdge>{{src, 0}}, std::move(cfg)));
+    {
+      PipelineRuntime rt(pl.get(), &sess);
+      EXPECT_TRUE(rt.launch());
+      rt.wait_idle();
+      rt.stop();
+    }
+    const string sig = head_bytes_(path, 2);
+    EXPECT_TRUE(sig.size() == 2 && (uint8_t)sig[0] == 0xFF &&
+                (uint8_t)sig[1] == 0xD8);
+    auto pic = read_back(path);
+    remove(path.c_str());
+    EXPECT_TRUE(pic != nullptr);
+    if (pic) {
+      const auto bytes = pic->materialize_contiguous();
+      const size_t plane = (size_t)pic->shape[1] * pic->shape[2];
+      std::printf("[no-ffmpeg] .jpg over white: %d %d %d\n",
+                  bytes.size() >= 3 * plane ? bytes[0] : -1,
+                  bytes.size() >= 3 * plane ? bytes[plane] : -1,
+                  bytes.size() >= 3 * plane ? bytes[2 * plane] : -1);
+      EXPECT_TRUE(bytes.size() >= 3 * plane && bytes[0] > 240 &&
+                  bytes[plane] > 240 && bytes[2 * plane] > 240);
+    }
+  }
+
+  // WebP: only FFmpeg writes it -- refused by name.
+  SaveImageStage webp(&sess, "webp", vector<InEdge>{},
+                      FlexData::from_json(R"({"path":"/tmp/x.webp"})"));
+  EXPECT_TRUE(webp.config_error().find("FFmpeg") != string::npos);
+}
+#endif

@@ -2,6 +2,8 @@
 #define GENERATIVE_MODELS_MINIMAX_H3_MINIMAX_H3_SCHEDULER_H
 
 #include <cstddef>
+#include <string>
+#include <string_view>
 #include <vector>
 
 namespace vpipe {
@@ -39,6 +41,11 @@ class MiniMaxH3Scheduler {
   // evaluations -- the terminal sigma has none. False when `num_steps`
   // is under 2 or the shift is not positive.
   //
+  // That is the REFERENCE's argument, kept so this class can be checked
+  // against it call for call. It is not what a user's `steps` means: the
+  // denoise loop counts forwards, as diffusers and ComfyUI do, and asks
+  // for steps + 1 points (see DenoiseRequest::num_steps).
+  //
   // The grid is linspace(1, 0, num_steps) pushed through
   //     sigma' = s*sigma / (1 + (s-1)*sigma)
   // with consecutive duplicates collapsed: the shift compresses the grid
@@ -48,12 +55,120 @@ class MiniMaxH3Scheduler {
   // SHORTER than the requested step count.
   bool set_timesteps(int num_steps);
 
+  // Rebuild the schedule from an explicit RAW grid instead of linspace:
+  // `raw` is pushed through the same shift and then installed verbatim --
+  // no deduplication, since a grid someone chose is not expected to
+  // collide and silently dropping a point would change the step count a
+  // distillation was trained at. This is how a few-step distillation
+  // that names its own grid is run (HyperFlow's 9 points, 8 forwards).
+  //
+  // False unless `raw` is strictly decreasing, starts at or below 1 and
+  // ends at exactly 0 -- and unless the SHIFTED grid still is, which is
+  // diffusers' own check on a grid handed to set_timesteps(sigmas=).
+  bool set_sigmas(const std::vector<float>& raw);
+
+  // The same, for a grid named in DOUBLE and shifted in double before
+  // the float32 cast -- diffusers' `shift_provided_sigmas`, which is how
+  // a few-step adapter's sampling contract builds its schedule (Pika H3
+  // Flex: knots / 1000). Same checks as set_sigmas.
+  bool set_sigmas_shifted(const std::vector<double>& raw);
+
+  // A schedule named AS RUN on ANOTHER modality's axis: `sigmas` are the
+  // sigmas of a schedule shifted by `given_shift` -- ComfyUI's custom
+  // SIGMAS, which are always the VIDEO's -- and each is carried to this
+  // one's as ComfyUI's DiT does (comfy/ldm/minimax/model.py,
+  // time_shift_sigma): back to the shared base grid,
+  //     b = sigma / (given + sigma (1 - given)),
+  // then out through this shift, in double, cast once. With `given_shift`
+  // equal to shift() the sigmas are installed as given. False unless
+  // `sigmas` is strictly decreasing from at most 1 to exactly 0, and
+  // unless the cast grid still is.
+  bool set_sigmas_mapped(const std::vector<double>& sigmas,
+                         double given_shift);
+
+  // True for a schedule given AS RUN: two or more finite sigmas, strictly
+  // decreasing from at most 1 to exactly 0. Else false, with the reason.
+  static bool sigmas_ok(const std::vector<double>& sigmas,
+                        std::string* why = nullptr);
+  // A sigma list as a graph writes it -- "1, 0.9844, ..., 0", commas or
+  // whitespace between, an optional [ ] around it (ComfyUI's SIGMAS
+  // pasted) -- into `out`, checked by sigmas_ok(). False with the reason
+  // when a token is not a number or the list is not a schedule.
+  static bool parse_sigmas(std::string_view text, std::vector<double>* out,
+                           std::string* why = nullptr);
+
+  // A schedule given AS RUN: `sigmas` installed verbatim, no shift --
+  // Open-H3-Regenerate-2K's refine names its sigmas outright. Strictly
+  // decreasing from at most 1 to exactly 0. Each timestep is 1 - sigma
+  // taken in double and rounded once, as the reference's Python-float
+  // sigmas give it.
+  bool set_sigmas_as_run(const std::vector<double>& sigmas);
+
+  // Open-H3-Regenerate-2K's refine sigmas (open_h3/sigmas.py), in
+  // double as the reference holds them. `start` < 0 is the release's
+  // own choice: 3 steps run {0.909375, 6/7, 2/3, 0} (the shift-6 points
+  // of a 4-step grid from 1, started at 0.909375), 2 steps run
+  // shifted_grid(0.7, 2), any other count shifted_grid(0.909375, steps).
+  // A `start` in (0, 1] runs shifted_grid(start, steps):
+  //
+  //   raw = start / (shift - (shift - 1) start)
+  //   [start] + [shift x / (1 + (shift - 1) x), x = raw (1 - i / steps),
+  //              i = 1 .. steps - 1] + [0]
+  //
+  // Empty when steps < 1 or start > 1.
+  static std::vector<double> refine_sigmas(int steps, double start = -1.0,
+                                           double shift = 6.0);
+
+  // The last `steps` steps of a RAW grid (1 -> 0, as a flow-map adapter
+  // states it) pushed through `shift` -- set_sigmas()'s float32 points,
+  // the terminal 0 included, widened to double for set_sigmas_as_run().
+  // Open-H3-Regenerate-2K-IC's samplers: up3 / up4 the last 3 / 4 steps
+  // of HyperFlow's 8 at shift 12, hf8 all of them. The whole grid when
+  // `steps` reaches its length; empty for steps < 1 or a grid
+  // set_sigmas() refuses.
+  static std::vector<double> grid_tail(const std::vector<float>& raw,
+                                       double shift, int steps);
+
+  // The plain Euler step a loop over Python-float sigmas takes:
+  //
+  //   x += float(sigma[i] - sigma[i+1]) * v
+  //
+  // the product rounded before the add (torch's two ops), with the
+  // difference taken in double -- the release's refine. Not step()'s
+  // ratio form, which is the same step in exact arithmetic and rounds
+  // differently. Needs set_sigmas_as_run().
+  bool step_plain(const float* velocity, int step_index, float* x,
+                  std::size_t n) const;
+
+  // Euler in its VELOCITY form, every operation in float32:
+  //
+  //   x += (sigma[i] - sigma[i+1]) * v
+  //
+  // on the grid's own float sigmas -- diffusers' MiniMaxH3Scheduler with
+  // `euler_update_form="velocity"`, which MiniMax-H3-Image's per-step
+  // heads were distilled with. The same update as step() in exact
+  // arithmetic; the last bit differs, and the bf16 forward amplifies it.
+  bool step_velocity(const float* velocity, int step_index, float* x,
+                     std::size_t n) const;
+
+  // torch.linspace(1, 0, num_points) in float32, at torch's rounding --
+  // the RAW grid set_timesteps shifts. Exposed for a distillation that
+  // keeps a SUBSET of a longer schedule (TaoMate-H3 runs points 0, 16,
+  // 33 and 49 of fifty): picking the raw points and shifting them is the
+  // same float32 arithmetic as shifting fifty and picking, point for
+  // point. Empty below 2.
+  static std::vector<float> linspace_grid(int num_points);
+
   // Sigma grid, descending, terminating at exactly 0. Size is one more
   // than timesteps().
   const std::vector<float>& sigmas() const { return _sigmas; }
   // The timestep the transformer is conditioned on at each step,
   // `1 - sigma`, ASCENDING towards 1 (clean).
   const std::vector<float>& timesteps() const { return _timesteps; }
+  // Where each step LANDS on the same axis, `1 - sigma[i+1]` -- the
+  // interval (timesteps()[i], endpoints()[i]) is what a flow-map adapter
+  // conditions step i on. Same size as timesteps(); the last is 1.
+  const std::vector<float>& endpoints() const { return _endpoints; }
   int num_inference_steps() const { return (int)_timesteps.size(); }
   double shift() const { return _shift; }
 
@@ -73,6 +188,26 @@ class MiniMaxH3Scheduler {
   // False when `step_index` is out of range or the sizes disagree.
   bool step(const float* velocity, int step_index, float* x,
             std::size_t n) const;
+
+  // One RE-NOISING step, in place: the clean estimate off the GRID sigma,
+  // put at the next sigma with fresh noise --
+  //
+  //   x0     = x + sigma[i] * v
+  //   x_next = (1 - sigma[i+1]) * x0 + sigma[i+1] * noise
+  //
+  // every operation in float32, so the last step (sigma[i+1] = 0)
+  // returns x0 exactly. diffusers' MiniMaxH3Scheduler with
+  // `stochastic_sampling`, the update Pika H3 Flex's adapters were
+  // trained for. `noise` may be null on that last step only.
+  bool step_renoise(const float* velocity, int step_index, float* x,
+                    const float* noise, std::size_t n) const;
+
+  // The x0 above on its own, into `out`: the model's CLEAN ESTIMATE at
+  // this step, which is what a latent preview decodes. Both samplers take
+  // it this way, so a preview is the same picture either one would step
+  // towards. Call it before the step overwrites `x`.
+  bool estimate_x0(const float* velocity, int step_index, const float* x,
+                   float* out, std::size_t n) const;
 
   // One `res_multistep` step -- the sampler the ComfyUI t2v template
   // actually ships (`KSamplerSelect: res_multistep`, eta = 0), a
@@ -102,6 +237,12 @@ class MiniMaxH3Scheduler {
   double             _shift;
   std::vector<float> _sigmas;
   std::vector<float> _timesteps;
+  std::vector<float> _endpoints;
+  // set_sigmas_as_run's sigmas as given; empty otherwise.
+  std::vector<double> _sigmas_d;
+
+  // timesteps / endpoints from `_sigmas`, float32 as the reference does.
+  void derive_();
 };
 
 }  // namespace genai

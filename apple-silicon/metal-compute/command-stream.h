@@ -3,9 +3,18 @@
 
 #include "apple-silicon/metal-compute/compute-encoder.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
+#include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace MTL {
 class CommandBuffer;
@@ -49,6 +58,12 @@ public:
   ComputeEncoder
   begin_compute(DispatchType dispatch_type = DispatchType::Serial);
 
+  // Internal (called by ComputeEncoder::dispatch when an op reached it
+  // with no valid kernel bound): latch `why` so the Fence the caller
+  // waits on reports it. Same latch the fire-and-forget commits use --
+  // see Failure. First failure wins.
+  void note_encode_failure_(const char* why);
+
   // Internal (called by ComputeEncoder::dispatch for the auto command-buffer
   // split): commit the current command buffer fire-and-forget and reopen a
   // fresh one, retargeting `enc` at it (same dispatch type). Not for direct
@@ -71,6 +86,58 @@ public:
   // thread, not the caller's, so synchronize access to anything
   // it captures.
   void on_completion(std::function<void()> handler);
+
+  // The failure latch shared by a stream and the Fence it hands out.
+  //
+  // split_encoder_ commits INTERMEDIATE command buffers fire-and-forget
+  // -- that is the whole point, it is what lets the CPU encode the next
+  // chunk while the GPU runs this one -- and nothing waits on them, so
+  // nothing was in a position to notice one FAIL. A long stream commits
+  // a dozen of these before the one the caller actually waits on, and an
+  // intermediate out-of-memory therefore skipped its work silently and
+  // reported success: exactly the shape of a corrupted result from a
+  // run that was merely too big.
+  //
+  // So each fire-and-forget buffer carries a completion handler that
+  // records the first failure here, and Fence::wait_ok() reports it
+  // alongside its own buffer's. The handler runs on a Metal thread,
+  // hence the atomic and the mutex.
+  struct Failure {
+    std::atomic<bool> failed{false};
+    std::mutex        mu;
+    std::string       reason;
+  };
+
+  // How many fire-and-forget buffers have COMPLETED process-wide, and how
+  // many of those ended in error.
+  //
+  // The latch above reports a failure, and a latch that never fires is
+  // indistinguishable from nothing ever failing -- which is exactly the
+  // reading a silent run invites. The completed count settles that: it is
+  // incremented by the same handler, so a nonzero value proves the
+  // handler runs and therefore that a zero error count means something.
+  //
+  // Process-wide and monotonic on purpose. A stream is opened and
+  // discarded many times per forward, so per-stream counters would be
+  // reset before anyone could read them.
+  static void fire_and_forget_stats(unsigned long long* completed,
+                                    unsigned long long* errored);
+
+  // With VPIPE_MC_GPU_TIME=1: the GPU time of every command buffer the
+  // process committed through a stream (GPUEndTime - GPUStartTime,
+  // summed), and how many. A loop's GPU busy time against its wall time
+  // is the GPU's idle between -- what a dispatch-bound loop loses.
+  // Process-wide and monotonic, as above; zero when off.
+  static void gpu_time_stats(double* busy_ms, unsigned long long* buffers);
+  // VPIPE_MC_GPU_TIME=2 also keeps each buffer's commit, GPU start and
+  // GPU end (seconds on the host's clock, CACurrentMediaTime's):
+  // taken (and cleared) here, for a profile of the gaps. Untaken, the
+  // newest 32768-65536 are kept.
+  // kstart / kend: the kernel driver's own processing of the buffer.
+  struct GpuSpan { double commit, kstart, kend, start, end; };
+  static std::vector<GpuSpan> take_gpu_spans();
+  // The same clock, for a caller's own marks against those spans.
+  static double host_seconds();
 
   // RAII handle on a committed MTL::CommandBuffer. Lets the caller
   // poll status, wait, or attach a completion callback.
@@ -133,6 +200,10 @@ public:
   private:
     friend class CommandStream;
     explicit Fence(MTL::CommandBuffer* cb) noexcept;
+    Fence(MTL::CommandBuffer* cb, std::shared_ptr<Failure> f) noexcept;
+    // The stream's latch, so wait_ok() also answers for the buffers
+    // committed and released before this one.
+    std::shared_ptr<Failure> _earlier;
 
     MTL::CommandBuffer* _cb = nullptr;
   };
@@ -143,10 +214,29 @@ public:
   // an empty Fence if no buffer was open.
   Fence commit();
 
+  // Commit everything `enc` has encoded so far, WAIT for the GPU to finish
+  // it, and reopen `enc` on a fresh command buffer of the same stream (same
+  // dispatch type), in place -- so a decision the host makes mid-forward
+  // (which weights to load next) can read what the GPU just wrote. Call it
+  // at a clean op boundary. Composes end / commit / wait_ok / begin_compute,
+  // inline. False, with nothing committed, on an encoder with no stream or
+  // inside a concurrent_scope; else Fence::wait_ok's answer (`why` set).
+  static bool sync_and_reopen(ComputeEncoder& enc, std::string* why = nullptr)
+  {
+    CommandStream* s = enc._stream;
+    if (s == nullptr || enc._scope_depth != 0) { return false; }
+    const DispatchType dt = enc._dt;
+    enc.end();
+    const bool ok = s->commit().wait_ok(why);
+    enc = s->begin_compute(dt);
+    return ok;
+  }
+
   MTL::CommandQueue* mtl_queue() const noexcept { return _queue; }
 
 private:
   friend class MetalCompute;
+  friend class ComputeEncoder;
   explicit CommandStream(MTL::CommandQueue* queue) noexcept;
 
   // Open the lazy command buffer if none is in flight, returning
@@ -155,8 +245,17 @@ private:
 
   MTL::CommandQueue*  _queue = nullptr;
   MTL::CommandBuffer* _cb    = nullptr;
+  // Created lazily on the first fire-and-forget commit; shared with every
+  // Fence this stream returns. See Failure.
+  std::shared_ptr<Failure> _fail;
+  // RESERVED for the next field (plugin ABI): a plugin holds this type BY
+  // VALUE, so its size is compiled into every plugin in the support
+  // window. A new member takes a reserved slot instead of growing it.
+  std::uintptr_t _reserved[2] = {};
 };
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

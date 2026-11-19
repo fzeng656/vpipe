@@ -11,6 +11,7 @@
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
 #include "stages/model-registry.h"
 #include "stages/sampler-spec.h"
 #include "stages/trigger-beat.h"
@@ -32,6 +33,8 @@
 #if defined(VPIPE_BUILD_APPLE_SILICON)
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/tokenizer.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/tensor-beat-bridge.h"
@@ -60,6 +63,11 @@ namespace vpipe {
 namespace {
 
 constexpr int kMinIdleTicks = 2;
+// A live frame's pixel budget on a Qwen tower when vlm_max_soft_tokens is
+// unset: the Qwen2/3-VL processor's classic bound (28 * 28 * 1280), what
+// the tower applied to every picture before it took the checkpoint's own
+// -- about 1000 tokens a frame.
+constexpr std::int64_t kQwenFramePixels = 28LL * 28 * 1280;
 
 // Debug: when VPIPE_VQA_DUMP_FRAMES=<dir> is set, write the EXACT planar
 // [3,H,W] u8 RGB buffer the VLM encoder is about to consume to a P6 PPM
@@ -481,6 +489,11 @@ RealtimeVqaStage::RealtimeVqaStage(const SessionContextIntf* s,
 }
 
 namespace {
+// The compute precisions the LM loader accepts, for the editor's
+// dropdown; the loader stays the authority.
+constexpr SpecExtra kComputeDtypeChoices[] = {
+  {spec_key::kChoices, "bf16,f16,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "VLM model: a models-DB key (registered by model-fetch) or an "
@@ -496,7 +509,8 @@ constexpr ConfigKey kAttrs[] = {
    .def_str = "", .suggest_db = kModelRegistryDb,
    .suggest_db_type = "qwen3.5-vision-encoder,gemma4-vision-encoder"},
   {.key = "compute_dtype", .type = ConfigType::String,
-   .doc = "bf16 | f16 | f32", .def_str = "bf16"},
+   .doc = "bf16 | f16 | f32", .def_str = "bf16",
+   .extra = kComputeDtypeChoices},
   {.key = "language", .type = ConfigType::String,
    .doc = "IETF UI/prompt locale for the built-in scene prompts "
           "(en-us | zh-cn | zh-tw); empty inherits the session language",
@@ -514,13 +528,13 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "fixed VLM input height; see vlm_input_width. 0 = native. "
           "Ignored when coreml_vision_path is set.", .def_int = 0},
   {.key = "vlm_max_soft_tokens", .type = ConfigType::Int,
-   .doc = "per-frame vision soft-token budget. 0 = encoder still/default "
-          "image budget (best detail). A positive value caps tokens/frame "
-          "to trade detail for prefill speed. Mainly affects Gemma-4 (its "
-          "dense-video budget ~64 tok/frame was too coarse for wide camera "
-          "frames). E.g. 64 restores the old coarse Gemma video budget. "
-          "Ignored when coreml_vision_path is set (the CoreML model's "
-          "output token count is fixed).",
+   .doc = "per-frame vision soft-token budget. 0 = the frame default: "
+          "Gemma-4's still-image budget, about 1000 tokens (~1 MP) a frame "
+          "on a Qwen tower, 256 on Pixtral. A positive value caps "
+          "tokens/frame to trade detail for prefill speed (e.g. 64 "
+          "restores the old coarse Gemma video budget). Ignored when "
+          "coreml_vision_path is set (the CoreML model's output token "
+          "count is fixed).",
    .def_int = 0},
   {.key = "max_frame_gap_ms", .type = ConfigType::Int,
    .doc = "inter-frame gap (ms) that closes a scene", .def_int = 10000},
@@ -712,8 +726,26 @@ std::vector<ResourceClaim>
 RealtimeVqaStage::declare_resources() const
 {
   if (_hf_dir.empty()) { return {}; }
-  return model_memory::weight_claims(
-      {resolve_model_dir(session(), _hf_dir)});
+  // The LM (streamable when it is a Mixture of Experts), what it runs in
+  // -- a scene's context (its frames' grids, at most max_frames_per_scene
+  // of them at a frame's budget) and a branch of it per question, its turn
+  // and answer -- and its GPU vision tower at a frame's budget
+  // (vlm_max_soft_tokens, else ~1 MP) -- none when a CoreML tower stands
+  // in for it.
+  const std::int64_t frame_tokens =
+      _vlm_max_soft_tokens > 0 ? _vlm_max_soft_tokens
+                               : kQwenFramePixels / (28 * 28);
+  genai::LmRunShape run;
+  run.page_tokens = _page_tokens;
+  run.max_pages = genai::LoadSpec{}.max_pages;   // the pool load() asks
+  run.kv_tokens = frame_tokens * _max_frames_per_scene + 1024;
+  run.contexts = 1 + (int)_questions.size();
+  run.branch_tokens = (std::int64_t)_max_new_tokens + 256;
+  run.i8_prefill = _i8_prefill;
+  return model_memory::lm_claims(
+      session(), resolve_model_dir(session(), _hf_dir), id(), run,
+      _coreml_vision_path.empty() ? kQwenFramePixels : -1,
+      _coreml_vision_path.empty() ? _vlm_max_soft_tokens : 0);
 }
 
 Job
@@ -749,9 +781,11 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   _lm->set_mtp_prefix_seed(false);
   // Accelerated mode (LOSSY, opt-in): dynamic-int8 prefill GEMMs -- a good
   // fit here (per-scene re-prefill). No-op on backends without the route.
-  if (_i8_prefill) { _lm->set_i8_prefill(true); }
+  // Asked off too: a warm model comes as the last stage left it
+  // (text-chat's note).
+  _lm->request_i8_prefill(_i8_prefill, mgr->launch_epoch());
   _chat_tpl = genai::make_chat_template(
-      _lm->config().architecture, _lm->tokenizer(), _disable_thinking);
+      _lm->config(), _lm->tokenizer(), _disable_thinking);
   if (!_chat_tpl) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): [metal] no chat template for '{}'; "
@@ -792,10 +826,12 @@ RealtimeVqaStage::initialize(RuntimeContext& ctx)
   }
   _mvis = _lm->metal_vision_encoder();
   _mgvis = _lm->metal_gemma4_vision_encoder();
+  _mpix  = _lm->metal_pixtral_vision_encoder();
+  _mlfm  = _lm->metal_lfm3_vision();
   _mgaud = _lm->metal_gemma4_audio_encoder();
   _mguni = _lm->gemma4_unified_embedder();
   if (_mguni && !_mguni->has_vision()) { _mguni = nullptr; }
-  if (!_mvis && !_mgvis && !_mguni) {
+  if (!_mvis && !_mgvis && !_mpix && !_mlfm && !_mguni) {
     session()->warn(fmt(
         "RealtimeVqaStage('{}'): [metal] no metal vision tower "
         "(model has no vision config?); frames will be dropped",
@@ -1214,7 +1250,8 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
                                   std::uint64_t ts_us, bool ts_present,
                                   const metal_compute::SharedBuffer* src_buf)
 {
-  if (!_lm || (!_mvis && !_m_coreml && !_mgvis && !_mguni)) {
+  if (!_lm || (!_mvis && !_m_coreml && !_mgvis && !_mpix && !_mlfm
+               && !_mguni)) {
     if (!_m_vision_warned) {
       session()->warn(fmt(
           "RealtimeVqaStage('{}'): [metal] vision tower unavailable; "
@@ -1314,6 +1351,35 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h;
       m.mw         = r.grid_w;
+    } else if (_mlfm) {
+      // LFM3-VL: a frame at vlm_max_soft_tokens' area when set, else the
+      // ~1 MP a live frame gets on the Qwen towers (~980 tokens), within
+      // the processor's own bounds; one row a token, 1-D positions.
+      const std::int64_t cell = (std::int64_t)_mlfm->config().patch *
+                                _mlfm->config().merge;
+      const std::int64_t frame_px =
+          _vlm_max_soft_tokens > 0
+              ? (std::int64_t)_vlm_max_soft_tokens * cell * cell
+              : kQwenFramePixels;
+      auto r = _mlfm->encode(urgb, uh, uw, frame_px);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
+    } else if (_mpix) {
+      // Pixtral sizes a frame by its own longest-edge rule, which at
+      // camera resolutions is ~1200 tokens a frame -- a scene of them
+      // overruns the context. vlm_max_soft_tokens caps the grid; unset,
+      // a frame gets 256 tokens, about what the other families' frame
+      // budgets give. Rows include the frame's [IMG_BREAK]/[IMG_END].
+      constexpr int kPixtralFrameTokens = 256;
+      auto r = _mpix->encode(urgb, uh, uw,
+                             _vlm_max_soft_tokens > 0 ? _vlm_max_soft_tokens
+                                                      : kPixtralFrameTokens);
+      m.embeddings = std::move(r.embeddings);
+      m.n_tokens   = r.n_tokens;
+      m.mh         = r.grid_h;
+      m.mw         = r.grid_w;
     } else if (_mguni) {
       // Gemma-4-12B "unified": encoder-less shallow embedder, host-f32
       // rows routed through the TokenRef embeddings_host splice.
@@ -1325,8 +1391,18 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
       }
     } else {
       // Metal MLX-free tower reports PRE-merger patches -> divide by S.
+      // A live frame keeps a budget of its own under the checkpoint's
+      // still-picture bound (16.7 MP on a Qwen3-VL repo, ~16k tokens):
+      // vlm_max_soft_tokens when set, else ~1 MP -- about 1000 tokens, a
+      // 1080p frame's worth, the size a scene of frames was tuned at.
       const int S = std::max(1, _mvis->config().spatial_merge);
-      auto r = _mvis->encode(urgb, uh, uw);
+      const std::int64_t cell =
+          (std::int64_t)_mvis->config().patch_size * S;
+      const std::int64_t frame_px =
+          _vlm_max_soft_tokens > 0
+              ? (std::int64_t)_vlm_max_soft_tokens * cell * cell
+              : kQwenFramePixels;
+      auto r = _mvis->encode(urgb, uh, uw, frame_px);
       m.embeddings = std::move(r.embeddings);
       m.n_tokens   = r.n_tokens;
       m.mh         = r.grid_h / S;
@@ -1337,9 +1413,11 @@ RealtimeVqaStage::m_encode_frame_(const std::uint8_t* rgb, int H, int W,
       std::chrono::duration<double>(clock::now() - t0).count();
   return m_append_mimg_(std::move(m), recv_ts_us, ts_us, ts_present,
                         _m_coreml ? "coreml"
-                                  : (_mgvis ? "metal-gemma4"
-                                            : (_mguni ? "gemma4-unified"
-                                                      : "metal-tower")),
+                                  : _mgvis ? "metal-gemma4"
+                                  : _mpix  ? "metal-pixtral"
+                                  : _mlfm  ? "metal-lfm3"
+                                  : _mguni ? "gemma4-unified"
+                                           : "metal-tower",
                         eff_w, eff_h, enc_s);
 }
 
@@ -1426,13 +1504,10 @@ RealtimeVqaStage::m_decode_(genai::LoadedLanguageModel::Context& ctx,
   // decode (m_decode_batched_) is preferred there and never uses MTP, and N
   // serial MTP decodes lose to one weight-amortized batched pass. rope is
   // anchored on ctx (post-image/audio mROPE or sequential) exactly as
-  // pdecode_begin reads it. Greedy OR penalty-free sampling -- the verify
-  // applies no repetition/presence penalty, so a penalised sampler stays on the
-  // loops below (which do apply it).
+  // pdecode_begin reads it. Penalties apply as pdecode's do, its seen-set
+  // primed from the first token alone (no text prompt) here too.
   const std::span<const std::int32_t> no_prompt;
-  const bool mtp_ok = use_mtp && cur >= 0 && _lm->mtp_available()
-      && (argmax || (sp.repetition_penalty == 1.0f
-                     && sp.presence_penalty == 0.0f));
+  const bool mtp_ok = use_mtp && cur >= 0 && _lm->mtp_available();
   if (mtp_ok) {
     auto is_stop = [tpl](std::int32_t id) {
       return tpl && tpl->is_stop_token(id);
@@ -2058,6 +2133,7 @@ RealtimeVqaStage::m_close_scene_(RuntimeContext& ctx)
       genai::TokenRef r;
       if (id == video_pad && img_idx < _m_imgs.size()) {
         r.kind = genai::TokenRef::Kind::ImageTokens;
+        r.text_id = id;
         // gemma4_unified: host-f32 rows; else native-f16 SharedBuffer.
         if (!_m_imgs[img_idx].embeddings_host.empty()) {
           r.embeddings_host = &_m_imgs[img_idx].embeddings_host;

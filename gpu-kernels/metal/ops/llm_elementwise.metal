@@ -164,7 +164,11 @@ kernel void moe_route_f16(
   logits  += (uint)tid.z * (uint)E;
   out_ids += (uint)tid.z * (uint)top_k;
   out_w   += (uint)tid.z * (uint)top_k;
-  const int PER = (E + 31) / 32;            // experts per lane (8 for E=256)
+  // Experts a lane: 16 whatever E (<= 512), the ones past E masked out --
+  // a bound known when compiled keeps lg / ex in registers (from E, the
+  // loops indexed them in memory). A masked one adds 0 to the sum, never
+  // wins a pick (its key is the start's -1), so every value is the same.
+  constexpr int PER = 16;
   float lg[16];                             // PER <= 16 (E <= 512)
   float lmax = -INFINITY;
   for (int j = 0; j < PER; ++j) {
@@ -184,6 +188,14 @@ kernel void moe_route_f16(
   }
   const float S = simd_sum(lsum);           // softmax denominator over all E
   float wsum = 0.0f;
+  // Lane k keeps pick k (its id, its weight as stored) and writes it at
+  // the end: the renorm read each weight back from out_w, a dependent
+  // device round trip a pick -- most of the kernel's 22 us a layer on an
+  // M5 Ultra (Qwen3.8-Flash-Next, top 10 of 512). Every lane adds the
+  // same picks in the same order, so each holds the same wsum.
+  const bool lanes = top_k <= 32;
+  int my_id = 0;
+  VPIPE_ELT my_w = (VPIPE_ELT)0.0f;
   for (int k = 0; k < top_k; ++k) {
     // local best among this lane's still-available experts
     float bv = -1.0f; int bi = -1;
@@ -203,9 +215,20 @@ kernel void moe_route_f16(
     }
     const float p = bv / S;                 // softmax prob of the selected expert
     wsum += p;
-    if (lid == 0) { out_ids[k] = bi; out_w[k] = (VPIPE_ELT)p; }
+    if (!lanes) {
+      if (lid == 0) { out_ids[k] = bi; out_w[k] = (VPIPE_ELT)p; }
+    } else if ((int)lid == k) {
+      my_id = bi;
+      my_w = (VPIPE_ELT)p;
+    }
   }
-  if (lid == 0 && norm_topk != 0 && wsum > 0.0f) {
+  const bool renorm = norm_topk != 0 && wsum > 0.0f;
+  if (lanes) {
+    if ((int)lid < top_k) {
+      out_ids[lid] = my_id;
+      out_w[lid] = renorm ? (VPIPE_ELT)((float)my_w / wsum) : my_w;
+    }
+  } else if (lid == 0 && renorm) {
     for (int k = 0; k < top_k; ++k) {
       out_w[k] = (VPIPE_ELT)((float)out_w[k] / wsum);
     }
@@ -301,6 +324,33 @@ kernel void moe_sort_setup_i32(
     off += ntile_e * MAXM;
   }
   ntiles_out[0] = off / MAXM;
+}
+
+// The work items of the matrix-core grouped GEMMs over the sorted MAXM-row
+// tiles: each expert's tiles `per` (<= 4) at a time, its last item what is
+// left -- items[i] = 4 * first tile + (tiles - 1), -1 past the last. An
+// item is one expert, so a threadgroup dequantizes its weight tile once for
+// per * MAXM rows without the segments padded to that. Single thread,
+// after moe_sort_setup_i32.
+kernel void moe_tile_items_i32(
+    const device int* hist [[buffer(0)]],  // [E]
+    const device int* boff [[buffer(1)]],  // [E]
+    device int* items      [[buffer(2)]],  // [maxitems]
+    constant int& E        [[buffer(3)]],
+    constant int& MAXM     [[buffer(4)]],
+    constant int& maxitems [[buffer(5)]],
+    constant int& per      [[buffer(6)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid != 0) { return; }
+  int ni = 0;
+  for (int e = 0; e < E; ++e) {
+    const int k = (hist[e] + MAXM - 1) / MAXM, t0 = boff[e] / MAXM;
+    for (int j = 0; j < k && ni < maxitems; j += per) {
+      items[ni++] = 4 * (t0 + j) + (min(per, k - j) - 1);
+    }
+  }
+  for (; ni < maxitems; ++ni) { items[ni] = -1; }
 }
 
 // Scatter pairs into sorted per-expert slots. grid(np). srow[slot]=token row,
@@ -478,6 +528,60 @@ kernel void scale_inplace_f16(
 }
 
 // out[i] = a[i] + b[i].   0:a 1:b 2:out 3:n
+// NON-FINITE TRIPWIRE: scan a tensor on the GPU and record the FIRST
+// offender, without draining anything.
+//
+// Reading a buffer back on the CPU to look for a NaN costs a full GPU
+// drain per check, which changes the timing of the very thing being
+// measured -- on MiniMax-H3 at video geometry, draining between ops made
+// a reproducible corruption disappear. This runs in the stream like any
+// other dispatch and writes a fixed 8-word report, so the check is one
+// extra pass over the tensor and the report is read ONCE per forward.
+//
+// `tag` identifies the call site (block * 16 + op). The first thread to
+// find a non-finite element claims the report with a compare-exchange
+// and writes what it saw; every other one only bumps the count. So the
+// report names the earliest DETECTED offender rather than a race between
+// reporters, and the count says whether it was one element or a region.
+//
+// report[0] claimed flag   report[1] tag        report[2] flat index
+// report[3] raw bits       report[4] total non-finite found
+//   0:x 1:report(atomic_uint[8]) 2:n 3:tag.  grid (n).
+kernel void nan_tripwire_f16(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device atomic_uint*     report [[buffer(1)]],
+    constant uint&          n      [[buffer(2)]],
+    constant uint&          tag    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= n) { return; }
+  const float v = (float)x[gid];
+  if (isfinite(v)) { return; }
+  atomic_fetch_add_explicit(&report[4], 1u, memory_order_relaxed);
+  // PER-CALL-SITE count as well as the running total. Whether a tensor
+  // holds five bad elements or four hundred million is the difference
+  // between a localised fault and a wholesale one, and a single shared
+  // counter cannot tell them apart -- it reported 2.8e9 for a tensor of
+  // 4.0e8, which is only a total over every check in the pass.
+  //
+  // Slot 16 + tag, so a 50-block stack at 16 ops fits in the 1024-word
+  // report. Tags past that are dropped rather than aliased onto another
+  // site's count: a wrong attribution is worse than a missing one.
+  if (tag < 1008u) {
+    atomic_fetch_add_explicit(&report[16u + tag], 1u, memory_order_relaxed);
+  }
+  uint expected = 0u;
+  if (!atomic_compare_exchange_weak_explicit(&report[0], &expected, 1u,
+                                             memory_order_relaxed,
+                                             memory_order_relaxed)) {
+    return;                                  // someone else claimed it
+  }
+  atomic_store_explicit(&report[1], tag, memory_order_relaxed);
+  atomic_store_explicit(&report[2], gid, memory_order_relaxed);
+  atomic_store_explicit(&report[3],
+                        (uint)as_type<ushort>(x[gid]), memory_order_relaxed);
+}
+
 kernel void residual_add_f16(
     const device VPIPE_ELT* a   [[buffer(0)]],
     const device VPIPE_ELT* b   [[buffer(1)]],
@@ -514,6 +618,29 @@ kernel void splitk_fold_f32_f16(
     acc += planes[(uint)s * (uint)n + gid];
   }
   out[gid] = VPIPE_ELT(acc);
+}
+
+// The fold, with a per-COLUMN bias added once at the end.
+//
+// A split-K GEMM writes S partial planes and the bias belongs to the sum,
+// not to any plane -- adding it per plane would multiply it by S. The
+// plain fold above stays for the callers that have no bias.
+//   0:planes 1:out 2:n (= M*N) 3:splits 4:bias [N] 5:N.  grid (n).
+kernel void splitk_fold_bias_f32_f16(
+    const device float*     planes [[buffer(0)]],
+    device VPIPE_ELT*       out    [[buffer(1)]],
+    constant int&           n      [[buffer(2)]],
+    constant int&           splits [[buffer(3)]],
+    const device VPIPE_ELT* bias   [[buffer(4)]],
+    constant int&           N      [[buffer(5)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n) { return; }
+  float acc = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    acc += planes[(uint)s * (uint)n + gid];
+  }
+  out[gid] = VPIPE_ELT(acc + (float)bias[(int)gid % N]);
 }
 
 // GELU (tanh approximation), the QwenImage FeedForward activation. VPIPE_ELT
@@ -736,6 +863,29 @@ kernel void gated_residual_tanh_v4_f16(
   const float4 s = float4(reinterpret_cast<const device VPIPE_ELT4*>(sub)[o]);
   device VPIPE_ELT4* hv = reinterpret_cast<device VPIPE_ELT4*>(h);
   hv[o] = VPIPE_ELT4(float4(hv[o]) + g * s);
+}
+
+// SwiGLU over FOUR elements per thread, contiguous, n % 4 == 0.
+//
+// The scalar form (swiglu_f16, above) is one element per thread, which on a DiT's
+// feed-forward is the largest elementwise dispatch in the model --
+// rows*ffn, 51M threads at 1024^2 -- and it runs nowhere near memory
+// bandwidth at that width. Same arithmetic, a quarter of the threads.
+//   0:gate 1:up 2:out 3:n4.  grid (n/4).
+kernel void swiglu_v4_f16(
+    const device VPIPE_ELT* gate [[buffer(0)]],
+    const device VPIPE_ELT* up   [[buffer(1)]],
+    device VPIPE_ELT*       out  [[buffer(2)]],
+    constant int&      n4   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n4) { return; }
+  const float4 g = float4(reinterpret_cast<const device VPIPE_ELT4*>(gate)[gid]);
+  const float4 u = float4(reinterpret_cast<const device VPIPE_ELT4*>(up)[gid]);
+  // Plain exp(), matching swiglu_generic_ above: the point is a
+  // wider thread, not a different function.
+  const float4 sg = g / (1.0f + exp(-g));
+  reinterpret_cast<device VPIPE_ELT4*>(out)[gid] = VPIPE_ELT4(sg * u);
 }
 
 // out = a + b over 4 elements per thread, 1-D grid of n/4 threads (n % 4 == 0).
@@ -1046,6 +1196,99 @@ kernel void upsample_nearest2x_hwc_f16(
   out[gid] = in[((ulong)(oy / 2) * W + (ox / 2)) * (uint)C + c];
 }
 
+// ---- AutoencoderKLQwenImage21's parameter-free residual shortcuts ----
+//
+// `is_residual` wraps each encoder/decoder level in a shortcut that is
+// pure index arithmetic -- no weights -- bridging the level's in/out
+// widths by REGROUPING channels against a space-to-depth. Both kernels
+// ACCUMULATE into `out`, because the reference adds the shortcut to the
+// main path's result and one thread owns each output element.
+//
+// THE TEMPORAL FACTOR SURVIVES ON A STILL, which is the part that looks
+// wrong and is not. These are video ops; a single latent frame is
+// zero-padded at the FRONT to `ft` frames, so the real frame is always
+// time index ft-1 and the padded ones contribute zeros. At a level with
+// ft=2 that makes half the shortcut's output channels exactly zero --
+// correct, and not something to "fix" by dropping the factor.
+//
+// Down: out[(oy,ox), o] += mean over g<G of src(n = o*G + g), where n
+// decomposes as (c, t, sy, sx) = (n/factor, rem/(fs*fs), (rem/fs)%fs,
+// rem%fs) with factor = ft*fs*fs, G = Cin*factor/Cout, and src is
+// in[(oy*fs+sy, ox*fs+sx), c] when t == ft-1 and zero otherwise.
+//   0:in[H*W,Cin] 1:out[(H/fs)*(W/fs),Cout] 2:H 3:W 4:Cin 5:Cout 6:ft
+//   7:fs.  grid (OH*OW*Cout) or (Cout, OH*OW).
+// Indices are ulong throughout: a full-resolution encoder level at 2048px
+// has H*W*C past 2^31, which is the silent all-zero failure this tree has
+// already paid for once.
+kernel void vae_res_avg_down_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H    [[buffer(2)]],
+    constant int&      W    [[buffer(3)]],
+    constant int&      Cin  [[buffer(4)]],
+    constant int&      Cout [[buffer(5)]],
+    constant int&      ft   [[buffer(6)]],
+    constant int&      fs   [[buffer(7)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const int OH = H / fs, OW = W / fs;
+  const ulong gid = (ulong)tpig.y * (uint)Cout + tpig.x;
+  const ulong total = (ulong)OH * (uint)OW * (uint)Cout;
+  if (gid >= total) { return; }
+  const uint o = (uint)(gid % (uint)Cout);
+  const uint p = (uint)(gid / (uint)Cout);
+  const int ox = (int)(p % (uint)OW);
+  const int oy = (int)(p / (uint)OW);
+  const int factor = ft * fs * fs;
+  const int G = (Cin * factor) / Cout;
+  float acc = 0.0f;
+  for (int g = 0; g < G; ++g) {
+    const int n = (int)o * G + g;
+    const int c = n / factor;
+    const int rem = n % factor;
+    const int t = rem / (fs * fs);
+    if (t != ft - 1) { continue; }          // a zero-padded frame
+    const int sy = (rem / fs) % fs;
+    const int sx = rem % fs;
+    const int iy = oy * fs + sy, ix = ox * fs + sx;
+    if (iy >= H || ix >= W) { continue; }
+    acc += (float)in[((ulong)iy * (uint)W + (uint)ix) * (uint)Cin + (uint)c];
+  }
+  out[gid] = (VPIPE_ELT)((float)out[gid] + acc / (float)G);
+}
+
+// Up: out[(y*2+sy, x*2+sx), o] += in[(y,x), j/repeats] with
+// j = ((o*ft + (ft-1))*2 + sy)*2 + sx and repeats = Cout*ft*4/Cin. The
+// ft-1 is the surviving frame after the reference drops the leading
+// ft-1 of them (`first_chunk`), which on a still leaves exactly one.
+//   0:in[H*W,Cin] 1:out[(2H)*(2W),Cout] 2:H 3:W 4:Cin 5:Cout 6:ft.
+//   grid ((2H)*(2W)*Cout) or (Cout, (2H)*(2W)).
+kernel void vae_res_dup_up_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H    [[buffer(2)]],
+    constant int&      W    [[buffer(3)]],
+    constant int&      Cin  [[buffer(4)]],
+    constant int&      Cout [[buffer(5)]],
+    constant int&      ft   [[buffer(6)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const int OH = 2 * H, OW = 2 * W;
+  const ulong gid = (ulong)tpig.y * (uint)Cout + tpig.x;
+  const ulong total = (ulong)OH * (uint)OW * (uint)Cout;
+  if (gid >= total) { return; }
+  const uint o = (uint)(gid % (uint)Cout);
+  const uint p = (uint)(gid / (uint)Cout);
+  const int ox = (int)(p % (uint)OW);
+  const int oy = (int)(p / (uint)OW);
+  const int repeats = (Cout * ft * 4) / Cin;
+  const int j = (((int)o * ft + (ft - 1)) * 2 + (oy & 1)) * 2 + (ox & 1);
+  const int c = j / repeats;
+  const ulong si = ((ulong)(oy / 2) * (uint)W + (uint)(ox / 2)) * (uint)Cin +
+                   (uint)c;
+  out[gid] = (VPIPE_ELT)((float)out[gid] + (float)in[si]);
+}
+
 // GLU over a [rows, 2*D] matrix split into halves: each row is [a(D) |
 // g(D)]; out[r,d] = a[r,d] * sigmoid(g[r,d]). Gemma-4 audio lconv1d GLU.
 //   0:in[rows,2*D] 1:out[rows,D] 2:rows 3:D.  grid (rows*D).
@@ -1056,10 +1299,10 @@ kernel void glu_split_f16(
     constant int&      D    [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= (uint)(rows * D)) { return; }
-  const int r = (int)gid / D;
-  const int d = (int)gid % D;
-  const int64_t base = (int64_t)r * (2 * D);
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
   const float a = float(in[base + d]);
   const float g = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(a * (1.0f / (1.0f + exp(-g))));
@@ -1186,6 +1429,193 @@ kernel void group_norm_frames_f16(
   }
 }
 
+// group_norm_frames_f16 in three COALESCED passes.
+//
+// The one-pass kernel above gives every (frame, group) its own
+// threadgroup. The groups are 4-32 channels of a channel-last row 128-1024
+// wide, so each of the G threadgroups reads a sliver of every row -- 8
+// bytes of each 256-byte row at C = 128 -- and a frame is fetched G times
+// over. MEASURED on a 17x832x480 encode, twelve 256^2 tiles: 6.0 s of
+// norms on the M4 Pro (16% of it, more than every level below the first
+// two put together) and 12.6 s on the M5; these three passes take 0.82 s
+// and ~1.2 s, the latter with a commit per norm to time it.
+//
+// Pass 1, per (frame, band of rows): each group's sum and sum of squares
+// as float partials. A threadgroup reads whole rows, every channel, in
+// order. Each thread owns ONE vec4 of channels -- 256 is a multiple of
+// C/4 -- and that vec4 lies inside one group, since C/G is a multiple of
+// 4. The host checks both and keeps the one-pass kernel otherwise.
+//   0:x[T,rows,C] 1:part[T,nband,G,2] 2:rows 3:C 4:G 5:band
+//   grid {256, nband, T}, tg {256,1,1}
+kernel void group_norm_frames_stats_f16(
+    const device VPIPE_ELT* x    [[buffer(0)]],
+    device float*           part [[buffer(1)]],
+    constant int&      rows [[buffer(2)]],
+    constant int&      C    [[buffer(3)]],
+    constant int&      G    [[buffer(4)]],
+    constant int&      band [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tgpg [[threadgroups_per_grid]],
+    uint  lid  [[thread_index_in_threadgroup]])
+{
+  const int C4   = C / 4;
+  const int v    = (int)lid % C4;
+  const int step = 256 / C4;               // rows one sweep covers
+  const int r0   = (int)tgid.y * band;
+  const int r1   = min(r0 + band, rows);
+  const device VPIPE_ELT4* xf = reinterpret_cast<const device VPIPE_ELT4*>(
+      x + (long)tgid.z * (long)rows * (long)C);
+  float s = 0.0f, q = 0.0f;
+  for (int r = r0 + (int)lid / C4; r < r1; r += step) {
+    const float4 a = float4(xf[(long)r * C4 + v]);
+    s += (a.x + a.y) + (a.z + a.w);
+    q += dot(a, a);
+  }
+  threadgroup float ts[256];
+  threadgroup float tq[256];
+  ts[lid] = s;
+  tq[lid] = q;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  // Group g is vec4 slots [g*Cg4, (g+1)*Cg4), each held by `step`
+  // threads: slot + k*C4.
+  const int Cg4 = C4 / G;
+  if ((int)lid < G) {
+    float a = 0.0f, b = 0.0f;
+    for (int k = 0; k < step; ++k) {
+      for (int j = 0; j < Cg4; ++j) {
+        const int t = k * C4 + (int)lid * Cg4 + j;
+        a += ts[t];
+        b += tq[t];
+      }
+    }
+    device float* p =
+        part + (((long)tgid.z * tgpg.y + tgid.y) * (long)G + lid) * 2;
+    p[0] = a;
+    p[1] = b;
+  }
+}
+
+// Pass 2: a (frame, group)'s partials into its mean and 1/std.
+//   0:part[T,nband,G,2] 1:stats[T,G,2] 2:nband 3:G 4:count (rows*C/G)
+//   5:eps   grid {G, T}
+kernel void group_norm_frames_finalize_f16(
+    const device float* part  [[buffer(0)]],
+    device float*       stats [[buffer(1)]],
+    constant int&      nband [[buffer(2)]],
+    constant int&      G     [[buffer(3)]],
+    constant int&      count [[buffer(4)]],
+    constant float&    eps   [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if ((int)gid.x >= G) { return; }
+  float s = 0.0f, q = 0.0f;
+  for (int b = 0; b < nband; ++b) {
+    const device float* p =
+        part + (((long)gid.y * nband + b) * (long)G + gid.x) * 2;
+    s += p[0];
+    q += p[1];
+  }
+  const float n    = (float)count;
+  const float mean = s / n;
+  const float var  = max(q / n - mean * mean, 0.0f);
+  device float* o = stats + ((long)gid.y * G + gid.x) * 2;
+  o[0] = mean;
+  o[1] = 1.0f / sqrt(var + eps);
+}
+
+// Pass 3: normalize, affine, optional SiLU, one vec4 a thread. With
+// `pad` the output is the frame REFLECT-PADDED by one pixel all round,
+// [T, H+2, W+2, C], which is what the hardware convolution that reads
+// it wants (conv3d_hw_causal_s1_f16) -- written here so the pad costs
+// no pass of its own. A pixel next to an edge also fills the halo cell
+// that reflects it: padded row 0 is image row 1 and padded row H+1 is
+// image row H-2 (torch's reflect, edge not repeated), and the same for
+// columns; a corner is both. Needs H, W >= 2.
+//   0:x[T,rows,C] 1:stats[T,G,2] 2:gamma[C] 3:beta[C] 4:out 5:rows 6:C
+//   7:G 8:do_silu 9:W 10:H 11:pad   grid {rows*C/4, T}
+kernel void group_norm_frames_apply_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device float*     stats [[buffer(1)]],
+    const device VPIPE_ELT* gamma [[buffer(2)]],
+    const device VPIPE_ELT* beta  [[buffer(3)]],
+    device VPIPE_ELT*       out   [[buffer(4)]],
+    constant int&      rows    [[buffer(5)]],
+    constant int&      C       [[buffer(6)]],
+    constant int&      G       [[buffer(7)]],
+    constant int&      do_silu [[buffer(8)]],
+    constant int&      W       [[buffer(9)]],
+    constant int&      H       [[buffer(10)]],
+    constant int&      pad     [[buffer(11)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int C4 = C / 4;
+  if ((long)gid.x >= (long)rows * C4) { return; }
+  const int  r = (int)gid.x / C4;
+  const int  v = (int)gid.x % C4;
+  const long t = (long)gid.y;
+  const int  g = (v * 4) / (C / G);
+  const device float* st = stats + (t * G + g) * 2;
+  const float mean = st[0], inv = st[1];
+  const float4 a  = float4(reinterpret_cast<const device VPIPE_ELT4*>(x)
+                               [(t * rows + r) * C4 + v]);
+  const float4 gm = float4(reinterpret_cast<const device VPIPE_ELT4*>(
+      gamma)[v]);
+  const float4 bt = float4(reinterpret_cast<const device VPIPE_ELT4*>(
+      beta)[v]);
+  float4 y = (a - mean) * inv * gm + bt;
+  if (do_silu != 0) { y = y / (1.0f + exp(-y)); }
+  const VPIPE_ELT4 o = VPIPE_ELT4(y);
+  device VPIPE_ELT4* of = reinterpret_cast<device VPIPE_ELT4*>(out);
+  if (pad == 0) {
+    of[(t * rows + r) * C4 + v] = o;
+    return;
+  }
+  const int  Wp = W + 2;
+  const int  yy = r / W, xx = r % W;
+  const long fb = t * (long)(H + 2) * Wp;
+  int rs[3], cs[3];
+  int nr = 0, nc = 0;
+  rs[nr++] = yy + 1;
+  if (yy == 1)     { rs[nr++] = 0; }
+  if (yy == H - 2) { rs[nr++] = H + 1; }
+  cs[nc++] = xx + 1;
+  if (xx == 1)     { cs[nc++] = 0; }
+  if (xx == W - 2) { cs[nc++] = W + 1; }
+  for (int i = 0; i < nr; ++i) {
+    for (int j = 0; j < nc; ++j) {
+      of[(fb + (long)rs[i] * Wp + cs[j]) * C4 + v] = o;
+    }
+  }
+}
+
+// REFLECT-pad a channel-last clip [T, H, W, C] by `lo` cells before and
+// `hi` after on both spatial axes: out [T, H+lo+hi, W+lo+hi, C], torch's
+// reflect (edge not repeated). For an input the hardware convolution
+// reads that no norm wrote -- the MiniMax-H3 encoder's downsample, whose
+// pad is (0, 1): bottom and right only.
+//   0:in 1:out 2:H 3:W 4:C 5:lo 6:hi   grid {Wp*C, Hp, T}
+kernel void reflect_pad_hwc_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      H  [[buffer(2)]],
+    constant int&      W  [[buffer(3)]],
+    constant int&      C  [[buffer(4)]],
+    constant int&      lo [[buffer(5)]],
+    constant int&      hi [[buffer(6)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int Wp = W + lo + hi, Hp = H + lo + hi;
+  if ((int)gid.x >= Wp * C || (int)gid.y >= Hp) { return; }
+  const int px = (int)gid.x / C, c = (int)gid.x % C;
+  int sy = (int)gid.y - lo, sx = px - lo;
+  if (sy < 0)  { sy = -sy; }
+  if (sy >= H) { sy = 2 * H - 2 - sy; }
+  if (sx < 0)  { sx = -sx; }
+  if (sx >= W) { sx = 2 * W - 2 - sx; }
+  out[(((long)gid.z * Hp + gid.y) * Wp + px) * C + c] =
+      in[(((long)gid.z * H + sy) * W + sx) * C + c];
+}
+
 // Causal depthwise Conv1d, kernel K, per-channel weight w[D, K] (tap kk
 // pairs with input position t+kk-(K-1); left-padded with zeros). One
 // thread per (t, d).   0:in[T,D] 1:w[D,K] 2:out[T,D] 3:T 4:D 5:K.
@@ -1211,95 +1641,7 @@ kernel void depthwise_conv1d_causal_f16(
   out[gid] = VPIPE_ELT(acc);
 }
 
-// ---- MageVAE (DiCo conv codec) ops --------------------------------------
-// Depthwise 3x3 conv, stride 1, pad 1, CHANNEL-LAST [H*W, C] (the VAE
-// layout): out[p, c] = sum_ky,kx in[(y+ky-1)*W + (x+kx-1), c] * w[c, ky, kx]
-// + b[c], zero outside the image. Each channel has its own 3x3 tap set
-// (groups == C), so unlike the dense 3x3 there is no im2col/GEMM to fold it
-// into -- one thread per (pixel, channel) reads 9 neighbours directly.
-//   0:in[H*W,C] 1:w[C,9] 2:b[C] 3:out[H*W,C] 4:H 5:W 6:C 7:has_bias.
-// grid (C, H*W) -- 2D so neither dimension overflows at >=1K px.
-kernel void depthwise_conv2d_3x3_hwc_f16(
-    const device VPIPE_ELT* in  [[buffer(0)]],
-    const device VPIPE_ELT* w   [[buffer(1)]],
-    const device VPIPE_ELT* b   [[buffer(2)]],
-    device VPIPE_ELT*       out [[buffer(3)]],
-    constant int&      H   [[buffer(4)]],
-    constant int&      W   [[buffer(5)]],
-    constant int&      C   [[buffer(6)]],
-    constant int&      has_bias [[buffer(7)]],
-    uint2 tpig [[thread_position_in_grid]])
-{
-  const int c = (int)tpig.x;
-  const uint p = tpig.y;
-  if (c >= C || p >= (uint)(H * W)) { return; }
-  const int y = (int)(p / (uint)W);
-  const int x = (int)(p % (uint)W);
-  float acc = has_bias ? float(b[c]) : 0.0f;
-  for (int ky = 0; ky < 3; ++ky) {
-    const int yy = y + ky - 1;
-    if (yy < 0 || yy >= H) { continue; }
-    for (int kx = 0; kx < 3; ++kx) {
-      const int xx = x + kx - 1;
-      if (xx < 0 || xx >= W) { continue; }
-      acc += float(in[((uint)yy * (uint)W + (uint)xx) * (uint)C + (uint)c])
-             * float(w[(uint)c * 9u + (uint)(ky * 3 + kx)]);
-    }
-  }
-  out[p * (uint)C + (uint)c] = VPIPE_ELT(acc);
-}
-
-// Column mean of a row-major [M, N] matrix: out[n] = (1/M) sum_m x[m, n].
-// The spatial global-average-pool of the DiCo channel-attention branch
-// (AdaptiveAvgPool2d(1) over a channel-last [H*W, C] activation). One
-// threadgroup per column, strided over rows, f32 accumulation.
-//   0:x[M,N] 1:out[N] 2:M 3:N.  grid (N * CM_TG) / tg (CM_TG).
-#define CM_TG 256
-kernel void col_mean_f16(
-    const device VPIPE_ELT* x   [[buffer(0)]],
-    device VPIPE_ELT*       out [[buffer(1)]],
-    constant int&      M   [[buffer(2)]],
-    constant int&      N   [[buffer(3)]],
-    uint3 tid  [[threadgroup_position_in_grid]],
-    uint3 ltid [[thread_position_in_threadgroup]],
-    uint  simd_lid [[thread_index_in_simdgroup]],
-    uint  simd_gid [[simdgroup_index_in_threadgroup]])
-{
-  const uint n = tid.x;
-  if (n >= (uint)N) { return; }
-  float s = 0.0f;
-  for (uint m = ltid.x; m < (uint)M; m += CM_TG) {
-    s += float(x[m * (uint)N + n]);
-  }
-  s = simd_sum(s);
-  threadgroup float part[CM_TG / 32];
-  if (simd_lid == 0) { part[simd_gid] = s; }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (simd_gid == 0) {
-    float a = (simd_lid < CM_TG / 32) ? part[simd_lid] : 0.0f;
-    a = simd_sum(a);
-    if (simd_lid == 0) { out[n] = VPIPE_ELT(a / (float)M); }
-  }
-}
-
-// Per-column gated scale, in place: y[m, n] *= sigmoid(v[n]). Fuses the
-// Sigmoid tail of the DiCo channel-attention with its broadcast multiply
-// (the pooled 1x1-conv logits arrive unactivated), so the [C] vector is
-// read once and no separate sigmoid pass is needed.
-//   0:y[M*N] (inout) 1:v[N] 2:N 3:total(=M*N).  grid (N, M).
-kernel void mul_rows_sigmoid_f16(
-    device VPIPE_ELT*       y [[buffer(0)]],
-    const device VPIPE_ELT* v [[buffer(1)]],
-    constant int&      N     [[buffer(2)]],
-    constant uint&     total [[buffer(3)]],
-    uint2 tpig [[thread_position_in_grid]])
-{
-  const uint gid = tpig.y * (uint)N + tpig.x;
-  if (gid >= total) { return; }
-  const float g = 1.0f / (1.0f + metal::precise::exp(-float(v[gid % (uint)N])));
-  y[gid] = VPIPE_ELT(float(y[gid]) * g);
-}
-
+// ---- exact GELU and affine LayerNorm ---------------------------------
 // Metal has no erf intrinsic; Abramowitz & Stegun 7.1.26 (max abs error
 // ~1.5e-7, well under f16 precision). Same formulation as the vision
 // metallib's helper -- each .metal is its own metallib, so it is redefined
@@ -1316,8 +1658,8 @@ inline float elt_erf_approx_(float x) {
   return s * y;
 }
 
-// EXACT (erf) GELU: out = x * 0.5 * (1 + erf(x / sqrt(2))). MageVAE calls
-// F.gelu() with the default approximate='none', so the tanh approximation
+// EXACT (erf) GELU: out = x * 0.5 * (1 + erf(x / sqrt(2))). What F.gelu()
+// computes with the default approximate='none', so the tanh approximation
 // used by the DiT feed-forwards (gelu_tanh_ff_f16) is NOT interchangeable
 // here -- they differ by ~1e-3 relative near |x| ~ 2.
 //   0:x 1:out 2:n.  grid (n).
@@ -1335,9 +1677,9 @@ kernel void gelu_erf_f16(
 
 // LayerNorm WITH affine (weight + bias), normalized over the last H dims:
 // out = (x-mean)/sqrt(var+eps) * w + b. The plain twin above has no affine
-// and the vision metallib's layer_norm_bias_f16 is half-only; MageVAE's
-// encoder LayerNorm2d layers carry affine params and run in both element
-// types, so it gets a VPIPE_ELT version here.
+// and the vision metallib's layer_norm_bias_f16 is half-only; a LayerNorm
+// with affine params that has to run in both element types gets this
+// VPIPE_ELT version.
 //   0:x 1:w[H] 2:b[H] 3:out 4:H 5:eps.  grid (1, rows) / tg (LN_FF_TG).
 kernel void layer_norm_affine_f16(
     const device VPIPE_ELT* x   [[buffer(0)]],
@@ -1377,190 +1719,6 @@ kernel void layer_norm_affine_f16(
   for (int i = (int)lid; i < H; i += LN_FF_TG) {
     outr[i] = VPIPE_ELT(((float)xr[i] - mean) * inv * (float)w[i]
                         + (float)b[i]);
-  }
-}
-
-// Gather non-overlapping dxd tiles out of a channel-last [H*W, C] image
-// into a tile-major [nt*d*d, C] buffer, REPLICATE-clamping coordinates past
-// the edge. This is the MageVAE CoD decoder's patched attention: the
-// reference F.pad(..., mode="replicate") to a whole number of dxd tiles is
-// exactly a clamp on the gather, so no separate pad pass is needed.
-//   0:in[H*W,C] 1:out[nt*d*d,C] 2:H 3:W 4:C 5:d 6:npw.
-// grid (C, d*d, nt) with nt = nph*npw.
-kernel void tile_gather_clamp_hwc_f16(
-    const device VPIPE_ELT* in  [[buffer(0)]],
-    device VPIPE_ELT*       out [[buffer(1)]],
-    constant int&      H   [[buffer(2)]],
-    constant int&      W   [[buffer(3)]],
-    constant int&      C   [[buffer(4)]],
-    constant int&      d   [[buffer(5)]],
-    constant int&      npw [[buffer(6)]],
-    uint3 tpig [[thread_position_in_grid]])
-{
-  const int c = (int)tpig.x;
-  const int uv = (int)tpig.y;
-  const int t = (int)tpig.z;
-  if (c >= C || uv >= d * d) { return; }
-  const int u = uv / d, v = uv % d;
-  int y = (t / npw) * d + u;
-  int x = (t % npw) * d + v;
-  y = metal::min(y, H - 1);
-  x = metal::min(x, W - 1);
-  out[((uint)t * (uint)(d * d) + (uint)uv) * (uint)C + (uint)c] =
-      in[((uint)y * (uint)W + (uint)x) * (uint)C + (uint)c];
-}
-
-// Scatter tiles back into a channel-last [H*W, C] image, dropping the
-// replicate-padded positions that fall outside the image (the reference
-// crops h_[:, :, :H, :W] after the tiled attention).
-//   0:src[nt*d*d,C] 1:out[H*W,C] 2:H 3:W 4:C 5:d 6:npw.
-// grid (C, d*d, nt).
-kernel void tile_scatter_hwc_f16(
-    const device VPIPE_ELT* src [[buffer(0)]],
-    device VPIPE_ELT*       out [[buffer(1)]],
-    constant int&      H   [[buffer(2)]],
-    constant int&      W   [[buffer(3)]],
-    constant int&      C   [[buffer(4)]],
-    constant int&      d   [[buffer(5)]],
-    constant int&      npw [[buffer(6)]],
-    uint3 tpig [[thread_position_in_grid]])
-{
-  const int c = (int)tpig.x;
-  const int uv = (int)tpig.y;
-  const int t = (int)tpig.z;
-  if (c >= C || uv >= d * d) { return; }
-  const int y = (t / npw) * d + uv / d;
-  const int x = (t % npw) * d + uv % d;
-  if (y >= H || x >= W) { return; }
-  out[((uint)y * (uint)W + (uint)x) * (uint)C + (uint)c] =
-      src[((uint)t * (uint)(d * d) + (uint)uv) * (uint)C + (uint)c];
-}
-
-// Add a row-cyclic constant table: y[r, n] += tbl[(r % P), n]. The MageVAE
-// decoder's NerfEmbedder contributes a fixed per-intra-patch-pixel DCT
-// position term (folded with the linear bias at load into a [P, N] table,
-// P = patch*patch), which repeats for every patch.
-//   0:y[M,N] (inout) 1:tbl[P,N] 2:N 3:P 4:total(=M*N).  grid (N, M).
-kernel void add_rows_mod_f16(
-    device VPIPE_ELT*       y   [[buffer(0)]],
-    const device VPIPE_ELT* tbl [[buffer(1)]],
-    constant int&      N     [[buffer(2)]],
-    constant int&      P     [[buffer(3)]],
-    constant uint&     total [[buffer(4)]],
-    uint2 tpig [[thread_position_in_grid]])
-{
-  const uint gid = tpig.y * (uint)N + tpig.x;
-  if (gid >= total) { return; }
-  const uint n = gid % (uint)N;
-  const uint r = gid / (uint)N;
-  y[gid] = VPIPE_ELT(float(y[gid]) + float(tbl[(r % (uint)P) * (uint)N + n]));
-}
-
-// ---- MageVAE per-pixel MLP head: f32 residual stream -------------------
-// The decoder's per-pixel MLP is a chain of GATED residual adds with no
-// normalization until the very end, so its residual grows enormously: on a
-// real photo the row entering the 3 blocks peaks at |x| ~ 39, and the blocks
-// take it to ~2.7e4, ~5.7e4, then ~1.5e5. f16 saturates at 65504, so the
-// brightest pixels (blown-out highlights) overflow to inf mid-chain; the
-// final RMS norm then computes inf * rsqrt(inf) = NaN, and the u8 conversion
-// turns NaN into 0 -- a whole latent cell's 16x16 patch comes out BLACK.
-// Keeping just this residual in f32 removes the range problem outright (the
-// reference runs the head in fp32/bf16, both of which have the exponent room);
-// every other tensor here stays f16, and no GEMM touches the f32 buffer.
-//
-// Widen [n] f16 -> f32: seeds the residual from the input projection.
-//   0:in[n] 1:out[n] 2:H 3:M.  grid (M), one row per thread.
-kernel void widen_rows_f16_to_f32(
-    const device VPIPE_ELT* in  [[buffer(0)]],
-    device float*           out [[buffer(1)]],
-    constant int&      H [[buffer(2)]],
-    constant uint&     M [[buffer(3)]],
-    uint gid [[thread_position_in_grid]])
-{
-  if (gid >= M) { return; }
-  const ulong o = (ulong)gid * (uint)H;
-  for (int i = 0; i < H; ++i) { out[o + i] = float(in[o + i]); }
-}
-
-// Per-ROW adaLN LayerNorm, reading the row from the f32 residual:
-//   out[r,i] = (LN(x[r,:])[i] * w[i] + b[i]) * (1 + mod[r, H+i]) + mod[r, i]
-// Shift/scale are PER ROW (every pixel gets its own, from that patch's
-// latent) and the rows are short (x_dim = 32), so one thread owns a whole
-// row. `mod` is the [M, 3H] chunk(shift, scale, gate) buffer; gate is used
-// by the twin below.
-// Two-pass variance (mean, then mean of squared deviations) rather than
-// E[x^2]-E[x]^2: the residual rows are large and near-constant, exactly where
-// the one-pass form cancels catastrophically.
-//   0:x(f32)[M,H] 1:w[H] 2:b[H] 3:mod[M,3H] 4:out[M,H] 5:H 6:eps 7:M. grid (M).
-kernel void layer_norm_mod_rows_x32_f16(
-    const device float*     x   [[buffer(0)]],
-    const device VPIPE_ELT* w   [[buffer(1)]],
-    const device VPIPE_ELT* b   [[buffer(2)]],
-    const device VPIPE_ELT* mod [[buffer(3)]],
-    device VPIPE_ELT*       out [[buffer(4)]],
-    constant int&      H   [[buffer(5)]],
-    constant float&    eps [[buffer(6)]],
-    constant uint&     M   [[buffer(7)]],
-    uint gid [[thread_position_in_grid]])
-{
-  if (gid >= M) { return; }
-  const device float* xr = x + (ulong)gid * (uint)H;
-  const device VPIPE_ELT* mr = mod + (ulong)gid * (uint)(3 * H);
-  device VPIPE_ELT* orow = out + (ulong)gid * (uint)H;
-  float s = 0.0f;
-  for (int i = 0; i < H; ++i) { s += xr[i]; }
-  const float mean = s / (float)H;
-  float v = 0.0f;
-  for (int i = 0; i < H; ++i) {
-    const float d = xr[i] - mean;
-    v += d * d;
-  }
-  const float inv = rsqrt(v / (float)H + eps);
-  for (int i = 0; i < H; ++i) {
-    const float ln = (xr[i] - mean) * inv * (float)w[i] + (float)b[i];
-    orow[i] = VPIPE_ELT(ln * (1.0f + (float)mr[H + i]) + (float)mr[i]);
-  }
-}
-
-// Per-ROW gated residual twin, accumulating into the f32 residual:
-//   x[r,i] += mod[r, 2H+i] * sub[r,i]
-//   0:x(f32)[M,H] (inout) 1:mod[M,3H] 2:sub[M,H] 3:H 4:M.  grid (M).
-kernel void gated_residual_rows_x32_f16(
-    device float*           x   [[buffer(0)]],
-    const device VPIPE_ELT* mod [[buffer(1)]],
-    const device VPIPE_ELT* sub [[buffer(2)]],
-    constant int&      H [[buffer(3)]],
-    constant uint&     M [[buffer(4)]],
-    uint gid [[thread_position_in_grid]])
-{
-  if (gid >= M) { return; }
-  const ulong xo = (ulong)gid * (uint)H;
-  const device VPIPE_ELT* mr = mod + (ulong)gid * (uint)(3 * H) + (uint)(2 * H);
-  for (int i = 0; i < H; ++i) {
-    x[xo + i] = x[xo + i] + float(mr[i]) * float(sub[xo + i]);
-  }
-}
-
-// rms_norm_fast_f16 reading the f32 residual and emitting f16:
-//   out[r,i] = x[r,i] * rsqrt(mean(x[r,:]^2) + eps) * w[i]
-//   0:x(f32)[M,H] 1:w[H] 2:out[M,H] 3:H 4:eps 5:M.  grid (M).
-kernel void rms_norm_rows_x32_f16(
-    const device float*     x   [[buffer(0)]],
-    const device VPIPE_ELT* w   [[buffer(1)]],
-    device VPIPE_ELT*       out [[buffer(2)]],
-    constant int&      H   [[buffer(3)]],
-    constant float&    eps [[buffer(4)]],
-    constant uint&     M   [[buffer(5)]],
-    uint gid [[thread_position_in_grid]])
-{
-  if (gid >= M) { return; }
-  const device float* xr = x + (ulong)gid * (uint)H;
-  device VPIPE_ELT* orow = out + (ulong)gid * (uint)H;
-  float acc = 0.0f;
-  for (int i = 0; i < H; ++i) { acc += xr[i] * xr[i]; }
-  const float inv = rsqrt(acc / (float)H + eps);
-  for (int i = 0; i < H; ++i) {
-    orow[i] = VPIPE_ELT(xr[i] * inv * (float)w[i]);
   }
 }
 
@@ -1698,6 +1856,31 @@ kernel void dequant_embed_gather_f16(
   const float s = float(scales[(uint)id * H_g + h / 64]);
   const float b = float(biases[(uint)id * H_g + h / 64]);
   out[(uint)t * H + h] = VPIPE_ELT(s * float(nib) + b);
+}
+
+// 2-bit group-128 variant (the ternary packs' table): weight U32 [vocab,
+// H/16], code h at bits 2*(h%16) of word h/16; scales/biases [vocab,
+// H/128]. Same signature and grid as the 4-bit gather.
+kernel void dequant_embed_gather_w2_g128_f16(
+    const device int*       ids    [[buffer(0)]],
+    const device uint32_t*  w      [[buffer(1)]],
+    const device VPIPE_ELT* scales [[buffer(2)]],
+    const device VPIPE_ELT* biases [[buffer(3)]],
+    device VPIPE_ELT*       out    [[buffer(4)]],
+    constant int&           H      [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int h = (int)gid.x;
+  if (h >= H) { return; }
+  const int t = (int)gid.y;
+  const int id = ids[t];
+  const int H_w = H / 16;
+  const int H_g = H / 128;
+  const uint32_t packed = w[(uint)id * H_w + h / 16];
+  const uint q = (packed >> (2 * (h % 16))) & 0x3;
+  const float s = float(scales[(uint)id * H_g + h / 128]);
+  const float b = float(biases[(uint)id * H_g + h / 128]);
+  out[(uint)t * H + h] = VPIPE_ELT(s * float(q) + b);
 }
 
 // 8-bit variant: weight U32 [vocab, H/4] (4 bytes per word, one byte per
@@ -2178,6 +2361,99 @@ kernel void embed_gather_q4k_f16(
   out[(uint)t * H + h] = VPIPE_ELT(q4k_value(sb, h & 255));
 }
 
+// A VAE mid-block attention's K, CENTRED for a materialized Q.K^T
+// (MetalKrea2Vae's kMat). Softmax ignores a constant added to a row, and
+// q_i . mean(k) is one, so the scores against k - mean(k) are the same
+// attention -- without the offset a positive-mean K puts on every score
+// of a row, which in f16 rounds away the differences between keys (at
+// 1.4e4 the steps are 8 apart). It is also what SageAttention calls
+// smoothing K, for the same reason under int8.
+//
+// The column sums IN A FIXED ORDER, so a decode is the same run to run:
+// vae_attn_colsum_f16 writes one partial a chunk of rows (a thread four
+// columns of it), vae_attn_colsum_reduce_f32 sums the chunks in turn.
+// Atomic adds summed them in whatever order the chunks finished, and two
+// identical generations came out ~70 dB apart.
+//   colsum: 0:x[rows, C]  1:part[chunks, C] f32  2:C (% 4 == 0)  3:rows
+//     4:rows_per; dispatch {C/4, chunks, 1}
+//   reduce: 0:part  1:sum[C] f32  2:C  3:chunks; dispatch {C, 1, 1}
+kernel void vae_attn_colsum_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    device float*           part  [[buffer(1)]],
+    const constant int& C        [[buffer(2)]],
+    const constant int& rows     [[buffer(3)]],
+    const constant int& rows_per [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int c4 = (int)gid.x;
+  if (c4 * 4 >= C) { return; }
+  const int r0 = (int)gid.y * rows_per;
+  const int r1 = min(rows, r0 + rows_per);
+  float4 a = 0.0f;
+  for (int r = r0; r < r1; ++r) {
+    const device VPIPE_ELT* p = x + (ulong)r * (ulong)C + (ulong)(c4 * 4);
+    a += float4((float)p[0], (float)p[1], (float)p[2], (float)p[3]);
+  }
+  *reinterpret_cast<device float4*>(part + (ulong)gid.y * (ulong)C +
+                                    (ulong)(c4 * 4)) = a;
+}
+
+kernel void vae_attn_colsum_reduce_f32(
+    const device float* part   [[buffer(0)]],
+    device float*       sum    [[buffer(1)]],
+    const constant int& C      [[buffer(2)]],
+    const constant int& chunks [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid;
+  if (c >= C) { return; }
+  float a = 0.0f;
+  for (int i = 0; i < chunks; ++i) { a += part[(ulong)i * (ulong)C + c]; }
+  sum[c] = a;
+}
+
+// out[r, c] = (x[r, c] - sum[c] / rows) * scale -- K centred and carrying
+// the softmax's 1/sqrt(C), so the product's scores come out scaled.
+//   0:x[rows, C]  1:out[rows, C]  2:sum[C] f32  3:C  4:inv_rows  5:scale
+//   dispatch {C, rows, 1}
+kernel void vae_attn_center_f16(
+    const device VPIPE_ELT* x      [[buffer(0)]],
+    device VPIPE_ELT*       out    [[buffer(1)]],
+    const device float*     sum    [[buffer(2)]],
+    const constant int&     C      [[buffer(3)]],
+    const constant float&   inv_rows [[buffer(4)]],
+    const constant float&   scale  [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid.x;
+  if (c >= C) { return; }
+  const ulong at = (ulong)gid.y * (ulong)C + (ulong)c;
+  out[at] = (VPIPE_ELT)(((float)x[at] - sum[c] * inv_rows) * scale);
+}
+
+// A speculative verify's per-position seen-sets, built on the GPU from
+// the round's own ids: row k = base | {ids[0..k]} -- the anchor and the
+// first k drafts, what the serial sampler's seen-set holds when it
+// samples position k. A penalised round so keeps its draft in the
+// verify's command buffer instead of reading the drafts back first.
+// 0:base [V] 1:ids [L] int32 2:rows [L, V] 3:V 4:L
+kernel void seen_rows_from_ids(
+    const device uchar* base [[buffer(0)]],
+    const device int*   ids  [[buffer(1)]],
+    device uchar*       rows [[buffer(2)]],
+    constant int&       V    [[buffer(3)]],
+    constant int&       L    [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const int t = (int)gid.x, k = (int)gid.y;
+  if (t >= V || k >= L) { return; }
+  uchar s = base[t];
+  for (int i = 0; i <= k; ++i) {
+    if (ids[i] == t) { s = 1; }
+  }
+  rows[(size_t)k * (size_t)V + (size_t)t] = s;
+}
+
 // Plain f16 strided copy: out[off + gid] = src[gid] for gid in [0, N).
 // Folds an already-f16 sub-tensor (the Q8_0 a/b projections, dequant'd to
 // f16 at load) into the fused dequant scratch for the k-quant prefill GEMM,
@@ -2192,6 +2468,143 @@ kernel void copy_f16(
 {
   if (gid >= (uint)N) { return; }
   out[off + (int)gid] = src[gid];
+}
+
+// Rect copy between two row-major planes with independent row strides:
+// out[dst_off + r*dst_stride + c] = src[src_off + r*src_stride + c].
+//
+// The Wan VAE's spatially TILED decode moves a tile (plus its halo) out of
+// a frame and its restored interior back in, and both are sub-rectangles
+// of a larger plane -- a 1-D copy cannot express either without one
+// dispatch per row. `row_elems` counts ELEMENTS, so a channel-last plane
+// passes width*channels and the kernel never needs to know which is which.
+// 0:src 1:out 2:src_off 3:dst_off 4:rows 5:row_elems 6:src_stride
+// 7:dst_stride
+kernel void copy_rect_f16(
+    const device VPIPE_ELT* src        [[buffer(0)]],
+    device VPIPE_ELT*       out        [[buffer(1)]],
+    constant int&           src_off    [[buffer(2)]],
+    constant int&           dst_off    [[buffer(3)]],
+    constant int&           rows       [[buffer(4)]],
+    constant int&           row_elems  [[buffer(5)]],
+    constant int&           src_stride [[buffer(6)]],
+    constant int&           dst_stride [[buffer(7)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const uint n = (uint)rows * (uint)row_elems;
+  if (gid >= n) { return; }
+  const int r = (int)(gid / (uint)row_elems);
+  const int c = (int)(gid % (uint)row_elems);
+  out[dst_off + r * dst_stride + c] = src[src_off + r * src_stride + c];
+}
+
+// copy_rect_f16 with 64-bit offsets and strides, on a 2D grid. A whole
+// channel-last plane of a 4096^2 VAE decode holds 4.3G elements (256
+// channels), past any int offset; the exact tiled decode copies tiles out
+// of such planes and their interiors back in.
+// 0:src 1:out 2:src_off 3:dst_off 4:rows 5:row_elems 6:src_stride
+// 7:dst_stride (all ELEMENTS). Grid {row_elems, rows}.
+kernel void copy_rect_wide_f16(
+    const device VPIPE_ELT* src        [[buffer(0)]],
+    device VPIPE_ELT*       out        [[buffer(1)]],
+    constant long&          src_off    [[buffer(2)]],
+    constant long&          dst_off    [[buffer(3)]],
+    constant int&           rows       [[buffer(4)]],
+    constant int&           row_elems  [[buffer(5)]],
+    constant long&          src_stride [[buffer(6)]],
+    constant long&          dst_stride [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  if ((int)gid.x >= row_elems || (int)gid.y >= rows) { return; }
+  const long r = (long)gid.y, c = (long)gid.x;
+  out[dst_off + r * dst_stride + c] = src[src_off + r * src_stride + c];
+}
+
+// ---- a key / value cache in 8 bits (TaoMate-H3's clean K/V) -------------
+//
+// Head-major planes [heads, rows, D], D a multiple of 64, stored as 8-bit
+// AFFINE groups of 64 along D: v ~= q * scale + min, q in [0, 255], a half
+// scale and a half minimum per group -- 1.0625 bytes an element against
+// bf16's 2. Affine rather than symmetric: a group of values or of rotated
+// keys need not straddle zero, and the minimum costs 3% more bytes for up
+// to twice the resolution on the ones that do not.
+//
+// quant: rows [src_row0, src_row0 + n) of a [heads, src_rows, D] plane ->
+//        q [heads, n, D], scale / minimum [heads, n, D / 64].
+// 0:src 1:q 2:scale 3:minimum 4:heads 5:n 6:D 7:src_rows 8:src_row0
+// One SIMD group a group of 64 (two elements a lane): grid heads*n*D/64*32.
+kernel void kv_quant_u8g64(
+    const device VPIPE_ELT* src      [[buffer(0)]],
+    device uchar*           q        [[buffer(1)]],
+    device half*            scale    [[buffer(2)]],
+    device half*            minimum  [[buffer(3)]],
+    constant int&           heads    [[buffer(4)]],
+    constant int&           n        [[buffer(5)]],
+    constant int&           D        [[buffer(6)]],
+    constant int&           src_rows [[buffer(7)]],
+    constant int&           src_row0 [[buffer(8)]],
+    uint gid  [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+  const uint G = (uint)D / 64u;
+  const uint g = gid / 32u;                      // the same across a SIMD
+  if (g >= (uint)heads * (uint)n * G) { return; }
+  const uint gi = g % G;
+  const uint r = (g / G) % (uint)n;
+  const uint h = g / (G * (uint)n);
+  const ulong s = ((ulong)h * (uint)src_rows + (uint)src_row0 + r) *
+                      (uint)D + gi * 64u + lane * 2u;
+  const float a = (float)src[s], b = (float)src[s + 1];
+  const float mn = simd_min(min(a, b));
+  const float mx = simd_max(max(a, b));
+  // Quantized against the scale and minimum AS STORED, so the rounding of
+  // the two halves is inside the code, not on top of it.
+  const half sh = (half)((mx - mn) / 255.0f);
+  const half mh = (half)mn;
+  const float sf = (float)sh, mf = (float)mh;
+  const float inv = sf > 0.0f ? 1.0f / sf : 0.0f;
+  const ulong d = ((ulong)h * (uint)n + r) * (uint)D + gi * 64u + lane * 2u;
+  q[d]     = (uchar)clamp(rint((a - mf) * inv), 0.0f, 255.0f);
+  q[d + 1] = (uchar)clamp(rint((b - mf) * inv), 0.0f, 255.0f);
+  if (lane == 0) {
+    scale[g]   = sh;
+    minimum[g] = mh;
+  }
+}
+
+// dequant: rows [q_row0, q_row0 + n) of q [heads, q_rows, D] (its groups
+// [heads, q_rows, D / 64]) -> rows [dst_row0, ...) of a [heads, dst_rows, D]
+// plane. 0:q 1:scale 2:minimum 3:dst 4:heads 5:n 6:D 7:q_rows 8:q_row0
+// 9:dst_rows 10:dst_row0. Four elements a thread: grid heads*n*D/4.
+kernel void kv_dequant_u8g64(
+    const device uchar*     q        [[buffer(0)]],
+    const device half*      scale    [[buffer(1)]],
+    const device half*      minimum  [[buffer(2)]],
+    device VPIPE_ELT*       dst      [[buffer(3)]],
+    constant int&           heads    [[buffer(4)]],
+    constant int&           n        [[buffer(5)]],
+    constant int&           D        [[buffer(6)]],
+    constant int&           q_rows   [[buffer(7)]],
+    constant int&           q_row0   [[buffer(8)]],
+    constant int&           dst_rows [[buffer(9)]],
+    constant int&           dst_row0 [[buffer(10)]],
+    uint gid [[thread_position_in_grid]])
+{
+  const uint per = (uint)D / 4u;
+  if (gid >= (uint)heads * (uint)n * per) { return; }
+  const uint c = (gid % per) * 4u;
+  const uint r = (gid / per) % (uint)n;
+  const uint h = gid / (per * (uint)n);
+  const ulong row = (ulong)h * (uint)q_rows + (uint)q_row0 + r;
+  const uchar4 v = *(const device uchar4*)(q + row * (uint)D + c);
+  const ulong g = row * ((uint)D / 64u) + c / 64u;
+  const float sf = (float)scale[g], mf = (float)minimum[g];
+  const ulong o = ((ulong)h * (uint)dst_rows + (uint)dst_row0 + r) *
+                      (uint)D + c;
+  dst[o]     = (VPIPE_ELT)((float)v.x * sf + mf);
+  dst[o + 1] = (VPIPE_ELT)((float)v.y * sf + mf);
+  dst[o + 2] = (VPIPE_ELT)((float)v.z * sf + mf);
+  dst[o + 3] = (VPIPE_ELT)((float)v.w * sf + mf);
 }
 
 // Diagnostic-only no-op carrying a REALISTIC dispatch arg load (8 read buffers
@@ -2622,6 +3035,208 @@ KQ_BATCH_ENTRY(qmv_q5k_batch4_f16, qmv_q5k_batch_impl, 4)
 KQ_BATCH_ENTRY(qmv_q6k_batch_f16,  qmv_q6k_batch_impl, 2)
 KQ_BATCH_ENTRY(qmv_q6k_batch4_f16, qmv_q6k_batch_impl, 4)
 
+// ---- NVFP4 (ModelOpt), served as a k-quant type -------------------------
+// A super-block (generative-models/shared/nvfp4.h) is 256 inputs of one
+// row in 148 bytes: f32 scale_2 at +0, the 16 block scales (E4M3, a block
+// 16 inputs) at +4, the 128 code bytes at +20 as ModelOpt packs them --
+// input 2i the low nibble, 2i+1 the high. w = e2m1(code) * e4m3(scale) *
+// scale_2.
+//
+// Neither table is a lookup. An E2M1 code's three magnitude bits, put on
+// a half's exponent low bits and top mantissa bit (subnormal for exponent
+// 0), read as the value times 2^-14; an E4M3 scale's seven, on the
+// exponent low bits and the top three mantissa bits, as its value times
+// 2^-8. Both factors are powers of two, folded into the block's scale
+// exactly: 2^22.
+
+// Two codes of a byte (the low nibble first) as their values / 2^14.
+inline float2 nvfp4_pair_(uint b) {
+  const uint lo = b & 0xFu, hi = (b >> 4) & 0xFu;
+  const uint bits = ((lo & 8u) << 12) | ((lo & 7u) << 9) |
+                    ((((hi & 8u) << 12) | ((hi & 7u) << 9)) << 16);
+  return float2(as_type<half2>(bits));
+}
+
+// A block scale (E4M3) as its value / 2^8.
+inline float nvfp4_scale_(uint s) {
+  return float(as_type<half>(ushort(((s & 0x80u) << 8) |
+                                    ((s & 0x7Fu) << 7))));
+}
+
+// The weight at input `pos` (0..255) of super-block `sb`.
+inline float nvfp4_value(const device uchar* sb, int pos) {
+  const float g = *(const device float*)sb;
+  const float2 p = nvfp4_pair_(sb[20 + (pos >> 1)]);
+  return ((pos & 1) != 0 ? p.y : p.x) *
+         (nvfp4_scale_(sb[4 + (pos >> 4)]) * g * 4194304.0f);
+}
+
+// Dequantize N served NVFP4 weights -> f16 (rows back to back).
+// 0:src 1:out 2:N.  grid (N).
+kernel void dequant_nvfp4_f16(
+    const device uchar* src [[buffer(0)]],
+    device VPIPE_ELT*   out [[buffer(1)]],
+    constant int&       N   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)N) { return; }
+  out[gid] = VPIPE_ELT(nvfp4_value(src + (gid >> 8) * 148u,
+                                   (int)(gid & 255u)));
+}
+
+// GEMV over a served NVFP4 weight [N, H]: y[o] = sum_h x[h] w[o, h].
+// One simdgroup a row: each lane reads 4 code bytes -- 8 inputs, half of
+// one 16-input block -- of every super-block, so its block scale is one
+// load and one decode. NSG=2 rows a threadgroup. Requires H % 256 == 0.
+// 0:w 1:x 2:y 3:H 4:N.  grid (32, ceil(N/2)*2, 1); threadgroup (32, 2, 1).
+kernel void qmv_nvfp4_f16(
+    const device uchar*     w [[buffer(0)]],
+    const device VPIPE_ELT* x [[buffer(1)]],
+    device VPIPE_ELT*       y [[buffer(2)]],
+    constant int&           H [[buffer(3)]],
+    constant int&           N [[buffer(4)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int NSG = 2;
+  const int row = (int)tid.y * NSG + (int)simd_gid;
+  if (row >= N) { return; }
+  const int nsb = H / 256;
+  const device uchar* rowp = w + (uint)row * (uint)(nsb * 148);
+  const int lane = (int)simd_lid;
+  float acc = 0.0f;
+  for (int s = 0; s < nsb; ++s) {
+    const device uchar* sb = rowp + s * 148;
+    const float d = nvfp4_scale_(sb[4 + (lane >> 1)]) *
+                    (*(const device float*)sb) * 4194304.0f;
+    const uint q = *(const device uint*)(sb + 20 + lane * 4);
+    const device VPIPE_ELT* xp = x + s * 256 + lane * 8;
+    float part = 0.0f;
+    for (int k = 0; k < 4; ++k) {
+      const float2 wv = nvfp4_pair_(q >> (8 * k));
+      part += wv.x * float(xp[2 * k]) + wv.y * float(xp[2 * k + 1]);
+    }
+    acc += part * d;
+  }
+  const float v = simd_sum(acc);
+  if (lane == 0) { y[row] = VPIPE_ELT(v); }
+}
+
+// The batched twin (MTP verify / batched decode): the weight read once per
+// MAXM rows; per row the single-row kernel's arithmetic in its order, so
+// bit-identical to it. The k-quant batch entries' binding.
+template <int MAXM>
+inline void qmv_nvfp4_batch_impl(
+    const device uchar*     w,
+    const device VPIPE_ELT* x,
+    device VPIPE_ELT*       y,
+    const constant int&     H,
+    const constant int&     N,
+    const constant int&     m_total,
+    const constant int&     ystride,
+    const constant int&     yoff,
+    uint3 tid, uint simd_gid, uint simd_lid)
+{
+  constexpr int NSG = 2;
+  const int row = (int)tid.y * NSG + (int)simd_gid;
+  if (row >= N) { return; }
+  const int base = (int)tid.z * MAXM;
+  const int m_rows = metal::min(MAXM, m_total - base);
+  if (m_rows <= 0) { return; }
+  const int nsb = H / 256;
+  const device uchar* rowp = w + (uint)row * (uint)(nsb * 148);
+  const int lane = (int)simd_lid;
+  const device VPIPE_ELT* xptr[MAXM];
+  for (int m = 0; m < MAXM; ++m) {
+    const int mm = (m < m_rows) ? m : (m_rows - 1);
+    xptr[m] = x + (uint)(base + mm) * H;
+  }
+  float acc[MAXM];
+  for (int m = 0; m < MAXM; ++m) { acc[m] = 0.0f; }
+  for (int s = 0; s < nsb; ++s) {
+    const device uchar* sb = rowp + s * 148;
+    const float d = nvfp4_scale_(sb[4 + (lane >> 1)]) *
+                    (*(const device float*)sb) * 4194304.0f;
+    const uint q = *(const device uint*)(sb + 20 + lane * 4);
+    const int xo = s * 256 + lane * 8;
+    float2 wv[4];
+    for (int k = 0; k < 4; ++k) { wv[k] = nvfp4_pair_(q >> (8 * k)); }
+    for (int m = 0; m < MAXM; ++m) {
+      const device VPIPE_ELT* xp = xptr[m] + xo;
+      float part = 0.0f;
+      for (int k = 0; k < 4; ++k) {
+        part += wv[k].x * float(xp[2 * k]) + wv[k].y * float(xp[2 * k + 1]);
+      }
+      acc[m] += part * d;
+    }
+  }
+  for (int m = 0; m < MAXM; ++m) {
+    const float v = simd_sum(acc[m]);
+    if (lane == 0 && m < m_rows) {
+      y[(uint)(base + m) * ystride + yoff + row] = VPIPE_ELT(v);
+    }
+  }
+}
+KQ_BATCH_ENTRY(qmv_nvfp4_batch_f16,  qmv_nvfp4_batch_impl, 2)
+KQ_BATCH_ENTRY(qmv_nvfp4_batch4_f16, qmv_nvfp4_batch_impl, 4)
+
+// Serve an NVFP4 linear [N, K] from its file tensors: the super-blocks
+// nvfp4::pack writes, byte for byte, with ComfyUI's spelling made
+// ModelOpt's on the way (the even column's nibble high -> low; the block
+// scales out of cuBLAS's swizzled 128 x 4 tiles) and, with a row
+// multiplier bound, scale_2 * mul[n] in f32 for row n's tensor scale (the
+// next projection's AWQ scale folded into this one's output rows) -- the
+// bytes LayerLoad::nvfp4_served packs on the host. A streamed NVFP4 layer
+// of MetalQwenModel is built by it. One thread a super-block, written as
+// its 37 words (scale_2, 4 of block scales, 32 of codes); K % 256 == 0.
+// 0:codes [N, K/2] 1:blocks (as stored) 2:scale_2 f32 [1] 3:mul f32 [N]
+// 4:dst 5:N 6:K 7:flags (1 high nibble first, 2 swizzled, 4 multiplier).
+// grid (K/256, N).
+kernel void nvfp4_serve(
+    const device uint*  codes  [[buffer(0)]],
+    const device uint*  blocks [[buffer(1)]],
+    const device float* s2     [[buffer(2)]],
+    const device float* mul    [[buffer(3)]],
+    device uint*        dst    [[buffer(4)]],
+    constant int&       N      [[buffer(5)]],
+    constant int&       K      [[buffer(6)]],
+    constant uint&      flags  [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]])
+{
+  const uint supers = (uint)K / 256u;
+  const uint s = gid.x, n = gid.y;
+  if (s >= supers || n >= (uint)N) { return; }
+  device uint* o = dst + ((ulong)n * supers + s) * 37ul;
+  float g = s2[0];
+  if ((flags & 4u) != 0u) { g = g * mul[n]; }
+  o[0] = as_type<uint>(g);
+  // Four blocks a word: contiguous in either layout (a swizzled tile
+  // keeps a row's four blocks together).
+  const uint B = (uint)K / 16u;
+  for (uint q = 0; q < 4u; ++q) {
+    const uint b = s * 16u + q * 4u;
+    ulong at;
+    if ((flags & 2u) != 0u) {
+      const ulong tiles = (ulong)((B + 3u) / 4u);
+      at = ((ulong)(n / 128u) * tiles + (ulong)(b / 4u)) * 512ul +
+           (ulong)(n % 32u) * 16ul + (ulong)((n % 128u) / 32u) * 4ul;
+    } else {
+      at = (ulong)n * B + b;
+    }
+    o[1 + q] = blocks[at / 4ul];
+  }
+  const device uint* c =
+      codes + ((ulong)n * (ulong)(K / 2) + (ulong)s * 128ul) / 4ul;
+  for (uint w = 0; w < 32u; ++w) {
+    uint v = c[w];
+    if ((flags & 1u) != 0u) {
+      v = ((v & 0x0F0F0F0Fu) << 4) | ((v >> 4) & 0x0F0F0F0Fu);
+    }
+    o[5 + w] = v;
+  }
+}
+
 // Transpose [A, B, D] -> [B, A, D] (D-vectors kept intact). Used by
 // batched prefill to swap token-major <-> head-major:
 //   q [n, Hq, D] -> [Hq, n, D]   (A=n, B=Hq)
@@ -2639,7 +3254,11 @@ kernel void transpose_abd_f16(
   if (d >= D) { return; }
   const int b = (int)gid.y;
   const int a = (int)gid.z;
-  out[((uint)b * A + a) * D + d] = in[((uint)a * B + b) * D + d];
+  // 64-bit: [A, B, D] passes 2^32 elements at a long sequence's heads
+  // (MiniMax-H3's 56 x 128 at 599,186 rows) -- in 32 bits the later
+  // heads read and wrote over the earlier ones.
+  out[((ulong)b * (ulong)A + (ulong)a) * (ulong)D + (ulong)d] =
+      in[((ulong)a * (ulong)B + (ulong)b) * (ulong)D + (ulong)d];
 }
 
 // transpose_abd with an output ROW-STRIDE: writes out[b*out_rs + a*D + d] so the
@@ -2659,7 +3278,9 @@ kernel void transpose_abd_rs_f16(
   const int b = (int)gid.y;
   const int a = (int)gid.z;
   const int rs = out_rs > 0 ? out_rs : A * D;
-  out[(uint)b * rs + a * D + d] = in[((uint)a * B + b) * D + d];
+  // 64-bit, as transpose_abd_f16.
+  out[(ulong)b * (ulong)rs + (ulong)(a * D + d)] =
+      in[((ulong)a * (ulong)B + (ulong)b) * (ulong)D + (ulong)d];
 }
 
 // transpose_abd with a PADDED output head-dim: [A, B, D] -> [B, A, Dp] where
@@ -4240,6 +4861,56 @@ kernel void group_norm_apply_f16(
                        + float(beta[c]));
 }
 
+// group_norm_chan_stats_f16 over a RECTANGLE of a channel-last [*, W, C]
+// plane, optionally ADDING to the partials already there. A plane too
+// large to hold whole is computed tile by tile; each tile contributes the
+// sums of the rows it owns, and group_norm_group_stats_f32 then reduces
+// the accumulated partials exactly as it does a whole plane's (pass the
+// whole plane's pixel count as `rows`). Block b sums rect pixels
+// [b*chunk, (b+1)*chunk) in raster order; indices are 64-bit, since a
+// whole 4096^2 plane is past 2^31 elements.
+//   0:x 1:part(f32)[NB][2*C] 2:W 3:C 4:y0 5:x0 6:rh 7:rw 8:NB 9:accumulate
+//   grid {256*NB}, tg {256}.
+kernel void group_norm_chan_stats_rect_f16(
+    const device VPIPE_ELT* x    [[buffer(0)]],
+    device float*           part [[buffer(1)]],
+    constant int&           W    [[buffer(2)]],
+    constant int&           C    [[buffer(3)]],
+    constant int&           y0   [[buffer(4)]],
+    constant int&           x0   [[buffer(5)]],
+    constant int&           rh   [[buffer(6)]],
+    constant int&           rw   [[buffer(7)]],
+    constant int&           NB   [[buffer(8)]],
+    constant int&           acc  [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 ltid [[thread_position_in_threadgroup]],
+    uint3 tptg [[threads_per_threadgroup]])
+{
+  const int  b    = (int)tgid.x;
+  const uint lid  = ltid.x;
+  const uint tgsz = tptg.x;
+  const long npx  = (long)rh * (long)rw;
+  const long chunk = (npx + NB - 1) / NB;
+  const long plo = (long)b * chunk;
+  const long phi = min(plo + chunk, npx);
+  for (int c0 = 0; c0 < C; c0 += (int)tgsz) {
+    const int c = c0 + (int)lid;
+    if (c >= C) { break; }
+    float s = 0.0f, sq = 0.0f;
+    long y = (long)y0 + plo / rw;
+    int  xi = (int)(plo % rw);
+    for (long p = plo; p < phi; ++p) {
+      const long px = y * (long)W + (long)(x0 + xi);
+      const float v = float(x[px * (long)C + (long)c]);
+      s += v; sq += v * v;
+      if (++xi == rw) { xi = 0; ++y; }
+    }
+    device float* ps = part + (long)b * 2 * (long)C + (long)c;
+    if (acc != 0) { ps[0] += s; ps[C] += sq; }
+    else          { ps[0] = s;  ps[C] = sq; }
+  }
+}
+
 // ---- direct 3x3 convolution for a SMALL output-channel count -----------
 // Channel-last [H, W, cin] -> [H, W, cout], stride 1, pad 1.
 //
@@ -4262,17 +4933,18 @@ kernel void group_norm_apply_f16(
 // hardware-conv path uses (out-channel fastest), so no extra weight twin.
 //   0:x 1:whwio 2:bias 3:out 4:Wd 5:Hd 6:cin 7:cout 8:has_bias
 //   grid {Wd, Hd}: one thread per output pixel.
-kernel void conv3x3_hwc_small_cout_f16(
-    const device VPIPE_ELT* x     [[buffer(0)]],
-    const device VPIPE_ELT* whwio [[buffer(1)]],
-    const device VPIPE_ELT* bias  [[buffer(2)]],
-    device VPIPE_ELT*       out   [[buffer(3)]],
-    constant int&           Wd       [[buffer(4)]],
-    constant int&           Hd       [[buffer(5)]],
-    constant int&           cin      [[buffer(6)]],
-    constant int&           cout_n   [[buffer(7)]],
-    constant int&           has_bias [[buffer(8)]],
-    uint3 gid [[thread_position_in_grid]])
+//
+// The _acc twin ADDS to what `out` already holds, so a causal 3x3x3 conv
+// runs as one call per temporal tap against that tap's [3,3,cin,cout]
+// block, with no three-frame concat (the Wan VAE's head, 3x96 -> 3 at
+// full resolution). Same contract.
+static inline void
+conv3x3_small_cout_body_(const device VPIPE_ELT* x,
+                         const device VPIPE_ELT* whwio,
+                         const device VPIPE_ELT* bias,
+                         device VPIPE_ELT* out, int Wd, int Hd, int cin,
+                         int cout_n, int has_bias, uint3 gid,
+                         bool accumulate)
 {
   const int px = (int)gid.x;
   const int py = (int)gid.y;
@@ -4299,10 +4971,43 @@ kernel void conv3x3_hwc_small_cout_f16(
     }
     const long ob = ((long)py * (long)Wd + (long)px) * (long)cout_n + (long)o0;
     for (int t = 0; t < nt; ++t) {
-      const float r = acc[t] + (has_bias != 0 ? float(bias[o0 + t]) : 0.0f);
+      float r = acc[t] + (has_bias != 0 ? float(bias[o0 + t]) : 0.0f);
+      if (accumulate) { r += float(out[ob + (long)t]); }
       out[ob + (long)t] = VPIPE_ELT(r);
     }
   }
+}
+
+kernel void conv3x3_hwc_small_cout_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* whwio [[buffer(1)]],
+    const device VPIPE_ELT* bias  [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&           Wd       [[buffer(4)]],
+    constant int&           Hd       [[buffer(5)]],
+    constant int&           cin      [[buffer(6)]],
+    constant int&           cout_n   [[buffer(7)]],
+    constant int&           has_bias [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  conv3x3_small_cout_body_(x, whwio, bias, out, Wd, Hd, cin, cout_n, has_bias,
+                           gid, /*accumulate=*/false);
+}
+
+kernel void conv3x3_hwc_small_cout_acc_f16(
+    const device VPIPE_ELT* x     [[buffer(0)]],
+    const device VPIPE_ELT* whwio [[buffer(1)]],
+    const device VPIPE_ELT* bias  [[buffer(2)]],
+    device VPIPE_ELT*       out   [[buffer(3)]],
+    constant int&           Wd       [[buffer(4)]],
+    constant int&           Hd       [[buffer(5)]],
+    constant int&           cin      [[buffer(6)]],
+    constant int&           cout_n   [[buffer(7)]],
+    constant int&           has_bias [[buffer(8)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  conv3x3_small_cout_body_(x, whwio, bias, out, Wd, Hd, cin, cout_n, has_bias,
+                           gid, /*accumulate=*/true);
 }
 
 // ---- Wan VAE: causal 3D convolution ---------------------------------
@@ -4382,6 +5087,276 @@ kernel void im2col_hwc_3x3x3_tiled_f16(
     val = (kt == 0u) ? t0[si] : (kt == 1u) ? t1[si] : t2[si];
   }
   out[gid] = val;
+}
+
+// FlashVSR's patchify PACK: a channel-first f32 latent gathered into the
+// rows a dense GEMM against the patch embedding consumes.
+//
+// The patch embedding is a Conv3d with kernel and stride both (1,2,2),
+// so it never overlaps and is a linear map over one 1x2x2 patch of every
+// channel. Packed as (channel, row, column) with the column fastest,
+// which is how the 5-D weight [dim, C, 1, 2, 2] flattens.
+//
+// THE UNPACK IS NOT THE MIRROR OF THIS, and that is the trap. The head's
+// output un-patchifies as `(x y z c)` -- channel FASTEST -- where this
+// packs channel SLOWEST. The two orders are genuinely different and both
+// produce a correctly shaped tensor, so a port that mirrors one into the
+// other is wrong in a way only a golden shows.
+//
+//   0:src f32 [C, T, H8, W8]  1:out [T*h*w, C*4]  2:C 3:T 4:H8 5:W8
+//   grid {C*4, T*(H8/2)*(W8/2)}.
+kernel void flashvsr_patch_pack_f16(
+    const device float* src [[buffer(0)]],
+    device VPIPE_ELT*   out [[buffer(1)]],
+    constant int&       C   [[buffer(2)]],
+    constant int&       T   [[buffer(3)]],
+    constant int&       H8  [[buffer(4)]],
+    constant int&       W8  [[buffer(5)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint h = (uint)H8 / 2u, w = (uint)W8 / 2u;
+  const uint cols = (uint)C * 4u;
+  const uint col = tpig.x, row = tpig.y;
+  if (col >= cols || row >= (uint)T * h * w) { return; }
+  const uint c  = col / 4u;
+  const uint ky = (col % 4u) / 2u;
+  const uint kx = col % 2u;
+  const uint x = row % w;
+  const uint y = (row / w) % h;
+  const uint t = row / (w * h);
+  const ulong si = (((ulong)c * (uint)T + t) * (uint)H8 + (2u * y + ky)) *
+                       (uint)W8 + (2u * x + kx);
+  out[(ulong)row * cols + col] = (VPIPE_ELT)src[si];
+}
+
+// The inverse, for the head's output. Column order is
+// ((kt*ph + ky)*pw + kx)*C + c -- channel FASTEST. See the warning
+// above: this is deliberately not the mirror of the pack.
+//
+//   0:src [T*h*w, C*4]  1:out f32 [C, T, H8, W8]  2:C 3:T 4:H8 5:W8
+//   grid {C*4, T*(H8/2)*(W8/2)}.
+kernel void flashvsr_patch_unpack_f16(
+    const device VPIPE_ELT* src [[buffer(0)]],
+    device float*           out [[buffer(1)]],
+    constant int&           C   [[buffer(2)]],
+    constant int&           T   [[buffer(3)]],
+    constant int&           H8  [[buffer(4)]],
+    constant int&           W8  [[buffer(5)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint h = (uint)H8 / 2u, w = (uint)W8 / 2u;
+  const uint cols = (uint)C * 4u;
+  const uint col = tpig.x, row = tpig.y;
+  if (col >= cols || row >= (uint)T * h * w) { return; }
+  const uint c  = col % (uint)C;
+  const uint sp = col / (uint)C;      // (ky*pw + kx), patch_t being 1
+  const uint ky = sp / 2u;
+  const uint kx = sp % 2u;
+  const uint x = row % w;
+  const uint y = (row / w) % h;
+  const uint t = row / (w * h);
+  const ulong di = (((ulong)c * (uint)T + t) * (uint)H8 + (2u * y + ky)) *
+                       (uint)W8 + (2u * x + kx);
+  out[di] = (float)src[(ulong)row * cols + col];
+}
+
+// The 3-D window permutation FlashVSR's attention runs in.
+//
+// Tokens laid out (frame, row, column) are gathered into (2,8,8) windows
+// of 128, which is what makes a "block" of the block-sparse attention a
+// contiguous run the flash kernel can span. `inverse` sends the
+// attention's output back.
+//
+// The window order is (wf, wh, ww) outer and (f, h, w) within, matching
+// the reference's partition; getting the two nestings the wrong way
+// round permutes the picture without changing its shape.
+//
+//   0:src  1:out  2:F 3:H 4:W 5:D 6:inverse.  grid {D, F*H*W}.
+kernel void flashvsr_window_permute_f16(
+    const device VPIPE_ELT* src     [[buffer(0)]],
+    device VPIPE_ELT*       out     [[buffer(1)]],
+    constant int&           F       [[buffer(2)]],
+    constant int&           H       [[buffer(3)]],
+    constant int&           W       [[buffer(4)]],
+    constant int&           D       [[buffer(5)]],
+    constant int&           inverse [[buffer(6)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint d = tpig.x, r = tpig.y;
+  if (d >= (uint)D || r >= (uint)(F * H * W)) { return; }
+  // r is the NATURAL index (f, h, w).
+  const uint w_ = r % (uint)W;
+  const uint h_ = (r / (uint)W) % (uint)H;
+  const uint f_ = r / ((uint)W * (uint)H);
+  const uint nh = (uint)H / 8u, nw = (uint)W / 8u;
+  const uint wf = f_ / 2u, wh = h_ / 8u, ww = w_ / 8u;
+  const uint if_ = f_ % 2u, ih = h_ % 8u, iw = w_ % 8u;
+  const uint blk = (wf * nh + wh) * nw + ww;
+  const uint idx = (if_ * 8u + ih) * 8u + iw;
+  const ulong perm = (ulong)(blk * 128u + idx) * (uint)D + d;
+  const ulong nat  = (ulong)r * (uint)D + d;
+  if (inverse != 0) { out[nat] = src[perm]; }
+  else              { out[perm] = src[nat]; }
+}
+
+// Per-window-block means of a head-major sequence, which is the proxy
+// FlashVSR's routing scores blocks by.
+//
+// out[h][b][d] = mean over the 128 tokens of block b. Reduced here
+// rather than on the host because the alternative is reading a whole
+// head-major q and k back per block per chunk -- 5 MB a time, sixty
+// times a clip at the smallest useful geometry.
+//
+// THE TWO STRIDES ARE INDEPENDENT, and conflating them is the bug this
+// signature exists to prevent. The source may be a key/value CACHE whose
+// per-head slab is sized for the largest chunk (`in_seq` tokens) while
+// only its live prefix is being reduced, so the destination's per-head
+// stride is `out_nb` blocks and has nothing to do with the source's.
+// Deriving one from the other made eleven of twelve heads read the
+// previous head's tail -- and it was nearly invisible, because a freshly
+// allocated buffer reads as zeros and a zero proxy still routes
+// plausibly.
+//
+//   0:src [H, in_seq, HD]  1:out [H, out_nb, HD]
+//   2:HD 3:in_seq 4:blk 5:out_nb
+//   grid {HD, out_nb, H}.
+kernel void flashvsr_block_mean_f16(
+    const device VPIPE_ELT* src    [[buffer(0)]],
+    device VPIPE_ELT*       out    [[buffer(1)]],
+    constant int&           HD     [[buffer(2)]],
+    constant int&           in_seq [[buffer(3)]],
+    constant int&           blk    [[buffer(4)]],
+    constant int&           out_nb [[buffer(5)]],
+    uint3 tpig [[thread_position_in_grid]])
+{
+  const uint d = tpig.x, b = tpig.y, h = tpig.z;
+  if (d >= (uint)HD || b >= (uint)out_nb) { return; }
+  const device VPIPE_ELT* s =
+      src + ((ulong)h * (uint)in_seq + b * (uint)blk) * (uint)HD + d;
+  float acc = 0.0f;
+  for (int i = 0; i < blk; ++i) { acc += (float)s[(ulong)i * (uint)HD]; }
+  out[((ulong)h * (uint)out_nb + b) * (uint)HD + d] =
+      (VPIPE_ELT)(acc / (float)blk);
+}
+
+// The 16x16 pixel unshuffle that opens FlashVSR's source projection,
+// fused with the u8 -> [-1, 1] scale.
+//
+// FUSED because the two together are the only thing standing between a
+// beat's pixels and the first GEMM, and doing them apart means a full
+// f32 copy of the clip: 1.2 GB at 1408x768 over a hundred frames, held
+// only to be read once. As one kernel the u8 frame is the only copy.
+//
+// The channel order is the reference's rearrange and is not free to
+// choose: 'b c (h hh) (w ww) -> b (c hh ww) h w' puts the COLOUR
+// slowest and the unshuffled column fastest, so channel = c*256 +
+// ky*16 + kx. Getting this wrong is silent -- the shapes agree and the
+// first convolution simply reads a permuted image.
+//
+//   0:src planar u8 [3,H,W]  1:out [(H/16)*(W/16), 768]
+//   2:H 3:W.  grid {768, (H/16)*(W/16)}.
+kernel void pixel_unshuffle16_u8_hwc_f16(
+    const device uchar*  src [[buffer(0)]],
+    device VPIPE_ELT*    out [[buffer(1)]],
+    constant int&        H   [[buffer(2)]],
+    constant int&        W   [[buffer(3)]],
+    uint2 tpig [[thread_position_in_grid]])
+{
+  const uint OW = (uint)W / 16u;
+  const uint OH = (uint)H / 16u;
+  const uint ch = tpig.x;                    // c*256 + ky*16 + kx
+  const uint r  = tpig.y;                    // oy*OW + ox
+  if (ch >= 768u || r >= OH * OW) { return; }
+  const uint c  = ch / 256u;
+  const uint ky = (ch % 256u) / 16u;
+  const uint kx = ch % 16u;
+  const uint oy = r / OW;
+  const uint ox = r % OW;
+  const uint y  = oy * 16u + ky;
+  const uint x  = ox * 16u + kx;
+  const ulong si = ((ulong)c * (uint)H + y) * (uint)W + x;
+  // Spelled as the reference spells it -- divide, then scale -- rather
+  // than folded into one multiply. The two differ in the last bit, and
+  // matching a golden is worth more here than one fused operation.
+  const float v = (float)src[si] / 255.0f * 2.0f - 1.0f;
+  out[(ulong)r * 768u + ch] = (VPIPE_ELT)v;
+}
+
+// The FOUR-tap causal conv3d im2col, for FlashVSR's source projection.
+//
+// Two things separate it from im2col_hwc_3x3x3_tiled_f16 above, and both
+// are properties of the module it serves rather than choices.
+//
+// FOUR temporal taps, not three. The projection halves the frame count
+// twice to meet the VAE's 4x temporal compression, so its kernel is
+// (4,3,3) at stride (2,1,1) and one output frame reads four input
+// frames. The stride is in TIME ONLY -- the spatial grid is unchanged,
+// which is why there is no OH/OW here.
+//
+// REPLICATE padding, not zero, and that is not a near miss. The
+// reference pads every edge by edge replication; a zero border darkens
+// the frame edge into rows the denoiser adds straight into its residual
+// stream, and it survives as a vignette on the restored video. There is
+// no tap_valid mask for the same reason: a tap before the start of the
+// sequence REPEATS the first frame rather than reading zero, and the
+// host says so by binding that frame's pointer twice. That keeps one
+// rule in one place and costs a binding.
+//
+// out[r, ((kt*3+ky)*3+kx)*C + c]
+//     = t{kt}[clamp(y+ky-1, 0, H-1)*W + clamp(x+kx-1, 0, W-1), c],
+// with r = y*W + x. A dense_gemm over W[Cout, 36*C] then realizes the
+// convolution. Row-tiled like its 3-tap twin: only output rows
+// [row_off, row_off+row_cnt) are written, into a TILE-LOCAL out, so the
+// column scratch is one band rather than the full [H*W, 36*C] -- four
+// thirds of the 3-tap scratch, so the banding matters at least as much.
+//   0:t0 1:t1 2:t2 3:t3 (each [H*W,C]) 4:out[row_cnt,36*C]
+//   5:H 6:W 7:C 8:row_off 9:row_cnt.
+//   grid {36*C, row_cnt}.
+kernel void im2col_hwc_4x3x3_rep_tiled_f16(
+    const device VPIPE_ELT* t0  [[buffer(0)]],
+    const device VPIPE_ELT* t1  [[buffer(1)]],
+    const device VPIPE_ELT* t2  [[buffer(2)]],
+    const device VPIPE_ELT* t3  [[buffer(3)]],
+    device VPIPE_ELT*       out [[buffer(4)]],
+    constant int&      H       [[buffer(5)]],
+    constant int&      W       [[buffer(6)]],
+    constant int&      C       [[buffer(7)]],
+    constant int&      row_off [[buffer(8)]],
+    constant int&      row_cnt [[buffer(9)]],
+    uint2 tpig [[thread_position_in_grid]],
+    uint2 tpg  [[threads_per_grid]])
+{
+  // 32-bit index math on the documented 2D grid -- see the note on
+  // im2col_hwc_3x3_f16 for why the 64-bit div/mod form is the slow path.
+  const uint cols = (uint)(36 * C);
+  ulong gid;
+  uint c, j, r;
+  if (tpg.x == cols) {                       // 2D {36*C, row_cnt}
+    if ((uint)tpig.y >= (uint)row_cnt) { return; }
+    c = (uint)tpig.x % (uint)C;
+    j = (uint)tpig.x / (uint)C;              // (kt*3 + ky)*3 + kx
+    r = (uint)row_off + (uint)tpig.y;        // global out row
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+  } else {
+    gid = (ulong)tpig.y * cols + tpig.x;     // tile-local
+    if (gid >= (ulong)(uint)row_cnt * cols) { return; }
+    c = (uint)(gid % (uint)C);
+    j = (uint)((gid / (uint)C) % 36u);
+    r = (uint)row_off + (uint)(gid / (ulong)cols);
+  }
+  const uint kt = j / 9u;
+  const uint ks = j % 9u;
+  const int x = (int)(r % (uint)W);
+  const int y = (int)(r / (uint)W);
+  int sy = y + (int)(ks / 3u) - 1;
+  int sx = x + (int)(ks % 3u) - 1;
+  sy = max(0, min(sy, H - 1));               // replicate, never zero
+  sx = max(0, min(sx, W - 1));
+  const ulong si = ((ulong)sy * W + sx) * (uint)C + c;
+  out[gid] = (kt == 0u) ? t0[si]
+           : (kt == 1u) ? t1[si]
+           : (kt == 2u) ? t2[si]
+                        : t3[si];
 }
 
 // Same causal 3D im2col, but with REFLECT spatial padding and an output
@@ -4661,6 +5636,10 @@ kernel void umt5_attn_f16(
 // gate_msa, shift_mlp, scale_mlp, gate_mlp.
 
 // out[m,n] = (1 + scale[idx[m], n]) * x[m,n] + shift[idx[m], n]
+// The row and column are taken unsigned, as the split kernels' are;
+// `total` is an int, so a dispatch covers at most 2^31 - 1 elements and
+// a longer activation is dispatched in row bands (idx, x and out bound
+// at the band's row).
 //   0:x[M,N] 1:mod[*,stride] 2:idx[M] (int32) 3:out[M,N] 4:N 5:stride
 //   6:scale_off 7:shift_off 8:total(=M*N).  grid (total).
 kernel void adaln_modulate_idx_f16(
@@ -4676,8 +5655,8 @@ kernel void adaln_modulate_idx_f16(
     uint gid [[thread_position_in_grid]])
 {
   if (gid >= (uint)total) { return; }
-  const int m = (int)gid / N;
-  const int n = (int)gid % N;
+  const uint m = gid / (uint)N;
+  const uint n = gid % (uint)N;
   const int64_t base = (int64_t)idx[m] * stride;
   const float sc = float(mod[base + scale_off + n]);
   const float sh = float(mod[base + shift_off + n]);
@@ -4699,8 +5678,8 @@ kernel void gated_residual_idx_f16(
     uint gid [[thread_position_in_grid]])
 {
   if (gid >= (uint)total) { return; }
-  const int m = (int)gid / N;
-  const int n = (int)gid % N;
+  const uint m = gid / (uint)N;
+  const uint n = gid % (uint)N;
   const int64_t base = (int64_t)idx[m] * stride;
   h[gid] = VPIPE_ELT(float(h[gid]) +
                      float(mod[base + gate_off + n]) * float(sub[gid]));
@@ -4717,6 +5696,13 @@ kernel void gated_residual_idx_f16(
 // gate-first matrix produces a plausible, wrong activation rather than
 // anything that fails loudly, which is why it is a separate entry point
 // instead of a flag on swiglu_f16.
+//
+// THE SPLIT KERNELS INDEX UNSIGNED (this one, the gate-first twin, SITU,
+// GLU): a row read as `(int)gid / D` went negative past 2^31 outputs --
+// MiniMax-H3's whole-sequence feed-forward, 14336 wide, from row 149,796
+// -- and read and wrote other rows. Unsigned they are right to the
+// grid's 2^32 threads; a caller with more rows than that dispatches
+// them in row bands.
 //   0:in[rows,2*D] 1:out[rows,D] 2:rows 3:D.  grid (rows*D).
 kernel void swiglu_split_value_first_f16(
     const device VPIPE_ELT* in  [[buffer(0)]],
@@ -4725,10 +5711,10 @@ kernel void swiglu_split_value_first_f16(
     constant int&      D    [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= (uint)(rows * D)) { return; }
-  const int r = (int)gid / D;
-  const int d = (int)gid % D;
-  const int64_t base = (int64_t)r * (2 * D);
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
   const float v = float(in[base + d]);
   const float g = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
@@ -4752,12 +5738,192 @@ kernel void swiglu_split_gate_first_f16(
     constant int&      D    [[buffer(3)]],
     uint gid [[thread_position_in_grid]])
 {
-  if (gid >= (uint)(rows * D)) { return; }
-  const int r = (int)gid / D;
-  const int d = (int)gid % D;
-  const int64_t base = (int64_t)r * (2 * D);
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
   const float g = float(in[base + d]);
   const float v = float(in[base + D + d]);
   out[gid] = VPIPE_ELT(v * (g / (1.0f + exp(-g))));
 }
 
+// MOSS-Image's SITU activation, read off a fused [hidden | gate]
+// projection -- hidden FIRST, as the reference's `.chunk(2, -1)` spells
+// it:
+//   out[r,d] = (4 tanh(g/4) sigmoid(g)) * (25 tanh(h/25)),
+//   h = in[r,d], g = in[r,D+d].
+// Both squashes are part of the model, not guards: the gate is a
+// bounded swish (4 tanh(g/4) saturates it at 4) and the value is
+// soft-clipped at 25. PRECISE tanh: the fast one loses relative
+// accuracy near zero, where 25 tanh(h/25) ~ h is the whole signal.
+// f32 inside, one rounding out; the reference rounds after every op in
+// bf16, which is further from its own fp32 run.
+//   0:in[rows,2*D] 1:out[rows,D] 2:rows 3:D.  grid (rows*D).
+kernel void situ_split_f16(
+    const device VPIPE_ELT* in  [[buffer(0)]],
+    device VPIPE_ELT*       out [[buffer(1)]],
+    constant int&      rows [[buffer(2)]],
+    constant int&      D    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if ((ulong)gid >= (ulong)rows * (ulong)D) { return; }
+  const uint r = gid / (uint)D;
+  const uint d = gid % (uint)D;
+  const ulong base = (ulong)r * (ulong)(2 * D);
+  const float h = float(in[base + d]);
+  const float g = float(in[base + D + d]);
+  const float gate = 4.0f * precise::tanh(g * 0.25f) / (1.0f + exp(-g));
+  out[gid] = VPIPE_ELT(gate * (25.0f * precise::tanh(h * 0.04f)));
+}
+
+// The same SITU over two SEPARATE buffers, hidden and gate -- MOSS-
+// Image's text blocks keep ffn_up and ffn_gate as two Linears.
+//   0:h[n] 1:g[n] 2:out[n] 3:n.  grid (n).  out may alias h or g.
+kernel void situ_f16(
+    const device VPIPE_ELT* hb  [[buffer(0)]],
+    const device VPIPE_ELT* gb  [[buffer(1)]],
+    device VPIPE_ELT*       out [[buffer(2)]],
+    constant int&      n   [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)n) { return; }
+  const float h = float(hb[gid]);
+  const float g = float(gb[gid]);
+  const float gate = 4.0f * precise::tanh(g * 0.25f) / (1.0f + exp(-g));
+  out[gid] = VPIPE_ELT(gate * (25.0f * precise::tanh(h * 0.04f)));
+}
+
+
+// One level of the WAVELET COLOUR FIX's low-pass (FlashVSR+'s reference
+// colour correction): a 3x3 Gaussian [1 2 1]^T [1 2 1] / 16 with its taps
+// `d` pixels apart, the edge replicated -- the reference's F.pad(
+// "replicate") then a dilated conv2d. Levels 1, 2, 4, 8, 16 in sequence
+// leave a picture's low frequencies. F32 throughout, in either library:
+// the fix works on decoded frames in [-1, 1], not on a model's tensors.
+//
+//   0:x [C, H, W] f32  1:y [C, H, W] f32  2:H 3:W 4:d.  grid {W, H, C}.
+kernel void wavelet_blur_f32(
+    const device float* x [[buffer(0)]],
+    device float*       y [[buffer(1)]],
+    constant int&       H [[buffer(2)]],
+    constant int&       W [[buffer(3)]],
+    constant int&       d [[buffer(4)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  if (gid.x >= (uint)W || gid.y >= (uint)H) { return; }
+  const ulong plane = (ulong)H * (uint)W;
+  const device float* p = x + (ulong)gid.z * plane;
+  const float k[3] = {0.25f, 0.5f, 0.25f};
+  float acc = 0.0f;
+  for (int i = -1; i <= 1; ++i) {
+    const int yy = clamp((int)gid.y + i * d, 0, H - 1);
+    for (int j = -1; j <= 1; ++j) {
+      const int xx = clamp((int)gid.x + j * d, 0, W - 1);
+      acc += (k[i + 1] * k[j + 1]) * p[(ulong)yy * (uint)W + (uint)xx];
+    }
+  }
+  y[(ulong)gid.z * plane + (ulong)gid.y * (uint)W + gid.x] = acc;
+}
+
+// A PRISM HADAMARD ROTATION (Bonsai 2's ternary packs): rows of a
+// [rows, K] activation transformed blockwise, 1024 values a block, by the
+// normalized Sylvester Walsh-Hadamard H (H[r][c] = (-1)^popcount(r & c) /
+// 32) and a sign vector s of length K. Forward -- a rotated linear's input
+// -- y = H(s * x); inverse -- an embedding row read in the rotated basis
+// -- y = s * (H x). F32 inside, as the packs were calibrated (one rounding,
+// at the store). H is symmetric and its own inverse, so the two compose to
+// the identity. In place is allowed (x == y): a block is read whole
+// before any of it is written.
+//
+// A threadgroup of 256 a (block, row): thread t holds the block's values
+// 4t .. 4t+3. The butterflies at distance 1 and 2 stay in its registers,
+// 4 .. 64 cross lanes of its simdgroup (shuffle by t ^ h/4), 128 .. 512
+// cross simdgroups through threadgroup memory.
+//
+// GROUPED INPUT (rep > 1): a gated-DeltaNet output in a GGUF's TILED
+// value-head order -- head j = r * nk + k -- read as the training's
+// GROUPED order, head k * rep + r, which is the order a rotated out_proj
+// was folded in (Prism's gdn_v_grouped). Position p of the row reads x at
+// (p % hd) + hd * ((p / (hd rep)) + nk ((p / hd) % rep)). Never in place.
+//
+//   0:x 1:y  2:signs (f32, K)  3:K (a multiple of 1024)  4:inverse (0|1)
+//   5:x_stride 6:y_stride (elements between rows)
+//   7:hd 8:nk 9:rep (rep <= 1: no permutation).
+//   grid {K/1024 * 256, rows, 1}, threadgroup {256, 1, 1}.
+kernel void prism_hadamard_rows_1024(
+    const device VPIPE_ELT* x       [[buffer(0)]],
+    device VPIPE_ELT*       y       [[buffer(1)]],
+    const device float*     signs   [[buffer(2)]],
+    constant int&           K       [[buffer(3)]],
+    constant int&           inverse [[buffer(4)]],
+    constant int&           xs      [[buffer(5)]],
+    constant int&           ys      [[buffer(6)]],
+    constant int&           hd      [[buffer(7)]],
+    constant int&           nk      [[buffer(8)]],
+    constant int&           rep     [[buffer(9)]],
+    uint2 tg   [[threadgroup_position_in_grid]],
+    uint  t    [[thread_index_in_threadgroup]])
+{
+  // K is a multiple of 1024 (the host's to check): every thread of a
+  // threadgroup reaches every barrier. The grid covers it exactly.
+  (void)K;
+  threadgroup float buf[1024];
+  const int k0 = (int)tg.x * 1024 + 4 * (int)t;
+  const device VPIPE_ELT* xr = x + (ulong)tg.y * (uint)xs;
+  float v[4];
+  for (int j = 0; j < 4; ++j) {
+    int src = k0 + j;
+    if (rep > 1) {
+      const int p = k0 + j;
+      src = (p % hd) + hd * ((p / (hd * rep)) + nk * ((p / hd) % rep));
+    }
+    v[j] = (float)xr[src];
+    if (inverse == 0) { v[j] *= signs[k0 + j]; }
+  }
+  // Distance 1 and 2: inside the thread.
+  {
+    const float a0 = v[0] + v[1], a1 = v[0] - v[1];
+    const float a2 = v[2] + v[3], a3 = v[2] - v[3];
+    v[0] = a0 + a2; v[2] = a0 - a2;
+    v[1] = a1 + a3; v[3] = a1 - a3;
+  }
+  // Distance 4 .. 64: lanes t ^ 1 .. t ^ 16 of the simdgroup.
+  for (ushort m = 1; m <= 16; m <<= 1) {
+    const bool upper = (t & m) != 0;
+    for (int j = 0; j < 4; ++j) {
+      const float p = simd_shuffle_xor(v[j], m);
+      v[j] = upper ? p - v[j] : v[j] + p;
+    }
+  }
+  // Distance 128 .. 512: threads t ^ 32 .. t ^ 128, through memory.
+  for (uint m = 32; m <= 128; m <<= 1) {
+    for (int j = 0; j < 4; ++j) { buf[4 * t + j] = v[j]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const bool upper = (t & m) != 0;
+    for (int j = 0; j < 4; ++j) {
+      const float p = buf[4 * (t ^ m) + j];
+      v[j] = upper ? p - v[j] : v[j] + p;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  device VPIPE_ELT* yr = y + (ulong)tg.y * (uint)ys + k0;
+  for (int j = 0; j < 4; ++j) {
+    float o = v[j] * 0.03125f;
+    if (inverse != 0) { o *= signs[k0 + j]; }
+    yr[j] = (VPIPE_ELT)o;
+  }
+}
+
+// x[r, c] *= s[c]: a column scale over `total` elements of rows `cols`
+// wide -- an NVFP4 projection's AWQ pre_quant_scale on its input.
+//   0:x 1:s(float[cols]) 2:cols 3:total. grid (total).
+kernel void scale_cols_inplace_f16(
+    device VPIPE_ELT*    x     [[buffer(0)]],
+    const device float*  s     [[buffer(1)]],
+    constant int&        cols  [[buffer(2)]],
+    constant int&        total [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+  if (gid >= (uint)total) { return; }
+  x[gid] = VPIPE_ELT(float(x[gid]) * s[gid % (uint)cols]);
+}

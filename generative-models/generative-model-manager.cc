@@ -2,19 +2,28 @@
 
 #include "generative-models/shared/gguf-convert.h"
 #include "generative-models/shared/gguf-file.h"
+#include "generative-models/lm-memory-limit.h"
+#include "generative-models/lm-run-memory.h"
 #include "generative-models/loaded-language-model.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
+#include "common/flex-bag.h"
+#include "common/memory-owner.h"
 #include "common/vpipe-format.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "apple-silicon/metal-compute/wire-on-alloc.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
 
 #include <sys/sysctl.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 
+#include <limits>
 #include <cerrno>
 #include <cstring>
+#include <optional>
 
 #include <chrono>
 #include <exception>
@@ -82,6 +91,9 @@ GenerativeModelManager::KeyHash::operator()(const Key& k) const noexcept
   mix(hash<string>{}(k.compute_dtype));
   mix(hash<int>{}(k.page_tokens));
   mix(hash<uint32_t>{}(k.max_pages));
+  mix(hash<string>{}(k.mtp_dir));
+  mix(hash<string>{}(k.draft_dir));
+  mix(hash<int>{}(k.draft_bits));
   return h;
 }
 std::string
@@ -126,27 +138,32 @@ GenerativeModelManager::weight_set(const string& dir, const string& variant)
   if (dir.empty()) { return nullptr; }
   const string key = canonicalize_(session(), dir) + "|" + variant;
 
+  // Anything nobody borrows any more is settled first, so a set this
+  // call is about to hand out is never sitting in the released state
+  // while a model reads it.
+  release_unheld_();
+
   {
     lock_guard<mutex> lk(_ws_mu);
-    // The POOL first, and it is taken OUT of it: a set in use is not
-    // spare capacity, and leaving it there would let a later eviction
-    // drop pages a live model is reading.
-    auto p = _pool.find(key);
-    if (p != _pool.end()) {
-      shared_ptr<WeightSet> sp = std::move(p->second);
-      _pool.erase(p);
-      _weight_sets[key] = sp;
-      if (session() != nullptr) {
-        session()->log_debug(fmt(
-            "GenerativeModelManager: recycled '{}' from the removable pool "
-            "({} MB, no reload)", key, sp->stats().bytes >> 20));
-      }
-      return sp;
-    }
     auto it = _weight_sets.find(key);
     if (it != _weight_sets.end()) {
-      if (auto sp = it->second.lock()) { return sp; }
-      _weight_sets.erase(it);
+      shared_ptr<WeightSet> sp = it->second;
+      if (session() != nullptr && sp->parked()) {
+        // NOT "no reload". A set the manager kept while nobody borrowed
+        // it is PARKED, so what this saves for certain is re-OPENING the
+        // checkpoint. The pages come back on the first read -- free if
+        // the kernel left them alone, a re-read if it did not. Claiming
+        // otherwise is how a reader learns to trust bytes nobody
+        // promised.
+        session()->log_debug(fmt(
+            "GenerativeModelManager: '{}' borrowed again ({} MB, parked -- "
+            "reactivated on first read)", key, sp->stats().bytes >> 20));
+      }
+      // Counted under the lock a park is decided under, so a park chosen
+      // before this hand-out sees it and stands down
+      // (WeightSet::park_unless_borrowed_since).
+      sp->note_borrowed();
+      return sp;
     }
   }
 
@@ -163,9 +180,11 @@ GenerativeModelManager::weight_set(const string& dir, const string& variant)
       // Someone else won the race. Hand back THEIR set and drop ours,
       // so everyone converges on one copy of the weights -- the whole
       // point. Ours has nothing materialised yet, so nothing is lost.
-      if (auto sp = it->second.lock()) { return sp; }
+      it->second->note_borrowed();
+      return it->second;
     }
     _weight_sets[key] = ws;
+    ws->note_borrowed();
   }
   // Registered after publication so the residency policy sees it, and
   // held by the set itself so it drops when the set does.
@@ -187,7 +206,7 @@ GenerativeModelManager::holds_weights(const string& dir) const
   const string pfx = canonicalize_(session(), dir) + "|";
   lock_guard<mutex> lk(_ws_mu);
   for (const auto& [k, w] : _weight_sets) {
-    if (k.rfind(pfx, 0) == 0 && !w.expired()) { return true; }
+    if (k.rfind(pfx, 0) == 0 && w != nullptr) { return true; }
   }
   return false;
 }
@@ -195,7 +214,7 @@ GenerativeModelManager::holds_weights(const string& dir) const
 namespace {
 
 // Believed physical RAM, honouring VPIPE_RAM_LIMIT_MB exactly as
-// model_memory::phys_ram() and stream-pin.h do -- the pool has to agree
+// model_memory::phys_ram() and stream-sizing.h do -- the pool has to agree
 // with the planning phase about the size of the box, or a graph that
 // planned against a simulated 16 GB machine would wire against a real
 // 64 GB one.
@@ -237,6 +256,13 @@ GenerativeModelManager::set_wired_pool_bytes(std::size_t bytes)
 }
 
 void
+GenerativeModelManager::note_wired_pool_refused()
+{
+  const std::size_t used = _pool_used.load(std::memory_order_relaxed);
+  _pool_granted.store(used > 0 ? used : 1, std::memory_order_relaxed);
+}
+
+void
 GenerativeModelManager::reopen_wired_pool()
 {
   // Only the CEILING is reset. `_pool_used` is what is really wired and
@@ -266,72 +292,331 @@ GenerativeModelManager::wired_pool_device_max() const
   return rec;
 }
 
+namespace {
+
+// The bytes of wired-model records whose model is gone, those records
+// dropped. A template, not a method: a private method of the manager is
+// an exported symbol (see `_warm` in the header).
+template <class Records>
+std::size_t
+gone_wired_bytes(Records& recs)
+{
+  std::size_t n = 0;
+  for (auto it = recs.begin(); it != recs.end();) {
+    if (it->lm.expired()) {
+      n += it->bytes;
+      it = recs.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return n;
+}
+
+}  // namespace
+
+namespace {
+
+// The conversations parked on a warm model that is going (park_context):
+// each saved where its host said, then let go -- before the model, which
+// `warm` still holds. A generic lambda, not a member: every method of the
+// manager is an exported symbol (see `_warm` in the header).
+const auto spill_parked = [](auto& warm, const SessionContextIntf* s) {
+  for (auto& p : warm.parked) {
+    if (p.spill.empty() || !p.ctx.valid() || !warm.lm) { continue; }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string err;
+    const int tokens = p.ctx.seq_len();
+    if (warm.lm->save_context(p.ctx, p.spill, p.meta, &err)) {
+      if (s != nullptr) {
+        s->info(fmt(
+            "GenerativeModelManager: conversation '{}' ({} tokens) saved "
+            "to {} in {} ms as its model goes", p.key, tokens, p.spill,
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count()));
+      }
+    } else if (s != nullptr) {
+      s->warn(fmt(
+          "GenerativeModelManager: conversation '{}' could not be saved "
+          "({}); its next turn prefills it again", p.key, err));
+    }
+  }
+  warm.parked.clear();
+};
+
+}  // namespace
+
 GenerativeModelManager::~GenerativeModelManager()
 {
-  // See the declaration: the pooled sets must be released while the
-  // registry they deregister from is still alive.
-  std::unordered_map<string, shared_ptr<WeightSet>> pool;
+  // The warm models first: they hold weight sets of their own. The
+  // conversations parked on them are saved before they go.
+  std::vector<Warm> warm;
+  std::vector<WarmModel> warm_models;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    _warm_stop = true;
+    warm.swap(_warm);
+    warm_models.swap(_warm_models);
+  }
+  _warm_cv.notify_all();
+  if (_warm_reaper.joinable()) { _warm_reaper.join(); }
+  for (auto& w : warm) { spill_parked(w, session()); }
+  warm.clear();
+  warm_models.clear();
+  // See the declaration: the sets must be released while the registry
+  // they deregister from is still alive.
+  std::unordered_map<string, shared_ptr<WeightSet>> sets;
   {
     lock_guard<mutex> lk(_ws_mu);
-    pool.swap(_pool);
+    sets.swap(_weight_sets);
   }
-  pool.clear();
+  sets.clear();
+}
+
+// How many BORROWERS a set has: everything holding it except this
+// manager's own reference.
+//
+// Racy by construction -- a peer may take a reference the instant after
+// this reads -- and that is tolerable in exactly one direction. Reading
+// one too many defers a park, which costs memory the box may want.
+// Reading one too FEW parks a set somebody is using, and the reader is
+// then handed pages the kernel is free to discard. So every caller here
+// treats a nonzero answer as "in use" and never rounds it down.
+static long
+borrowers_(const shared_ptr<WeightSet>& ws)
+{
+  const long n = (long)ws.use_count() - 1;   // minus the manager's own
+  return n < 0 ? 0 : n;
+}
+
+namespace {
+
+// A set chosen for parking, with what was true of it WHERE it was chosen
+// (under _ws_mu): its borrowers and its hand-out count. Both go to
+// park_if_unborrowed_ -- the first to decline a set in use, the second
+// to stand down if the set is handed out before the park lands.
+struct ParkPick {
+  shared_ptr<WeightSet> ws;
+  long                  borrowers = 0;
+  std::uint64_t         epoch     = 0;
+};
+
+// Caller holds _ws_mu.
+ParkPick
+pick_(const shared_ptr<WeightSet>& ws)
+{
+  // Counted BEFORE the pick's own copy below adds a reference.
+  const long n = borrowers_(ws);
+  return ParkPick{ws, n, ws->borrow_epoch()};
+}
+
+}  // namespace
+
+// THE BORROW RULE, in the one place every park in this file goes
+// through: a set anything is borrowing is never parked.
+//
+// Parking makes pages purgeable, and the reader that loses them is the
+// one holding cached SharedBuffer handles -- aliases of the very buffers
+// the set would reactivate, read in a forward pass that never asks the
+// set for anything and so never triggers the reactivation. There is no
+// way to make that safe from here: the manager cannot know a live model
+// is idle, and the model has no hook that fires before it reads. So the
+// answer is not to.
+//
+// `borrowers` is passed IN rather than derived here, and that is
+// load-bearing. use_count() is only true before the caller has taken a
+// copy of its own; every site computes it under _ws_mu, in the same
+// walk that selects the set, and hands it over. Deriving it inside this
+// function would see the caller's temporary and report one borrower too
+// many for every set -- which is to say it would park nothing, ever.
+//
+// AND THE COUNT GOES STALE, because the park runs after the caller let
+// go of _ws_mu: a weight_set() in between can hand the set to a model
+// that reads its tensors before the park lands, and that model then
+// holds buffers the park makes purgeable. `epoch` -- the hand-out count
+// read with `borrowers` -- closes it: the set re-checks it under its own
+// lock, which every such read takes, and parks only if nothing was handed
+// out since.
+std::size_t
+GenerativeModelManager::park_if_unborrowed_(const shared_ptr<WeightSet>& ws,
+                                            long          borrowers,
+                                            std::uint64_t epoch)
+{
+  if (ws == nullptr || ws->parked() || borrowers > 0) { return 0; }
+  return ws->park_unless_borrowed_since(epoch);
+}
+
+std::size_t
+GenerativeModelManager::park_if_unborrowed_(const shared_ptr<WeightSet>& ws,
+                                            long borrowers)
+{
+  // See the declaration: kept for the exported symbol, and a park that
+  // cannot tell whether a borrower arrived since it was decided is the
+  // one this class must not make.
+  (void)ws;
+  (void)borrowers;
+  return 0;
+}
+
+void
+GenerativeModelManager::set_before_park_for_test(std::function<void()> hook)
+{
+  lock_guard<mutex> lk(_ws_mu);
+  _before_park_for_test = std::move(hook);
+}
+
+std::size_t
+GenerativeModelManager::release_unheld_()
+{
+  std::vector<ParkPick> to_park;
+  std::vector<pair<string, shared_ptr<WeightSet>>> to_drop;
+  std::function<void()> before_park;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    for (auto it = _weight_sets.begin(); it != _weight_sets.end();) {
+      const shared_ptr<WeightSet>& ws = it->second;
+      if (ws == nullptr || borrowers_(ws) > 0) { ++it; continue; }
+      if (!ws->recyclable()) {
+        // A set SPECIALISED to a run's parameters must not outlive the
+        // run: handing it to a launch that does not share them gives
+        // that launch weights which are silently wrong for it. Keeping
+        // it is the one thing worse than re-reading it.
+        to_drop.emplace_back(it->first, std::move(it->second));
+        it = _weight_sets.erase(it);
+        continue;
+      }
+      if (!ws->parked()) { to_park.push_back(pick_(ws)); }
+      ++it;
+    }
+    before_park = std::move(_before_park_for_test);
+    _before_park_for_test = nullptr;
+  }
+  // The window the hand-out count exists for; see park_if_unborrowed_.
+  if (before_park) { before_park(); }
+  // BOTH outside the lock. Parking walks the set's buffers and takes the
+  // registry's mutex; dropping the last reference unmaps a checkpoint.
+  // Holding _ws_mu across either would put every other model's open
+  // behind it.
+  std::size_t parked = 0;
+  for (const ParkPick& p : to_park) {
+    // 0 borrowers by construction -- that is what put it in this list,
+    // measured under the lock before `to_park` took its own reference.
+    parked += park_if_unborrowed_(p.ws, 0, p.epoch);
+  }
+  if (session() != nullptr) {
+    if (parked > 0) {
+      session()->log_debug(fmt(
+          "GenerativeModelManager: parked {} MB across {} checkpoint(s) "
+          "nothing is borrowing (kept, purgeable, reactivated on the next "
+          "read)", parked >> 20, to_park.size()));
+    }
+    for (const auto& [k, ws] : to_drop) {
+      session()->log_debug(fmt(
+          "GenerativeModelManager: dropped '{}' rather than keeping it -- "
+          "not recyclable ({})", k,
+          ws->unrecyclable_reason().empty() ? std::string("unstated")
+                                            : ws->unrecyclable_reason()));
+    }
+  }
+  to_drop.clear();
+  return parked;
 }
 
 void
 GenerativeModelManager::pool_weights(const string& dir, const string& variant)
 {
   if (dir.empty()) { return; }
-  const string key = canonicalize_(session(), dir) + "|" + variant;
-  shared_ptr<WeightSet> ws;
+  // NOTHING TO HAND OVER any more: the manager already owns every set it
+  // opened, so a stage that is finished has only to drop its own
+  // reference. What this call still does -- and the reason it is worth
+  // keeping at the call sites -- is ask the manager to SETTLE the
+  // checkpoint now rather than at whatever unrelated moment happens to
+  // reach release_unheld_() next.
+  //
+  // It is therefore safe in either order. The old contract required
+  // pooling BEFORE the models were reset, because the manager's
+  // reference was weak and there was nothing left to pool afterwards;
+  // called before, this now finds the caller's own models still
+  // borrowing and settles nothing, and the next manager call settles it
+  // instead. Called AFTER, it settles immediately. Both are correct;
+  // only the timing differs.
+  (void)variant;
+  release_unheld_();
+}
+
+std::size_t
+GenerativeModelManager::drop_weights(const string& dir)
+{
+  if (dir.empty()) { return 0; }
+  // THE BYTES BACK NOW, which is the one thing release_unheld_() will
+  // not do for a recyclable checkpoint. Parking makes pages reclaimable;
+  // it does not return them, and a caller freeing a text encoder so a
+  // 1024px VAE decode fits needs them returned. `unload_when_idle:
+  // destroy` is that caller, and it meant this before the manager owned
+  // anything -- dropping the last reference used to unmap the
+  // checkpoint, and now it does not.
+  //
+  // Still refuses a BORROWED set, for the same reason park does: one
+  // stage does not get to unmap a checkpoint a peer is reading. A
+  // borrowed one is left alone and settles when the last borrower goes.
+  const string pfx = canonicalize_(session(), dir) + "|";
+  std::vector<pair<string, shared_ptr<WeightSet>>> dropped;
+  std::size_t freed = 0;
   {
     lock_guard<mutex> lk(_ws_mu);
-    auto it = _weight_sets.find(key);
-    if (it == _weight_sets.end()) { return; }
-    ws = it->second.lock();
-  }
-  if (!ws) { return; }
-  if (!ws->recyclable()) {
-    // NOT an error, and said rather than silent: a checkpoint that
-    // reloads every launch looks exactly like one the pool never saw,
-    // and the difference is the whole reason the flag exists.
-    if (session() != nullptr) {
-      session()->log_debug(fmt(
-          "GenerativeModelManager: '{}' is not recyclable ({}), so it is "
-          "dropped rather than pooled", key,
-          ws->unrecyclable_reason().empty() ? std::string("unstated")
-                                            : ws->unrecyclable_reason()));
+    for (auto it = _weight_sets.begin(); it != _weight_sets.end();) {
+      if (it->first.rfind(pfx, 0) != 0 || it->second == nullptr ||
+          borrowers_(it->second) > 0) {
+        ++it;
+        continue;
+      }
+      freed += it->second->stats().bytes;
+      dropped.emplace_back(it->first, std::move(it->second));
+      it = _weight_sets.erase(it);
     }
-    return;
   }
-  // Purgeable on the way in. The pool holds the set so a relaunch can
-  // find it; marking it lets the kernel take the pages meanwhile, which
-  // is what makes pooling free rather than a claim on the box.
-  const size_t parked = _weights.park(ws.get());
-  {
-    lock_guard<mutex> lk(_ws_mu);
-    _pool[key] = std::move(ws);
-  }
-  if (session() != nullptr) {
+  // Outside the lock: the last reference going unmaps a checkpoint.
+  if (!dropped.empty() && session() != nullptr) {
     session()->log_debug(fmt(
-        "GenerativeModelManager: '{}' released to the removable pool "
-        "({} MB purgeable, recycled free by a relaunch)", key,
-        parked >> 20));
+        "GenerativeModelManager: dropped {} checkpoint(s) under '{}', {} MB "
+        "-- asked for outright, not parked", dropped.size(), dir,
+        freed >> 20));
   }
+  dropped.clear();
+  return freed;
 }
 
 std::size_t
 GenerativeModelManager::pooled_bytes() const
 {
-  std::vector<shared_ptr<WeightSet>> live;
+  std::vector<shared_ptr<WeightSet>> spare;
   {
     lock_guard<mutex> lk(_ws_mu);
-    live.reserve(_pool.size());
-    for (const auto& [k, w] : _pool) { (void)k; live.push_back(w); }
+    for (const auto& [k, w] : _weight_sets) {
+      (void)k;
+      if (w != nullptr && borrowers_(w) == 0) { spare.push_back(w); }
+    }
   }
+  // Counted AFTER the copies above are made, so `borrowers_` inside the
+  // loop would see this vector's own references. It does not run again:
+  // membership was decided under the lock.
   std::size_t n = 0;
-  for (const auto& w : live) { n += w->stats().bytes; }
+  for (const auto& w : spare) { n += w->stats().bytes; }
   return n;
+}
+
+std::size_t
+GenerativeModelManager::settle_unborrowed()
+{
+  return release_unheld_();
+}
+
+std::size_t
+GenerativeModelManager::drop_unborrowed()
+{
+  // Every spare set, least recently used first: no figure is ever reached
+  // before the last one goes.
+  return pool_evict(std::numeric_limits<std::size_t>::max());
 }
 
 std::size_t
@@ -342,10 +627,28 @@ GenerativeModelManager::pool_evict(std::size_t want)
   std::size_t freed = 0;
   {
     lock_guard<mutex> lk(_ws_mu);
-    for (auto it = _pool.begin(); it != _pool.end() && freed < want;) {
+    // LEAST RECENTLY USED first, because these are all equally droppable
+    // and the one nobody has touched is the one least likely to be
+    // wanted next. The pool this replaced had no order at all -- it was
+    // an unordered_map walked front to back -- which meant a caller
+    // asking for one block's worth could take the checkpoint another
+    // pipeline was about to reuse.
+    std::vector<std::unordered_map<string, shared_ptr<WeightSet>>::iterator>
+        spare;
+    for (auto it = _weight_sets.begin(); it != _weight_sets.end(); ++it) {
+      if (it->second != nullptr && borrowers_(it->second) == 0) {
+        spare.push_back(it);
+      }
+    }
+    std::sort(spare.begin(), spare.end(),
+              [](const auto& a, const auto& b) {
+                return a->second->last_use() < b->second->last_use();
+              });
+    for (auto& it : spare) {
+      if (freed >= want) { break; }
       freed += it->second->stats().bytes;
       dropped.emplace_back(it->first, std::move(it->second));
-      it = _pool.erase(it);
+      _weight_sets.erase(it);
     }
   }
   // Released OUTSIDE the lock: dropping the last reference unmaps a
@@ -353,8 +656,8 @@ GenerativeModelManager::pool_evict(std::size_t want)
   // every other model's open behind it.
   if (!dropped.empty() && session() != nullptr) {
     session()->log_debug(fmt(
-        "GenerativeModelManager: dropped {} pooled checkpoint(s), {} MB, to "
-        "make room", dropped.size(), freed >> 20));
+        "GenerativeModelManager: dropped {} unborrowed checkpoint(s), {} MB, "
+        "to make room", dropped.size(), freed >> 20));
   }
   dropped.clear();
   return freed;
@@ -379,7 +682,7 @@ GenerativeModelManager::wired_pool_pct() const
 }
 
 std::size_t
-GenerativeModelManager::wired_pool_limit() const
+GenerativeModelManager::wired_pool_ask() const
 {
   // The ASK: an absolute figure when one was given, else the share of
   // the box. Zero either way turns wiring off entirely, which is a
@@ -399,6 +702,14 @@ GenerativeModelManager::wired_pool_limit() const
   // failures it can actually diagnose.
   const std::size_t devmax = wired_pool_device_max();
   if (devmax > 0 && ask > devmax) { ask = devmax; }
+  return ask;
+}
+
+std::size_t
+GenerativeModelManager::wired_pool_limit() const
+{
+  const std::size_t ask = wired_pool_ask();
+  if (ask == 0) { return 0; }
   // Then whatever the box turned out to grant. Recorded only after an
   // mlock refusal, and never above the ask -- an operator lowering the
   // limit must not be overruled by a ceiling discovered when it was
@@ -419,7 +730,73 @@ GenerativeModelManager::wired_pool_can_take(std::size_t bytes) const
 {
   const std::size_t lim = wired_pool_limit();
   if (lim == 0) { return false; }
-  return _pool_used.load(std::memory_order_relaxed) + bytes <= lim;
+  // A language model's load on this thread holds what it wired so far, not
+  // yet charged (it is, as the load ends): a model wiring the rest of
+  // itself mid-load -- an expert cache's pass -- would take the room twice.
+  return _pool_used.load(std::memory_order_relaxed) +
+             metal_compute::WireOnAlloc::live_now() + bytes <= lim;
+}
+
+namespace {
+
+// The kernel's view of the pages behind `p`: whether they are file-backed,
+// which decides whether a refused mlock is a shortage, and a line for the
+// log that names what was refused.
+struct PageRegion {
+  bool        known       = false;
+  bool        file_backed = false;
+  std::string text        = "region unknown";
+};
+
+PageRegion
+page_region_(const void* p)
+{
+  PageRegion r;
+  mach_vm_address_t addr = (mach_vm_address_t)(std::uintptr_t)p;
+  mach_vm_size_t rsize = 0;
+  vm_region_extended_info_data_t info{};
+  mach_msg_type_number_t cnt = VM_REGION_EXTENDED_INFO_COUNT;
+  mach_port_t obj = MACH_PORT_NULL;
+  if (mach_vm_region(mach_task_self(), &addr, &rsize,
+                     VM_REGION_EXTENDED_INFO, (vm_region_info_t)&info, &cnt,
+                     &obj) != KERN_SUCCESS) {
+    return r;
+  }
+  r.known       = true;
+  r.file_backed = info.external_pager != 0;
+  r.text = fmt("region {} KB at +{} KB, prot {}, share_mode {}, user_tag {}, "
+               "external_pager {}, resident {} of {} pages",
+               rsize >> 10,
+               ((std::uintptr_t)p - (std::uintptr_t)addr) >> 10,
+               info.protection, info.share_mode, info.user_tag,
+               info.external_pager, info.pages_resident,
+               rsize / vm_page_size)();
+  return r;
+}
+
+}  // namespace
+
+bool
+GenerativeModelManager::pool_wirable(
+    const metal_compute::SharedBuffer& b) noexcept
+{
+  return b.byte_size() >= kMinWiredBytes;
+}
+
+void
+GenerativeModelManager::charge_external_wired(std::size_t bytes)
+{
+  if (bytes == 0) { return; }
+  _pool_used.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void
+GenerativeModelManager::release_external_wired(std::size_t bytes)
+{
+  if (bytes == 0) { return; }
+  std::size_t was = _pool_used.load(std::memory_order_relaxed);
+  while (!_pool_used.compare_exchange_weak(
+      was, was > bytes ? was - bytes : 0, std::memory_order_relaxed)) {}
 }
 
 std::size_t
@@ -427,6 +804,9 @@ GenerativeModelManager::wire_into_pool(metal_compute::SharedBuffer& b)
 {
   const std::size_t n = b.byte_size();
   if (n == 0 || b.is_wired()) { return 0; }
+  // NOT A POOL QUESTION -- see pool_wirable(). Skipped silently, and above
+  // all without touching the ceiling.
+  if (!pool_wirable(b)) { return 0; }
   if (!wired_pool_can_take(n)) {
     // SAID ONCE. A caller sees only "0 bytes wired" and cannot tell a
     // full pool from a box that refused -- and those want opposite
@@ -443,25 +823,57 @@ GenerativeModelManager::wire_into_pool(metal_compute::SharedBuffer& b)
   }
   if (!b.set_wired(true)) {
     const int e = errno;
+    const PageRegion rg = page_region_(b.contents());
+    // ONLY A SHORTAGE CAPS THE POOL. ENOMEM / EAGAIN on anonymous memory is
+    // the box saying what it will give; a file-backed page (external
+    // pager) will not wire at any budget, and any other errno is this
+    // buffer's own property. Those skip THIS buffer and leave the ceiling
+    // alone -- the collapse on them is what froze identical runs at
+    // random levels. An unreadable region keeps the old, cautious answer.
+    const bool shortage =
+        (e == ENOMEM || e == EAGAIN) && !(rg.known && rg.file_backed);
+    if (!shortage) {
+      // The FIRST skip is said at info: a buffer class that never wires is
+      // silent protection lost, and the log is the only place it shows.
+      // Function-local so the manager's layout -- which plugins compile
+      // against -- does not move.
+      static std::atomic<bool> skip_said{false};
+      if (!skip_said.exchange(true, std::memory_order_relaxed) &&
+          session() != nullptr) {
+        session()->info(fmt(
+            "wired pool: {} bytes would not wire (errno {}: {}; the buffer "
+            "is {}, {}); skipped, the pool is unchanged (further skips are "
+            "logged at debug)", n, e, std::strerror(e),
+            b.is_owned() ? "an owned allocation" : "a subview or wrapper",
+            rg.text));
+      } else if (session() != nullptr) {
+        session()->log_debug(fmt(
+            "wired pool: {} bytes would not wire (errno {}: {}; the buffer "
+            "is {}, {}); skipped, the pool is unchanged", n, e,
+            std::strerror(e),
+            b.is_owned() ? "an owned allocation" : "a subview or wrapper",
+            rg.text));
+      }
+      return 0;
+    }
     // The box refused. Collapse the ceiling to what is already held so
     // callers stop asking -- the percentage was only ever an up-to, and
-    // this is the box saying what it will actually give.
+    // this is the box saying what it will actually give. reopen_wired_pool
+    // is how a caller asks again later.
     const std::size_t used = _pool_used.load(std::memory_order_relaxed);
-    _pool_granted.store(used > 0 ? used : 1, std::memory_order_relaxed);
-    // WARN, not info: the pool has just collapsed to whatever happened
-    // to be held, so every later request fails too and the run silently
-    // loses the protection it was configured for. errno is the part
-    // that says WHY -- ENOMEM against a limit far above what was asked
-    // means the pages themselves would not wire, which is what a
-    // read-only file mapping does.
+    note_wired_pool_refused();
+    // WARN, not info: every later request fails too until a reopen, and
+    // the run loses protection it was configured for. WHAT was refused is
+    // named, in bytes, because that is what says why.
     if (!_pool_refused_said.exchange(true, std::memory_order_relaxed)
         && session() != nullptr) {
       session()->warn(fmt(
-          "wired pool: the box refused to wire {} MB (errno {}: {}) with "
-          "{} MB of a {} MB pool in use. The pool is capped at what is "
-          "already held; the rest of this run's weights stay reclaimable",
-          n >> 20, e, std::strerror(e), used >> 20,
-          wired_pool_limit() >> 20));
+          "wired pool: the box refused to wire {} bytes (errno {}: {}) with "
+          "{} MB of a {} MB pool in use; the buffer is {}, offset {}, {}. "
+          "The pool is capped at what is already held until a model reopens "
+          "it", n, e, std::strerror(e), used >> 20, wired_pool_limit() >> 20,
+          b.is_owned() ? "an owned allocation" : "a subview or wrapper",
+          b.byte_offset(), rg.text));
     }
     return 0;
   }
@@ -479,6 +891,36 @@ GenerativeModelManager::unwire_from_pool(metal_compute::SharedBuffer& b)
   while (!_pool_used.compare_exchange_weak(
       was, was > n ? was - n : 0, std::memory_order_relaxed)) {}
 }
+
+namespace {
+
+// Phases a..b (running-order positions) into `key`'s bits. A position
+// past the mask's 64 is not recorded; the hull then answers alone.
+void
+add_phase_bits(std::unordered_map<std::string, std::uint64_t>& bits,
+               const std::string& key, int a, int b)
+{
+  std::uint64_t m = 0;
+  for (int i = std::max(0, a); i <= b && i < 64; ++i) {
+    m |= std::uint64_t{1} << i;
+  }
+  if (m != 0) { bits[key] |= m; }
+}
+
+// Whether `bits` has `key` alive at position `p`: nullopt when no phased
+// statement recorded it, so the caller falls back to the hull.
+std::optional<bool>
+phase_bit(const std::unordered_map<std::string, std::uint64_t>& bits,
+          const std::string& key, int p)
+{
+  const auto it = bits.find(key);
+  if (it == bits.end() || it->second == 0 || p < 0 || p >= 64) {
+    return std::nullopt;
+  }
+  return ((it->second >> p) & 1u) != 0;
+}
+
+}  // namespace
 
 void
 GenerativeModelManager::declare_weights(const string& dir,
@@ -510,6 +952,24 @@ GenerativeModelManager::declare_weights(const string& dir,
   // reverse.
   auto [it, fresh] = _phase.try_emplace(key, phase);
   if (!fresh && phase.empty()) { it->second.clear(); }
+  // What a stage ASSERTED, remembered past the clear above: one store
+  // holding two components (both MiniMax-H3 VAEs in one Draw Things
+  // .ckpt) is claimed by vae-decode for `decode` and, unphased, by
+  // audio-vae-decode -- whose later refinement to `decode-audio` then
+  // replaced the decode claim, and the video VAE was absent from the
+  // phase that runs it.
+  if (!phase.empty()) {
+    const int a = phase_index_(phase);
+    const int b = last_phase.empty() ? a : phase_index_(last_phase);
+    if (a >= 0 && b >= 0) {
+      auto [as, nu] = _phase_asserted.try_emplace(key, a, b);
+      if (!nu) {
+        as->second.first = std::min(as->second.first, a);
+        as->second.second = std::max(as->second.second, b);
+      }
+      add_phase_bits(_phase_bits, key, a, std::max(a, b));
+    }
+  }
   // The interval's END takes the LATER of two claims, mirroring how the
   // wider lifetime wins above: a component two stages describe is alive
   // until the last of them is finished with it.
@@ -536,7 +996,28 @@ GenerativeModelManager::set_declaration_phase(const string& dir,
   // call, so it must not be read as a disagreement -- doing so silently
   // discarded every refinement, and the arithmetic still looked
   // plausible because it fell back to the safe, conservative total.
-  if (it->second.empty()) { it->second = phase; return; }
+  if (it->second.empty()) {
+    // ...unless another stage asserted a phase for these same bytes at
+    // declare time: then the refinement WIDENS to cover both, earliest
+    // start to latest end, rather than replacing what that stage said.
+    // (The bits keep the two apart: what lies between them is in the
+    // hull, not in either claim -- see _phase_bits.)
+    const auto as = _phase_asserted.find(key);
+    const int p = phase_index_(phase);
+    if (p >= 0) { add_phase_bits(_phase_bits, key, p, p); }
+    if (as != _phase_asserted.end() && p >= 0 &&
+        (as->second.first != p || as->second.second != p)) {
+      const int lo = std::min(as->second.first, p);
+      const int hi = std::max(as->second.second, p);
+      it->second = _phase_order[(std::size_t)lo];
+      if (hi != lo) {
+        _phase_last[key] = _phase_order[(std::size_t)hi];
+      }
+      return;
+    }
+    it->second = phase;
+    return;
+  }
   // A different phase already decided: two stages disagree about when
   // this checkpoint is held, so it is held throughout. Persistent is
   // the only reading consistent with both, and it is the safe one.
@@ -554,7 +1035,29 @@ GenerativeModelManager::revise_declaration(const string& dir,
   // Only a checkpoint that was declared can be revised: an undeclared
   // one is not being counted from an estimate, so there is nothing to
   // correct.
-  if (it != _declared.end()) { it->second = bytes; }
+  if (it == _declared.end()) { return; }
+  // NEVER BELOW THE DECLARED FLOOR, short of a withdrawal (0). A floor is
+  // the least this checkpoint can be held at, and revisions come from a
+  // model that has just LOADED -- when a block-streaming one holds its
+  // trunk and has not yet built the slot pair its first forward
+  // allocates. Taken as said, that figure sits two blocks per stack under
+  // the floor the checkpoint was planned against, in BOTH ledgers: this
+  // map is the preload column, and the floor ledger takes the smaller of
+  // it and the floor. Under-counting is the direction that admits a graph
+  // the box cannot hold.
+  if (bytes > 0) {
+    const auto f = _declared_floor.find(key);
+    if (f != _declared_floor.end() && bytes < f->second) {
+      bytes = f->second;
+    }
+  }
+  it->second = bytes;
+}
+
+std::uint64_t
+GenerativeModelManager::launch_epoch() const noexcept
+{
+  return _launch_epoch.load(std::memory_order_relaxed);
 }
 
 void
@@ -597,10 +1100,17 @@ GenerativeModelManager::clear_declarations()
   lock_guard<mutex> lk(_ws_mu);
   _declared.clear();
   _declared_floor.clear();
+  // A new launch: its stages' requests to shared models start afresh.
+  _launch_epoch.fetch_add(1, std::memory_order_relaxed);
   // Same scope, same reason as the declarations they qualify: a phase
   // is stated per launch from the owning stage's policy, and a graph
   // without that stage must not inherit its claim.
   _phase.clear();
+  _phase_asserted.clear();
+  _phase_bits.clear();
+  // ...and the interval's end with them: kept, a relaunch's claim of the
+  // same checkpoint inherited the last run's end phase.
+  _phase_last.clear();
   _released.clear();
   // Cleared with the declarations, and for the same reason: it is a fact
   // about THIS run's sizing. A relaunch at a different resolution, or
@@ -663,6 +1173,61 @@ GenerativeModelManager::phase_index_(const string& p) const
 }
 
 size_t
+GenerativeModelManager::declared_scratch(const string& label) const
+{
+  lock_guard<mutex> lk(_ws_mu);
+  auto it = _scratch.find(label);
+  return it == _scratch.end() ? 0 : it->second.bytes;
+}
+
+size_t
+GenerativeModelManager::planned_weight_bytes(const string& dir) const
+{
+  if (dir.empty()) { return 0; }
+  const auto per_dir = per_dir_bytes_();
+  auto it = per_dir.find(canonicalize_(session(), dir));
+  return it == per_dir.end() ? 0 : it->second;
+}
+
+bool
+GenerativeModelManager::counts_in_phase(const string& dir,
+                                        const string& phase) const
+{
+  if (dir.empty()) { return false; }
+  const string key = canonicalize_(session(), dir);
+  // phase_footprint_'s rule, for one checkpoint.
+  const auto per_dir = per_dir_bytes_();
+  if (per_dir.find(key) == per_dir.end()) { return false; }
+  std::unordered_map<string, string> phase_of, last_of;
+  std::unordered_map<string, std::uint64_t> bits;
+  std::vector<string> order;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    phase_of = _phase;
+    last_of  = _phase_last;
+    bits     = _phase_bits;
+    order    = _phase_order;
+  }
+  auto it = phase_of.find(key);
+  if (it == phase_of.end() || it->second.empty()) { return true; }
+  auto index_of = [&](const string& p) {
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      if (order[i] == p) { return (int)i; }
+    }
+    return -1;
+  };
+  const int p = index_of(phase);
+  if (phase_bit(bits, key, 0).has_value()) {
+    return p >= 0 && phase_bit(bits, key, p).value_or(false);
+  }
+  const auto lt = last_of.find(key);
+  const int a = index_of(it->second);
+  const int z = lt != last_of.end() ? index_of(lt->second) : a;
+  if (a < 0 || z <= a) { return it->second == phase; }
+  return a <= p && p <= z;
+}
+
+size_t
 GenerativeModelManager::scratch_bytes(const string& phase) const
 {
   lock_guard<mutex> lk(_ws_mu);
@@ -717,19 +1282,59 @@ size_t
 GenerativeModelManager::park_weights(const string& dir)
 {
   if (dir.empty()) { return 0; }
-  const string key = canonicalize_(session(), dir);
-  shared_ptr<WeightSet> ws;
+  // BY PREFIX, because `_weight_sets` is keyed by canonical dir AND
+  // variant ("<canon>|<variant>", see weight_set()). Looking the bare
+  // canonical dir up in that map cannot match anything -- not even the
+  // ordinary empty-variant case, whose key still carries the separator
+  // -- so this returned 0 for every checkpoint that ever existed, and
+  // `unload_when_idle: park` reclaimed nothing anywhere.
+  //
+  // That zero was visible and was attributed to the other reason a park
+  // gives back nothing (a model that reads UNCACHED has nothing in the
+  // set to park). Both are real; this one came first and hid the other.
+  // The memory-cap path was never affected: enforce_memory_cap() walks
+  // `_weight_sets` itself and never asks by name.
+  //
+  // One directory may hold several variants (a quantized twin of the
+  // same checkpoint); parking is per SET, so park them all and report
+  // the total -- the caller asked about a directory.
+  //
+  // AND ONLY WHAT NOBODY IS BORROWING, which is the third reason this
+  // can return 0 and the only one that is a refusal rather than an
+  // absence. The manager owns these checkpoints; a stage asking to park
+  // one is speaking for itself, and it cannot speak for a peer whose
+  // model is mid-forward over the same bytes. Parking under that peer
+  // hands it pages the kernel may discard, and nothing on its read path
+  // would notice. So a borrowed set is skipped and SAID, and it settles
+  // on its own through release_unheld_() once the last borrower lets go.
+  const string pfx = canonicalize_(session(), dir) + "|";
+  vector<ParkPick> sets;
   {
     lock_guard<mutex> lk(_ws_mu);
-    auto it = _weight_sets.find(key);
-    if (it == _weight_sets.end()) { return 0; }
-    ws = it->second.lock();
+    for (const auto& [k, w] : _weight_sets) {
+      if (k.rfind(pfx, 0) != 0 || w == nullptr) { continue; }
+      // Counted HERE, under the lock and before the copy below adds a
+      // reference of its own. Reading it afterwards would report one
+      // borrower too many for every set and park nothing, ever.
+      sets.push_back(pick_(w));
+    }
   }
-  if (!ws || ws->parked()) { return 0; }
-  const size_t got = _weights.park(ws.get());
-  if (got == 0) { return 0; }        // nothing parkable (mapped/uncached)
-  ws->set_parked(true);
-  return got;
+  size_t total = 0;
+  size_t borrowed = 0;
+  for (const auto& [ws, holders, epoch] : sets) {
+    if (ws->parked()) { continue; }
+    if (holders > 0) { ++borrowed; continue; }
+    const size_t got = park_if_unborrowed_(ws, holders, epoch);
+    if (got == 0) { continue; }      // nothing parkable (mapped/uncached)
+    total += got;
+  }
+  if (borrowed > 0 && session() != nullptr) {
+    session()->log_debug(fmt(
+        "GenerativeModelManager: '{}' is still borrowed by {} model(s), so "
+        "it is not parked; it settles when the last one lets go", dir,
+        borrowed));
+  }
+  return total;
 }
 
 bool
@@ -741,9 +1346,19 @@ GenerativeModelManager::accounts_for(const string& dir) const
   lock_guard<mutex> lk(_ws_mu);
   if (_declared.find(canon) != _declared.end()) { return true; }
   for (const auto& [k, w] : _weight_sets) {
-    if (k.rfind(pfx, 0) == 0 && !w.expired()) { return true; }
+    if (k.rfind(pfx, 0) == 0 && w != nullptr) { return true; }
   }
   return false;
+}
+
+bool
+GenerativeModelManager::declares(const string& dir) const
+{
+  if (dir.empty()) { return false; }
+  const string canon = canonicalize_(session(), dir);
+  lock_guard<mutex> lk(_ws_mu);
+  auto it = _declared.find(canon);
+  return it != _declared.end() && it->second > 0;
 }
 
 // Bytes per canonical directory: what each checkpoint costs right now,
@@ -763,7 +1378,7 @@ GenerativeModelManager::per_dir_bytes_(bool use_floor) const
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
-      if (auto sp = w.lock()) {
+      if (const shared_ptr<WeightSet>& sp = w; sp != nullptr) {
         // Key back to the plain directory: two variants of one
         // checkpoint are two sets but must be summed under one dir so
         // a declaration for it compares against the whole.
@@ -894,12 +1509,14 @@ GenerativeModelManager::phase_peak(
   const auto per_dir = per_dir_bytes_(/*use_floor=*/true);
 
   std::unordered_map<string, string> first_of, last_of;
+  std::unordered_map<string, std::uint64_t> bits;
   std::unordered_map<string, ScratchClaim> scratch;
   std::vector<string> order;
   {
     lock_guard<mutex> lk(_ws_mu);
     first_of = _phase;
     last_of  = _phase_last;
+    bits     = _phase_bits;
     scratch  = _scratch;
     order    = _phase_order;
   }
@@ -911,7 +1528,7 @@ GenerativeModelManager::phase_peak(
   // bytes with a lifetime -- so they are walked together rather than
   // summed separately and added, which is what made a latent alive
   // across three phases impossible to express.
-  struct Live { std::size_t bytes; int first; int last; };
+  struct Live { std::size_t bytes; int first; int last; string dir; };
   std::vector<Live> live;
   live.reserve(per_dir.size() + scratch.size());
 
@@ -936,22 +1553,29 @@ GenerativeModelManager::phase_peak(
     if (b == 0) { continue; }
     auto it = first_of.find(dir);
     auto lt = last_of.find(dir);
-    const auto [a, z] = span(it == first_of.end() ? string() : it->second,
-                             lt == last_of.end() ? string() : lt->second);
-    live.push_back({b, a, z});
+    const string f = it == first_of.end() ? string() : it->second;
+    const auto [a, z] =
+        span(f, lt == last_of.end() ? string() : lt->second);
+    // A phased checkpoint is alive where its claims put it (_phase_bits),
+    // not across the hull of them; unphased is the whole run.
+    live.push_back({b, a, z, f.empty() ? string() : dir});
   }
   for (const auto& [label, c] : scratch) {
     (void)label;
     if (c.bytes == 0) { continue; }
     const auto [a, z] = span(c.phase, c.last_phase);
-    live.push_back({c.bytes, a, z});
+    live.push_back({c.bytes, a, z, string()});
   }
 
   std::size_t peak = 0;
   for (int p = 0; p < (int)order.size(); ++p) {
     std::size_t at = 0;
     for (const Live& l : live) {
-      if (l.first <= p && p <= l.last) { at += l.bytes; }
+      const std::optional<bool> on =
+          l.dir.empty() ? std::nullopt : phase_bit(bits, l.dir, p);
+      if (on.has_value() ? *on : (l.first <= p && p <= l.last)) {
+        at += l.bytes;
+      }
     }
     if (by_phase != nullptr) { by_phase->emplace_back(order[(std::size_t)p], at); }
     if (at > peak) { peak = at; }
@@ -964,11 +1588,22 @@ GenerativeModelManager::phase_footprint_(const string& phase,
                                          bool use_floor) const
 {
   const auto per_dir = per_dir_bytes_(use_floor);
-  std::unordered_map<string, string> phase_of;
+  std::unordered_map<string, string> phase_of, last_of;
+  std::unordered_map<string, std::uint64_t> bits;
+  std::vector<string> order;
   {
     lock_guard<mutex> lk(_ws_mu);
     phase_of = _phase;
+    last_of  = _phase_last;
+    bits     = _phase_bits;
+    order    = _phase_order;
   }
+  auto index_of = [&](const string& p) {
+    for (std::size_t i = 0; i < order.size(); ++i) {
+      if (order[i] == p) { return (int)i; }
+    }
+    return -1;
+  };
 
   std::size_t persistent = 0;                 // held for the whole run
   std::unordered_map<string, std::size_t> by_phase;
@@ -982,7 +1617,28 @@ GenerativeModelManager::phase_footprint_(const string& phase,
       persistent += b;
       continue;
     }
-    by_phase[it->second] += b;
+    // Over its WHOLE interval, first phase to last, as phase_peak reads
+    // it: counted in its first phase alone, a component alive across
+    // two (one store holding both a decode-audio and a decode VAE) was
+    // missing from the second.
+    // Where its claims put it, when they were recorded (_phase_bits):
+    // not the phases between two holders that let go in between.
+    if (phase_bit(bits, dir, 0).has_value()) {
+      for (int i = 0; i < (int)order.size(); ++i) {
+        if (phase_bit(bits, dir, i).value_or(false)) {
+          by_phase[order[(std::size_t)i]] += b;
+        }
+      }
+      continue;
+    }
+    const auto lt = last_of.find(dir);
+    const int a = index_of(it->second);
+    const int z = lt != last_of.end() ? index_of(lt->second) : a;
+    if (a < 0 || z <= a) {
+      by_phase[it->second] += b;
+      continue;
+    }
+    for (int i = a; i <= z; ++i) { by_phase[order[(std::size_t)i]] += b; }
   }
 
   if (!phase.empty()) {
@@ -1049,6 +1705,79 @@ GenerativeModelManager::memory_cap() const
   return _memory_cap.load(memory_order_relaxed);
 }
 
+void
+GenerativeModelManager::set_swap_allowance_bytes(std::size_t bytes)
+{
+  const std::size_t was = _swap_allowance.exchange(bytes, memory_order_relaxed);
+  if (session() == nullptr || was == bytes) { return; }
+  if (bytes == 0) {
+    session()->info(fmt(
+        "GenerativeModelManager: swap allowance removed -- a forward is now "
+        "sized against reclaimable RAM alone, which excludes anonymous pages "
+        "that would need swap"));
+  } else {
+    session()->info(fmt(
+        "GenerativeModelManager: swap allowance {} MB (how much a forward "
+        "may plan to push into the compressor or swap on top of what the OS "
+        "reports reclaimable; nothing is reserved)", bytes >> 20));
+  }
+}
+
+std::size_t
+GenerativeModelManager::swap_allowance_bytes() const
+{
+  return _swap_allowance.load(memory_order_relaxed);
+}
+
+GenerativeModelManager::SwapSupply
+GenerativeModelManager::swap_supply()
+{
+  SwapSupply s;
+  vm_statistics64_data_t vm;
+  mach_msg_type_number_t n = HOST_VM_INFO64_COUNT;
+  if (::host_statistics64(mach_host_self(), HOST_VM_INFO64,
+                          reinterpret_cast<host_info64_t>(&vm), &n)
+      != KERN_SUCCESS) {
+    return s;
+  }
+  vm_size_t page = 0;
+  if (::host_page_size(mach_host_self(), &page) != KERN_SUCCESS) {
+    page = 16384;
+  }
+  // vm_statistics64 counts PAGES; task_vm_info reports BYTES. Multiply
+  // before the two are ever compared.
+  //
+  // `internal_page_count` is documented as "pages that are anonymous"
+  // and `external_page_count` as "pages that are file-backed", so the
+  // two partition memory by BACKING STORE. `wire_count` cuts across
+  // both, which is why subtracting it whole errs low: it removes the
+  // file-backed wired pages from a pool that never contained them.
+  s.anon      = (std::size_t)vm.internal_page_count * (std::size_t)page;
+  s.purgeable = (std::size_t)vm.purgeable_count * (std::size_t)page;
+  s.wired     = (std::size_t)vm.wire_count * (std::size_t)page;
+
+  // OUR OWN anonymous bytes. `ti.internal` is this task's internal
+  // (anonymous) footprint, so it is exactly the term to remove: driving
+  // vpipe's own pages to swap to make room for vpipe's next forward is
+  // the thrash this gate exists to avoid. Self-WIRED bytes are NOT
+  // removed again -- they are unswappable and already inside `wired`.
+  task_vm_info_data_t ti;
+  mach_msg_type_number_t c = TASK_VM_INFO_COUNT;
+  if (::task_info(mach_task_self(), TASK_VM_INFO,
+                  reinterpret_cast<task_info_t>(&ti), &c) == KERN_SUCCESS) {
+    s.self_anon = (std::size_t)ti.internal;
+  }
+  const std::size_t out = s.purgeable + s.wired + s.self_anon;
+  s.spare = s.anon > out ? s.anon - out : 0;
+  return s;
+}
+
+std::size_t
+GenerativeModelManager::swappable_other_bytes()
+{
+  return swap_supply().spare;
+}
+
 std::size_t
 GenerativeModelManager::active_bytes() const
 {
@@ -1058,7 +1787,7 @@ GenerativeModelManager::active_bytes() const
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) { live.push_back(std::move(sp)); }
+      if (w != nullptr) { live.push_back(w); }
     }
   }
   std::size_t total = 0;
@@ -1083,29 +1812,29 @@ GenerativeModelManager::enforce_memory_cap()
   // has touched for a while goes before one in active use, so the
   // common case is that the cap costs nothing: the parked pages are
   // never reclaimed and the next access is a state flip.
-  std::vector<std::shared_ptr<WeightSet>> live;
+  std::vector<ParkPick> live;
   {
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) {
-        if (!sp->parked()) { live.push_back(std::move(sp)); }
-      }
+      // Borrowers counted HERE, before `live` takes a reference of its
+      // own; see park_if_unborrowed_.
+      if (w != nullptr && !w->parked()) { live.push_back(pick_(w)); }
     }
   }
   std::sort(live.begin(), live.end(),
-            [](const std::shared_ptr<WeightSet>& a,
-               const std::shared_ptr<WeightSet>& b) {
-              return a->last_use() < b->last_use();
+            [](const auto& a, const auto& b) {
+              return a.ws->last_use() < b.ws->last_use();
             });
 
   std::size_t freed = 0;
-  for (const auto& ws : live) {
+  std::size_t in_use = 0;
+  for (const auto& [ws, holders, epoch] : live) {
     if (active <= cap) { break; }
-    const std::size_t got = _weights.park(ws.get());
+    if (holders > 0) { in_use += ws->stats().bytes; continue; }
+    const std::size_t got = park_if_unborrowed_(ws, holders, epoch);
     if (got == 0) { continue; }        // nothing parkable (all mapped)
-    ws->set_parked(true);
     freed  += got;
     active -= (got > active) ? active : got;
     if (session() != nullptr) {
@@ -1114,12 +1843,26 @@ GenerativeModelManager::enforce_memory_cap()
           "now ~{} MB)", got >> 20, ws->dir(), cap >> 20, active >> 20));
     }
   }
-  if (freed > 0 && active > cap && session() != nullptr) {
-    session()->warn(fmt(
-        "GenerativeModelManager: still ~{} MB active after parking "
-        "everything parkable (cap {} MB). Mapped weights and KV cannot be "
-        "parked -- the cap is a target, not a guarantee",
-        active >> 20, cap >> 20));
+  if (active > cap && session() != nullptr) {
+    // WHY it fell short, because the two reasons want different
+    // responses. Mapped weights and KV are the cap's standing
+    // limitation. Bytes a model is still BORROWING are a different
+    // thing: they are not unreclaimable, they are in use, and what
+    // returns them is the stage letting go -- an `unload_when_idle`
+    // policy, not a bigger cap.
+    if (in_use > 0) {
+      session()->warn(fmt(
+          "GenerativeModelManager: still ~{} MB active after parking "
+          "everything it could (cap {} MB); ~{} MB of that is borrowed by "
+          "live models and is not the manager's to park -- a stage has to "
+          "let go of it first", active >> 20, cap >> 20, in_use >> 20));
+    } else if (freed > 0) {
+      session()->warn(fmt(
+          "GenerativeModelManager: still ~{} MB active after parking "
+          "everything parkable (cap {} MB). Mapped weights and KV cannot be "
+          "parked -- the cap is a target, not a guarantee",
+          active >> 20, cap >> 20));
+    }
   }
   return freed;
 }
@@ -1135,32 +1878,36 @@ GenerativeModelManager::reclaim_at_least(std::size_t bytes)
   const std::size_t from_pool = pool_evict(bytes);
   if (from_pool >= bytes) { return from_pool; }
   bytes -= from_pool;
-  // Same LRU snapshot the cap path takes: a set nobody has touched goes
-  // before one in active use, so the common case is that this costs a
-  // state flip and no re-read.
-  std::vector<std::shared_ptr<WeightSet>> live;
+  // Then whatever is left UNBORROWED, least-recently-used first. What
+  // this pass cannot do is take from a live model: parking a set a model
+  // is reading hands it pages the kernel may discard, and it has no way
+  // to notice (park_if_unborrowed_). So the honest ceiling on this call
+  // is "everything nobody is using", and a caller that still does not
+  // fit has to make room by dropping something of its own -- which is
+  // exactly what the image and video stages do, freeing their DiT before
+  // a decode rather than hoping this call covers it.
+  std::vector<ParkPick> live;
   {
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) {
-        if (!sp->parked()) { live.push_back(std::move(sp)); }
-      }
+      // Borrowers counted HERE; see park_if_unborrowed_.
+      if (w != nullptr && !w->parked()) { live.push_back(pick_(w)); }
     }
   }
   std::sort(live.begin(), live.end(),
-            [](const std::shared_ptr<WeightSet>& a,
-               const std::shared_ptr<WeightSet>& b) {
-              return a->last_use() < b->last_use();
+            [](const auto& a, const auto& b) {
+              return a.ws->last_use() < b.ws->last_use();
             });
 
   std::size_t freed = 0;
-  for (const auto& ws : live) {
+  std::size_t in_use = 0;
+  for (const auto& [ws, holders, epoch] : live) {
     if (freed >= bytes) { break; }
-    const std::size_t got = _weights.park(ws.get());
+    if (holders > 0) { in_use += ws->stats().bytes; continue; }
+    const std::size_t got = park_if_unborrowed_(ws, holders, epoch);
     if (got == 0) { continue; }        // nothing parkable (all mapped)
-    ws->set_parked(true);
     freed += got;
     if (session() != nullptr) {
       session()->log_debug(fmt(
@@ -1168,6 +1915,12 @@ GenerativeModelManager::reclaim_at_least(std::size_t bytes)
           "({} of {} MB requested)", got >> 20, ws->dir(), freed >> 20,
           bytes >> 20));
     }
+  }
+  if (freed + from_pool < bytes && in_use > 0 && session() != nullptr) {
+    session()->log_debug(fmt(
+        "GenerativeModelManager: {} MB short of the {} MB asked for; ~{} MB "
+        "is borrowed by live models and is not the manager's to park",
+        (bytes - freed) >> 20, (bytes + from_pool) >> 20, in_use >> 20));
   }
   // BOTH, or a caller that asked for 8 GB and got 6 from the pool and 2
   // from parking would be told 2 and conclude it had failed.
@@ -1180,18 +1933,23 @@ GenerativeModelManager::weight_report() const
   // Snapshot the live sets under the lock, then measure OUTSIDE it: a
   // set's stats() takes its own mutex, and holding the cache lock
   // across that would put the report in the way of a concurrent load.
-  std::vector<std::shared_ptr<WeightSet>> live;
+  //
+  // The borrower count is taken HERE, under the lock, because it is the
+  // one field that stops being true the moment it is copied: the manager
+  // holds a reference of its own and `live` is about to hold a second,
+  // so measuring it later reports two holders for a set one model has.
+  std::vector<pair<std::shared_ptr<WeightSet>, long>> live;
   {
     lock_guard<mutex> lk(_ws_mu);
     live.reserve(_weight_sets.size());
     for (const auto& [k, w] : _weight_sets) {
       (void)k;
-      if (auto sp = w.lock()) { live.push_back(std::move(sp)); }
+      if (w != nullptr) { live.emplace_back(w, borrowers_(w)); }
     }
   }
   std::vector<WeightUsage> out;
   out.reserve(live.size());
-  for (const auto& ws : live) {
+  for (const auto& [ws, holders] : live) {
     const auto st = ws->stats();
     WeightUsage u;
     u.dir          = ws->dir();
@@ -1200,9 +1958,10 @@ GenerativeModelManager::weight_report() const
     u.copied_bytes = st.copied_bytes;
     u.tensors      = st.entries;
     u.parts        = st.parts;
-    // Minus the reference this snapshot itself holds, so the number
-    // reads as "models using it", which is what a caller means.
-    u.holders      = ws.use_count() - 1;
+    // "Models using it", which is what a caller means -- not counting
+    // the manager, which holds every set it ever opened.
+    u.holders      = holders;
+    u.parked       = ws->parked();
     out.push_back(std::move(u));
   }
   return out;
@@ -1215,7 +1974,7 @@ GenerativeModelManager::weight_set_count() const
   std::size_t n = 0;
   for (const auto& [k, w] : _weight_sets) {
     (void)k;
-    if (!w.expired()) { ++n; }
+    if (w != nullptr) { ++n; }
   }
   return n;
 }
@@ -1241,15 +2000,133 @@ GenerativeModelManager::GenerativeModelManager(const SessionContextIntf* s)
   // forward pass, free) is routed through Session::mlx_runtime() so
   // it runs on the dedicated MLX thread, where the (Stream, encoder)
   // TLS map is primed once and stays warm.
+  //
+  // The warm holds' reaper, started by the first keep_warm or
+  // keep_model_warm: each language model and each other model dropped
+  // at its time. A lambda held in a member, not a method (see `_warm`).
+  _warm_reap = [this] {
+    std::unique_lock<mutex> rl(_warm_mu);
+    while (!_warm_stop) {
+      const auto now = std::chrono::steady_clock::now();
+      std::vector<Warm> expired;
+      std::vector<WarmModel> expired_models;
+      auto soonest = std::chrono::steady_clock::time_point::max();
+      for (auto w = _warm.begin(); w != _warm.end();) {
+        if (w->until <= now) {
+          expired.push_back(std::move(*w));
+          w = _warm.erase(w);
+        } else {
+          soonest = std::min(soonest, w->until);
+          ++w;
+        }
+      }
+      for (auto w = _warm_models.begin(); w != _warm_models.end();) {
+        if (w->until <= now) {
+          expired_models.push_back(std::move(*w));
+          w = _warm_models.erase(w);
+        } else {
+          soonest = std::min(soonest, w->until);
+          ++w;
+        }
+      }
+      if (!expired.empty() || !expired_models.empty()) {
+        // Freed with the lock dropped: a 16 GB model's buffers take a
+        // moment, and a keep_warm must not wait on them.
+        rl.unlock();
+        for (auto& w : expired) {
+          spill_parked(w, session());
+          if (session()) {
+            session()->info(fmt(
+                "GenerativeModelManager: '{}' was kept warm and is now "
+                "idle -- unloaded", w.dir));
+          }
+        }
+        for (const auto& w : expired_models) {
+          if (session()) {
+            session()->info(fmt(
+                "GenerativeModelManager: the {} of '{}' was kept warm and "
+                "is now idle -- unloaded ({} MB)", w.kind, w.dir,
+                w.bytes >> 20));
+          }
+        }
+        expired.clear();
+        expired_models.clear();
+        rl.lock();
+        release_external_wired(gone_wired_bytes(_wired_lms));
+        continue;
+      }
+      if (soonest == std::chrono::steady_clock::time_point::max()) {
+        _warm_cv.wait(rl);
+      } else {
+        _warm_cv.wait_until(rl, soonest);
+      }
+    }
+  };
 }
 
 shared_ptr<LoadedLanguageModel>
 GenerativeModelManager::load(const LoadSpec& spec)
 {
+  const std::string mtp_spec = bag::text(spec.extra, load_spec::kMtpDir);
   Key key{ canonicalize_(session(), spec.hf_dir),
            spec.compute_dtype,
            spec.page_tokens,
-           spec.max_pages };
+           spec.max_pages,
+           mtp_spec.empty() ? std::string()
+                            : canonicalize_(session(), mtp_spec) };
+  {
+    const std::string dd = bag::text(spec.extra, load_spec::kDraftDir);
+    key.draft_dir = dd.empty() ? std::string() : canonicalize_(session(), dd);
+    key.draft_bits = (int)bag::integer(spec.extra, load_spec::kDraftBits, 8);
+  }
+
+  // A model kept warm from this FOLDER under another key -- other pages,
+  // dtype or drafter: a host that changed how it loads its model -- is
+  // let go first, its conversations saved as its expiry saves them. The
+  // load would otherwise make a second copy beside it, both resident
+  // until the old hold ran out (two of an 88 GB model on a 256 GB Mac).
+  // The one this key is handed is kept, and so is one still IN USE -- a
+  // peer stage on the folder under its own settings, another graph: the
+  // hold is not its only owner, so letting it go would free nothing and
+  // only lose the conversations parked on it.
+  {
+    shared_ptr<LoadedLanguageModel> same;
+    {
+      lock_guard<mutex> lk(_mu);
+      if (auto it = _cache.find(key); it != _cache.end()) {
+        same = it->second.lock();
+      }
+    }
+    std::vector<Warm> other;
+    {
+      lock_guard<mutex> lk(_warm_mu);
+      for (auto w = _warm.begin(); w != _warm.end();) {
+        if (w->dir == key.hf_dir && w->lm != same
+            && w->lm.use_count() == 1) {
+          other.push_back(std::move(*w));
+          w = _warm.erase(w);
+        } else {
+          ++w;
+        }
+      }
+    }
+    // Freed outside the locks, as the reaper frees a hold.
+    for (auto& w : other) {
+      spill_parked(w, session());
+      if (session()) {
+        session()->info(fmt(
+            "GenerativeModelManager::load('{}'): kept warm under other "
+            "settings -- unloaded before this load", w.dir));
+      }
+    }
+  }
+
+  // Models wired by an earlier load that are gone give their bytes back
+  // to the pool before this one sizes anything.
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    release_external_wired(gone_wired_bytes(_wired_lms));
+  }
 
   // Fast path: existing live entry. Locked briefly; the lookup is
   // O(1) and weak_ptr::lock() is a couple of atomics.
@@ -1285,11 +2162,14 @@ GenerativeModelManager::load(const LoadSpec& spec)
   const string dir = key.hf_dir;
   const int    page_tokens = key.page_tokens;
   const uint32_t max_pages = key.max_pages;
+  const string mtp_dir = key.mtp_dir;
+  const string draft_dir = key.draft_dir;
+  const int    draft_bits = key.draft_bits;
   using ProfClock = std::chrono::steady_clock;
   const bool profile_load = std::getenv("VPIPE_LOAD_PROFILE") != nullptr;
   auto build =
       [this, &dir, compute_dtype, page_tokens, max_pages, rt,
-       profile_load]
+       profile_load, &mtp_dir, &draft_dir, draft_bits]
       () -> shared_ptr<LoadedLanguageModel> {
         auto t0 = ProfClock::now();
         ModelLoader loader(session());
@@ -1330,9 +2210,26 @@ GenerativeModelManager::load(const LoadSpec& spec)
         auto built = make_shared<LoadedLanguageModel>(
             std::move(*loaded), std::move(tok),
             compute_dtype, page_tokens, max_pages,
-            rt, session(), std::string(dir));
+            rt, session(), std::string(dir), mtp_dir);
         if (!built->valid()) {
           return nullptr;
+        }
+        // A DFlash drafter is an accelerator: one that cannot draft for
+        // this model is warned about and the model serves without it.
+        if (!draft_dir.empty()) {
+          std::string err;
+          if (!built->attach_draft_model(draft_dir, draft_bits, &err)) {
+            if (session()) {
+              session()->warn(fmt(
+                  "GenerativeModelManager::load('{}'): drafter '{}' not "
+                  "attached: {}", dir, draft_dir, err));
+            }
+          } else if (session()) {
+            session()->info(fmt(
+                "GenerativeModelManager::load('{}'): {} drafter '{}' "
+                "attached (w{})", dir, built->spec_drafter(), draft_dir,
+                draft_bits));
+          }
         }
         auto t3 = ProfClock::now();
         if (profile_load && session()) {
@@ -1343,8 +2240,54 @@ GenerativeModelManager::load(const LoadSpec& spec)
         return built;
       };
   // Metal-only: run inline -- the metal backend loads its own weights
-  // and the LM's dispatch_() runs inline when runtime == nullptr.
-  shared_ptr<LoadedLanguageModel> lm = build();
+  // and the LM's dispatch_() runs inline when runtime == nullptr. Inline is
+  // also what lets a WireOnAlloc scope on this thread see every buffer the
+  // load makes (load_spec::kWireWeights).
+  const bool wire = bag::flag(spec.extra, load_spec::kWireWeights);
+  // The most it may hold (load_spec::kMemoryLimitMb): read on this
+  // thread by the load, which sizes an expert cache within it.
+  const std::size_t limit = (std::size_t)std::max<std::int64_t>(
+      0, bag::integer(spec.extra, load_spec::kMemoryLimitMb, 0)) << 20;
+  // And its expert cache, when the host names one (kExpertCacheMb).
+  const std::size_t cache = (std::size_t)std::max<std::int64_t>(
+      0, bag::integer(spec.extra, load_spec::kExpertCacheMb, 0)) << 20;
+  // And whether its n-gram table is asked for in memory (kNgramResident).
+  const bool ngram = bag::flag(spec.extra, load_spec::kNgramResident);
+  shared_ptr<LoadedLanguageModel> lm;
+  std::size_t wired = 0, wired_tmp = 0, held_back = 0, room = 0;
+  {
+    std::optional<metal_compute::WireOnAlloc> scope;
+    if (wire) {
+      // Within the pool's room, as every other model's wiring is: the
+      // pool's ceiling is the host's word on what this process makes
+      // unswappable, and a model wired whole past it -- a 16 GB helper
+      // under an 8 GB pool -- overdrew it with nothing said. What does not
+      // fit stays reclaimable. Two loads at once may each see the same
+      // room; what each charges after is what it holds.
+      const std::size_t lim  = wired_pool_limit();
+      const std::size_t used = wired_pool_used();
+      room = lim > used ? lim - used : 0;
+      scope.emplace(room);
+    }
+    {
+      LmMemoryLimit cap(limit, cache, ngram);
+      // Whose its load is (common/memory-owner.h): this model's -- its
+      // weights, and what marks its own use as it allocates (an expert
+      // cache, its K/V) -- whatever stage asked for it.
+      MemoryOwnerScope owner(key.hf_dir, "language-model");
+      MemoryUseScope use(MemoryUse::kWeights);
+      lm = build();
+    }
+    if (scope) {
+      // What THIS load wired and still holds, counted on this thread --
+      // not the process's wired size before and after, which also takes
+      // in whatever a concurrently initializing peer wired or unwired
+      // meanwhile (wire-on-alloc.h).
+      wired = scope->live_bytes();
+      wired_tmp = scope->wired_bytes() - wired;
+      held_back = scope->held_back_bytes();
+    }
+  }
   if (!lm) {
     if (session()) {
       session()->warn(fmt(
@@ -1352,6 +2295,35 @@ GenerativeModelManager::load(const LoadSpec& spec)
           "(see prior warns)", key.hf_dir));
     }
     return nullptr;
+  }
+  // What the load left wired -- its temporaries, freed, already gave
+  // theirs back to the kernel -- is charged to the pool while it lives, so
+  // every model sizing its resident set plans around it.
+  if (wire) {
+    charge_external_wired(wired);
+    // What it fills after the load, on a thread of its own (an n-gram
+    // table held in memory): held, unwired, and not seen by the scope --
+    // without it a warm model read tens of GB lighter than it is.
+    const std::size_t later = lm->filled_after_load_bytes();
+    {
+      lock_guard<mutex> lk(_warm_mu);
+      _wired_lms.push_back(Wired{lm, wired, wired + held_back + later});
+    }
+    if (session()) {
+      session()->info(fmt(
+          "GenerativeModelManager::load('{}'): {} MB wired as it loaded "
+          "(the compressor cannot take it; charged to the wired pool; {} MB "
+          "of load temporaries wired and freed){}{}",
+          key.hf_dir, wired >> 20, wired_tmp >> 20,
+          held_back > 0
+              ? fmt("; {} MB left unwired -- the wired pool had {} MB of "
+                    "room", held_back >> 20, room >> 20)()
+              : std::string(),
+          later > 0
+              ? fmt("; {} MB more filled after the load, unwired",
+                    later >> 20)()
+              : std::string()));
+    }
   }
 
   // Re-lock and stash the result. If a racing thread already
@@ -1369,6 +2341,448 @@ GenerativeModelManager::load(const LoadSpec& spec)
     _cache[key] = lm;
   }
   return lm;
+}
+
+void
+GenerativeModelManager::keep_warm(const shared_ptr<LoadedLanguageModel>& lm,
+                                  const string& dir, double seconds)
+{
+  if (!lm) { return; }
+  const string key = canonicalize_(session(), dir);
+  // what the plan booked for its runs, still declared as the stage lets
+  // it go (warm_run_bytes' bound where the model cannot say)
+  const std::size_t booked = declared_scratch(lm_run_label(dir));
+  std::vector<Warm> dropped;   // freed outside the lock
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    if (_warm_stop) { return; }
+    auto it = std::find_if(_warm.begin(), _warm.end(),
+                           [&](const Warm& w) { return w.lm == lm; });
+    if (seconds <= 0) {
+      if (it != _warm.end()) {
+        dropped.push_back(std::move(*it));
+        _warm.erase(it);
+      }
+    } else {
+      const auto until = std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(seconds));
+      if (it != _warm.end()) {
+        it->until = std::max(it->until, until);
+        it->run_booked = std::max(it->run_booked, booked);
+      } else {
+        _warm.push_back(Warm{lm, key, until, {}, booked});
+      }
+      if (!_warm_reaper.joinable()) {
+        _warm_reaper = std::thread(_warm_reap);
+      }
+    }
+  }
+  _warm_cv.notify_all();
+  for (auto& w : dropped) { spill_parked(w, session()); }
+}
+
+size_t
+GenerativeModelManager::release_warm_unclaimed()
+{
+  std::unordered_set<string> declared;
+  {
+    lock_guard<mutex> lk(_ws_mu);
+    for (const auto& [dir, bytes] : _declared) {
+      if (bytes > 0) { declared.insert(dir); }
+    }
+  }
+  if (declared.empty()) { return 0; }
+  std::vector<Warm> gone;
+  std::vector<WarmModel> gone_models;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto it = _warm.begin(); it != _warm.end();) {
+      if (declared.count(it->dir) == 0) {
+        gone.push_back(std::move(*it));
+        it = _warm.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    for (auto it = _warm_models.begin(); it != _warm_models.end();) {
+      if (declared.count(it->dir) == 0) {
+        gone_models.push_back(std::move(*it));
+        it = _warm_models.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+  for (auto& w : gone) {
+    spill_parked(w, session());
+    if (session()) {
+      session()->info(fmt(
+          "GenerativeModelManager: '{}' was kept warm; this launch does "
+          "not use it -- unloaded to make room", w.dir));
+    }
+  }
+  for (const auto& w : gone_models) {
+    if (session()) {
+      session()->info(fmt(
+          "GenerativeModelManager: the {} of '{}' was kept warm; this "
+          "launch does not use it -- unloaded to make room ({} MB)",
+          w.kind, w.dir, w.bytes >> 20));
+    }
+  }
+  const std::size_t n = gone.size() + gone_models.size();
+  gone.clear();   // the models go now -- and what they had wired with them
+  gone_models.clear();
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    release_external_wired(gone_wired_bytes(_wired_lms));
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_count() const
+{
+  lock_guard<mutex> lk(_warm_mu);
+  return _warm.size();
+}
+
+std::vector<string>
+GenerativeModelManager::warm_dirs() const
+{
+  std::vector<string> dirs;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) { dirs.push_back(w.dir); }
+  for (const auto& w : _warm_models) {
+    if (std::find(dirs.begin(), dirs.end(), w.dir) == dirs.end()) {
+      dirs.push_back(w.dir);
+    }
+  }
+  return dirs;
+}
+
+void
+GenerativeModelManager::keep_model_warm(const string& kind, const string& dir,
+                                        const string& key,
+                                        shared_ptr<void> model,
+                                        std::size_t bytes, double seconds)
+{
+  if (!model || kind.empty()) { return; }
+  const string cdir = canonicalize_(session(), dir);
+  // Freed outside the lock: the one replaced, or this one let go now.
+  std::vector<WarmModel> dropped;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    // A build of the same model under other settings goes: the next
+    // stage would build its own anyway.
+    for (auto it = _warm_models.begin(); it != _warm_models.end();) {
+      if (it->kind == kind && it->dir == cdir) {
+        dropped.push_back(std::move(*it));
+        it = _warm_models.erase(it);
+      } else {
+        ++it;
+      }
+    }
+    if (seconds <= 0 || _warm_stop) {
+      dropped.push_back(WarmModel{kind, cdir, key, std::move(model), bytes,
+                                  {}});
+    } else {
+      const auto until = std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(seconds));
+      _warm_models.push_back(WarmModel{kind, cdir, key, std::move(model),
+                                       bytes, until});
+      if (!_warm_reaper.joinable()) {
+        _warm_reaper = std::thread(_warm_reap);
+      }
+    }
+  }
+  _warm_cv.notify_all();
+  dropped.clear();
+}
+
+shared_ptr<void>
+GenerativeModelManager::take_warm_model(const string& kind, const string& dir,
+                                        const string& key)
+{
+  const string cdir = canonicalize_(session(), dir);
+  shared_ptr<void> got;
+  std::vector<WarmModel> stale;   // freed outside the lock
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto it = _warm_models.begin(); it != _warm_models.end();) {
+      if (it->kind != kind || it->dir != cdir) {
+        ++it;
+        continue;
+      }
+      if (!got && it->key == key) {
+        got = std::move(it->model);
+      } else {
+        stale.push_back(std::move(*it));
+      }
+      it = _warm_models.erase(it);
+    }
+  }
+  for (const auto& w : stale) {
+    if (session()) {
+      session()->log_debug(fmt(
+          "GenerativeModelManager: the {} of '{}' kept warm was built "
+          "otherwise -- unloaded ({} MB)", w.kind, w.dir, w.bytes >> 20));
+    }
+  }
+  stale.clear();
+  return got;
+}
+
+size_t
+GenerativeModelManager::warm_model_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm_models) {
+    if (w.dir == cdir) { n += w.bytes; }
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_held_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) {
+    if (w.dir != cdir || !w.lm) { continue; }
+    for (const auto& x : _wired_lms) {
+      // by owner, as warm_report compares them
+      if (!x.lm.owner_before(w.lm) && !w.lm.owner_before(x.lm)) {
+        n += x.held;
+      }
+    }
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_run_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) {
+    if (w.dir != cdir || !w.lm) { continue; }
+    // idle while warm, so its buffers stand still
+    const size_t exact = w.lm->run_state_bytes();
+    n += exact > 0 ? exact : w.run_booked;
+  }
+  return n;
+}
+
+size_t
+GenerativeModelManager::warm_wired_bytes(const string& dir) const
+{
+  const string cdir = canonicalize_(session(), dir);
+  size_t n = 0;
+  lock_guard<mutex> lk(_warm_mu);
+  for (const auto& w : _warm) {
+    if (w.dir != cdir || !w.lm) { continue; }
+    for (const auto& x : _wired_lms) {
+      if (!x.lm.owner_before(w.lm) && !w.lm.owner_before(x.lm)) {
+        n += x.bytes;
+      }
+    }
+  }
+  // ...and the models stages built and keep, where they said.
+  for (const auto& w : _warm_models) {
+    if (w.dir == cdir) { n += w.wired; }
+  }
+  return n;
+}
+
+void
+GenerativeModelManager::note_warm_wired(const string& kind, const string& dir,
+                                        const string& key, size_t bytes)
+{
+  const string cdir = canonicalize_(session(), dir);
+  lock_guard<mutex> lk(_warm_mu);
+  for (auto& w : _warm_models) {
+    if (w.kind == kind && w.dir == cdir && w.key == key) { w.wired = bytes; }
+  }
+}
+
+size_t
+GenerativeModelManager::warm_kv_bytes() const
+{
+  std::vector<shared_ptr<LoadedLanguageModel>> lms;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (const auto& w : _warm) { lms.push_back(w.lm); }
+  }
+  size_t bytes = 0;
+  for (const auto& lm : lms) {
+    if (lm) { bytes += lm->kv_bytes(); }
+  }
+  // A hold that expired while its model was read above went with `lms`,
+  // on this thread, after the reaper had looked: what it wired goes back
+  // to the pool now, as the reaper would have given it. (The manager is
+  // never a const object; only this reader is const.)
+  lms.clear();
+  {
+    auto* self = const_cast<GenerativeModelManager*>(this);
+    lock_guard<mutex> lk(_warm_mu);
+    self->release_external_wired(gone_wired_bytes(self->_wired_lms));
+  }
+  return bytes;
+}
+
+std::vector<GenerativeModelManager::WarmUsage>
+GenerativeModelManager::warm_report() const
+{
+  return warm_report(nullptr);
+}
+
+std::vector<GenerativeModelManager::WarmUsage>
+GenerativeModelManager::warm_report(
+    std::vector<std::optional<std::size_t>>* held) const
+{
+  if (held != nullptr) { held->clear(); }
+  std::vector<WarmUsage> out;
+  // Each language model's place in `out`: its K/V is read outside the
+  // lock, as warm_kv_bytes reads it.
+  std::vector<std::pair<size_t, shared_ptr<LoadedLanguageModel>>> lms;
+  const auto now = std::chrono::steady_clock::now();
+  auto left = [&](std::chrono::steady_clock::time_point until) {
+    const double s = std::chrono::duration<double>(until - now).count();
+    return s > 0 ? s : 0.0;
+  };
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (const auto& w : _warm) {
+      WarmUsage u;
+      u.kind    = "language-model";
+      u.dir     = w.dir;
+      u.seconds = left(w.until);
+      std::optional<std::size_t> h;
+      for (const auto& x : _wired_lms) {
+        // Compared by owner: a lock() would take a reference to every
+        // wired model, and one whose last holder let go meanwhile
+        // would be freed here, under the lock.
+        if (w.lm && !x.lm.owner_before(w.lm) && !w.lm.owner_before(x.lm)) {
+          u.bytes += x.bytes;
+          h = h.value_or(0) + x.held;
+        }
+      }
+      if (held != nullptr) { held->push_back(h); }
+      lms.emplace_back(out.size(), w.lm);
+      out.push_back(std::move(u));
+    }
+    for (const auto& w : _warm_models) {
+      out.push_back({w.kind, w.dir, w.bytes, 0, left(w.until)});
+      if (held != nullptr) { held->push_back(std::nullopt); }
+    }
+  }
+  for (const auto& [i, lm] : lms) {
+    if (lm) { out[i].kv_bytes = lm->kv_bytes(); }
+  }
+  // A hold that expired while its model was read above went with `lms`,
+  // on this thread, after the reaper had looked: what it wired goes back
+  // to the pool now, as the reaper would have given it. (The manager is
+  // never a const object; only this reader is const.)
+  lms.clear();
+  {
+    auto* self = const_cast<GenerativeModelManager*>(this);
+    lock_guard<mutex> lk(_warm_mu);
+    self->release_external_wired(gone_wired_bytes(self->_wired_lms));
+  }
+  return out;
+}
+
+void
+GenerativeModelManager::park_context(const string&                    key,
+                                     const shared_ptr<LoadedLanguageModel>& lm,
+                                     LoadedLanguageModel::Context     ctx,
+                                     string                           meta,
+                                     const string&                    spill)
+{
+  if (key.empty() || !lm || !ctx.valid()) { return; }
+  Parked p{key, std::move(ctx), std::move(meta), spill};
+  // What the key held before goes, outside the lock -- each with its
+  // model, so a reaper dropping that hold meanwhile cannot take the
+  // model from under the context.
+  std::vector<Warm> replaced;
+  bool kept = false;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto& w : _warm) {
+      for (auto it = w.parked.begin(); it != w.parked.end();) {
+        if (it->key != key) {
+          ++it;
+          continue;
+        }
+        Warm old{w.lm, w.dir, w.until, {}};
+        old.parked.push_back(std::move(*it));
+        replaced.push_back(std::move(old));
+        it = w.parked.erase(it);
+      }
+    }
+    auto it = std::find_if(_warm.begin(), _warm.end(),
+                           [&](const Warm& w) { return w.lm == lm; });
+    if (it != _warm.end() && !_warm_stop) {
+      it->parked.push_back(std::move(p));
+      kept = true;
+    }
+  }
+  replaced.clear();
+  if (!kept) {
+    // Not kept warm: the model may go with its last user, now.
+    Warm now{lm, string(), {}, {}};
+    now.parked.push_back(std::move(p));
+    spill_parked(now, session());
+  }
+}
+
+bool
+GenerativeModelManager::take_context(const string&                    key,
+                                     const shared_ptr<LoadedLanguageModel>& lm,
+                                     LoadedLanguageModel::Context*    ctx,
+                                     string*                          meta)
+{
+  if (key.empty() || !lm || ctx == nullptr) { return false; }
+  lock_guard<mutex> lk(_warm_mu);
+  for (auto& w : _warm) {
+    if (w.lm != lm) { continue; }
+    for (auto it = w.parked.begin(); it != w.parked.end(); ++it) {
+      if (it->key != key) { continue; }
+      *ctx = std::move(it->ctx);
+      if (meta != nullptr) { *meta = std::move(it->meta); }
+      w.parked.erase(it);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool
+GenerativeModelManager::drop_context(const string& key)
+{
+  std::vector<Warm> gone;
+  {
+    lock_guard<mutex> lk(_warm_mu);
+    for (auto& w : _warm) {
+      for (auto it = w.parked.begin(); it != w.parked.end();) {
+        if (it->key != key) {
+          ++it;
+          continue;
+        }
+        Warm old{w.lm, w.dir, w.until, {}};
+        old.parked.push_back(std::move(*it));
+        gone.push_back(std::move(old));
+        it = w.parked.erase(it);
+      }
+    }
+  }
+  return !gone.empty();
 }
 
 size_t

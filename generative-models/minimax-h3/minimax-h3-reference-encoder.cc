@@ -5,11 +5,16 @@
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-references.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
+#include "generative-models/shared/torch-randn.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace vpipe {
 namespace genai {
@@ -69,6 +74,83 @@ to_vae_input_(metal_compute::MetalCompute* mc, const std::uint8_t* rgb,
   return buf;
 }
 
+void
+pack_condition_rows_raw_(const std::uint16_t* mp, int z, int lt, int lh,
+                         int lw, int patch_h, int patch_w,
+                         const std::vector<float>& mean,
+                         const std::vector<float>& std_,
+                         std::vector<float>* rows);
+
+void
+pack_condition_rows_(const metal_compute::SharedBuffer& moments, int z,
+                     int lt, int lh, int lw, int patch_h, int patch_w,
+                     const std::vector<float>& mean,
+                     const std::vector<float>& std_,
+                     std::vector<float>* rows)
+{
+  pack_condition_rows_raw_(
+      static_cast<const std::uint16_t*>(moments.contents()), z, lt, lh, lw,
+      patch_h, patch_w, mean, std_, rows);
+}
+
+// The CONDITION NOISE AUGMENTATION the released checkpoint was trained
+// with: `0.999*z + 0.001*noise` on every visual conditioning row.
+//
+// It is not a denoising step and not a regulariser -- it is the
+// distribution the anchors were trained in, so rows handed over exactly
+// clean are off-distribution. ComfyUI applies it in `_cond_video_rows`
+// (`VISUAL_COND_TIMESTEP = 0.999`) and diffusers documents the same
+// number as `keyframe_noise_aug`, saying so outright: "the released
+// model was trained with its anchors very slightly noised, so
+// conditioning on exactly t = 1.0 is off-distribution".
+//
+// A deliberately NON variance-preserving lerp, matching the reference:
+// the magnitude lands at 0.999x rather than being sqrt-corrected. The
+// stream restarts per condition, as ComfyUI's does, so a reference
+// packs the same rows wherever it sits in the request.
+//
+// AUDIO rows are left alone: the reference holds them at 1.0.
+void
+augment_condition_rows_(std::vector<float>* rows, std::size_t from,
+                        double aug, std::uint64_t seed)
+{
+  if (rows == nullptr || from >= rows->size()) { return; }
+  augment_condition_values(rows->data() + from, rows->size() - from, aug,
+                           seed);
+}
+
+// The same gather as pack_condition_rows_, over an f32 latent that is
+// ALREADY in the DiT's whitened space -- so there is no moments buffer
+// to take the mean half of, and no whitening left to apply.
+void
+pack_latent_rows_(const float* z_data, int z, int lt, int lh, int lw,
+                  int patch_h, int patch_w, std::vector<float>* rows)
+{
+  const std::size_t vox = (std::size_t)lt * lh * lw;
+  const int gh = lh / patch_h, gw = lw / patch_w;
+  const int PE = z * patch_h * patch_w;
+  const std::size_t base = rows->size();
+  rows->resize(base + (std::size_t)lt * gh * gw * PE);
+  float* out = rows->data() + base;
+  for (int t = 0; t < lt; ++t) {
+    for (int cell = 0; cell < gh * gw; ++cell) {
+      float* row = out + ((std::size_t)t * gh * gw + cell) * PE;
+      const int by = (cell / gw) * patch_h;
+      const int bx = (cell % gw) * patch_w;
+      for (int c = 0; c < z; ++c) {
+        for (int y = 0; y < patch_h; ++y) {
+          for (int x = 0; x < patch_w; ++x) {
+            const std::size_t k = (std::size_t)c * vox +
+                                  ((std::size_t)t * lh + (by + y)) * lw +
+                                  (bx + x);
+            row[((std::size_t)c * patch_h + y) * patch_w + x] = z_data[k];
+          }
+        }
+      }
+    }
+  }
+}
+
 // The MEAN half of the VAE's moments, whitened and packed into DiT rows.
 //
 // Two deliberate departures from the reference, both shared with the
@@ -77,13 +159,12 @@ to_vae_input_(metal_compute::MetalCompute* mc, const std::uint8_t* rgb,
 // seed 42; an anchor whose whole job is to be exact does not want noise
 // in it), and the latent is not rounded through float16 first.
 void
-pack_condition_rows_(const metal_compute::SharedBuffer& moments, int z,
-                     int lt, int lh, int lw, int patch_h, int patch_w,
-                     const std::vector<float>& mean,
-                     const std::vector<float>& std_,
-                     std::vector<float>* rows)
+pack_condition_rows_raw_(const std::uint16_t* mp, int z,
+                         int lt, int lh, int lw, int patch_h, int patch_w,
+                         const std::vector<float>& mean,
+                         const std::vector<float>& std_,
+                         std::vector<float>* rows)
 {
-  const auto* mp = static_cast<const std::uint16_t*>(moments.contents());
   const std::size_t vox = (std::size_t)lt * lh * lw;
   const int gh = lh / patch_h, gw = lw / patch_w;
   const int PE = z * patch_h * patch_w;
@@ -115,7 +196,157 @@ pack_condition_rows_(const metal_compute::SharedBuffer& moments, int z,
   }
 }
 
+// The posterior SAMPLED, as the reference's encode_vae_condition draws
+// it: DiagonalGaussianDistribution's sample off `rng` (a fresh torch CPU
+// generator, or the request's) -- noise drawn over the whole [1, z, lt, lh, lw]
+// latent in C order -- the logvar clamped to [-30, 20], the sample
+// rounded to float16, then whitened. Into an f32 [z, lt, lh, lw] latent.
+bool
+sample_condition_latent_(const std::uint16_t* mp, int z, int lt, int lh,
+                         int lw, TorchCpuRandn& rng,
+                         const std::vector<float>& mean,
+                         const std::vector<float>& std_,
+                         std::vector<float>* out)
+{
+  const std::size_t vox = (std::size_t)lt * lh * lw;
+  const std::size_t n = (std::size_t)z * vox;
+  const std::vector<float> eps = rng.randn(n);
+  if (eps.size() != n) { return false; }
+  const bool whiten = (int)mean.size() == z && (int)std_.size() == z;
+  out->resize(n);
+  for (int c = 0; c < z; ++c) {
+    const float mu = whiten ? mean[(std::size_t)c] : 0.0f;
+    const float sd = whiten ? std_[(std::size_t)c] : 1.0f;
+    for (std::size_t i = 0; i < vox; ++i) {
+      const std::size_t k = (std::size_t)c * vox + i;
+      const float m = bf16_to_f32_(mp[k]);
+      const float lv =
+          std::min(std::max(bf16_to_f32_(mp[n + k]), -30.0f), 20.0f);
+      const float stdv = std::exp(0.5f * lv);
+      const float smp = m + stdv * eps[k];
+      const float h = (float)(_Float16)smp;
+      (*out)[k] = sd != 0.0f ? (h - mu) / sd : (h - mu);
+    }
+  }
+  return true;
+}
+
+// How many of a normalized reference's `nf` frames the video VAE
+// encodes. A clip is snapped DOWN to `17n + 5` so it encodes without
+// padding -- which only bites when the reference is SHORTER than the
+// target, whose own count already has that form. The clamp is what
+// Python's slice does for a clip shorter than one chunk. A still is its
+// one frame.
+int
+vae_frames_(bool video, int nf, const MetalMiniMaxH3VideoVae::Config& vc)
+{
+  if (!video) { return nf; }
+  int use = nf;
+  const int fpc = vc.clip_length;
+  const int lpc = vc.tokens_per_chunk();
+  if (fpc > 0 && lpc > 0) {
+    use = std::max(1, (nf - lpc) / fpc) * fpc + lpc;
+    use = std::min(use, nf);
+  }
+  return use;
+}
+
+// The frames a video reference is truncated to: the generated count, or
+// -- kept whole -- all it has.
+int
+target_frames_(const MediaReference& m, const ReferencePlan& plan)
+{
+  return m.whole ? std::numeric_limits<int>::max() : plan.target_frames;
+}
+
+// What one reference will cost, in the unit ReferenceEncoders::progress
+// counts: pixel-frames through the video VAE, padded to whole clips as
+// encode_video pads them (`vae`), plus one frame of the canvas for the
+// resize, the tower and a soundtrack. Planned from the same geometry the
+// resize then uses, so the weights cannot drift from the work. A
+// reference with no VAE work -- a soundtrack, a carried latent -- or
+// whose geometry does not resolve weighs 1: it still moves the bar, and
+// a geometry that fails does so in the loop, where the message belongs.
+std::uint64_t
+reference_work_(const MediaReference& m, const ReferencePlan& plan,
+                const MetalMiniMaxH3VideoVae* video_vae, std::uint64_t* vae)
+{
+  *vae = 0;
+  if (m.kind == MediaReference::Kind::kAudio) { return 1; }
+  if (m.has_video_latent() && m.rgb.empty()) { return 1; }
+  int nf = 0, th = 0, tw = 0;
+  if (m.kind == MediaReference::Kind::kImage && plan.edge_min > 0) {
+    // MiniMax-H3-Image's short-edge rule (the crop is not worth weighing).
+    h3i::bound_short_edge(m.width, m.height, plan.edge_min, plan.edge_max,
+                          plan.canvas_multiple, &tw, &th);
+    nf = 1;
+  } else if (m.kind == MediaReference::Kind::kImage &&
+             plan.area_min_pixels > 0) {
+    // P-H3-Image's rule; the first picture's floor is a few percent of
+    // the bar, not worth carrying the index for.
+    ph3::size_in_area_range(m.width, m.height, plan.area_min_pixels,
+                            plan.area_max_pixels, plan.canvas_multiple, &tw,
+                            &th);
+    nf = 1;
+  } else if (m.kind == MediaReference::Kind::kImage) {
+    const int edge = m.short_edge >= 0 ? m.short_edge
+                                       : plan.reference_image_short_edge;
+    if (!resolve_reference_image_size(m.height, m.width, edge,
+                                      plan.canvas_multiple,
+                                      plan.reference_image_max_pixels, &th,
+                                      &tw)) {
+      return 1;
+    }
+    nf = 1;
+  } else {
+    const int edge =
+        m.short_edge >= 0 ? m.short_edge : plan.canvas_short_edge;
+    if (!video_reference_geometry(m.num_frames, m.height, m.width, m.fps,
+                                  target_frames_(m, plan),
+                                  plan.canvas_multiple, edge,
+                                  plan.canvas_max_pixels, &nf, &th, &tw,
+                                  kFps)) {
+      return 1;
+    }
+  }
+  const std::uint64_t frame =
+      std::max<std::uint64_t>(1, (std::uint64_t)th * (std::uint64_t)tw);
+  if (video_vae != nullptr && !m.has_video_latent()) {
+    const auto& vc = video_vae->config();
+    const int use =
+        vae_frames_(m.kind == MediaReference::Kind::kVideo, nf, vc);
+    const int cl = std::max(1, vc.clip_length);
+    const int padded = use <= 1 ? 1 : (use + cl - 1) / cl * cl;
+    *vae = (std::uint64_t)padded * frame;
+  }
+  return frame + *vae;
+}
+
 }  // namespace
+
+void
+augment_condition_values(float* v, std::size_t n, double aug,
+                         std::uint64_t seed)
+{
+  if (v == nullptr || !(aug < 1.0) || aug <= 0.0) { return; }
+  std::uint64_t s = seed + 0x9e3779b97f4a7c15ull;
+  auto next_normal = [&]() {
+    auto u = [&]() {
+      std::uint64_t z = (s += 0x9e3779b97f4a7c15ull);
+      z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
+      z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
+      z ^= (z >> 31);
+      return ((double)(z >> 11) + 0.5) * (1.0 / 9007199254740992.0);
+    };
+    const double u1 = u(), u2 = u();
+    return std::sqrt(-2.0 * std::log(u1)) *
+           std::cos(6.283185307179586 * u2);
+  };
+  const float a = (float)aug, b = (float)(1.0 - aug);
+  for (std::size_t i = 0; i < n; ++i) {
+    v[i] = a * v[i] + b * (float)next_normal();
+  }
+}
 
 bool
 condition_frame_indices(int num_frames, double fps, double sample_fps,
@@ -149,18 +380,10 @@ condition_frame_indices(int num_frames, double fps, double sample_fps,
     }
     cursor += stride;
   }
-  if ((int)indices->size() < temporal_patch) {
-    const long long minimum = rnd((double)(temporal_patch - 1) * stride) + 1;
-    return fail("a reference video is read at " +
-                std::to_string(sample_fps) + " fps and its sampled frames "
-                "are merged in groups of " + std::to_string(temporal_patch) +
-                ", so it must run at least " + std::to_string(minimum) +
-                " frames, got " + std::to_string(num_frames));
-  }
-
   // One timestamp per sampled frame, the LAST repeated until the count
   // fills a whole number of merged groups, then a group's label is the
-  // mean of its first and last.
+  // mean of its first and last. One frame sampled is one group, the
+  // frame twice (ComfyUI's repeat-pad; the tower repeats its pixels).
   std::vector<double> ts;
   ts.reserve(indices->size() + (std::size_t)temporal_patch);
   for (std::size_t i = 0; i < indices->size(); ++i) {
@@ -184,10 +407,11 @@ validate_reference_request(const std::vector<MediaReference>& refs,
     if (err != nullptr) { *err = std::move(m); }
     return false;
   };
-  if (refs.empty()) {
-    return fail("a ref2va request needs at least one reference; a "
-                "text-only request is the t2va workflow");
-  }
+  // An EMPTY list is Ref2VA's prompt-only form: the presentation is the
+  // prompt alone and the layout packs no reference block, which is the
+  // t2va sequence exactly. It is only reachable by saying so -- see the
+  // stage, which refuses a request that merely has none.
+  if (refs.empty()) { return true; }
   int n_img = 0, n_vid = 0, n_aud = 0;
   for (const MediaReference& r : refs) {
     switch (r.kind) {
@@ -216,11 +440,45 @@ validate_reference_request(const std::vector<MediaReference>& refs,
                 std::to_string(limits.max_references) +
                 " references in total, got " + std::to_string(refs.size()));
   }
-  if (n_img == 0 && n_vid == 0) {
-    return fail("an audio reference has to be paired with at least one "
-                "image or video reference and cannot be used on its own");
-  }
+  // Audio alone passes: its label precedes the prompt and its rows sit
+  // on the clock ahead of the generated ones, as ComfyUI's reference
+  // node packs a request of nothing but soundtracks.
   return true;
+}
+
+double
+audio_reference_seconds(const MediaReference& m, double max_seconds)
+{
+  if (!m.whole || m.sample_rate <= 0 || m.channels <= 0) {
+    return max_seconds;
+  }
+  const double samples = (double)(m.pcm.size() / (std::size_t)m.channels);
+  return samples / (double)m.sample_rate + 1.0;
+}
+
+std::size_t
+audio_encode_bytes(const std::vector<MediaReference>& refs,
+                   const ReferencePlan& plan,
+                   const MetalMiniMaxH3AudioVae* vae)
+{
+  if (vae == nullptr || plan.target_frames <= 0) { return 0; }
+  const double max_seconds = (double)plan.target_frames / kFps;
+  std::size_t most = 0;
+  for (const MediaReference& m : refs) {
+    // encode_references' order: a carried latent first, never encoded.
+    if (m.has_audio_latent() || !m.has_audio() || m.channels <= 0 ||
+        m.sample_rate <= 0) {
+      continue;
+    }
+    // normalize_audio_reference's cut, at the source rate.
+    const long long n = (long long)(m.pcm.size() / (std::size_t)m.channels);
+    const long long cap = (long long)(audio_reference_seconds(m, max_seconds)
+                                      * (double)m.sample_rate);
+    const int kept = (int)std::min(n, std::max(0LL, cap));
+    most = std::max(most, MetalMiniMaxH3AudioVae::encode_scratch_bytes(
+                              vae->config(), kept, 2));
+  }
+  return most;
 }
 
 bool
@@ -242,6 +500,17 @@ encode_references(const std::vector<MediaReference>& refs,
   }
 
   EncodedReferences r;
+  // The row WIDTHS belong to the models, not to the request, so they are
+  // set before any reference is read. A modality with no rows still has
+  // a width: a request of stills packs no audio, and its empty audio
+  // beat has to say [0, 32] rather than [0, 1] for the DiT to take it.
+  if (models.video_vae != nullptr) {
+    r.video_row_elems = models.video_vae->config().z_channels *
+                        plan.patch_h * plan.patch_w;
+  }
+  if (models.audio_vae != nullptr) {
+    r.audio_row_elems = models.audio_vae->config().latent_channels;
+  }
   // The tower results are held for the whole traversal: the
   // presentation points INTO them (one buffer per reference, indexed by
   // temporal cell), so they have to outlive the conditioner call.
@@ -253,43 +522,167 @@ encode_references(const std::vector<MediaReference>& refs,
 
   metal_compute::MetalCompute* mc = models.mc;
 
+  // Phase timing. `tick` restarts the clock and returns the ms since
+  // the last call, so each phase is measured by bracketing it -- no
+  // cost at all when `models.log` is unset.
+  const bool timing = (bool)models.log;
+  auto now_ = [] {
+    return std::chrono::steady_clock::now();
+  };
+  auto mark = now_();
+  auto tick = [&]() -> long long {
+    const auto t = now_();
+    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        t - mark).count();
+    mark = t;
+    return (long long)ms;
+  };
+
   const double max_seconds = (double)plan.target_frames / kFps;
 
+  // ---- progress, planned before anything runs --------------------------
+  // See ReferenceEncoders::progress for the unit. The whole request is
+  // weighed up front so the total never moves: a bar that rescales
+  // itself mid-run reads as progress going backwards.
+  const bool reporting = (bool)models.progress;
+  std::vector<std::uint64_t> work(refs.size(), 1), vae_work(refs.size(), 0);
+  std::uint64_t total_work = 0;
+  if (reporting) {
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+      work[i] = reference_work_(refs[i], plan, models.video_vae,
+                                &vae_work[i]);
+      total_work += work[i];
+    }
+  }
+  std::uint64_t done_work = 0;      // the references already finished
+  auto report = [&](std::uint64_t done, const std::string& detail) {
+    if (reporting) {
+      models.progress(std::min(done, total_work), total_work, detail);
+    }
+  };
+  auto stopped = [&]() {
+    return models.stopping && models.stopping();
+  };
+  // A STOP IS NOT A FAILURE: false, and `err` left exactly as it was.
+  // An empty reason is what the caller matches on, so nothing has to
+  // recognise a message.
+  auto bail_stop = [&]() { return false; };
+
+  // REACH INTO THE VIDEO VAE, which is where the time is -- 96% of a
+  // reference encode, and one long clip can spend minutes in a single
+  // phase. Bounding a stop by "the current reference" would leave the
+  // request people actually wait through no more interruptible than
+  // before. The VAE checks between tiles, each of which committed and
+  // waited, so the bound is one tile.
+  //
+  // CLEARED ON THE WAY OUT. The VAE outlives this call -- the stage
+  // holds it across requests -- so a predicate left behind would be
+  // consulted by the next encode, whose RuntimeContext may be gone.
+  struct VaeStopGuard {
+    MetalMiniMaxH3VideoVae* vae;
+    ~VaeStopGuard() { if (vae != nullptr) { vae->set_stop(nullptr); } }
+  } vae_stop_guard{models.video_vae};
+  if (models.video_vae != nullptr && models.stopping) {
+    models.video_vae->set_stop(models.stopping);
+  }
+
+  // MiniMax-H3-Image's posteriors: ONE generator for the request, drawn
+  // in reference order (ReferencePlan::posterior_one_stream).
+  TorchCpuRandn post_rng(plan.posterior_seed >= 0
+                             ? (std::uint64_t)plan.posterior_seed
+                             : 0);
   for (std::size_t i = 0; i < refs.size(); ++i) {
+    if (stopped()) { return bail_stop(); }
     const MediaReference& m = refs[i];
+    std::int64_t post_draws = 0;
     const std::string where = "reference " + std::to_string(i + 1);
+    const char* kind =
+        m.kind == MediaReference::Kind::kImage   ? "image"
+        : m.kind == MediaReference::Kind::kVideo ? "video"
+                                                 : "audio";
+    const std::string label = "reference " + std::to_string(i + 1) + "/" +
+                              std::to_string(refs.size()) + " (" + kind +
+                              ")";
+    report(done_work, label);
     Reference L;
+    ReferenceFit fit;
+    long long ms_audio = 0, ms_norm = 0, ms_vision = 0, ms_vae = 0;
+    int vision_frames = 0;
+    fit.kind       = m.kind;
+    fit.src_h      = m.height;
+    fit.src_w      = m.width;
+    fit.src_fps    = m.fps;
+    fit.src_frames = m.num_frames;
     vision_of.push_back(-1);
 
     // ---- the soundtrack, FIRST ---------------------------------------
     // Its rows are packed immediately before this reference's video
     // rows, so it is encoded in that order too -- one traversal, one
     // order, nothing to keep in step afterwards.
-    if (m.has_audio()) {
+    //
+    // A CARRIED soundtrack latent is already the DiT's rows, whitened:
+    // laid channel-major as the VAE's would be, no VAE, no resample --
+    // the audio half of the round trip the carried video latent skips.
+    if (m.has_audio_latent()) {
+      const int AC = m.audio_latent_channels;
+      const int n  = m.audio_latent_frames;
+      if (models.audio_vae != nullptr &&
+          models.audio_vae->config().latent_channels != AC) {
+        return fail(where + ": a carried soundtrack latent is " +
+                    std::to_string(AC) + " wide where the audio VAE's is " +
+                    std::to_string(
+                        models.audio_vae->config().latent_channels));
+      }
+      if (r.audio_row_elems == 0) { r.audio_row_elems = AC; }
+      if (AC != r.audio_row_elems) {
+        return fail(where + ": a carried soundtrack latent is " +
+                    std::to_string(AC) + " wide where the other "
+                    "soundtracks' rows are " +
+                    std::to_string(r.audio_row_elems));
+      }
+      const std::size_t need = (std::size_t)2 * AC * n;
+      if (m.audio_latent.size() < need) {
+        return fail(where + ": a carried soundtrack latent is shorter "
+                            "than its own shape");
+      }
+      const std::size_t base = r.audio_rows.size();
+      r.audio_rows.resize(base + need);
+      pack_audio_latent_rows(m.audio_latent.data(), AC, n, n,
+                             r.audio_rows.data() + base);
+      fit.audio_kept_seconds = (double)n / (double)kAudioLatentsPerSecond;
+      fit.audio_src_seconds  = fit.audio_kept_seconds;
+      L.num_audio_latents = n;
+    } else if (m.has_audio()) {
       if (models.audio_vae == nullptr) {
         return fail(where + " carries a soundtrack but no audio VAE is "
                             "loaded");
       }
       const int n_samp = (int)(m.pcm.size() / (std::size_t)m.channels);
+      if (m.sample_rate > 0) {
+        fit.audio_src_seconds = (double)n_samp / (double)m.sample_rate;
+      }
       std::vector<float> pcm;
       int kept = 0;
       std::string nerr;
       if (!normalize_audio_reference(m.pcm.data(), m.channels, n_samp,
-                                     m.sample_rate, max_seconds, &pcm, &kept,
-                                     &nerr)) {
+                                     m.sample_rate,
+                                     audio_reference_seconds(m, max_seconds),
+                                     &pcm, &kept, &nerr)) {
         return fail(where + ": " + nerr);
       }
       std::vector<float> lat;
       int frames = 0;
       std::string aerr;
+      report(done_work, label + ": soundtrack");
+      if (timing) { (void)tick(); }
       if (!models.audio_vae->encode(pcm.data(), 2, kept, &lat, &frames,
                                     &aerr)) {
         return fail(where + ": the audio VAE encode failed (" +
                     (aerr.empty() ? "unknown error" : aerr) + ")");
       }
+      if (timing) { ms_audio = tick(); }
       const auto& ac = models.audio_vae->config();
       const int AC = ac.latent_channels;
-      r.audio_row_elems = AC;
       const bool whiten = (int)ac.latents_mean.size() == AC &&
                           (int)ac.latents_std.size() == AC;
       const std::size_t base = r.audio_rows.size();
@@ -301,11 +694,57 @@ encode_references(const std::vector<MediaReference>& refs,
         r.audio_rows[base + k] =
             sd != 0.0f ? (lat[k] - mu) / sd : (lat[k] - mu);
       }
+      if (m.sample_rate > 0) {
+        fit.audio_kept_seconds = (double)kept / (double)m.sample_rate;
+      }
       L.num_audio_latents = frames;
     }
 
+    // ---- a reference that carries its own latent ----------------------
+    // Nothing to normalize, nothing for the VAE, and -- with no pixels
+    // -- nothing for the VISION TOWER either, so this reference
+    // contributes DiT rows but no conditioning rows. That is a real
+    // difference from the pixel route and not a detail: the tower's
+    // reading of the clip is part of the prompt. A caller that wants
+    // both wires the pixels AS WELL, and the branch further down uses
+    // the latent for the rows while the tower still reads the picture.
+    const bool latent_only = m.kind != MediaReference::Kind::kAudio
+                             && m.has_video_latent() && m.rgb.empty();
+    if (latent_only) {
+      // Presented, the text encoder would find no vision for it.
+      if (m.presented && models.text != nullptr) {
+        return fail(where + ": a carried latent with no pixels has nothing "
+                            "for the vision tower to read; it can only be "
+                            "the DiT's (not presented)");
+      }
+      const int lh = m.latent_height, lw = m.latent_width;
+      if ((lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
+        return fail(where + ": a carried latent is " + std::to_string(lh) +
+                    "x" + std::to_string(lw) + ", which the DiT's " +
+                    std::to_string(plan.patch_h) + "x" +
+                    std::to_string(plan.patch_w) + " patch does not divide");
+      }
+      const std::size_t need =
+          (std::size_t)m.latent_z * m.latent_frames * lh * lw;
+      if (m.video_latent.size() < need) {
+        return fail(where + ": a carried latent is shorter than its own "
+                            "shape");
+      }
+      const std::size_t before = r.video_rows.size();
+      pack_latent_rows_(m.video_latent.data(), m.latent_z, m.latent_frames,
+                        lh, lw, plan.patch_h, plan.patch_w, &r.video_rows);
+      augment_condition_rows_(&r.video_rows, before,
+                              plan.condition_noise_aug,
+                              plan.condition_noise_seed);
+      L.num_latent_frames = m.latent_frames;
+      L.latent_height     = lh;
+      L.latent_width      = lw;
+      fit.vae_frames      = 0;
+      fit.rate_frames     = m.latent_frames;
+    }
+
     // ---- the pixels ---------------------------------------------------
-    if (m.kind != MediaReference::Kind::kAudio) {
+    if (m.kind != MediaReference::Kind::kAudio && !latent_only) {
       if (m.num_frames <= 0 || m.height <= 0 || m.width <= 0) {
         return fail(where + " has no pixels");
       }
@@ -318,32 +757,153 @@ encode_references(const std::vector<MediaReference>& refs,
       std::vector<std::uint8_t> px;
       int nf = 0, th = 0, tw = 0;
       std::string nerr;
-      if (m.kind == MediaReference::Kind::kImage) {
-        if (!normalize_image_reference(m.rgb.data(), m.height, m.width,
-                                       plan.reference_image_short_edge,
-                                       plan.canvas_multiple, &px, &th, &tw,
-                                       &nerr)) {
+      report(done_work, label + ": resize");
+      if (timing) { (void)tick(); }
+      // A reference's own short edge wins over the plan's. Negative
+      // means it did not state one.
+      if (m.kind == MediaReference::Kind::kImage && plan.edge_min > 0) {
+        // MiniMax-H3-Image's: the short edge kept within its range, else
+        // scaled to the nearer end; then cut at the top left to whole VAE
+        // cells -- a picture keeps its own size, never the canvas's.
+        int bw = 0, bh = 0;
+        h3i::bound_short_edge(m.width, m.height, plan.edge_min,
+                              plan.edge_max, plan.canvas_multiple, &bw, &bh);
+        std::vector<std::uint8_t> full;
+        if (bh == m.height && bw == m.width) {
+          full = m.rgb;
+        } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                              m.width, bh, bw, &full)) {
+          return fail(where + ": the resize to " + std::to_string(bw) + "x" +
+                      std::to_string(bh) + " failed");
+        }
+        const int cell = models.video_vae != nullptr
+                             ? models.video_vae->config().patch
+                             : 16;
+        th = bh / cell * cell;
+        tw = bw / cell * cell;
+        if (th <= 0 || tw <= 0) {
+          return fail(where + " is smaller than one VAE cell");
+        }
+        if (th == bh && tw == bw) {
+          px = std::move(full);
+        } else {
+          px.resize((std::size_t)3 * th * tw);
+          for (int c = 0; c < 3; ++c) {
+            for (int y = 0; y < th; ++y) {
+              std::memcpy(px.data() + ((std::size_t)c * th + y) * tw,
+                          full.data() + ((std::size_t)c * bh + y) * bw,
+                          (std::size_t)tw);
+            }
+          }
+        }
+        nf = 1;
+        fit.rate_frames = 1;
+      } else if (m.kind == MediaReference::Kind::kImage &&
+                 plan.area_min_pixels > 0) {
+        // P-H3-Image's area range, the first picture -- the one edited --
+        // held at the canvas floor when the plan names one.
+        std::int64_t lo = plan.area_min_pixels;
+        if (i == 0 && plan.first_min_pixels > 0) {
+          lo = std::max(lo, plan.first_min_pixels);
+        }
+        ph3::size_in_area_range(m.width, m.height, lo, plan.area_max_pixels,
+                                plan.canvas_multiple, &tw, &th);
+        if (th == m.height && tw == m.width) {
+          px = m.rgb;
+        } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                              m.width, th, tw, &px)) {
+          return fail(where + ": the resize to " + std::to_string(tw) + "x" +
+                      std::to_string(th) + " failed");
+        }
+        nf = 1;
+        fit.rate_frames = 1;
+      } else if (m.kind == MediaReference::Kind::kImage) {
+        const int edge = m.short_edge >= 0 ? m.short_edge
+                                           : plan.reference_image_short_edge;
+        if (!normalize_image_reference(m.rgb.data(), m.height, m.width, edge,
+                                       plan.canvas_multiple,
+                                       plan.reference_image_max_pixels, &px,
+                                       &th, &tw, &nerr)) {
           return fail(where + ": " + nerr);
         }
         nf = 1;
+        fit.rate_frames = 1;
       } else {
+        const int edge =
+            m.short_edge >= 0 ? m.short_edge : plan.canvas_short_edge;
         if (!normalize_video_reference(m.rgb.data(), m.num_frames, m.height,
-                                       m.width, m.fps, plan.target_frames,
-                                       plan.canvas_multiple,
-                                       plan.canvas_short_edge,
+                                       m.width, m.fps,
+                                       target_frames_(m, plan),
+                                       plan.canvas_multiple, edge,
                                        plan.canvas_max_pixels, &px, &nf, &th,
                                        &tw, kFps, &nerr)) {
           return fail(where + ": " + nerr);
         }
+        // What the RATE resample produced, before the truncation. The
+        // two losses have different remedies, so they are counted apart
+        // rather than as one shortfall against the source.
+        const std::vector<int> counts =
+            frame_resample_counts(m.num_frames, m.fps, kFps);
+        int total = 0;
+        for (int c : counts) { total += c; }
+        fit.rate_frames = total;
       }
+      if (timing) { ms_norm = tick(); }
+      fit.canvas_h    = th;
+      fit.canvas_w    = tw;
+      fit.used_frames = nf;
 
       // The CONDITIONER's read: 2 fps for a video, the whole (single)
-      // frame for an image. Its canvas is the tower's own smart-resize,
-      // not this one -- the two models genuinely see different pixels.
-      if (models.vision != nullptr) {
+      // frame for an image. The tower smart-resizes to a canvas of its
+      // own, so the two models genuinely see different pixels -- but it
+      // resizes FROM `px`, at the canvas resolved above, so that canvas
+      // still sets how much the tower is given to look at.
+      //
+      // Which makes the canvas a CONDITIONING knob and not only a latent
+      // one, and it is the half that is easy to miss: the reference rows
+      // and the VAE cost are visible in the layout, while the token count
+      // just quietly moves. MEASURED on the two-reference ref2va example,
+      // changing only the video canvas 1344x768 -> 960x544: 3115 -> 2119
+      // conditioning rows, all of it the clip's vision blocks (the still
+      // is encoded at its own short edge and did not move).
+      // Not presented, the tower's reading would go unread.
+      if (models.vision != nullptr && m.presented) {
+        report(done_work, label + ": vision tower");
+        if (timing) { (void)tick(); }
         MetalQwenVisionEncoder::Result res;
         std::vector<float> secs;
-        if (m.kind == MediaReference::Kind::kImage) {
+        if (m.kind == MediaReference::Kind::kImage &&
+            plan.vision_edge > 0) {
+          // MiniMax-H3-Image's: the tower's own copy at a fixed short
+          // edge, from the picture as it arrived.
+          int vw = 0, vh = 0;
+          h3i::bound_short_edge(m.width, m.height, plan.vision_edge,
+                                plan.vision_edge, plan.canvas_multiple, &vw,
+                                &vh);
+          std::vector<std::uint8_t> vpx;
+          if (vh == m.height && vw == m.width) {
+            vpx = m.rgb;
+          } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                                m.width, vh, vw, &vpx)) {
+            return fail(where + ": the vision resize failed");
+          }
+          res = models.vision->encode(vpx.data(), vh, vw);
+        } else if (m.kind == MediaReference::Kind::kImage &&
+                   plan.vision_pixels > 0) {
+          // The tower's OWN copy (P-H3-Image): resized from the picture
+          // as it arrived, not from the VAE's.
+          int vw = 0, vh = 0;
+          ph3::size_at_area(m.width, m.height, plan.vision_pixels,
+                            plan.canvas_multiple, &vw, &vh);
+          std::vector<std::uint8_t> vpx;
+          if (vh == m.height && vw == m.width) {
+            vpx = m.rgb;
+          } else if (!resize_lanczos_planar_rgb(m.rgb.data(), m.height,
+                                                m.width, vh, vw, &vpx)) {
+            return fail(where + ": the vision resize failed");
+          }
+          res = models.vision->encode(vpx.data(), vh, vw);
+        } else if (m.kind == MediaReference::Kind::kImage) {
           res = models.vision->encode(px.data(), th, tw);
         } else {
           std::vector<int> idx;
@@ -359,9 +919,11 @@ encode_references(const std::vector<MediaReference>& refs,
                         px.data() + (std::size_t)idx[k] * frame_bytes,
                         frame_bytes);
           }
+          vision_frames = (int)idx.size();
           res = models.vision->encode_video(sampled.data(), (int)idx.size(),
                                             th, tw);
         }
+        if (timing) { ms_vision = tick(); }
         if (res.embeddings.empty()) {
           return fail(where + ": the vision tower produced nothing");
         }
@@ -370,50 +932,158 @@ encode_references(const std::vector<MediaReference>& refs,
         block_seconds.push_back(std::move(secs));
       }
 
-      // The VAE's read: the full 24 fps clip at MiniMax-H3's canvas.
-      if (models.video_vae != nullptr) {
+      // A CARRIED latent needs no VAE at all -- it is already the
+      // thing the VAE would have produced, without the round trip that
+      // attenuates it.
+      if (m.has_video_latent()) {
+        const int lh = m.latent_height, lw = m.latent_width;
+        if ((lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
+          return fail(where + ": a carried latent is " +
+                      std::to_string(lh) + "x" + std::to_string(lw) +
+                      ", which the DiT's " + std::to_string(plan.patch_h) +
+                      "x" + std::to_string(plan.patch_w) + " patch does "
+                      "not divide");
+        }
+        const std::size_t need = (std::size_t)m.latent_z * m.latent_frames
+                                 * lh * lw;
+        if (m.video_latent.size() < need) {
+          return fail(where + ": a carried latent is shorter than its "
+                      "own shape");
+        }
+        const std::size_t before2 = r.video_rows.size();
+        pack_latent_rows_(m.video_latent.data(), m.latent_z,
+                          m.latent_frames, lh, lw, plan.patch_h,
+                          plan.patch_w, &r.video_rows);
+        augment_condition_rows_(&r.video_rows, before2,
+                                plan.condition_noise_aug,
+                                plan.condition_noise_seed);
+        L.num_latent_frames = m.latent_frames;
+        L.latent_height     = lh;
+        L.latent_width      = lw;
+        fit.vae_frames      = 0;
+      } else if (models.video_vae != nullptr) {
         if (mc == nullptr) { return fail("the video VAE has no compute"); }
         const auto& vc = models.video_vae->config();
-        int use = nf;
-        if (m.kind == MediaReference::Kind::kVideo) {
-          // Snap DOWN to `17n + 5` so the VAE encodes without padding.
-          // Only bites when the reference is SHORTER than the target,
-          // whose own count already has that form. The clamp is what
-          // Python's slice does for a clip shorter than one chunk.
-          const int fpc = vc.clip_length;
-          const int lpc = vc.tokens_per_chunk();
-          if (fpc > 0 && lpc > 0) {
-            use = std::max(1, (nf - lpc) / fpc) * fpc + lpc;
-            use = std::min(use, nf);
-          }
-        }
+        const int use =
+            vae_frames_(m.kind == MediaReference::Kind::kVideo, nf, vc);
+        fit.vae_frames = use;
+        if (timing) { (void)tick(); }
         metal_compute::SharedBuffer in =
             to_vae_input_(mc, px.data(), use, th, tw);
         if (in.empty()) { return fail(where + ": VAE input alloc failed"); }
         int lf = 0;
         std::string eerr;
+        // THE LONG STRETCH, so the bar moves per tile inside it: the
+        // reference's VAE share, in proportion to the tiles the VAE has
+        // finished. Cleared on every way out -- the VAE is the stage's,
+        // and a callback left on it would point at this frame.
+        struct TileProgressReset {
+          MetalMiniMaxH3VideoVae* vae;
+          ~TileProgressReset() { vae->set_tile_progress(nullptr); }
+        } tile_reset{models.video_vae};
+        if (reporting) {
+          const std::uint64_t at = done_work + (work[i] - vae_work[i]);
+          const std::uint64_t span = vae_work[i];
+          report(at, label + ": video VAE");
+          models.video_vae->set_tile_progress(
+              [&report, &label, at, span](int d, int t) {
+                const std::uint64_t part =
+                    t > 0 ? span * (std::uint64_t)std::max(d, 0) /
+                                (std::uint64_t)t
+                          : 0;
+                report(at + part, label + ": video VAE tile " +
+                                      std::to_string(d) + "/" +
+                                      std::to_string(t));
+              });
+        }
         metal_compute::SharedBuffer mom =
             models.video_vae->encode_video(in, use, th, tw, &lf, &eerr);
         if (mom.empty() || lf <= 0) {
+          // A STOP COMES BACK THROUGH HERE, as an empty buffer with no
+          // reason -- that is the VAE's contract for one, because a
+          // stop is not a failure. Asking before reporting is what
+          // keeps "the video VAE encode failed (unknown error)" off the
+          // screen of somebody who pressed stop. MEASURED before this
+          // check existed: a timer-fired stop 14 s into a 2048x2048
+          // reference was served in 7.6 s and then filed as a failure.
+          if (stopped()) { return bail_stop(); }
           return fail(where + ": the video VAE encode failed (" +
                       (eerr.empty() ? "unknown error" : eerr) + ")");
         }
-        const int lh = th / vc.patch, lw = tw / vc.patch;
-        if ((lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
+        // The latent the VAE made, and -- MiniMax-H3-Image's -- cut to
+        // whole DiT patches at the top left after the posterior is
+        // sampled over all of it.
+        const int full_h = th / vc.patch, full_w = tw / vc.patch;
+        const bool crop = plan.edge_min > 0 && lf == 1;
+        const int lh = crop ? full_h / plan.patch_h * plan.patch_h : full_h;
+        const int lw = crop ? full_w / plan.patch_w * plan.patch_w : full_w;
+        if (lh <= 0 || lw <= 0 ||
+            (lh % plan.patch_h) != 0 || (lw % plan.patch_w) != 0) {
           return fail(where + " encodes to a " + std::to_string(lh) + "x" +
                       std::to_string(lw) + " latent, which the DiT's " +
                       std::to_string(plan.patch_h) + "x" +
                       std::to_string(plan.patch_w) + " patch does not "
                       "divide");
         }
-        r.video_row_elems = vc.z_channels * plan.patch_h * plan.patch_w;
-        pack_condition_rows_(mom, vc.z_channels, lf, lh, lw, plan.patch_h,
-                             plan.patch_w, vc.latents_mean, vc.latents_std,
-                             &r.video_rows);
+        const std::size_t before = r.video_rows.size();
+        if (plan.posterior_seed >= 0) {
+          std::vector<float> lat;
+          // A fresh generator per picture, or the request's one stream.
+          TorchCpuRandn fresh((std::uint64_t)plan.posterior_seed);
+          TorchCpuRandn& rng = plan.posterior_one_stream ? post_rng : fresh;
+          if (!sample_condition_latent_(
+                  static_cast<const std::uint16_t*>(mom.contents()),
+                  vc.z_channels, lf, full_h, full_w, rng, vc.latents_mean,
+                  vc.latents_std, &lat)) {
+            return fail(where + ": the posterior sample failed");
+          }
+          post_draws =
+              (std::int64_t)vc.z_channels * lf * full_h * full_w;
+          if (lh != full_h || lw != full_w) {
+            // [z, lf, full_h, full_w] -> [z, lf, lh, lw], the top left.
+            std::vector<float> cut((std::size_t)vc.z_channels * lf * lh * lw);
+            for (std::size_t c = 0; c < (std::size_t)vc.z_channels * lf;
+                 ++c) {
+              for (int y = 0; y < lh; ++y) {
+                std::memcpy(cut.data() + (c * lh + y) * lw,
+                            lat.data() + (c * full_h + y) * full_w,
+                            (std::size_t)lw * sizeof(float));
+              }
+            }
+            lat = std::move(cut);
+          }
+          pack_latent_rows_(lat.data(), vc.z_channels, lf, lh, lw,
+                            plan.patch_h, plan.patch_w, &r.video_rows);
+        } else {
+          pack_condition_rows_(mom, vc.z_channels, lf, lh, lw, plan.patch_h,
+                               plan.patch_w, vc.latents_mean, vc.latents_std,
+                               &r.video_rows);
+        }
+        augment_condition_rows_(&r.video_rows, before,
+                                plan.condition_noise_aug,
+                                plan.condition_noise_seed);
         L.num_latent_frames = lf;
         L.latent_height     = lh;
         L.latent_width      = lw;
+        if (timing) { ms_vae = tick(); }
       }
+    }
+
+    if (timing) {
+      models.log(
+          "[h3-refenc] " + where + " (" + kind + " " +
+          std::to_string(m.num_frames) + "f " + std::to_string(m.width) + "x" +
+          std::to_string(m.height) + " -> " + std::to_string(fit.used_frames) +
+          "f " + std::to_string(fit.canvas_w) + "x" +
+          std::to_string(fit.canvas_h) + "): resize " +
+          std::to_string(ms_norm) + " ms, vision tower " +
+          std::to_string(vision_frames) + " frames " +
+          std::to_string(ms_vision) + " ms, video VAE " +
+          std::to_string(fit.vae_frames) + "f -> " +
+          std::to_string(L.num_latent_frames) + " latent " +
+          std::to_string(ms_vae) + " ms, audio VAE " +
+          std::to_string(L.num_audio_latents) + " latents " +
+          std::to_string(ms_audio) + " ms");
     }
 
     L.kind = m.kind == MediaReference::Kind::kImage ? Reference::Kind::kImage
@@ -421,27 +1091,34 @@ encode_references(const std::vector<MediaReference>& refs,
                  ? Reference::Kind::kVideo
                  : Reference::Kind::kAudio;
     r.layout.push_back(L);
-    if (models.progress) {
-      // +1: the presentation below is a step of its own. See the
-      // declaration of ReferenceEncoders::progress.
-      models.progress((int)i + 1, (int)refs.size() + 1);
-    }
+    r.fits.push_back(fit);
+    r.posterior_draws.push_back(post_draws);
+    done_work += work[i];
+    report(done_work, label + ": done");
   }
 
   // ---- the presentation ------------------------------------------------
   // One conditioner call over the whole request: the labels are numbered
   // across references, so this cannot be done a reference at a time.
+  //
+  // THE LAST CHANCE TO STOP CHEAPLY. What follows is a single call with
+  // no hook to offer, so a stop arriving inside it is served when it
+  // returns; checking here is what keeps a stop from paying for a
+  // conditioner run whose output is about to be thrown away.
+  if (stopped()) { return bail_stop(); }
   if (models.text != nullptr) {
     std::vector<MiniMaxH3TextEncoder::Reference> pres;
     pres.reserve(refs.size());
     for (std::size_t i = 0; i < refs.size(); ++i) {
+      // The DiT's alone: no label, the ones after it numbered without it.
+      if (!refs[i].presented) { continue; }
       MiniMaxH3TextEncoder::Reference p;
       p.kind = refs[i].kind == MediaReference::Kind::kImage
                    ? MiniMaxH3TextEncoder::Reference::Kind::kImage
                : refs[i].kind == MediaReference::Kind::kVideo
                    ? MiniMaxH3TextEncoder::Reference::Kind::kVideo
                    : MiniMaxH3TextEncoder::Reference::Kind::kAudio;
-      p.has_audio = refs[i].has_audio();
+      p.has_audio = refs[i].has_soundtrack();
       const int vi = vision_of[i];
       if (vi >= 0) {
         p.vision = &vision[(std::size_t)vi];
@@ -450,6 +1127,15 @@ encode_references(const std::vector<MediaReference>& refs,
       pres.push_back(std::move(p));
     }
     std::string cerr;
+    // Indeterminate: see ReferenceEncoders::progress.
+    if (reporting) {
+      models.progress(0, 0, refs.empty()
+                                ? std::string("conditioner, prompt only")
+                                : "conditioner, " +
+                                      std::to_string(refs.size()) +
+                                      " reference(s)");
+    }
+    if (timing) { (void)tick(); }
     r.conditioning = models.text->encode_references(pres, prompt,
                                                     &r.token_tags,
                                                     &r.n_tokens, &cerr);
@@ -457,17 +1143,38 @@ encode_references(const std::vector<MediaReference>& refs,
       return fail("the conditioner failed (" +
                   (cerr.empty() ? "unknown error" : cerr) + ")");
     }
+    if (timing) {
+      models.log("[h3-refenc] presentation: " + std::to_string(r.n_tokens) +
+                 " tokens, conditioner " + std::to_string(tick()) + " ms");
+    }
   }
 
-  // The presentation is done -- reported here rather than inside the
+  // The request is done -- reported here rather than inside the
   // `models.text` branch above, because reaching this line is what makes
-  // the request finished whether or not a conditioner was attached.
-  if (models.progress) {
-    models.progress((int)refs.size() + 1, (int)refs.size() + 1);
-  }
+  // it finished whether or not a conditioner was attached.
+  report(total_work, "done");
 
   *out = std::move(r);
   return true;
+}
+
+void
+pack_condition_rows_for_test(const std::uint16_t* moments, int z, int frames,
+                             int h, int w, int patch_h, int patch_w,
+                             const std::vector<float>& latents_mean,
+                             const std::vector<float>& latents_std,
+                             std::vector<float>* rows)
+{
+  pack_condition_rows_raw_(moments, z, frames, h, w, patch_h, patch_w,
+                           latents_mean, latents_std, rows);
+}
+
+void
+pack_latent_rows_for_test(const float* latent, int z, int frames, int h,
+                          int w, int patch_h, int patch_w,
+                          std::vector<float>* rows)
+{
+  pack_latent_rows_(latent, z, frames, h, w, patch_h, patch_w, rows);
 }
 
 }  // namespace minimax_h3

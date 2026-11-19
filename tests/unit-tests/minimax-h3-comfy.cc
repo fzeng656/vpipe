@@ -28,6 +28,7 @@
 #include "generative-models/shared/comfy-checkpoint.h"
 #include "common/flex-data.h"
 #include "stages/model-detect.h"
+#include "stages/model-quantize-stage.h"
 
 #include <cstdint>
 #include <cstring>
@@ -498,6 +499,50 @@ TEST(minimax_h3_comfy, scan_repo_lists_every_readable_component)
   fs::remove_all(part, ec);
 }
 
+// A repository that IS one H3 VAE file, at its top with no `vae/` and no
+// config.json: Mamad8/MiniMax-H3-Image-VAE, registered by its directory.
+// The Comfy-Org probe looks in `vae/` and there is no class to read, so
+// both VAE stages took the directory for a Qwen-Image VAE and refused it
+// ("missing latents_mean/latents_std") -- named by its file, it ran.
+TEST(minimax_h3_comfy, a_repository_of_one_vae_file_resolves_to_it)
+{
+  const fs::path root = scratch_() / "image-vae";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const fs::path file =
+      root / "minimax_h3_t1_image_vae_step1597.safetensors";
+  write_component_(file, "minimax_h3_video_vae", "{\"vae_clip_length\": 17}");
+  // A file beside it that names no VAE changes nothing.
+  write_component_(root / "example.safetensors", "format", "pt");
+
+  EXPECT_TRUE(builtin_vae_family(root.string()) == "minimax-h3");
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(root.string()) ==
+              file.string());
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(file.string()) ==
+              file.string());
+  // The role-subdirectory search alone misses it: that was the gap.
+  EXPECT_TRUE(comfy::resolve_component(root.string(), "vae",
+                                       "minimax_h3_video_vae").empty());
+
+  // A `vae/` beside it still wins: the top is the last resort.
+  const fs::path sub =
+      root / "vae" / "minimax_h3_video_vae_fp16.safetensors";
+  write_component_(sub, "minimax_h3_video_vae", "{\"vae_clip_length\": 17}");
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(root.string()) ==
+              sub.string());
+
+  // A directory whose files name no H3 VAE is the standalone Qwen-Image
+  // VAE it always was.
+  const fs::path other = scratch_() / "standalone-vae";
+  fs::remove_all(other, ec);
+  write_component_(other / "qwen_image_vae.safetensors", "format", "pt");
+  EXPECT_TRUE(builtin_vae_family(other.string()) == "krea2");
+  EXPECT_TRUE(MetalMiniMaxH3VideoVae::resolve_vae_dir(other.string()) ==
+              other.string());
+  fs::remove_all(root, ec);
+  fs::remove_all(other, ec);
+}
+
 // The record has to SAY which components a checkout holds, so a later
 // failure reads as "this copy has no text encoder" rather than as an
 // unsupported model.
@@ -773,4 +818,258 @@ TEST(minimax_h3_comfy, a_told_partition_beats_the_filename)
   std::printf("[minimax_h3_comfy] a tree with both DiTs resolves fl2va "
               "untold, ref2va when told\n");
   fs::remove_all(root, ec);
+}
+
+// THE RELEASED MiniMaxAI LAYOUT, through all THREE resolvers.
+//
+// MiniMaxAI publishes both partitions from ONE repo, so a fetch lands
+// them a level down -- <root>/FL2VA/transformer and <root>/Ref2VA/... --
+// and the models-DB record points at the repo root, because both records
+// share it. The root itself carries no model_index.json, no config.json,
+// no transformer/ and no diffusion_models/: every probe a resolver
+// naturally reaches for is one directory too high.
+//
+// The DiT loader has always walked down to the partition. model-quantize
+// has its OWN resolver, and it did not -- so pointing src_model at the
+// registry key resolved to the root, missed every rung, and fell through
+// to the LANGUAGE-model quantizer, which reported `arch='unknown'
+// layer_prefix='' n_layers=0` and then "no submodule matching target
+// 'dit'". Two messages that both read as "this family is unsupported"
+// for a family this build fully supports.
+//
+// That resolver was unreachable from a test, which is the reason it
+// could drift twice. It is reachable now, and this asserts the two agree
+// on the shape that separated them.
+TEST(minimax_h3_comfy, the_released_partition_layout_resolves_for_quantize)
+{
+  const fs::path root = scratch_() / "minimaxai-repo";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+
+  auto write_partition_ = [&](const char* part) {
+    const fs::path p = root / part;
+    fs::create_directories(p / "transformer");
+    std::ofstream mi(p / "model_index.json");
+    mi << "{\"transformer\": [\"diffusers\", \"MiniMaxH3DiTModel\"]}";
+    std::ofstream cf(p / "transformer" / "config.json");
+    cf << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+  };
+  write_partition_("FL2VA");
+  write_partition_("Ref2VA");
+
+  // The root really is bare -- if any of these ever appears, the rungs
+  // above would catch it and this test would stop testing the rung it
+  // was written for.
+  ASSERT_TRUE(!fs::exists(root / "model_index.json"));
+  ASSERT_TRUE(!fs::exists(root / "config.json"));
+  ASSERT_TRUE(!fs::is_directory(root / "transformer", ec));
+  ASSERT_TRUE(!fs::is_directory(root / "diffusion_models", ec));
+
+  // The loader, which always knew.
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string(),
+                                                         "fl2va") ==
+              (root / "FL2VA" / "transformer").string());
+  EXPECT_TRUE(MetalMiniMaxH3Transformer::resolve_dit_dir(root.string(),
+                                                         "ref2va") ==
+              (root / "Ref2VA" / "transformer").string());
+
+  // model-quantize, which did not. The family matters as much as the
+  // path: it is what routes the source to the DiT quantizer instead of
+  // the LM one.
+  {
+    std::string fam;
+    const std::string d = ModelQuantizeStage::resolve_source_dit_dir(
+        root.string(), &fam, "fl2va");
+    EXPECT_TRUE(d == (root / "FL2VA" / "transformer").string());
+    EXPECT_TRUE(fam == "minimax-h3");
+  }
+  {
+    std::string fam;
+    const std::string d = ModelQuantizeStage::resolve_source_dit_dir(
+        root.string(), &fam, "ref2va");
+    EXPECT_TRUE(d == (root / "Ref2VA" / "transformer").string());
+    EXPECT_TRUE(fam == "minimax-h3");
+  }
+  // Untold, both resolvers prefer FL2VA -- the historical answer, so a
+  // graph written before Ref2VA existed keeps resolving as it did.
+  {
+    std::string fam;
+    EXPECT_TRUE(ModelQuantizeStage::resolve_source_dit_dir(
+                    root.string(), &fam) ==
+                (root / "FL2VA" / "transformer").string());
+  }
+  // Pointing at the partition directly still works -- it is the rung
+  // above, and it is what unblocked this by hand.
+  {
+    std::string fam;
+    EXPECT_TRUE(ModelQuantizeStage::resolve_source_dit_dir(
+                    (root / "FL2VA").string(), &fam) ==
+                (root / "FL2VA" / "transformer").string());
+    EXPECT_TRUE(fam == "minimax-h3");
+  }
+
+  // A directory that is NOT a DiT of any family must still resolve to
+  // nothing. The new rung delegates to a resolver that answers with the
+  // path it was handed when it matches nothing, so without the family
+  // confirmation this would claim every directory in the world.
+  {
+    const fs::path plain = scratch_() / "not-a-dit";
+    fs::remove_all(plain, ec);
+    fs::create_directories(plain);
+    std::ofstream f(plain / "config.json");
+    f << "{\"model_type\": \"qwen3\"}";
+    f.close();
+    std::string fam = "sentinel";
+    EXPECT_TRUE(ModelQuantizeStage::resolve_source_dit_dir(
+                    plain.string(), &fam).empty());
+    EXPECT_TRUE(fam.empty());
+    fs::remove_all(plain, ec);
+  }
+
+  std::printf("[minimax_h3_comfy] the released partition layout resolves "
+              "for the loader and for model-quantize\n");
+  fs::remove_all(root, ec);
+}
+
+// WHERE THE COMPONENTS ARE COPIED FROM, which is a different question
+// from where the DiT is -- and the one that was wrong.
+//
+// resolve_source_dit_dir already found <repo>/FL2VA/transformer (the
+// test above pins it), but the pass that does the work was handed the
+// SOURCE, looked for <repo>/transformer, and reported
+//
+//   minimax-h3 root '<repo>' has no 'transformer' component to quantize
+//
+// for a repo that was fully downloaded. The components sit beside the
+// DiT, not beside the repo, so the root to copy from is the DiT's
+// parent.
+TEST(minimax_h3_comfy, a_partitioned_repo_quantizes_from_the_partition)
+{
+  const fs::path root = scratch_() / "minimaxai-piperoot";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+
+  auto write_partition_ = [&](const char* part) {
+    const fs::path p = root / part;
+    fs::create_directories(p / "transformer");
+    fs::create_directories(p / "text_encoder");
+    std::ofstream mi(p / "model_index.json");
+    mi << "{\"transformer\": [\"diffusers\", \"MiniMaxH3DiTModel\"],"
+          " \"_minimax_h3\": {\"partition\": \""
+       << (std::string(part) == "FL2VA" ? "fl2va" : "ref2va") << "\"}}";
+    std::ofstream cf(p / "transformer" / "config.json");
+    cf << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+  };
+  write_partition_("FL2VA");
+  write_partition_("Ref2VA");
+
+  // The partition asked for is the one copied from -- NOT the repo, and
+  // not the other half.
+  for (const char* part : {"FL2VA", "Ref2VA"}) {
+    const std::string want = std::string(part) == "FL2VA" ? "fl2va" : "ref2va";
+    std::string fam;
+    const std::string dit =
+        ModelQuantizeStage::resolve_source_dit_dir(root.string(), &fam, want);
+    ASSERT_TRUE(fam == "minimax-h3");
+    const std::string pr =
+        ModelQuantizeStage::pipeline_root_for(root.string(), dit);
+    EXPECT_TRUE(pr == (root / part).string());
+    if (pr != (root / part).string()) {
+      std::printf("[minimax_h3_comfy] %s: dit='%s' pr='%s' want='%s'\n",
+                  want.c_str(), dit.c_str(), pr.c_str(),
+                  (root / part).string().c_str());
+    }
+    // ... and the component the failing message named is really there
+    // once the root is right, which is the whole point.
+    EXPECT_TRUE(fs::is_directory(fs::path(pr) / "transformer", ec));
+    // The partition survives into what the output will record: it is
+    // read from the model_index.json beside the transformer, which only
+    // exists at the partition root.
+    EXPECT_TRUE(MetalMiniMaxH3Transformer::partition_of(dit) == want);
+  }
+
+  // An ORDINARY diffusers root is untouched: the DiT's parent IS the
+  // source, so nothing moves for every other family.
+  {
+    const fs::path plain = scratch_() / "plain-diffusers";
+    fs::remove_all(plain, ec);
+    fs::create_directories(plain / "transformer");
+    std::ofstream cf(plain / "transformer" / "config.json");
+    cf << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+    cf.close();
+    EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(
+                    plain.string(), (plain / "transformer").string())
+                == plain.string());
+  }
+
+  // A DiT resolved to something that is not a pipeline root leaves the
+  // source alone rather than copying from a tree nobody named.
+  EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(root.string(), "")
+              == root.string());
+  EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(
+                  root.string(), (root / "nope" / "transformer").string())
+              == root.string());
+
+  // ---- A COMFY-ORG REPACK MUST NOT MOVE ----
+  //
+  // Routing sends a repack to the comfy pass BEFORE this derivation is
+  // reached, so in practice it never sees one. Asserted anyway, because
+  // "unreachable today" is the state this file has already watched a
+  // resolver rot in, and because the two shapes fail here for DIFFERENT
+  // reasons -- only one of which is the ordering.
+  {
+    const fs::path repack = scratch_() / "comfy-repack-root";
+    fs::remove_all(repack, ec);
+
+    // A SOURCE repack: the DiT is a FILE under diffusion_models/. Its
+    // parent is a real directory that is NOT the source, so the parent
+    // test alone would move the root onto diffusion_models/ and copy a
+    // role subdir as if it were a pipeline. What stops that is the
+    // "looks like a pipeline root" guard -- this is the case that makes
+    // the guard load-bearing rather than defensive.
+    const fs::path dfile =
+        repack / "diffusion_models" / "minimax_h3_fl2va_bf16.safetensors";
+    write_component_(dfile, "config", kH3Config);
+    EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(repack.string(),
+                                                      dfile.string())
+                == repack.string());
+
+    // An ALREADY-QUANTIZED repack: the DiT is the diffusion_models/
+    // DIRECTORY, so the parent IS the source and the derivation
+    // short-circuits before the guard. Chaining a second pass over a
+    // repack goes through here.
+    fs::remove_all(repack / "diffusion_models", ec);
+    fs::create_directories(repack / "diffusion_models");
+    {
+      std::ofstream f(repack / "diffusion_models" / "config.json");
+      f << "{\"_class_name\": \"MiniMaxH3DiTModel\"}";
+    }
+    EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(
+                    repack.string(), (repack / "diffusion_models").string())
+                == repack.string());
+  }
+}
+
+// The real Comfy-Org-shaped pack on disk, when one is present. Synthetic
+// trees pin the rules; this pins that the rules describe a checkpoint
+// somebody actually produced. Env-gated, so it skips where the model is
+// not installed.
+TEST(minimax_h3_comfy, a_real_repack_pack_does_not_move)
+{
+  const char* root = std::getenv("VPIPE_MINIMAX_H3_REPACK_PATH");
+  if (root == nullptr || *root == '\0') {
+    std::printf("[minimax_h3_comfy] VPIPE_MINIMAX_H3_REPACK_PATH unset; "
+                "skipping the on-disk repack check\n");
+    return;
+  }
+  std::string fam;
+  const std::string dit =
+      ModelQuantizeStage::resolve_source_dit_dir(root, &fam);
+  std::printf("[minimax_h3_comfy] real pack: fam='%s' dit='%s'\n",
+              fam.c_str(), dit.c_str());
+  EXPECT_TRUE(fam == "minimax-h3");
+  // Whatever shape it resolved to, the pass must copy from the pack
+  // itself -- never from a role subdir inside it.
+  EXPECT_TRUE(ModelQuantizeStage::pipeline_root_for(root, dit)
+              == std::string(root));
 }

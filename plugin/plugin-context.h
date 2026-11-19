@@ -2,22 +2,29 @@
 #define VPIPE_PLUGIN_CONTEXT_H
 
 #include "pipeline/stage-registry.h"
+#include "plugin/plugin-abi.h"
 #include "interfaces/session-services-intf.h"
 #include "stages/model-catalog.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
 class SessionContextIntf;
 
 namespace genai { class VideoModelFamily; }
+namespace genai { class ImageModelFamily; }
 namespace genai { class VaeModelFamily; }
 namespace genai { class QuantizableFamily; }
 
@@ -30,15 +37,29 @@ namespace genai { class QuantizableFamily; }
 // no-op registration (the name/arch is already taken) is logged as a
 // warning through the session so collisions are visible.
 class VpipePluginContext {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
+  // `plugin_abi` is the version the plugin reported -- the host's own
+  // when the context is not for a loaded plugin (tests, built-ins).
   VpipePluginContext(const SessionContextIntf* session,
-                     std::string_view          plugin_name);
+                     std::string_view          plugin_name,
+                     std::uint32_t             plugin_abi =
+                         VPIPE_PLUGIN_ABI_VERSION);
 
   // ---- introspection -------------------------------------------------
-  // The host's plugin ABI version (== VPIPE_PLUGIN_ABI_VERSION) and a
-  // human libvpipe version string, so a plugin can feature-detect.
+  // The HOST's plugin ABI version (== VPIPE_PLUGIN_ABI_VERSION), the one
+  // this plugin was built for (the same, or VPIPE_PLUGIN_ABI_OLDEST when
+  // a newer host loads it inside the support window), and a human
+  // libvpipe version string.
   std::uint32_t    abi_version()  const noexcept;
+  std::uint32_t    plugin_abi()   const noexcept { return _plugin_abi; }
   std::string_view host_version() const noexcept;
+
+  // Does this host provide `feature` (a VPIPE_FEATURE_* string)? The way a
+  // plugin uses an addition when it is there and does without when it is
+  // not. One it cannot do without belongs in VpipePluginInfo::
+  // required_features instead, so the host refuses the plugin at load.
+  bool has_feature(std::string_view feature) const noexcept;
 
   // ---- stages --------------------------------------------------------
   // Register a stage type T (a TypedStage<T> subclass with a static
@@ -90,6 +111,23 @@ public:
   // mistake worth seeing.
   bool register_video_family(std::unique_ptr<genai::VideoModelFamily> family);
 
+  // ---- image families --------------------------------------------------
+  // The same seam for `generate-image`, drawn at the same place: given
+  // conditioning, geometry, a step count and a seed, produce a LATENT.
+  // The family owns its denoise loop -- its scheduler, its guidance
+  // rule, its patchify, its residency -- and the stage owns the ports,
+  // the beats, the geometry bookkeeping and the sampler/scheduler
+  // selections, which it hands down unparsed.
+  //
+  // A latent rather than pixels, which is why an image family and a VAE
+  // family together need no stage of their own: generate-image's oport0
+  // is what the stock `vae-decode` reads. See
+  // generative-models/image-model-registry.h.
+  //
+  // Takes ownership; first-wins on `tag()`, on the same terms as the
+  // video registry above.
+  bool register_image_family(std::unique_ptr<genai::ImageModelFamily> family);
+
   // ---- VAE families ----------------------------------------------------
   // Contribute a VAE DECODER, so the stock `vae-decode` stage can turn a
   // latent from an out-of-tree checkpoint into RGB frames. The family
@@ -104,10 +142,41 @@ public:
   //
   // Takes ownership; the registry outlives every stage. First-wins on
   // `tag()`, and a tag colliding with a built-in family name
-  // ("wan", "minimax-h3", "flux2", "mage", "krea2") is refused outright:
+  // ("wan", "minimax-h3", "flux2", "krea2") is refused outright:
   // dispatch is pointer-guarded so it would still run the right code,
   // but every log line would read as a built-in.
   bool register_vae_family(std::unique_ptr<genai::VaeModelFamily> family);
+
+  // ---- family profiles ------------------------------------------------
+  // WHAT YOUR FAMILY KNOWS ABOUT ITSELF THAT THE HOST CANNOT, for any
+  // host subsystem that asks: how your prompt is conditioned, which of
+  // your DiT's tensors are worth quantizing, and whatever comes next.
+  //
+  // `domain` names the subsystem and `family` your model's tag; the bag
+  // carries that domain's vocabulary. The domains and their keys live in
+  // headers beside the code that reads them --
+  // generative-models/conditioner-profile.h,
+  // generative-models/quantize-profile.h -- each of which names the
+  // `domain` string to pass.
+  //
+  // ONE METHOD, DELIBERATELY. The ABI is a strict-equality cookie, so
+  // every entry point added here is a rebuild every plugin author pays
+  // for. A domain STRING keeps that decision out of the ABI: the next
+  // subsystem that wants per-family facts picks a name, writes a key
+  // header, and needs no new method and no version bump.
+  //
+  // It is the counterpart to the acceleration bag, running the other
+  // way: that one is the host telling a family what the graph asked for,
+  // this one a family telling the host what its checkpoint needs. Both
+  // are FlexData for the same reason -- a typed struct puts one side's
+  // vocabulary into the other's ABI.
+  //
+  // A profile is DATA, never behaviour. It cannot hand the host code to
+  // run, reach machinery the host did not offer, or switch off a policy
+  // the host enforces. A family whose needs exceed its domain's
+  // vocabulary ships a stage -- see docs/PLUGINS.md.
+  bool register_family_profile(std::string domain, std::string family,
+                               FlexData profile);
 
   // ---- quantizable families --------------------------------------------
   // Contribute a QUANTIZE recipe, so `model-quantize` can package this
@@ -154,8 +223,16 @@ private:
 
   const SessionContextIntf* _session;
   std::string               _plugin;
+  std::uint32_t             _plugin_abi;
 };
 
+// The features this host provides, and a lookup. Callable at any time,
+// not only while registering -- a stage may test for one at run time.
+std::span<const std::string_view> host_features() noexcept;
+bool host_has_feature(std::string_view feature) noexcept;
+
 }
+
+VPIPE_API_END
 
 #endif

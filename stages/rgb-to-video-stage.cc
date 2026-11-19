@@ -26,19 +26,73 @@ namespace vpipe {
 
 namespace {
 
+// The CLOSED SETS, for the editor's dropdown. Every one of these keys is
+// already closed in resolve_config_(), which fails the stage on anything
+// else and stays the authority -- what these add is that the editor
+// offers the values instead of leaving the user to find them in the doc
+// and then discover a typo at launch.
+constexpr SpecExtra kPixFmtChoices[] = {
+  {spec_key::kChoices, "yuv420p,yuv422p,yuv444p,rgb24"},
+};
+constexpr SpecExtra kColorRangeChoices[] = {
+  {spec_key::kChoices, "limited,full"},
+};
+constexpr SpecExtra kColorspaceChoices[] = {
+  {spec_key::kChoices, "bt601,bt709"},
+};
+
 const ConfigKey kAttrs[] = {
   {.key = "fps", .type = ConfigType::Real, .required = false,
    .doc = "frame rate to declare when the producer's sideband carries none. "
           "16 is the Wan video default",
    .def_real = 16.0},
   {.key = "pix_fmt", .type = ConfigType::String, .required = false,
-   .doc = "pixel format of the emitted frames: \"yuv420p\" (what H.264 "
-          "wants) or \"rgb24\" (no conversion, for a lossless codec)",
-   .def_str = "yuv420p"},
+   .doc = "pixel format of the emitted frames. \"yuv420p\" (the "
+          "default) is what an SDR H.264 clip is and what every encoder "
+          "takes. \"yuv422p\" and \"yuv444p\" keep more chroma -- 444 "
+          "keeps all of it, so an RGB round trip through this stage and "
+          "back is limited only by the codec -- which is worth having on "
+          "an INTERMEDIATE this graph will read back itself, and costs "
+          "bitrate on a delivery file. \"rgb24\" does no conversion at "
+          "all, for a lossless codec. CHECK THE ENCODER TAKES IT: "
+          "h264_videotoolbox, the default, is yuv420p ONLY, so 422 and "
+          "444 need video_codec set to something that accepts them "
+          "(libx264, ffv1). A subsampled axis may not be odd -- 420 "
+          "needs both even, 422 the width -- and this stage refuses "
+          "rather than rounding",
+   .def_str = "yuv420p", .extra = kPixFmtChoices},
+  {.key = "color_range", .type = ConfigType::String, .required = false,
+   .doc = "the YUV swing this stage writes, and TAGS the file with. "
+          "\"limited\" (the default) is 16..235 studio swing, what every "
+          "player assumes of an SDR H.264 clip and therefore the safe "
+          "delivery choice. \"full\" is 0..255: it keeps all 256 code "
+          "values instead of 219, which is worth having on an "
+          "INTERMEDIATE this graph will read back itself -- a multi-part "
+          "video chain handing each clip to the next -- but a player that "
+          "ignores the range tag renders it with crushed blacks. Either "
+          "way the file says which it is, so vpipe reads it back "
+          "unchanged; the choice is about what ELSE opens it",
+   .def_str = "limited", .extra = kColorRangeChoices},
+  {.key = "colorspace", .type = ConfigType::String, .required = false,
+   .doc = "the YUV MATRIX this stage writes, and TAGS the file with. "
+          "\"bt601\" (the default) is what this stage has always "
+          "emitted and what a player assumes of a clip that does not "
+          "say; \"bt709\" is the correct matrix for HD delivery and "
+          "what a player assumes of HD when the file is silent. It is a "
+          "different question from color_range -- the matrix tilts HUE "
+          "and saturation where the range moves CONTRAST -- and the two "
+          "errors do not cancel. Changing it changes the pixels, not "
+          "just the tag: the file says which matrix it is either way, so "
+          "vpipe reads it back unchanged whichever you pick",
+   .def_str = "bt601", .extra = kColorspaceChoices},
 };
 const PortSpec kIports[] = {
-  {.name = "image", .doc = "planar U8 RGB TensorBeat [3, H, W], one per frame "
-                           "in presentation order",
+  {.name = "image", .doc = "planar RGB [3, H, W] or RGBA [4, H, W] "
+                           "TensorBeat, one per frame in presentation "
+                           "order: U8, or F16 / F32 in 0..1 (avf-load-video, "
+                           "vae-decode, video-to-rgb), rounded to 8 bits. "
+                           "No video pixel format here carries alpha, so "
+                           "a fourth plane is composited over white",
    .type = &typeid(TensorBeatPayload),
    .tags = "rgb-frames", .clock_group = 0},
 };
@@ -50,9 +104,13 @@ const PortSpec kOports[] = {
 };
 const StageSpec kSpec = {
   .type_name = "rgb-to-video",
-  .doc       = "Adapts planar U8 RGB image beats into the VideoStreamParams + "
-               "FrameRef stream a save-video encoder reads. The seam between "
-               "the generative image format and ffmpeg.",
+  .doc       = "Adapts planar RGB or RGBA image beats (U8, F16, F32) "
+               "into the "
+               "VideoStreamParams + FrameRef stream a save-video encoder "
+               "reads. The seam between the generative image format and "
+               "ffmpeg. An RGBA frame is flattened onto white, since "
+               "neither yuv420p nor rgb24 carries alpha; put an alpha-mix "
+               "ahead of this stage to composite over anything else.",
   .display_name = "RGB to Video",
   .category  = StageCategory::Visual,
   .iports    = kIports,
@@ -60,15 +118,67 @@ const StageSpec kSpec = {
   .attrs     = kAttrs,
 };
 
-// BT.601 studio-swing RGB -> YUV, which is what an SDR H.264 clip at this
-// size is assumed to be by every player that will open it. Full-swing
-// (JPEG) coefficients would look washed out through the same pipeline.
-inline void
-rgb_to_yuv_(float r, float g, float b, float& y, float& u, float& v)
+// RGB -> YUV, for either matrix at either swing.
+//
+// DERIVED FROM THE TWO LUMA COEFFICIENTS, not written out four times.
+// BT.601 and BT.709 differ only in Kr/Kb, and the swing only in two
+// scale factors, so a table of four hand-typed matrices would be three
+// chances to transpose a digit into a hue tilt nothing reports. The
+// arithmetic below reproduces the published BT.601 constants exactly --
+// which is asserted in rgb_to_video_colorspace, so a change here that
+// moves the numbers is a failing test rather than a quietly different
+// file.
+//
+//   Y'  = Kr*R' + Kg*G' + Kb*B'                  (Kg = 1 - Kr - Kb)
+//   Cb  = (B' - Y') / (2 * (1 - Kb))             in [-0.5, +0.5]
+//   Cr  = (R' - Y') / (2 * (1 - Kr))
+//
+// Studio swing puts Y' in 16..235 (219 codes) and the chroma in 16..240
+// (224); full swing uses all 256 for both.
+struct YuvMatrix {
+  float y0, yr, yg, yb;
+  float ur, ug, ub;
+  float vr, vg, vb;
+};
+
+inline YuvMatrix
+yuv_matrix_(float kr, float kb, bool full)
 {
-  y = 16.0f  + 0.256788f * r + 0.504129f * g + 0.097906f * b;
-  u = 128.0f - 0.148223f * r - 0.290993f * g + 0.439216f * b;
-  v = 128.0f + 0.439216f * r - 0.367788f * g - 0.071427f * b;
+  const float kg = 1.0f - kr - kb;
+  const float ys = full ? 1.0f : 219.0f / 255.0f;
+  // 255 (full) or 224 (studio) code values spread over the [-0.5, +0.5]
+  // of Cb/Cr, and the /255 that takes R,G,B from bytes to [0,1].
+  const float cs = (full ? 255.0f : 224.0f) / (2.0f * 255.0f);
+  YuvMatrix m{};
+  m.y0 = full ? 0.0f : 16.0f;
+  m.yr = ys * kr;  m.yg = ys * kg;  m.yb = ys * kb;
+  const float cb = cs / (1.0f - kb);
+  m.ur = -cb * kr; m.ug = -cb * kg; m.ub =  cb * (1.0f - kb);
+  const float cr = cs / (1.0f - kr);
+  m.vr =  cr * (1.0f - kr); m.vg = -cr * kg; m.vb = -cr * kb;
+  return m;
+}
+
+// The two matrices this stage can write. BT.601 is the default because
+// it is what every player assumes of an SDR clip that does not say, and
+// what this stage has always emitted; BT.709 is the correct one for HD
+// delivery and is what a player assumes of HD when the file is silent.
+// Either way the file is TAGGED, so the choice only decides what a
+// reader that ignores the tag makes of it.
+inline YuvMatrix bt601_matrix_(bool full) {
+  return yuv_matrix_(0.299f, 0.114f, full);
+}
+inline YuvMatrix bt709_matrix_(bool full) {
+  return yuv_matrix_(0.2126f, 0.0722f, full);
+}
+
+inline void
+rgb_to_yuv_(const YuvMatrix& m, float r, float g, float b,
+            float& y, float& u, float& v)
+{
+  y = m.y0  + m.yr * r + m.yg * g + m.yb * b;
+  u = 128.0f + m.ur * r + m.ug * g + m.ub * b;
+  v = 128.0f + m.vr * r + m.vg * g + m.vb * b;
 }
 
 inline std::uint8_t
@@ -95,14 +205,38 @@ RgbToVideoStage::RgbToVideoStage(const SessionContextIntf* s,
   if (!(_fps > 0.0)) { _fps = 16.0; }
   _pix_fmt_name = attr_str("pix_fmt");
   if (_pix_fmt_name.empty()) { _pix_fmt_name = "yuv420p"; }
+  const std::string cs = attr_str("colorspace");
+  if (cs == "bt709") {
+    _bt709 = true;
+  } else if (cs == "bt601" || cs.empty()) {
+    _bt709 = false;
+  } else {
+    fail_config(fmt("RgbToVideoStage('{}'): colorspace '{}' is neither "
+                    "'bt601' nor 'bt709'", this->id(), cs));
+  }
+  const std::string cr = attr_str("color_range");
+  _full_range = (cr == "full");
+  if (!cr.empty() && cr != "full" && cr != "limited") {
+    fail_config(fmt("RgbToVideoStage('{}'): color_range '{}' is neither "
+                    "\"limited\" nor \"full\"", this->id(), cr));
+  }
   if (_pix_fmt_name == "yuv420p") {
     _pix_fmt = AV_PIX_FMT_YUV420P;
+    _chroma_x = 2; _chroma_y = 2;
+  } else if (_pix_fmt_name == "yuv422p") {
+    _pix_fmt = AV_PIX_FMT_YUV422P;
+    _chroma_x = 2; _chroma_y = 1;
+  } else if (_pix_fmt_name == "yuv444p") {
+    _pix_fmt = AV_PIX_FMT_YUV444P;
+    _chroma_x = 1; _chroma_y = 1;
   } else if (_pix_fmt_name == "rgb24") {
     _pix_fmt = AV_PIX_FMT_RGB24;
+    _chroma_x = 1; _chroma_y = 1;      // unused; no chroma plane
   } else {
     // Deferred validation: the constructor never throws, so an unusable
     // pix_fmt is reported here and the runtime skips the stage at launch.
-    fail_config(fmt("pix_fmt '{}' is not yuv420p or rgb24", _pix_fmt_name));
+    fail_config(fmt("pix_fmt '{}' is not yuv420p, yuv422p, yuv444p or "
+                    "rgb24", _pix_fmt_name));
   }
   allocate_oports(spec().oports.size());
 }
@@ -136,23 +270,42 @@ RgbToVideoStage::process(RuntimeContext& ctx)
     co_return;
   }
   const auto* tbp = dynamic_cast<const TensorBeatPayload*>(in.get());
-  if (tbp == nullptr || tbp->dtype != TensorBeat::DType::U8 ||
-      tbp->shape.size() != 3 || tbp->shape[0] != 3) {
+  if (tbp == nullptr ||
+      (tbp->dtype != TensorBeat::DType::U8 &&
+       tbp->dtype != TensorBeat::DType::F16 &&
+       tbp->dtype != TensorBeat::DType::F32) ||
+      tbp->shape.size() != 3 ||
+      (tbp->shape[0] != 3 && tbp->shape[0] != 4)) {
     session()->warn(fmt(
-        "RgbToVideoStage('{}'): expected a planar U8 RGB [3,H,W] TensorBeat, "
-        "got {}; skipping", this->id(), in->describe()));
+        "RgbToVideoStage('{}'): expected a planar U8, F16 or F32 RGB "
+        "[3,H,W] or RGBA [4,H,W] TensorBeat, got {}; skipping",
+        this->id(), in->describe()));
     co_return;
   }
+  const int CH = (int)tbp->shape[0];
   const int H = (int)tbp->shape[1], W = (int)tbp->shape[2];
   if (H <= 0 || W <= 0) { co_return; }
 
   // The producer knows the clip's rate when it made the frames; the config
-  // is only the fallback for one that does not.
+  // is only the fallback for one that does not. A FRAME states it as the
+  // rational `fps_num` / `fps_den` (video-to-rgb, temporal-resample), a
+  // clip as `fps`; reading only the latter encoded every frame stream at
+  // the fallback -- 124 frames at 24 came out a 16 fps file.
   double fps = _fps;
+  std::int64_t rate_num = 0, rate_den = 0;
   if (tbp->sideband.is_object()) {
     FlexData sb = tbp->sideband;          // as_object() is a view: keep it
     auto o = sb.as_object();
-    if (o.contains("fps")) {
+    if (o.contains("fps_num") && o.contains("fps_den")) {
+      const std::int64_t n = o.at("fps_num").as_int(0);
+      const std::int64_t d = o.at("fps_den").as_int(0);
+      if (n > 0 && d > 0 && n <= INT32_MAX && d <= INT32_MAX) {
+        rate_num = n;
+        rate_den = d;
+        fps = (double)n / (double)d;
+      }
+    }
+    if (rate_num == 0 && o.contains("fps")) {
       const double f = o.at("fps").as_real(0.0);
       if (f > 0.0) { fps = f; }
     }
@@ -161,24 +314,54 @@ RgbToVideoStage::process(RuntimeContext& ctx)
   if (!_header_sent) {
     _w = W;
     _h = H;
-    // yuv420p subsamples chroma by two in each axis, so an odd dimension
-    // has no representation. Refuse rather than round: the encoder would
-    // otherwise either fail deep inside libx264 or silently drop a line.
-    if (_pix_fmt == AV_PIX_FMT_YUV420P && ((W & 1) != 0 || (H & 1) != 0)) {
+    // A SUBSAMPLED AXIS HAS NO ODD SIZE. Refuse rather than round: the
+    // encoder would otherwise either fail deep inside libx264 or
+    // silently drop a line. Which axes are subsampled is the format's,
+    // so the check is too -- 4:2:0 needs both even, 4:2:2 only the
+    // width, 4:4:4 and rgb24 neither, and a check written for 4:2:0
+    // alone would refuse a perfectly good odd-height 4:2:2 frame.
+    if ((_chroma_x > 1 && (W % _chroma_x) != 0)
+        || (_chroma_y > 1 && (H % _chroma_y) != 0)) {
       session()->error(fmt(
-          "RgbToVideoStage('{}'): {}x{} is odd and yuv420p subsamples chroma "
-          "2x2; use pix_fmt rgb24 or an even frame size", this->id(), W, H));
+          "RgbToVideoStage('{}'): {}x{} does not divide {}'s {}x{} chroma "
+          "subsampling; use an even {} or a pix_fmt that subsamples less "
+          "({} or rgb24)", this->id(), W, H, _pix_fmt_name, _chroma_x,
+          _chroma_y,
+          (_chroma_x > 1 && (W % _chroma_x) != 0) ? "width" : "height",
+          _chroma_y > 1 ? "yuv422p, yuv444p" : "yuv444p"));
       co_return;
     }
     VideoStreamParams p;
     p.width = W;
     p.height = H;
     p.pix_fmt = _pix_fmt;
-    // A rational rate from the double, denominator 1000, so 16 stays 16/1
-    // and 23.976 survives as 23976/1000 rather than becoming 24.
-    const long long num = (long long)std::llround(fps * 1000.0);
-    p.frame_rate = AVRational{(int)num, 1000};
-    p.time_base  = AVRational{1000, (int)num};
+    // DECLARE what rgb_to_yuv_ actually wrote, so the sink can tag the
+    // file and no reader has to fall back on convention. Saying so is
+    // what lets a decode come back with the contrast and hue it went in
+    // with -- and it is the config's two keys that decide it, never an
+    // assumption about the size.
+    //
+    // PRIMARIES and TRANSFER travel too. They were left UNSPECIFIED,
+    // which is a smaller error than a wrong matrix and the same kind: a
+    // reader falls back on convention, and the convention for an
+    // untagged HD file is BT.709 whatever the matrix says.
+    if (_pix_fmt != AV_PIX_FMT_RGB24) {
+      p.color_range = _full_range ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+      p.colorspace  = _bt709 ? AVCOL_SPC_BT709 : AVCOL_SPC_SMPTE170M;
+      p.color_primaries = _bt709 ? AVCOL_PRI_BT709 : AVCOL_PRI_SMPTE170M;
+      p.color_trc   = _bt709 ? AVCOL_TRC_BT709 : AVCOL_TRC_SMPTE170M;
+    }
+    // The producer's rational as it stated it (30000/1001 exactly), else
+    // one from the double at denominator 1000, so 16 stays 16/1 and
+    // 23.976 survives as 23976/1000 rather than becoming 24.
+    if (rate_num > 0) {
+      p.frame_rate = AVRational{(int)rate_num, (int)rate_den};
+      p.time_base  = AVRational{(int)rate_den, (int)rate_num};
+    } else {
+      const long long num = (long long)std::llround(fps * 1000.0);
+      p.frame_rate = AVRational{(int)num, 1000};
+      p.time_base  = AVRational{1000, (int)num};
+    }
     auto hdr = std::make_unique<VideoStreamParamsPayload>(p);
     // Provenance rides on the HEADER because there is nowhere else for
     // it: a FrameRef is a bare AVFrame with no sideband, and the sink
@@ -221,9 +404,71 @@ RgbToVideoStage::process(RuntimeContext& ctx)
   // timestamp and has nothing to infer the final one from.
   f->duration = 1;
 
-  const std::uint8_t* rp = tbp->as_u8();
-  const std::uint8_t* gp = rp + (std::size_t)H * W;
-  const std::uint8_t* bp = gp + (std::size_t)H * W;
+  // A PADDED ROW PITCH shears every row here, because the reads below
+  // index the planes as tight -- and load-image forwards FFmpeg's
+  // 32-byte-aligned GBRP linesize, so a width that is not a multiple of
+  // 32 arrives strided. Materialise when it is not contiguous.
+  AlignedVector<std::uint8_t> contig;
+  using DType = TensorBeat::DType;
+  const std::uint8_t* src =
+      tbp->dtype == DType::U8 ? tbp->as_u8()
+    : tbp->dtype == DType::F32
+        ? reinterpret_cast<const std::uint8_t*>(tbp->as_f32())
+        : reinterpret_cast<const std::uint8_t*>(tbp->as_f16());
+  if (!tbp->is_contiguous()) {
+    contig = tbp->materialize_contiguous();
+    src = contig.data();
+  }
+  const std::size_t plane = (std::size_t)H * W;
+
+  // FLOAT FRAMES ARE 0..1 -- video-to-rgb's default F32, avf-load-video's
+  // and vae-decode's F16 -- and every pixel format here is 8-bit, so they
+  // round to U8 first, clamped: an HDR or linear frame's values above 1
+  // clip, as they would on an 8-bit display. Their colour tags are not
+  // read; the encoder writes the matrix and range its config names.
+  std::vector<std::uint8_t> narrowed;
+  if (tbp->dtype != DType::U8) {
+    const std::size_t n = (std::size_t)CH * plane;
+    narrowed.resize(n);
+    const bool f32 = tbp->dtype == DType::F32;
+    const auto* s32 = reinterpret_cast<const float*>(src);
+    const auto* s16 = reinterpret_cast<const _Float16*>(src);
+    for (std::size_t i = 0; i < n; ++i) {
+      const float v = f32 ? s32[i] : (float)s16[i];
+      // !(v > 0) also catches NaN.
+      narrowed[i] = !(v > 0.0f) ? 0
+                  : v >= 1.0f   ? 255
+                  : (std::uint8_t)(v * 255.0f + 0.5f);
+    }
+    src = narrowed.data();
+  }
+
+  // COMPOSITE OVER WHITE, since neither yuv420p nor rgb24 carries alpha.
+  // Truncating the fourth plane is NOT the neutral choice: under a
+  // transparent pixel the stored colour is arbitrary, and on a generated
+  // RGBA frame it is usually black -- so dropping the plane fringes every
+  // edge in black, which reads as a bad model rather than a lost channel.
+  // out = a*rgb + (1-a)*255, the same arithmetic save-image flattens a
+  // transparent PNG with. Put an `alpha-mix` ahead of this stage to
+  // composite over any other colour, or over another clip.
+  std::vector<std::uint8_t> flat;
+  if (CH == 4) {
+    flat.resize(3 * plane);
+    const std::uint8_t* ap = src + 3 * plane;
+    for (int c = 0; c < 3; ++c) {
+      const std::uint8_t* sp = src + (std::size_t)c * plane;
+      std::uint8_t* dp = flat.data() + (std::size_t)c * plane;
+      for (std::size_t i = 0; i < plane; ++i) {
+        const int a = ap[i];
+        dp[i] = (std::uint8_t)((sp[i] * a + 255 * (255 - a) + 127) / 255);
+      }
+    }
+    src = flat.data();
+  }
+
+  const std::uint8_t* rp = src;
+  const std::uint8_t* gp = rp + plane;
+  const std::uint8_t* bp = gp + plane;
   if (_pix_fmt == AV_PIX_FMT_RGB24) {
     for (int y = 0; y < H; ++y) {
       std::uint8_t* row = f->data[0] + (std::size_t)y * f->linesize[0];
@@ -235,36 +480,48 @@ RgbToVideoStage::process(RuntimeContext& ctx)
       }
     }
   } else {
-    // Luma at full resolution; chroma averaged over each 2x2 block, which
-    // is the box filter yuv420p's sample siting expects. Averaging in the
-    // RGB domain and converting once per block would be cheaper and wrong
-    // at edges, so the conversion runs per pixel and the AVERAGE is taken
-    // in the chroma domain.
+    // Once per frame, not once per pixel: the loops below run millions
+    // of times and have no business re-deciding which matrix this is.
+    const YuvMatrix mat =
+        _bt709 ? bt709_matrix_(_full_range) : bt601_matrix_(_full_range);
+    // Luma at full resolution; chroma averaged over each subsampling
+    // block -- 2x2 for 4:2:0, 2x1 for 4:2:2, 1x1 (i.e. no averaging) for
+    // 4:4:4 -- which is the box filter those formats' sample siting
+    // expects. Averaging in the RGB domain and converting once per block
+    // would be cheaper and wrong at edges, so the conversion runs per
+    // pixel and the AVERAGE is taken in the chroma domain.
     for (int y = 0; y < H; ++y) {
       std::uint8_t* yr = f->data[0] + (std::size_t)y * f->linesize[0];
       for (int x = 0; x < W; ++x) {
         const std::size_t i = (std::size_t)y * W + x;
         float yy, uu, vv;
-        rgb_to_yuv_((float)rp[i], (float)gp[i], (float)bp[i], yy, uu, vv);
+        rgb_to_yuv_(mat, (float)rp[i], (float)gp[i], (float)bp[i],
+                    yy, uu, vv);
         yr[x] = clamp_u8_(yy);
       }
     }
-    for (int y = 0; y < H; y += 2) {
-      std::uint8_t* ur = f->data[1] + (std::size_t)(y / 2) * f->linesize[1];
-      std::uint8_t* vr = f->data[2] + (std::size_t)(y / 2) * f->linesize[2];
-      for (int x = 0; x < W; x += 2) {
+    const int hx = _chroma_x, hy = _chroma_y;
+    const float inv = 1.0f / (float)(hx * hy);
+    for (int y = 0; y < H; y += hy) {
+      std::uint8_t* ur = f->data[1] + (std::size_t)(y / hy) * f->linesize[1];
+      std::uint8_t* vr = f->data[2] + (std::size_t)(y / hy) * f->linesize[2];
+      for (int x = 0; x < W; x += hx) {
         float su = 0.0f, sv = 0.0f;
-        for (int dy = 0; dy < 2; ++dy) {
-          for (int dx = 0; dx < 2; ++dx) {
+        for (int dy = 0; dy < hy; ++dy) {
+          for (int dx = 0; dx < hx; ++dx) {
             const std::size_t i = (std::size_t)(y + dy) * W + (x + dx);
             float yy, uu, vv;
-            rgb_to_yuv_((float)rp[i], (float)gp[i], (float)bp[i], yy, uu, vv);
+            rgb_to_yuv_(mat, (float)rp[i], (float)gp[i], (float)bp[i],
+                        yy, uu, vv);
             su += uu;
             sv += vv;
           }
         }
-        ur[x / 2] = clamp_u8_(su * 0.25f);
-        vr[x / 2] = clamp_u8_(sv * 0.25f);
+        // At 4:4:4 the block is one pixel and `inv` is 1, so this is the
+        // conversion with no averaging at all -- the same code path
+        // rather than a special case that could disagree with it.
+        ur[x / hx] = clamp_u8_(su * inv);
+        vr[x / hx] = clamp_u8_(sv * inv);
       }
     }
   }

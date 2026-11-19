@@ -7,12 +7,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 extern "C" {
 #include <libavutil/log.h>
+// Each library's own VERSION_MAJOR: what this build's headers describe.
+#include <libavcodec/version.h>
+#include <libavdevice/version.h>
+#include <libavfilter/version.h>
+#include <libavformat/version.h>
+#include <libavutil/version.h>
+#include <libswresample/version.h>
+#include <libswscale/version.h>
 }
 
 using namespace std;
@@ -68,6 +77,11 @@ ffmpeg_log_cb_(void* avcl, int level, const char* fmt_str, va_list vl)
   const LogSinkIntf* s =
     g_ff_log_target.load(std::memory_order_acquire);
   if (s) {
+    // Verbose, ERRORs included: a decoder concealing a damaged frame
+    // says so at ERROR, from its own threads, for every such frame. The
+    // reason a SYNCHRONOUS call refused is carried by the caller instead
+    // -- FfmpegLogCapture (ffmpeg-log-tap.h) collects this thread's
+    // lines around the call and its error message ends with them.
     s->log_verbose(fmt("[ffmpeg:{}] {}", class_name, msg_view));
   }
 
@@ -157,6 +171,23 @@ constexpr const char* kAvDeviceCandidates[] = {
   "libavdevice.so.58",
 };
 
+constexpr const char* kAvFilterCandidates[] = {
+  "libavfilter.dylib",
+  "libavfilter.11.dylib",
+  "libavfilter.10.dylib",
+  "libavfilter.9.dylib",
+  "libavfilter.8.dylib",
+  "libavfilter.7.dylib",
+  "/opt/homebrew/lib/libavfilter.dylib",
+  "/usr/local/lib/libavfilter.dylib",
+  "libavfilter.so",
+  "libavfilter.so.11",
+  "libavfilter.so.10",
+  "libavfilter.so.9",
+  "libavfilter.so.8",
+  "libavfilter.so.7",
+};
+
 constexpr const char* kSwResampleCandidates[] = {
   "libswresample.dylib",
   "libswresample.6.dylib",
@@ -223,33 +254,136 @@ preferred_candidates_(string_view lib_name)
   return out;
 }
 
+// VPIPE_NO_FFMPEG=1: load no FFmpeg at all, as on a machine without one
+// -- what a host (or a test) checks its fallbacks against. The loader
+// is handed a name nothing has, so it fails as an absent FFmpeg does.
+bool
+ffmpeg_refused_()
+{
+  const char* v = ::getenv("VPIPE_NO_FFMPEG");
+  return v != nullptr && *v != '\0' && string_view(v) != "0";
+}
+
+// VPIPE_FFMPEG_ANY_MAJOR=1: load an FFmpeg of another major (see
+// pick_ffmpeg_library).
+bool
+ffmpeg_any_major_()
+{
+  const char* v = ::getenv("VPIPE_FFMPEG_ANY_MAJOR");
+  return v != nullptr && *v != '\0' && string_view(v) != "0";
+}
+
+string
+version_string_(unsigned v)
+{
+  return std::to_string((v >> 16) & 0xff) + "." +
+         std::to_string((v >> 8) & 0xff) + "." + std::to_string(v & 0xff);
+}
+
 template <size_t N>
 string
-find_first_loadable_(const LogSinkIntf*  session,
-                     const char* const   (&candidates)[N],
-                     string_view         lib_name)
+find_first_loadable_(const LogSinkIntf*      session,
+                     const char* const       (&candidates)[N],
+                     string_view             lib_name,
+                     const char*             version_symbol,
+                     unsigned                want_major,
+                     LibraryHandle::LoadMode mode)
 {
-  for (const string& c : preferred_candidates_(lib_name)) {
-    void* h = ::dlopen(c.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (h) {
-      ::dlclose(h);
-      session->log_normal(fmt("{}: using '{}'", lib_name, c));
-      return c;
-    }
+  if (ffmpeg_refused_()) {
+    return "VPIPE_NO_FFMPEG";
   }
-  for (const char* c : candidates) {
-    void* h = ::dlopen(c, RTLD_NOW | RTLD_LOCAL);
-    if (h) {
-      ::dlclose(h);
-      session->log_normal(fmt("{}: using '{}'", lib_name, c));
-      return string(c);
+  vector<string> all = preferred_candidates_(lib_name);
+  for (const char* c : candidates) { all.emplace_back(c); }
+  // Loads it, reads its version, lets it go: LibraryHandle opens the
+  // pick again, which the loader's reference count makes free.
+  auto probe = [version_symbol](const string& path, unsigned* version) {
+    void* h = ::dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (h == nullptr) { return false; }
+    using VersionFn = unsigned (*)();
+    auto fn = reinterpret_cast<VersionFn>(::dlsym(h, version_symbol));
+    *version = fn != nullptr ? fn() : 0u;
+    ::dlclose(h);
+    return true;
+  };
+  const FfmpegPick pick = pick_ffmpeg_library(all, lib_name, want_major,
+                                              ffmpeg_any_major_(), probe);
+  if (!pick.path.empty()) {
+    if (session != nullptr) {
+      session->log_normal(fmt("{}: using '{}' ({})", lib_name, pick.path,
+                              version_string_(pick.version)));
+      if (!pick.passed_over.empty()) {
+        session->log_normal(fmt(
+            "{}: passed over {} -- not major {}, this build's", lib_name,
+            pick.passed_over, want_major));
+      }
+      if (pick.other_major) { session->warn(fmt("{}", pick.why)); }
     }
+    return pick.path;
   }
-  // Hand the canonical bare soname back so LibraryHandle's failure
-  // path produces a meaningful error message.
+  if (!pick.why.empty()) {
+    // error() throws for a Required library, as a failed dlopen does.
+    if (session != nullptr) {
+      if (mode == LibraryHandle::LoadMode::Required) {
+        session->error(fmt("{}", pick.why));
+      } else {
+        session->warn(fmt("{}", pick.why));
+      }
+    }
+    return "VPIPE_FFMPEG_MAJOR_MISMATCH";
+  }
+  // Nothing loads: hand the canonical bare soname back so
+  // LibraryHandle's failure path produces a meaningful error message.
   return string(candidates[0]);
 }
 
+}
+
+FfmpegPick
+pick_ffmpeg_library(const vector<string>& candidates, string_view lib,
+                    unsigned want_major, bool any_major,
+                    const function<bool(const string&, unsigned*)>& probe)
+{
+  FfmpegPick out;
+  string found;              // every loadable one of another major
+  string first_other;
+  unsigned first_other_v = 0;
+  for (const string& c : candidates) {
+    unsigned v = 0;
+    if (!probe(c, &v)) { continue; }
+    const unsigned major = (v >> 16) & 0xff;
+    if (major == want_major) {
+      out.path = c;
+      out.version = v;
+      out.passed_over = found;
+      return out;
+    }
+    if (first_other.empty()) {
+      first_other = c;
+      first_other_v = v;
+    }
+    found += (found.empty() ? "" : ", ") + string("'") + c + "' " +
+             (v != 0 ? version_string_(v) : string("(no version)"));
+  }
+  if (first_other.empty()) { return out; }   // nothing loads at all
+  const string want = std::to_string(want_major);
+  if (any_major) {
+    out.path = first_other;
+    out.version = first_other_v;
+    out.other_major = true;
+    out.why = string(lib) + ": '" + first_other + "' is major " +
+              std::to_string((first_other_v >> 16) & 0xff) + " and this "
+              "build's FFmpeg headers are major " + want + "; loaded "
+              "anyway (VPIPE_FFMPEG_ANY_MAJOR) -- FFmpeg's structures are "
+              "read at the offsets those headers give";
+    return out;
+  }
+  out.why = string(lib) + ": no FFmpeg of major " + want + " -- the "
+            "major this build's headers describe, and the only one whose "
+            "structures it reads correctly; found " + found + ". Install "
+            "that FFmpeg (or point VPIPE_FFMPEG_DIR at one), or rebuild "
+            "against the one installed. VPIPE_FFMPEG_ANY_MAJOR=1 loads it "
+            "anyway";
+  return out;
 }
 
 // ---------------------------------------------------------------------
@@ -258,7 +392,8 @@ find_first_loadable_(const LogSinkIntf*  session,
 
 LibAvUtil::LibAvUtil(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvUtilCandidates,
-                                          "libavutil"),
+                                          "libavutil", "avutil_version",
+                                          LIBAVUTIL_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -279,6 +414,7 @@ LibAvUtil::LibAvUtil(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(frame_free,          "av_frame_free");
   VPIPE_RESOLVE(frame_unref,         "av_frame_unref");
   VPIPE_RESOLVE(frame_get_buffer,    "av_frame_get_buffer");
+  VPIPE_RESOLVE(get_pix_fmt_name,    "av_get_pix_fmt_name");
   VPIPE_RESOLVE(rescale_q,           "av_rescale_q");
   VPIPE_RESOLVE(rescale_q_rnd,       "av_rescale_q_rnd");
   VPIPE_RESOLVE(get_sample_fmt_name, "av_get_sample_fmt_name");
@@ -288,6 +424,7 @@ LibAvUtil::LibAvUtil(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(buffer_unref,        "av_buffer_unref");
   VPIPE_RESOLVE(hwdevice_ctx_create, "av_hwdevice_ctx_create");
   VPIPE_RESOLVE(hwframe_transfer_data, "av_hwframe_transfer_data");
+  VPIPE_RESOLVE(strdup,              "av_strdup");
 
 #undef VPIPE_RESOLVE
 }
@@ -316,7 +453,8 @@ LibAvUtil::version_micro() const noexcept
 
 LibAvCodec::LibAvCodec(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvCodecCandidates,
-                                          "libavcodec"),
+                                          "libavcodec", "avcodec_version",
+                                          LIBAVCODEC_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -376,7 +514,8 @@ LibAvCodec::version_micro() const noexcept
 
 LibAvFormat::LibAvFormat(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvFormatCandidates,
-                                          "libavformat"),
+                                          "libavformat", "avformat_version",
+                                          LIBAVFORMAT_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -396,6 +535,7 @@ LibAvFormat::LibAvFormat(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(find_stream_info,         "avformat_find_stream_info");
   VPIPE_RESOLVE(find_input_format,        "av_find_input_format");
   VPIPE_RESOLVE(read_frame,               "av_read_frame");
+  VPIPE_RESOLVE(seek_frame,               "av_seek_frame");
   VPIPE_RESOLVE(alloc_output_context2,    "avformat_alloc_output_context2");
   VPIPE_RESOLVE(new_stream,               "avformat_new_stream");
   VPIPE_RESOLVE(write_header,             "avformat_write_header");
@@ -436,7 +576,8 @@ LibAvFormat::version_micro() const noexcept
 
 LibSwResample::LibSwResample(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kSwResampleCandidates,
-                                          "libswresample"),
+                                          "libswresample", "swresample_version",
+                                          LIBSWRESAMPLE_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -481,7 +622,8 @@ LibSwResample::version_micro() const noexcept
 
 LibSwScale::LibSwScale(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kSwScaleCandidates,
-                                          "libswscale"),
+                                          "libswscale", "swscale_version",
+                                          LIBSWSCALE_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -496,6 +638,8 @@ LibSwScale::LibSwScale(const LogSinkIntf* s, LoadMode mode)
   VPIPE_RESOLVE(get_cached_context, "sws_getCachedContext");
   VPIPE_RESOLVE(scale,              "sws_scale");
   VPIPE_RESOLVE(free_context,       "sws_freeContext");
+  VPIPE_RESOLVE(set_colorspace_details, "sws_setColorspaceDetails");
+  VPIPE_RESOLVE(get_coefficients,       "sws_getCoefficients");
 
 #undef VPIPE_RESOLVE
 }
@@ -519,12 +663,64 @@ LibSwScale::version_micro() const noexcept
 }
 
 // ---------------------------------------------------------------------
+// LibAvFilter
+// ---------------------------------------------------------------------
+
+LibAvFilter::LibAvFilter(const LogSinkIntf* s, LoadMode mode)
+  : LibraryHandle(s, find_first_loadable_(s, kAvFilterCandidates,
+                                          "libavfilter", "avfilter_version",
+                                          LIBAVFILTER_VERSION_MAJOR, mode),
+                  mode)
+{
+  if (!valid()) {
+    return;
+  }
+
+#define VPIPE_RESOLVE(F, N)                                            \
+  api.F = reinterpret_cast<decltype(api.F)>(this->require_symbol(N))
+
+  VPIPE_RESOLVE(version,                   "avfilter_version");
+  VPIPE_RESOLVE(get_by_name,               "avfilter_get_by_name");
+  VPIPE_RESOLVE(graph_alloc,               "avfilter_graph_alloc");
+  VPIPE_RESOLVE(graph_free,                "avfilter_graph_free");
+  VPIPE_RESOLVE(graph_alloc_filter,        "avfilter_graph_alloc_filter");
+  VPIPE_RESOLVE(init_str,                  "avfilter_init_str");
+  VPIPE_RESOLVE(graph_parse_ptr,           "avfilter_graph_parse_ptr");
+  VPIPE_RESOLVE(graph_config,              "avfilter_graph_config");
+  VPIPE_RESOLVE(inout_alloc,               "avfilter_inout_alloc");
+  VPIPE_RESOLVE(inout_free,                "avfilter_inout_free");
+  VPIPE_RESOLVE(buffersrc_add_frame_flags, "av_buffersrc_add_frame_flags");
+  VPIPE_RESOLVE(buffersink_get_frame,      "av_buffersink_get_frame");
+
+#undef VPIPE_RESOLVE
+}
+
+unsigned
+LibAvFilter::version_major() const noexcept
+{
+  return api.version ? (api.version() >> 16) & 0xff : 0;
+}
+
+unsigned
+LibAvFilter::version_minor() const noexcept
+{
+  return api.version ? (api.version() >> 8) & 0xff : 0;
+}
+
+unsigned
+LibAvFilter::version_micro() const noexcept
+{
+  return api.version ? api.version() & 0xff : 0;
+}
+
+// ---------------------------------------------------------------------
 // LibAvDevice
 // ---------------------------------------------------------------------
 
 LibAvDevice::LibAvDevice(const LogSinkIntf* s, LoadMode mode)
   : LibraryHandle(s, find_first_loadable_(s, kAvDeviceCandidates,
-                                          "libavdevice"),
+                                          "libavdevice", "avdevice_version",
+                                          LIBAVDEVICE_VERSION_MAJOR, mode),
                   mode)
 {
   if (!valid()) {
@@ -574,6 +770,10 @@ FFmpegLibraries::FFmpegLibraries(const LogSinkIntf*      s,
   // it isn't required for the existing rtsp/file pipelines, and many
   // bundled FFmpeg installs ship without it.
   , _avdevice(s, LibraryHandle::LoadMode::Optional)
+  // ...and avfilter for the same reason: the filter graphs are used by
+  // the resampling stages only, and a build without them should lose
+  // those stages rather than the pipeline.
+  , _avfilter(s, LibraryHandle::LoadMode::Optional)
 {
   // Funnel FFmpeg's own log emissions into session->log_verbose().
   // Process-wide effects: bumps the global log threshold to VERBOSE

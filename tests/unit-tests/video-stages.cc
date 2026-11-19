@@ -10,6 +10,9 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "common/encoded-segment.h"
+#include "stages/audio-video/video-to-rgb-stage.h"
+#include "stages/audio-video/temporal-stack-stage.h"
 #include "stages/load-video-stage.h"
 #include "stages/save-video-stage.h"
 #include "stages/audio-video/video-tokens.h"
@@ -21,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -171,6 +175,44 @@ private:
 };
 
 // Counts the FrameRefs a decoder hands out, ignoring the stream header.
+// Counts what load-video emits. It emits ENCODED PACKETS now, not
+// decoded FrameRefs -- for this fixture (H.264, one access unit per
+// picture) the two counts are the same number, and the thing being
+// guarded is the demuxer's, not the decoder's: a track whose edit list
+// is written to a short duration hands back N-1 packets for N frames.
+// Counts planar RGB tensors, and remembers the geometry of the last.
+class RgbCounter : public TypedStage<RgbCounter> {
+public:
+  static constexpr const char* kTypeName = "ut-rgb-counter";
+  using TypedStage::TypedStage;
+
+  unsigned frames = 0, groups = 0;
+  std::int64_t stacked = 0, w = 0, h = 0;
+
+  void reset_run_state() override
+  {
+    frames = 0; groups = 0; stacked = 0; w = 0; h = 0;
+  }
+
+  Job process(RuntimeContext& ctx) override
+  {
+    auto t = co_await ctx.read(0);
+    if (!t) { ctx.signal_done(); co_return; }
+    if (const auto* tb = dynamic_cast<const TensorBeatPayload*>(t.get())) {
+      ++frames;
+      if (tb->shape.size() == 3) {
+        h = tb->shape[1];
+        w = tb->shape[2];
+      } else if (tb->shape.size() == 4) {
+        ++groups;
+        stacked = tb->shape[0];
+        h = tb->shape[2];
+        w = tb->shape[3];
+      }
+    }
+  }
+};
+
 class FrameCounter : public TypedStage<FrameCounter> {
 public:
   static constexpr const char* kTypeName = "ut-frame-counter";
@@ -184,7 +226,7 @@ public:
   {
     auto t = co_await ctx.read(0);
     if (!t) { ctx.signal_done(); co_return; }
-    if (dynamic_cast<const FrameRefPayload*>(t.get()) != nullptr) {
+    if (dynamic_cast<const EncodedSegmentPayload*>(t.get()) != nullptr) {
       ++frames;
     }
   }
@@ -334,6 +376,135 @@ TEST(video_stages, encoder_relaunch_writes_again) {
   remove(out_path.c_str());
 }
 
+// THE ISSUE-38 CASE, on the stage that had no numbering at all: before
+// this, every launch of a save-video graph wrote the same name and
+// erased the previous clip unless somebody retyped the path in the
+// web-ui between runs. With `no_overwrite` the second run lands beside
+// the first; the test above still shows the default rewriting, and the
+// pair is what says the flag is what moved.
+TEST(video_stages, encoder_no_overwrite_keeps_each_run) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-enc-nov-") + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SynthVideoSource>(
+    &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->target_frames = 6;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(src_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url",
+               FlexData::make_string(dir + "/clip-%03d.mp4"));
+    obj.insert("no_overwrite", FlexData::make_bool(true));
+    obj.insert("enable_audio", FlexData::make_bool(false));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  auto* enc = static_cast<SaveVideoStage*>(pl->insert_stage(
+    make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg))));
+
+  string url_run0;
+  for (int run = 0; run < 2; ++run) {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    if (run == 0) { url_run0 = enc->resolved_url(); }
+  }
+  const size_t a = file_size_or_zero_(dir + "/clip-000.mp4");
+  const size_t b = file_size_or_zero_(dir + "/clip-001.mp4");
+  filesystem::remove_all(dir, ec);
+  EXPECT_TRUE(url_run0 == dir + "/clip-000.mp4");
+  EXPECT_TRUE(a > 0);
+  EXPECT_TRUE(b > 0);
+}
+
+// %t names the clip after the wall clock. The stage resolves the name
+// ONCE per run (the muxer reads the extension before the file is
+// opened, and the two must agree), so the check is that exactly one
+// file appeared and the token is gone from it.
+TEST(video_stages, encoder_timestamp_token_names_the_clip) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string dir = string("/tmp/vpipe-enc-t-") + to_string(getpid());
+  error_code ec;
+  filesystem::remove_all(dir, ec);
+  filesystem::create_directories(dir, ec);
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<SynthVideoSource>(
+    &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->target_frames = 4;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<SynthVideoSource*>(
+    pl->insert_stage(std::move(src_u)));
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url",
+               FlexData::make_string(dir + "/take-%t.mp4"));
+    obj.insert("enable_audio", FlexData::make_bool(false));
+    FlexData v = FlexData::make_object();
+    v.as_object().insert("preset", FlexData::make_string("ultrafast"));
+    obj.insert("video", std::move(v));
+  }
+  auto* enc = static_cast<SaveVideoStage*>(pl->insert_stage(
+    make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg))));
+
+  {
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  const string url = enc->resolved_url();
+  int n = 0;
+  string name;
+  for (const auto& e : filesystem::directory_iterator(dir, ec)) {
+    name = e.path().filename().string();
+    ++n;
+  }
+  const size_t sz = file_size_or_zero_(url);
+  filesystem::remove_all(dir, ec);
+
+  EXPECT_TRUE(n == 1);
+  // "take-YYYYmmdd-HHMMSS.mp4"
+  EXPECT_TRUE(name.size() == string("take-20260924-111530.mp4").size());
+  EXPECT_TRUE(name.find("%t") == string::npos);
+  EXPECT_TRUE(url == dir + "/" + name);
+  EXPECT_TRUE(sz > 0);
+}
+
+TEST(video_stages, encoder_broken_template_is_deferred_config) {
+  Session sess;
+  FlexData cfg = FlexData::make_object();
+  cfg.as_object().insert("output_url",
+                         FlexData::make_string("/tmp/c-%t{%Y.mp4"));
+  SaveVideoStage e(&sess, "e", {}, std::move(cfg));
+  // NOT just "some error": this stage also refuses 0 input edges, and
+  // that message would carry the test on its own -- which is exactly
+  // what it did until an ablation run showed the assertion surviving
+  // with the template check deleted. The message has to be ABOUT the
+  // template, so look for the path in it.
+  EXPECT_FALSE(e.config_error().empty());
+  EXPECT_TRUE(e.config_error().find("/tmp/c-%t{%Y.mp4")
+              != string::npos);
+}
+
 // Every frame handed to the encoder must come back out of the file.
 // It did not: the encoder leaves AVPacket::duration at 0, the mov
 // muxer derives each sample's duration from the NEXT sample's
@@ -404,9 +575,197 @@ TEST(video_stages, encoder_keeps_every_frame) {
   if (got != kFrames) {
     // cerr is silenced above; the COUNT is the whole diagnosis, since
     // "one short" and "nothing at all" are entirely different bugs.
-    cout << "decoded " << got << " frames, expected " << kFrames << "\n";
+    cout << "demuxed " << got << " packets, expected " << kFrames << "\n";
   }
   EXPECT_TRUE(got == kFrames);
+  remove(out_path.c_str());
+}
+
+// The chain the payload change exists for: a FILE reaching the tensor
+// world.
+//
+// load-video used to decode and emit FrameRefs, and the only consumer of
+// those in the tree is save-video -- so no file could reach video-to-rgb,
+// image-resample, temporal-decimation or anything else that works in
+// tensors, and the whole rgb-frames half of the graph was reachable only
+// from a live camera. Emitting rtsp-capture's EncodedSegments instead
+// makes the file and the camera the same input.
+//
+// The count is still the assertion: 33 frames in, 33 planar u8 RGB
+// tensors out, through a decoder this stage no longer owns.
+TEST(video_stages, a_file_reaches_the_tensor_chain) {
+  Session sess;
+  CerrSilencer hush;
+
+  const unsigned kFrames = 33;
+  const string out_path = tmp_path_("chain-src", ".mp4");
+  remove(out_path.c_str());
+  {
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<SynthVideoSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->target_frames = kFrames;
+    src_u->fps = AVRational{16, 1};
+    src_u->allocate_oports(1);
+    auto* src = static_cast<SynthVideoSource*>(
+      pl->insert_stage(std::move(src_u)));
+    FlexData enc_cfg = FlexData::make_object();
+    enc_cfg.as_object().insert("output_url", FlexData::make_string(out_path));
+    enc_cfg.as_object().insert("enable_audio", FlexData::make_bool(false));
+    auto enc_u = make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
+    pl->insert_stage(std::move(enc_u));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  ASSERT_TRUE(file_size_or_zero_(out_path) > 0);
+
+  unsigned tensors = 0;
+  std::int64_t stacked = 0, w = 0, h = 0;
+  {
+    auto pl = make_unique<Pipeline>("p2", &sess);
+    FlexData lv_cfg = FlexData::make_object();
+    lv_cfg.as_object().insert("input_url", FlexData::make_string(out_path));
+    lv_cfg.as_object().insert("enable_audio", FlexData::make_bool(false));
+    auto lv_u = make_unique<LoadVideoStage>(
+      &sess, "lv", vector<InEdge>{}, std::move(lv_cfg));
+    lv_u->allocate_oports(1);
+    auto* lv = static_cast<LoadVideoStage*>(pl->insert_stage(std::move(lv_u)));
+
+    FlexData vr_cfg = FlexData::make_object();
+    vr_cfg.as_object().insert("output_dtype", FlexData::make_string("u8"));
+    auto vr_u = make_unique<VideoToRgbStage>(
+      &sess, "vr", vector<InEdge>{{lv, 0}}, std::move(vr_cfg));
+    auto* vr = static_cast<VideoToRgbStage*>(pl->insert_stage(std::move(vr_u)));
+
+    // Through temporal-stack, because that is where the storage class
+    // bites: video-to-rgb's metal fast path emits SHARED (Metal-buffer)
+    // beats, whose `data` vector is empty and whose bytes live in the
+    // external handle. A consumer that reads `data` sees every frame as
+    // an empty tensor and silently stacks nothing -- which is what this
+    // chain did the first time it ran.
+    FlexData ts_cfg = FlexData::make_object();
+    ts_cfg.as_object().insert("mode", FlexData::make_string("video"));
+    auto ts_u = make_unique<TemporalStackStage>(
+      &sess, "ts", vector<InEdge>{{vr, 0}}, std::move(ts_cfg));
+    auto* ts = static_cast<TemporalStackStage*>(
+      pl->insert_stage(std::move(ts_u)));
+
+    auto cnt_u = make_unique<RgbCounter>(
+      &sess, "cnt", vector<InEdge>{{ts, 0}}, FlexData::make_object());
+    auto* cnt = static_cast<RgbCounter*>(pl->insert_stage(std::move(cnt_u)));
+
+    PipelineRuntime rt(pl.get(), &sess);
+    // A REFUSED LAUNCH is the failure to watch for: the edge is checked
+    // by payload type AND tag, so the old FrameRef contract would fail
+    // here rather than at the first beat.
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+    tensors = cnt->groups;
+    stacked = cnt->stacked;
+    w = cnt->w;
+    h = cnt->h;
+  }
+  cout << "load-video -> video-to-rgb -> temporal-stack: " << tensors
+       << " group(s) of " << stacked << " frame(s) " << w << "x" << h
+       << ", expected 1 of " << kFrames << "\n";
+  EXPECT_TRUE(tensors == 1);
+  EXPECT_TRUE(stacked == kFrames);
+  EXPECT_TRUE(w > 0 && h > 0);
+  remove(out_path.c_str());
+}
+
+// A stream WITH B-FRAMES decodes whole, through both decoder slots. The
+// decoder holds the first picture back until later (non-IDR) packets
+// arrive. video-to-rgb used to count itself synced only once a frame
+// came OUT, so its gate dropped every packet after the IDR: 1 frame of
+// 25. The file above is written without B-frames (VideoToolbox's
+// default), which is why that test never saw it.
+TEST(video_stages, a_stream_with_b_frames_decodes_whole) {
+  Session sess;
+  CerrSilencer hush;
+
+  const unsigned kFrames = 33;
+  const string out_path = tmp_path_("bframes", ".mp4");
+  remove(out_path.c_str());
+  {
+    auto pl = make_unique<Pipeline>("p", &sess);
+    auto src_u = make_unique<SynthVideoSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+    src_u->target_frames = kFrames;
+    src_u->fps = AVRational{16, 1};
+    src_u->allocate_oports(1);
+    auto* src = static_cast<SynthVideoSource*>(
+      pl->insert_stage(std::move(src_u)));
+    // bf=2: VideoToolbox (and libx264, the non-Apple fallback) reorder
+    // with it -- I B B B P on this fixture.
+    FlexData enc_cfg = FlexData::from_json(
+      R"({"enable_audio":false,"video_options":{"bf":"2"}})");
+    enc_cfg.as_object().insert("output_url", FlexData::make_string(out_path));
+    auto enc_u = make_unique<SaveVideoStage>(
+      &sess, "enc", vector<InEdge>{{src, 0}}, std::move(enc_cfg));
+    pl->insert_stage(std::move(enc_u));
+    PipelineRuntime rt(pl.get(), &sess);
+    EXPECT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  ASSERT_TRUE(file_size_or_zero_(out_path) > 0);
+
+  // The fixture must actually reorder, or this tests nothing.
+  int delay = -1;
+  {
+    const FFmpegLibraries& libs = *sess.services()->ffmpeg_libraries();
+    AVFormatContext* ic = nullptr;
+    if (libs.avformat().api.open_input(&ic, out_path.c_str(), nullptr,
+                                       nullptr) == 0) {
+      if (libs.avformat().api.find_stream_info(ic, nullptr) >= 0) {
+        for (unsigned i = 0; i < ic->nb_streams; ++i) {
+          const AVCodecParameters* cp = ic->streams[i]->codecpar;
+          if (cp->codec_type == AVMEDIA_TYPE_VIDEO) {
+            delay = cp->video_delay;
+          }
+        }
+      }
+      libs.avformat().api.close_input(&ic);
+    }
+  }
+  printf("[video_stages] b-frame fixture: decoder delay %d\n", delay);
+  EXPECT_TRUE(delay > 0);
+
+  for (const char* hw : {"auto", "none"}) {
+    unsigned frames = 0;
+    {
+      auto pl = make_unique<Pipeline>("p2", &sess);
+      FlexData lv_cfg = FlexData::from_json(R"({"enable_audio":false})");
+      lv_cfg.as_object().insert("input_url", FlexData::make_string(out_path));
+      auto lv_u = make_unique<LoadVideoStage>(
+        &sess, "lv", vector<InEdge>{}, std::move(lv_cfg));
+      lv_u->allocate_oports(1);
+      auto* lv = static_cast<LoadVideoStage*>(
+        pl->insert_stage(std::move(lv_u)));
+      FlexData vr_cfg = FlexData::make_object();
+      vr_cfg.as_object().insert("hwaccel", FlexData::make_string(hw));
+      auto vr_u = make_unique<VideoToRgbStage>(
+        &sess, "vr", vector<InEdge>{{lv, 0}}, std::move(vr_cfg));
+      auto* vr = static_cast<VideoToRgbStage*>(
+        pl->insert_stage(std::move(vr_u)));
+      auto cnt_u = make_unique<RgbCounter>(
+        &sess, "cnt", vector<InEdge>{{vr, 0}}, FlexData::make_object());
+      auto* cnt = static_cast<RgbCounter*>(pl->insert_stage(std::move(cnt_u)));
+      PipelineRuntime rt(pl.get(), &sess);
+      EXPECT_TRUE(rt.launch());
+      rt.wait_idle();
+      rt.stop();
+      frames = cnt->frames;
+    }
+    printf("[video_stages] b-frames, hwaccel %s: %u of %u frames\n", hw,
+           frames, kFrames);
+    EXPECT_TRUE(frames == kFrames);
+  }
   remove(out_path.c_str());
 }
 
@@ -473,16 +832,20 @@ public:
   int channels    = 2;
   int sample_rate = 32000;
   int samples     = 32000;      // 1 s
+  // Beats, not total length. A multi-part join sends one PER FILE and a
+  // chunking producer one per chunk, and neither lands on the codec's
+  // frame boundary -- which is the case a single beat cannot reach.
+  int beats       = 1;
   bool send_rate  = true;
   // What audio-vae-decode carries forward from the latent it decoded.
   string model_name;
 
-  void reset_run_state() override { _sent = false; }
+  void reset_run_state() override { _sent = 0; }
 
   Job process(RuntimeContext& ctx) override
   {
-    if (_sent) { ctx.signal_done(); co_return; }
-    _sent = true;
+    if (_sent >= beats) { ctx.signal_done(); co_return; }
+    ++_sent;
     auto b = make_unique<TensorBeatPayload>();
     b->dtype = TensorBeat::DType::F32;
     b->shape = {channels, samples};
@@ -520,7 +883,7 @@ public:
     return s;
   }
 private:
-  bool _sent = false;
+  int _sent = 0;
 };
 
 }  // namespace
@@ -605,6 +968,90 @@ TEST(video_stages, encoder_muxes_raw_stereo_pcm) {
   EXPECT_TRUE(n_audio == 1);
   EXPECT_TRUE(ach == 2);
   EXPECT_TRUE(arate == 32000);
+  remove(out_path.c_str());
+}
+
+// SEVERAL PCM beats, none of them a whole number of codec frames.
+//
+// A block codec takes a SHORT frame only as the stream's last: FFmpeg
+// pads it, latches `last_audio_frame`, and answers the NEXT
+// send_frame with EINVAL. The sink used to end every beat with one, so
+// a graph sending one beat per clip was fine and a graph sending one
+// per chunk -- audio-to-pcm -- or one per file -- a joined load-video --
+// lost everything after the first. MEASURED on a 5-part 896x512 story:
+// 1585 frames offered, 627 taken, 958 refused, and the run still exited
+// 0 with 20 s of audio under 50 s of video.
+//
+// 32400 is deliberately not a multiple of 1024 (31.64 frames), so every
+// beat boundary lands mid-frame.
+TEST(video_stages, encoder_joins_pcm_beats_across_frame_boundaries) {
+  Session sess;
+  CerrSilencer hush;
+
+  const string out_path = tmp_path_("enc-pcm-beats", ".m4a");
+  remove(out_path.c_str());
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto asrc_u = make_unique<SynthPcmSource>(
+    &sess, "asrc", vector<InEdge>{}, FlexData::make_object());
+  asrc_u->samples = 32400;
+  asrc_u->beats   = 3;
+  asrc_u->allocate_oports(1);
+  auto* asrc = static_cast<SynthPcmSource*>(
+    pl->insert_stage(std::move(asrc_u)));
+  const int64_t want = 32400LL * 3;
+
+  FlexData enc_cfg = FlexData::make_object();
+  {
+    auto obj = enc_cfg.as_object();
+    obj.insert("output_url", FlexData::make_string(out_path));
+    obj.insert("enable_video", FlexData::make_bool(false));
+  }
+  auto enc_u = make_unique<SaveVideoStage>(
+    &sess, "enc", vector<InEdge>{{asrc, 0}}, std::move(enc_cfg));
+  auto* enc = static_cast<SaveVideoStage*>(
+    pl->insert_stage(std::move(enc_u)));
+  EXPECT_TRUE(enc->config_error().empty());
+
+  PipelineRuntime rt(pl.get(), &sess);
+  EXPECT_TRUE(rt.launch());
+  rt.wait_idle();
+  rt.stop();
+
+  int64_t got = 0, meta = 0;
+  {
+    const FFmpegLibraries& libs = *sess.services()->ffmpeg_libraries();
+    AVFormatContext* ic = nullptr;
+    if (libs.avformat().api.open_input(&ic, out_path.c_str(), nullptr,
+                                       nullptr) == 0) {
+      if (libs.avformat().api.find_stream_info(ic, nullptr) >= 0) {
+        for (unsigned i = 0; i < ic->nb_streams; ++i) {
+          AVStream* st = ic->streams[i];
+          if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) { continue; }
+          // mp4 audio is timed in samples, so the duration IS the count
+          // once it is rescaled off the stream's own base.
+          const int64_t rate = st->codecpar->sample_rate;
+          if (st->duration > 0 && st->time_base.den > 0) {
+            got = st->duration * st->time_base.num * rate / st->time_base.den;
+          }
+        }
+        AVDictionaryEntry* e = libs.avutil().api.dict_get(
+          ic->metadata, kAudioSamplesMetaKey, nullptr, 0);
+        if (e != nullptr && e->value != nullptr) { meta = atoll(e->value); }
+      }
+      libs.avformat().api.close_input(&ic);
+    }
+  }
+  printf("[video_stages] 3 beats x 32400: container %lld samples, "
+         "true-length tag %lld, wanted %lld\n",
+         (long long)got, (long long)meta, (long long)want);
+  // Before the fix this stopped at ~32768 -- the first beat and nothing
+  // after it. The upper bound is the codec rounding its LAST frame up.
+  EXPECT_TRUE(got >= want);
+  EXPECT_TRUE(got < want + 2048);
+  // And the true-length tag must be the real count, not the padded one,
+  // since that is what a joining reader trims to.
+  EXPECT_TRUE(meta == want);
   remove(out_path.c_str());
 }
 

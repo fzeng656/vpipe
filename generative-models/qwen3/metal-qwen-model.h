@@ -30,29 +30,42 @@
 #include "apple-silicon/metal-compute/event.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
+#include <thread>
 #include <deque>
 #include <unordered_map>
 #include <vector>
 
 namespace vpipe::metal_compute { class MetalCompute; class ComputeEncoder; }
+namespace vpipe { class SessionContextIntf; }
 
 namespace vpipe::genai {
 
 struct ModelConfig;
 class I8GemmContext;   // fwd (shared/i8-gemm.h)
 class WeightSet;       // generative-models/weight-set.h
+class MetalDFlashDrafter;   // shared/dflash-drafter.h
+class DFlashTarget;         // shared/dflash-drafter.h
+class MetalLlamaWeights;   // llama3/metal-llama-weights.h
+class MoeExpertCache;      // moe-expert-cache.h
+class SafetensorsRanges;   // safetensors-ranges.h
+class WiredPool;           // shared/wired-pool.h
 
 // k-quant family of a NATIVE GGUF weight (no requant). kNone => the weight
 // is on the affine (safetensors / gemma-style) path. The metal forward
 // dispatches the matching qmv (decode) / dequant-to-f16 + dense GEMM
 // (prefill) per tensor; q4_K and q5_K share get_scale_min_k4, q6_K is its
-// own block format. See gguf-convert GgufQwen35Converter.
-enum class KQ : std::uint8_t { kNone = 0, kQ4K, kQ5K, kQ6K };
+// own block format. See gguf-convert GgufQwen35Converter. kNVFP4 is a
+// ModelOpt NVFP4 linear served in k-quant form (generative-models/shared/
+// nvfp4.h): 256-input super-blocks of E2M1 codes, E4M3 block scales and
+// the tensor's f32 scale -- the same qmv / dequant-and-GEMM route.
+enum class KQ : std::uint8_t { kNone = 0, kQ4K, kQ5K, kQ6K, kNVFP4 };
 
 // Streaming / stop / position control for MetalQwenModel::mtp_decode. All
 // fields optional; the defaults reproduce the original generate-to-budget,
@@ -76,15 +89,23 @@ struct MtpDecodeCtl {
   std::function<bool(std::span<const std::int32_t>)> on_round;
   // Set true iff a stop token (is_stop) ended generation (vs budget/abort).
   bool* hit_stop = nullptr;
+  // Draft tokens offered to the verifier, every round (the first has
+  // none): `accepted` of them kept -- an acceptance rate.
+  long* drafted = nullptr;
   // Sampler for the VERIFY (speculative sampling). greedy (default) accepts a
   // draft iff it == argmax(P); a non-greedy sampler accepts iff it == a token
   // SAMPLED from P at that position (per-position seed). Either way every
   // committed token IS the verifier's pick from the correctly-conditioned P, so
   // the output distribution is exactly autoregressive sampling from the main
   // model -- the drafter (MTP head, still argmax) only affects acceptance rate,
-  // not the tokens. (Penalties/seen-set are NOT applied in the verify; the
-  // caller restricts the sampled path to no-penalty configs.)
+  // not the tokens. Repetition / presence PENALTIES apply too: each verified
+  // position samples against the seen-set pdecode would hold at that step
+  // (`prime`, every token kept before, the drafts up to it), so penalised
+  // sampling stays token-exact with pdecode_begin(prime) as well.
   GpuSamplerParams sampler{};
+  // The prompt the penalty seen-set starts from (pdecode_begin's `prompt`);
+  // first_token is added to it. Unused without penalties.
+  std::span<const std::int32_t> prime;
 };
 
 class MetalQwenModel {
@@ -128,10 +149,25 @@ public:
     // loads the *_bf16 kernel metallibs and keeps the checkpoint's bf16
     // scales/norms/conv raw (no load-time conversion).
     bool  use_bf16    = false;
-    // Quantization bit-width of the linear weights: 4 (Qwen3.5/Llama) or
-    // 8 (Qwen3-ASR). Selects the affine_qmv/affine_qmm_steel w4g64 vs
-    // w8g64 kernel entry points and the packed-weight row stride.
+    // Whether the kernel tuners MEASURE -- the decode and prefill
+    // attention sets, the batched-GEMV ladder, the int8 split (the accel
+    // key `autotune`, accel-keys.h). False takes the choice believed
+    // fastest on this GPU, timing nothing and reading no kept answer:
+    // what a generating model's backbone (a TTS, a song's, a conditioning
+    // encoder) is given for a run that must repeat. A chat keeps it.
+    bool  autotune    = true;
+    // A SEPARATE MTP drafter's directory (LoadSpec::mtp_dir): its
+    // model.safetensors carries the head under bare names (fc, layers.0,
+    // norm, pre_fc_norm_*), its norms TRUE weights, its fc quantized.
+    // Probed before the model's own head.
+    std::string mtp_dir;
+    // Quantization bit-width of the linear weights: 4 (Qwen3.5/Llama), 8
+    // (Qwen3-ASR) or 2 (the ternary packs, group 128). Selects the
+    // affine_qmv/affine_qmm_steel w4g64 / w8g64 / w2g128 kernel entry
+    // points and the packed-weight row stride.
     int   quant_bits  = 4;
+    // ... and the group the affine scales cover: 64, or 128 at 2 bits.
+    int   quant_group = 64;
     // Dense mode: every layer is full-attention (no gated-DeltaNet
     // layers). Used by the Qwen3-ASR text decoder, a plain Qwen3 dense
     // transformer.
@@ -187,8 +223,58 @@ public:
     // layers resident so pinned + running stays within that fraction of
     // physical RAM. Pinned layers are read once and reused by every
     // prefill; only the tail streams. 0 => pure streaming.
+    //
+    // THE FALLBACK, not the path. A backbone stream_decode can serve
+    // (streams_raw) takes that instead even for a prefill-only caller --
+    // its resident set grows by measurement and gives layers back under
+    // pressure, where a prefix is sized once from a fraction of RAM and
+    // can neither -- and ignores both fields. What still reads them is
+    // what that path does not build: attention biases (Qwen2.5-VL), packs
+    // other than a uniform w8, and a gated-DeltaNet hybrid's pack (a
+    // hybrid streams bf16 only).
     bool   stream_layers = false;
     double pin_frac      = 0.0;
+    // IN-MEMORY QUANTIZATION of a raw checkpoint. 8 quantizes every
+    // projection of an UNQUANTIZED (raw HF float) checkpoint to affine w8
+    // group 64 as the layer is built, and the model then runs the affine
+    // path an 8-bit pack takes -- at ~53% of the bf16 bytes, which for an
+    // autoregressive backbone is the difference between fitting in RAM
+    // and paging. 0 keeps a raw checkpoint dense. No effect on a
+    // checkpoint that is already quantized, nor without raw_layers()
+    // eligibility (dense full-attention, backbone_only, bf16, plain
+    // RMSNorm, q/k norms, no attention bias).
+    int    load_quant_bits = 0;
+    // DECODE-CAPABLE layer streaming, for the same eligible backbones
+    // and, in bf16, the gated-DeltaNet hybrids (Qwen3.5: both kinds of
+    // layer refill one slot pair, laid out as a pool that serves either):
+    // a streamed layer keeps its raw checkpoint tensors in one of two
+    // pread-refilled slots (shared/block-slots.h) and is rebuilt -- w8
+    // or bf16, exactly as a resident layer is -- inside the command
+    // buffer that runs it, so streamed and resident output are
+    // byte-identical. The resident set grows by measurement
+    // (shared/block-residency.h) and is wired into the pool. Serves both
+    // forward_embeddings_hidden and decode_embedding_hidden, and every
+    // taps forward (the conditioning encoders'); pin_frac is not used.
+    // Takes the place of stream_layers when it engages, so a caller that
+    // can take either asks for both and gets this where streams_raw()
+    // says so.
+    bool   stream_decode = false;
+    // MIXTURE-OF-EXPERTS: hold the ROUTED experts in a cache of about this
+    // many bytes (generative-models/moe-expert-cache.h) instead of resident.
+    // Everything else loads as usual and is wired; an expert is read from
+    // disk when a step routes to it and it is not cached, and the cache
+    // keeps the experts selected most often. 0 (the default) = every
+    // expert resident. The engine decides (expert_cache_plan); the output
+    // is the resident model's, byte for byte.
+    std::size_t expert_cache_bytes = 0;
+    // QWEN3.8-FLASH-NEXT: hold the n-gram PLE table (tens of GB) in memory,
+    // filled on a thread of its own after the load, its rows then read
+    // from there rather than from disk at every prompt (a shard at a time:
+    // a row of a shard not yet in memory is read from disk as without it).
+    // The host's choice (load_spec::kNgramResident) where the model, every
+    // expert and the table fit (lm_ngram_resident); the same rows either
+    // way, bit for bit.
+    bool ple_resident = false;
     // Weight-name root prepended before "model." / "lm_head." Qwen3.5-VL
     // nests the LM under "language_model."; Qwen3-ASR is at the root ("").
     std::string weight_prefix = "language_model.";
@@ -207,6 +293,57 @@ public:
     // T everywhere, H at 1+3k, W at 2+3k. Qwen2.5-VL (sectioned, classic HF
     // apply_multimodal_rotary_pos_emb): contiguous blocks [T..|H..|W..].
     bool  mrope_interleaved = true;
+    // YaRN RoPE (Ministral-3): with rope_yarn_factor > 1 the inv_freq
+    // table blends interpolated (/factor) and extrapolated frequencies
+    // across the [beta_fast, beta_slow] correction band of the ORIGINAL
+    // context, exactly as HF's _compute_yarn_parameters (truncate) and
+    // mlx-lm's YarnRoPE build it. Its attention factor (mscale over
+    // mscale_all_dim) must be 1 -- Ministral's is -- and load() refuses
+    // anything else rather than run without the cos/sin scale.
+    float rope_yarn_factor      = 1.0f;
+    int   rope_yarn_orig_ctx    = 0;
+    float rope_yarn_beta_fast   = 32.0f;
+    float rope_yarn_beta_slow   = 1.0f;
+    float rope_yarn_attn_factor = 1.0f;
+    // Llama-4 attention temperature (Ministral-3): queries scaled by
+    // 1 + beta * log(1 + floor(pos / orig)) after their RoPE, at each
+    // row's own position (rope_partial_qscale_f16). Exactly 1 below
+    // `orig`. beta 0 = off.
+    float attn_temp_beta = 0.0f;
+    int   attn_temp_orig = 0;
+
+    // ---- Hyper-connections (Qwen3.8-Flash-Next, model_type qwen4_exp) --
+    // hc_count > 1: no pre-norms and no residual adds -- the residual is
+    // hc_count streams of `hidden` ([rows, hc_count*hidden]), every
+    // sublayer reads a mix of them and writes into each at its own
+    // injection weight, and a final mixer collapses them for the head
+    // (metal-qwen-hc.cc). hc_lowrank is the input mixer's rank.
+    int   hc_count   = 1;
+    int   hc_lowrank = 0;
+    bool  hc() const { return hc_count > 1; }
+    // The group every non-expert affine projection is re-encoded at (as
+    // w8): 64 where every such group the checkpoint uses is a multiple of
+    // 64 (oQ5e: 64 / 128), else 32 (MLX's 4-bit packs). Either is
+    // lossless; the experts and the n-gram table keep their own.
+    int   hc_group = 64;
+    // The gated-DeltaNet output norm's gate: silu (Qwen3.5) or sigmoid
+    // (qwen4_exp's output_gate_type).
+    bool  gdn_gate_sigmoid = false;
+    // Per-layer n-gram embedding (PLE): the 0-based layer that adds it
+    // (-1 none), the largest n-gram and hashed heads per order, the
+    // embedding width (every head's slice concatenated), the dilated
+    // depthwise conv's kernel (its dilation is ple_ngram), and the EOS id
+    // the hashed token history restarts at.
+    int   ple_layer = -1;
+    int   ple_ngram = 3;
+    int   ple_heads_per_ngram = 8;
+    int   ple_dim = 0;
+    int   ple_conv_kernel = 4;
+    int   ple_eos = -1;
+    // The QSA token indexer on the full-attention layers: query heads,
+    // head dim, token budget and block (compress) ratio. 0 heads = none.
+    // Attention is dense while a query sees <= budget + ratio - 1 tokens.
+    int   qsa_heads = 0, qsa_head_dim = 0, qsa_budget = 0, qsa_ratio = 0;
 
     int key_dim()   const { return gdn_k_heads * gdn_k_dim; }   // 2048
     int value_dim() const { return gdn_v_heads * gdn_v_dim; }   // 4096
@@ -246,6 +383,9 @@ public:
   static Config config_from(const ModelConfig& c);
 
   ContextManager* context_manager() { return _ctx.get(); }
+  // What the model keeps beside a context's KV (the MTP head's own KV on a
+  // hyper-connection model), given back when the context is released.
+  void forget_context(ContextId cid);
   // The model's own root context (the one the cid-less forward()/prefill()/
   // decode_pipelined() overloads drive). Exposed so tests can branch() it.
   ContextId root_context() const { return _cid; }
@@ -293,14 +433,26 @@ public:
   // last position; empty on failure.
   // `deepstack` (Qwen3-VL) injects the tower's per-layer features into the
   // image rows exactly as forward_embeddings_taps does -- the stock Qwen3-VL
-  // forward applies them, so a multimodal GENERATION (Mage-Flow's edit
-  // content screen) needs them to match the reference's .generate().
+  // forward applies them, so a multimodal GENERATION (a family's content
+  // screen judging an edit) needs them to match the reference's
+  // .generate().
   std::vector<float> prefill_multimodal_buf(
       ContextId cid, metal_compute::SharedBuffer&& x,
       const std::vector<std::int32_t>& position_ids, int n,
       const DeepstackInject* deepstack = nullptr);
   std::vector<float> prefill_embeddings_buf(
       ContextId cid, metal_compute::SharedBuffer&& x, int n);
+  // A hyper-connection model's spliced prefill (an image or video turn):
+  // the rows `emb` [n, hidden] (host f32: text embeddings and the tower's
+  // rows) WITH the token ids they stand for -- each media row its
+  // placeholder's -- which the n-gram PLE hashes, and the 3-axis mROPE
+  // positions [3 * n] (empty: 1-D). Returns the last row's logits.
+  // `all_logits` (tests): every row's logits [n * vocab].
+  std::vector<float> prefill_hc_spliced(
+      ContextId cid, const std::vector<float>& emb,
+      const std::vector<std::int32_t>& ids,
+      const std::vector<std::int32_t>& position_ids, int n,
+      std::vector<float>* all_logits = nullptr);
 
   // Backbone forward over a pre-assembled [n*hidden] f16 embedding stream
   // that returns the LAST position's FINAL-NORMED hidden as a [hidden]-row
@@ -311,6 +463,13 @@ public:
   metal_compute::SharedBuffer
   forward_embeddings_hidden(ContextId cid,
                             const metal_compute::SharedBuffer& x, int n);
+  // The same forward, returning EVERY position's final-normed hidden
+  // ([n, hidden], compute dtype) -- for a model whose own heads run over
+  // the whole prompt (Fish Audio Drama 3's codebook tower keeps K/V for
+  // every row). Empty on failure.
+  metal_compute::SharedBuffer
+  forward_embeddings_hidden_all(ContextId cid,
+                                const metal_compute::SharedBuffer& x, int n);
 
   // Backbone forward over a pre-assembled [n*hidden] compute-dtype embedding
   // stream that captures the per-layer hidden states (the un-normed residual
@@ -354,6 +513,24 @@ public:
                           int key_valid_len = 0,
                           const DeepstackInject* deepstack = nullptr);
 
+  // forward_embeddings_taps for a BATCH of text sequences, LAYER-MAJOR:
+  // every sequence runs through a layer before any runs the next. A model
+  // whose layers stream (Config::stream_layers) then reads each layer from
+  // disk ONCE for the whole batch, where one sequence at a time re-reads
+  // the stack per sequence -- which is what a dataset's captions cost a
+  // box that cannot hold its encoder. Each sequence gets its own context,
+  // so nothing attends across sequences. `xs[b]` (bf16 [ns[b], H]) is
+  // consumed as that sequence's residual stream, exactly as
+  // forward_embeddings_taps consumes its `x`. Returns one taps buffer per
+  // sequence ([tap][pos][hidden]), each equal to what
+  // forward_embeddings_taps returns for that sequence alone; empty on
+  // failure. Plain RoPE at sequential positions, no deepstack.
+  std::vector<metal_compute::SharedBuffer>
+  forward_embeddings_taps_batch(
+      const std::vector<metal_compute::SharedBuffer*>& xs,
+      const std::vector<int>& ns, const std::vector<int>& tap_layers,
+      int key_valid_len = 0);
+
   // Like forward_embeddings_taps but with 3-axis mROPE (position_ids [3*n],
   // row 0=T,1=H,2=W) for a text+vision-spliced multimodal sequence -- the
   // image-aware conditioning tap (Qwen-Image-Edit last-hidden, or Krea-2's
@@ -386,6 +563,214 @@ public:
   // prompt both ways.
   bool streaming_layers() const { return _stream_layers; }
   int  pinned_layers()    const { return _pinned_layers; }
+  // The routed-expert cache (Config::expert_cache_bytes), null when every
+  // expert is resident: its hit rate, its reads.
+  const MoeExpertCache* expert_cache() const { return _xc.get(); }
+  // A checkpoint's routed-expert bytes AS HELD (0 for a dense model): what
+  // a cache stands in for. The rest is everything else the model holds.
+  static std::size_t routed_expert_bytes(const MetalLlamaWeights& wts,
+                                         const Config& c);
+  // A checkpoint's bytes the model never holds resident: Qwen3.8-Flash-
+  // Next's n-gram PLE table (read by row). 0 for every other model.
+  // Beside routed_expert_bytes, what sizes the cache and the claim's
+  // floor.
+  static std::size_t unheld_bytes(const MetalLlamaWeights& wts,
+                                  const Config& c);
+  // What a checkpoint's held bytes grow by on the way in: a hyper-
+  // connection model re-encodes its non-expert affine projections to w8
+  // at its group, so a 4-bit pack's hold ~1.8x their size on disk. 0 for
+  // every other model. Beside the two above, what sizes the cache and the
+  // claim's floor.
+  static std::size_t held_growth_bytes(const MetalLlamaWeights& wts,
+                                       const Config& c);
+  // How many bytes of cache to give the routed experts of a checkpoint
+  // with `experts` of them in a model holding `rest` besides, on a box
+  // that may spend `budget` on the whole of it: 0 when all of it fits (keep
+  // every expert), else what is left after `rest` -- at least one layer's
+  // worth of transient slots plus as many resident as there is room for.
+  // `layer_expert_bytes` is one layer's experts.
+  static std::size_t expert_cache_plan(std::size_t budget, std::size_t rest,
+                                       std::size_t experts,
+                                       std::size_t layer_expert_bytes);
+  // The same decision for an LM loaded on its own (the model manager's
+  // LoadedLanguageModel): the box's RAM (VPIPE_RAM_LIMIT_MB honoured), the
+  // models the manager holds or has declared beside this one with the
+  // activation scratch the plan holds, the irreversible headroom, and
+  // `scratch` (this model's K/V and activations). 0 for a dense model, or
+  // a MoE that fits. `limit` (bytes, 0 none): the most the model may hold
+  // in all, `scratch` in it (load_spec::kMemoryLimitMb). `cache` (bytes, 0
+  // none): the cache the host asks for (load_spec::kExpertCacheMb) -- at
+  // most that, never past what the box and the limit leave.
+  static std::size_t lm_expert_cache_bytes(
+      const SessionContextIntf* session, const std::string& dir,
+      const Config& c, std::size_t scratch, std::size_t limit = 0,
+      std::size_t cache = 0);
+  // Whether a host asking for the n-gram table in memory (load_spec::
+  // kNgramResident) gets it: where the model with EVERY expert resident
+  // and the table fits what lm_expert_cache_bytes sizes the model in --
+  // the box beside the manager's other models and scratch, the
+  // irreversible headroom, `limit` and a `cache` asked for (which must
+  // hold every expert). The experts come first: on a box that must cache
+  // them, the table stays on disk. False for every model without one.
+  static bool lm_ngram_resident(const SessionContextIntf* session,
+                                const std::string& dir, const Config& c,
+                                std::size_t scratch, std::size_t limit = 0,
+                                std::size_t cache = 0);
+  // Bytes of the n-gram table held in memory so far (0 when it is read
+  // from disk), and whether its fill is done -- for the plan and tests.
+  std::size_t ple_resident_bytes() const;
+  bool ple_resident_done() const;
+  // The whole table's bytes when it is held in memory (Config::
+  // ple_resident), however far its fill has got; 0 when it is read from
+  // disk. The load returns before the fill is done, and on another
+  // thread, so what the load allocated leaves this out.
+  std::size_t ple_table_bytes() const;
+  // How many leading layers a prefill-streamed load of `c` over `wts`
+  // pins (0 unless it streams with a pin_frac, and 0 where streams_raw()
+  // -- residency replaces the prefix there) -- the rule load() takes,
+  // for a caller that must know before it builds (a model kept warm is
+  // only the one asked for if it pinned as many).
+  static int pinned_layer_count(const MetalLlamaWeights& wts,
+                                const Config& c);
+  // Whether a load of `c` over `wts` streams its layers through the
+  // raw-source slots (Config::stream_decode engaged): a raw float stack
+  // of an eligible backbone, a uniform affine w8 pack of one, or an NVFP4
+  // one (its served super-blocks built per refill). The rule load()
+  // takes, for a caller that must know before it builds -- which floor to
+  // declare, whether a pin is asked for at all.
+  static bool streams_raw(const MetalLlamaWeights& wts, const Config& c);
+  // What an NVFP4 Qwen stack (ModelOpt's or ComfyUI's: a language model,
+  // or a conditioning encoder's text stack) holds once loaded natively:
+  // every NVFP4 linear as its served super-blocks (148 bytes a 256 inputs
+  // against the file's 144), an int8 / FP8 tensor beside them in the
+  // compute dtype, the rest as stored. 0 for any other checkpoint --
+  // the figure dir_weights_bytes books such a checkpoint at. `stored`,
+  // when given: the same tensors' bytes on disk.
+  static std::size_t nvfp4_held_bytes(const MetalLlamaWeights& wts,
+                                      std::size_t* stored = nullptr);
+  // The LEAST a layer-streaming load holds, from the checkpoint alone:
+  // everything outside the stack under `layer_stem` ("model.layers.")
+  // plus what is in flight -- the raw-source slot pair (a layer's
+  // sources and the products built beside them, twice) where the stack
+  // is one stream_decode serves, else two of the widest layer (the
+  // prefill path builds one and frees it). The figure a streamable
+  // claim promises; 0 when nothing is under the stem.
+  static std::size_t stream_floor_bytes(const MetalLlamaWeights& wts,
+                                        const std::string& layer_stem);
+
+  // ---- Raw-source layers (Config::load_quant_bits / stream_decode) -------
+  // Whether the layers are built by this model (in-memory w8 or bf16
+  // streaming from a raw checkpoint, or a streamed affine w8 pack),
+  // whether a raw checkpoint was quantized on the way in, whether the
+  // source is a pack, and whether layers stream through decode.
+  bool raw_layers()        const { return _raw; }
+  bool quantized_on_load() const { return _raw_quant && !_raw_pack; }
+  bool streams_pack()      const { return _raw_pack; }
+  bool streams_nvfp4()     const { return _raw_nv; }
+  bool streams_decode()    const;
+  // Residency, as the block-streaming DiTs take it (docs/MODEL-MEMORY.md
+  // mechanisms 6 and 7). The reserve is what must stay clear for whatever
+  // runs after this model's forward and has not allocated yet; growth is
+  // off until one is set, and 0 is a real answer. The schedule sizes the
+  // growth rate from how many forwards the run will make.
+  void set_residency_reserve(std::size_t bytes);
+  void set_residency_schedule(int forwards);
+  std::size_t release_resident_layers(std::size_t bytes);
+  int  resident_layer_count() const;
+  // Give the slot pair back when every layer the last forward ran is
+  // resident -- two layers a preload never held. For a caller about to
+  // leave the model idle (kept warm); a forward does it at its top. An
+  // eviction later builds the pair again. Returns the bytes given back.
+  std::size_t release_idle_slots();
+  // Wire what this model keeps into the pool: the checkpoint's cached
+  // trunk first, then (preloaded) every layer. For the OWNER to call once
+  // it has loaded its own tensors from the same checkpoint -- a MOSS
+  // model's embedding tables and heads are that trunk, and they load
+  // after this model does. Streaming models also re-wire the trunk at
+  // the top of every forward.
+  void wire_resident();
+  // Take ownership of a buffer the OWNER built and reads on every token --
+  // a MOSS model's w8 embedding table and text head, which are transforms
+  // of the checkpoint and so are not the set's to wire. It is wired with
+  // the trunk (ahead of any layer) and lives as long as this model; the
+  // reference stays valid for that long. NOT counted in resident_bytes():
+  // the owner already books what it built.
+  metal_compute::SharedBuffer& adopt_trunk(metal_compute::SharedBuffer b);
+  // The backbone weight bytes this model holds NOW: every built layer
+  // (all of them, preloaded; the promoted ones, streaming), the two
+  // streaming slots and the final norm. K/V is not included.
+  std::uint64_t resident_bytes() const;
+  // A digest of every weight buffer the model holds, one per buffer in a
+  // fixed order (each layer's, then the embedding, head and final norm;
+  // an empty buffer digests as 0): two loads of one checkpoint must agree
+  // entry for entry, and the first that does not names the buffer. A
+  // diagnostic -- it reads every byte, ~1 s for 36 GB.
+  std::vector<std::uint64_t> weight_digests() const;
+  // The speculative verify's scratch, pooled for the model's life once a
+  // drafter runs: what it grows to for rounds of at most `rows` rows
+  // (every slot at its widest, the long-context attention's partials
+  // and `mtp_head`'s rows included) -- for a plan made before the model
+  // loads -- and what it holds now. `*conditional`: the share only some
+  // rounds take (that attention, a sampled round's rows, the fused
+  // in_proj of a uniform or k-quant model).
+  static std::size_t verify_scratch_bytes(const Config& c, int rows,
+                                          bool mtp_head,
+                                          std::size_t* conditional = nullptr);
+  // A hyper-connection model's (Qwen3.8-Flash-Next's) run beyond its
+  // weights, for a plan made before it loads: one forward's activations
+  // at a prefill piece's rows (hc_piece_rows, or the prompt's when
+  // shorter), the K/V of `ctx_tokens` (its full layers, the QSA key
+  // layers, the MTP head's), and a context's recurrent state in the three
+  // ring slots a speculative decode keeps. 0 for any other model.
+  static std::size_t hc_run_bytes(const Config& c, std::int64_t ctx_tokens);
+  // The most rows a hyper-connection prefill runs a piece: each piece
+  // reads every routed expert it picks that the cache lacks, so fewer,
+  // wider pieces read less -- 8192 where a forward's activations at that
+  // many rows fit a twelfth of the box (its believed RAM), else 4096,
+  // else 2048.
+  static int hc_piece_rows(const Config& c);
+  // One forward's activations at `n` rows (the part of hc_run_bytes that
+  // grows with them).
+  static std::size_t hc_forward_bytes(const Config& c, std::size_t n);
+  // Any model's working memory beside its weights, for the LM stages'
+  // plan (lm_run_bytes): a prompt of up to max_seq rows of `kv_tokens`, its
+  // embeddings (the muxer's and the copy) and a prefill piece through
+  // forward_chunk_ (its buffers, element by element; the whole prompt in
+  // one with `one_pass` -- an MTP seed, a DFlash drafter's taps; the
+  // matrix-core MLP's gate|up with `matrix_cores`; `plain_mlp`: a dense,
+  // mixed or k-quant checkpoint's second MLP buffer), the dequantized-
+  // weight scratch, the paged K/V of `kv_tokens` at the capacity the
+  // pool's doubling reaches (one layer's old pool beside the new while it
+  // copies), `contexts` contexts' recurrent state and the decode scratch.
+  // A hyper-connection model's is hc_run_bytes, its other contexts' state
+  // beside it. `prompt_rows` > 0: the longest prompt a context prefills,
+  // where that is less than the K/V -- several contexts each prefilled
+  // on its own (MiniMax-Music3's prompt and its guidance twin); else the
+  // prompt is the K/V's tokens up to max_seq.
+  static std::size_t run_bytes(const Config& c, std::int64_t kv_tokens,
+                               int contexts, bool one_pass, bool plain_mlp,
+                               bool matrix_cores,
+                               std::int64_t prompt_rows = 0);
+  std::size_t verify_scratch_held() const;
+
+  // Sizes of a raw-source backbone, from the checkpoint alone -- for a
+  // stage that has to plan before anything loads. `layer_prefix` is the
+  // stem before the layer index ("language_model.layers."); `quant_bits`
+  // 8 builds w8, 0 keeps bf16. An affine w8 group-64 pack is sized too
+  // (`pack`): its layers stream as they sit, whatever `quant_bits` says.
+  // Zeros when the layers are neither raw nor such a pack.
+  struct RawSizes {
+    int         n_layers = 0;
+    std::size_t raw      = 0;   // on-disk bytes of all layers
+    std::size_t built    = 0;   // what all layers hold once built
+    std::size_t layer    = 0;   // what the WIDEST layer holds built
+    std::size_t slot     = 0;   // one streaming slot: sources + products
+    bool        pack     = false;   // the layers are already affine w8
+    bool        nv       = false;   // the layers are NVFP4, served
+  };
+  static RawSizes raw_sizes(const MetalLlamaWeights& wts,
+                            const std::string& layer_prefix, int n_layers,
+                            int quant_bits);
   // [n_layers][channels] abs-max (hidden for qkv/gateup, ffn_inner for down).
   const std::vector<std::vector<float>>& calib_qkv()    const { return _calib_qkv; }
   const std::vector<std::vector<float>>& calib_gateup() const { return _calib_gu; }
@@ -462,6 +847,14 @@ public:
   // position. Empty on failure.
   std::vector<float> prefill(ContextId cid,
                              const std::vector<std::int32_t>& ids);
+  // Every row's logits ([n * vocab]) of a prefill: teacher forcing and
+  // evaluation. Hyper-connection models only for now (empty otherwise).
+  // `mtp_logits`, when given and the model carries an MTP head, receives
+  // the head's logits for each (row t, token t + 1) pair it primes its KV
+  // with ([(n - 1) * vocab]; row t predicts token t + 2).
+  std::vector<float> prefill_all_logits(
+      ContextId cid, const std::vector<std::int32_t>& ids,
+      std::vector<float>* mtp_logits = nullptr);
   std::vector<float> prefill(const std::vector<std::int32_t>& ids) {
     return prefill(_cid, ids);
   }
@@ -537,6 +930,22 @@ public:
                            std::span<const std::int32_t>   rope_pos,
                            std::vector<float>&             out_logits);
 
+  // The batched counterpart of decode_embedding_hidden: each of the N
+  // contexts `cids` appends ONE position whose input row is row i of
+  // `emb` ([N, hidden], compute dtype), in one forward that reads every
+  // projection once for all N, and the N FINAL-NORMED hiddens come back
+  // in the returned [N, hidden] buffer (internal scratch, valid until the
+  // next batched call). No lm_head runs: the caller owns its heads, and
+  // `post_hidden` is appended to the same command buffer for them. Plain
+  // sequential RoPE (the KV slot position). Quantized stacks only (a
+  // dense one has no batched projections); nullptr otherwise or on
+  // failure.
+  const metal_compute::SharedBuffer* decode_batched_embedding_hidden(
+      std::span<const ContextId> cids, const metal_compute::SharedBuffer& emb,
+      const std::function<void(metal_compute::ComputeEncoder&,
+                               const metal_compute::SharedBuffer&)>*
+          post_hidden = nullptr);
+
   // Self-contained greedy batched decode (synchronous), built on
   // decode_batched_step: generate `n_steps` argmax tokens for each branch.
   // out[b] = the per-step argmax ids. Verified token-exact vs serial
@@ -569,11 +978,21 @@ public:
 
   const Config& config() const { return _cfg; }
 
+  // The QSA selects a few rows ran in two phases (tests).
+  long qsa_two_phase_selects() const { return _qsa_two; }
   // ---- MTP speculative decode (Multi-Token Prediction) ----------------
   // Whether a bundled MTP head (mtp.safetensors: one full-attn decoder layer
-  // + the eh-fusion `fc` and pre-norms) was loaded. Drives the spec-decode
-  // fast path; false => callers use the plain serial decode.
-  bool has_mtp() const noexcept { return _mtp.ok; }
+  // + the eh-fusion `fc` and pre-norms) was loaded AND this model's layout
+  // can run it. Drives the spec-decode fast path; false => callers use the
+  // plain serial decode. mtp_decode verifies on the de-fused mixed-affine,
+  // k-quant and dense layouts only: a UNIFORM affine model (mlx-community's
+  // plain 4-bit) with a head beside it -- one lent from its OptiQ pack --
+  // loads the head, but mtp_decode refuses it, and reporting it usable sent
+  // text-chat down a path that emitted nothing past the first token.
+  bool has_mtp() const noexcept
+  {
+    return (_mtp.ok && (_mixed || _kquant || _dense)) || _hc_mtp != nullptr;
+  }
 
   // Speculative greedy decode with the MTP head as the drafter and THIS model
   // as the verifier. Generates up to `n_steps` tokens from `first_token`
@@ -611,6 +1030,71 @@ public:
   bool mtp_teacher_force(ContextId cid, const std::vector<std::int32_t>& cont,
                          int chunk, long* d1_hits, long* d1_total);
 
+  // ---- DFlash block-drafter speculative decode --------------------------
+  // A DFlash / DFlash 2 drafter (shared/dflash-drafter.h) borrows this
+  // model's embedding and lm_head and conditions on the residual stream at
+  // its target_layer_ids. Once attached, every TEXT prefill taps those
+  // layers and feeds the drafter's context cache, and dflash_decode()
+  // drafts a block per round, verifies it in one forward, and keeps the
+  // longest prefix the verifier agrees with. Runs on every layout this
+  // model loads (uniform affine, mixed, k-quant, dense) -- unlike MTP it
+  // does not ask for the de-fused layout. Detach with nullptr.
+  bool attach_dflash(std::unique_ptr<MetalDFlashDrafter> drafter,
+                     std::string* err = nullptr);
+  bool has_dflash() const noexcept { return _dflash != nullptr; }
+  // The split-K verify / batched-decode GEMV tiles (see _ks_verify), on
+  // or off for this model -- e.g. a test pinning the row-identical
+  // ladder to prove the speculative loop exact against serial decode.
+  // A no-op where the tiles did not load (8-bit, k-quant).
+  // Decode's GEMVs follow the verify's: on the one-row split-K tile while
+  // the verify runs split-K, so a speculative decode and the plain one
+  // compute every row alike (see _decode_ks).
+  void set_qmv_ksplit(bool verify, bool batched) noexcept
+  {
+    _ks_verify = verify && _ks_loaded;
+    _ks_batched = batched && _ks_loaded;
+    _decode_ks = _ks_verify && _ks1_ok;
+  }
+  // Split-K GEMV dispatches encoded so far: a test's proof the tier ran.
+  std::uint64_t qmv_ksplit_dispatches() const noexcept
+  {
+    return _ks_dispatches;
+  }
+  // Test hook: a hash of each logits row the greedy decode step
+  // (decode_step_fast) and the speculative verify compute, by context and
+  // position. A verify's later row at a position replaces its earlier
+  // one, so a speculative decode leaves the rows it committed (all but
+  // its last round's rejected tail): the plain decode's byte for byte, or
+  // a near-tie somewhere can turn. Off until set; setting it clears them.
+  void set_row_hashes(bool on);
+  std::uint64_t row_hash(ContextId cid, int pos) const;   // 0: none
+  const MetalDFlashDrafter* dflash() const noexcept { return _dflash.get(); }
+  // The attached drafter and this model's embedding + head as the drafter
+  // sees them -- for a test that drives ingest / draft by hand. Null when
+  // nothing is attached.
+  MetalDFlashDrafter* dflash_mut() noexcept { return _dflash.get(); }
+  DFlashTarget* dflash_target() noexcept;
+
+  // Counters of one speculative decode.
+  struct SpecStats {
+    long   rounds   = 0;    // verify forwards
+    long   drafted  = 0;    // draft tokens offered to the verifier
+    long   accepted = 0;    // of those, kept
+    double gpu_ms   = 0.0;  // wall time of the round command buffers
+  };
+
+  // Speculative decode with the DFlash drafter: the dflash counterpart of
+  // mtp_decode, same contract (first_token not yet appended; out_ids
+  // includes it and excludes a stop token; greedy is token-exact vs a
+  // greedy loop, a sampler vs decode_pipelined with the same seed and
+  // prime, penalties included). `block` overrides the drafter's trained
+  // block size (2 .. its block_size; 0 = trained). False when no drafter
+  // is attached or a round failed before anything was kept.
+  bool dflash_decode(ContextId cid, std::int32_t first_token, int n_steps,
+                     std::vector<std::int32_t>& out_ids,
+                     const MtpDecodeCtl& ctl = {}, int block = 0,
+                     SpecStats* stats = nullptr);
+
   // Toggle the shared-prefix batched decode attention at runtime (default set
   // at load from VPIPE_QWEN_SHARED_ATTN + kernel availability). For A/B tests
   // and benchmarks that compare the shared-prefix path against per-branch.
@@ -633,6 +1117,12 @@ public:
   // extra prefill cost). DEFAULT OFF -- a stage opts in (text-chat) or leaves
   // it off (realtime-vqa). VPIPE_MTP_NO_SEED hard-disables regardless.
   void set_mtp_prefix_seed(bool on) noexcept { _mtp_seed_enabled = on; }
+  // Told after each piece of a prefill read in pieces (prefill-
+  // progress.h): the tokens read so far of the call's. Empty: none.
+  void set_prefill_progress(std::function<void(int, int)> fn)
+  {
+    _prefill_progress = std::move(fn);
+  }
   bool mtp_prefix_seed() const noexcept { return _mtp_seed_enabled; }
 
   // M5 matrix-core fast-path engagement -- for perf-GUARD tests, NOT timing.
@@ -648,6 +1138,26 @@ public:
   //   gqa_flash_decode  -- GQA flash-decode kernel (each kv-head read once for
   //                        all G query heads; default on for full-attn models).
   bool uses_matrix_cores() const noexcept { return _use_mma; }
+  // MoE prefill on the matrix cores, for the same kind of guard: the routed
+  // experts' grouped GEMMs dispatched on their NAX twins, and the shared
+  // expert's on dequant + matmul2d, since load (each counts its GEMMs).
+  std::uint64_t moe_nax_gemms() const noexcept { return _moe_nax_gemms; }
+  std::uint64_t moe_shared_mma_gemms() const noexcept
+  { return _moe_shared_mma_gemms; }
+  // ...and over 64-row work items (two sorted tiles of one expert), the
+  // hyper-connection blocks a prefill fused on the matrix units (hc_pre's
+  // three launches), and the QSA prefill attention on two simdgroups a row.
+  std::uint64_t moe_nax64_gemms() const noexcept { return _moe_nax64_gemms; }
+  std::uint64_t hc_fused_blocks() const noexcept { return _hc_fused_blocks; }
+  std::uint64_t qsa_nax2_layers() const noexcept { return _qsa_nax2_layers; }
+  // The prefill-attention kernel set: the member serving an n-row fresh
+  // prompt ("legacy" when the set does not serve it -- a 128-wide head
+  // under 1536 rows or before its first such prefill, or a head dim it has
+  // no members for), and whether a named member ("nax" on the M5) is
+  // loaded at all.
+  const char* prefill_attention_kernel(int n) const;
+  bool prefill_attention_has(std::string_view member) const
+  { return _prefill_set.has(member); }
   bool mma_flash_attn() const noexcept { return _fn_sdpa_mma.valid(); }
   bool gqa_flash_decode() const noexcept { return _gqa_vec; }
   // Dynamic-int8 accelerated PREFILL GEMMs (see shared/i8-gemm.h): LOSSY
@@ -656,11 +1166,17 @@ public:
   // overrides. Wired from the stage config via the exec.
   void set_i8_gemm(bool on);
   bool i8_gemm_enabled() const noexcept { return _i8 != nullptr; }
+  // GEMMs the int8 tier actually took since load -- engagement, which an
+  // enabled tier does not imply: it declines every shape under its M / K
+  // floors (1024 rows; a decode step is one).
+  std::uint64_t i8_gemm_count() const noexcept { return _i8_count; }
   // Mixed-precision affine (OptiQ) de-fused per-tensor path engaged (some
   // 4-bit, some 8-bit linears). For the token-exact OptiQ guard test.
   bool uses_mixed_precision() const noexcept { return _mixed; }
   // Native k-quant (GGUF) path engaged (per-tensor q4_K/q5_K/q6_K blocks).
   bool uses_kquant() const noexcept { return _kquant; }
+  // Unquantized (dense f16/bf16) linears: no affine GEMV tiers apply.
+  bool uses_dense() const noexcept { return _dense; }
 
 private:
   MetalQwenModel() = default;
@@ -715,7 +1231,8 @@ private:
       std::size_t page_off, int n_pages,
       const ContextManager::AppendSlot& slot,
       const metal_compute::SharedBuffer& pgtab, std::size_t pgtab_off,
-      bool return_hidden = false);
+      bool return_hidden = false,
+      metal_compute::CommandStream* stream = nullptr);
 
   // Encode the next-token pick (greedy argmax or full GPU sampler) into
   // `enc`: reads `logits`, writes the chosen id to out_id[out_off], and
@@ -788,7 +1305,46 @@ private:
   // *taps_out at slot offset j*n*H (j = index into tap_layers) -- the
   // per-layer hidden states a downstream consumer conditions on (matches HF
   // output_hidden_states[L+1]). *taps_out must be a [tap_layers->size()*n*H]
-  // compute-dtype buffer. No effect when either is null.
+  // compute-dtype buffer. No effect when either is null. `tap_row0` > 0
+  // taps only rows [tap_row0, n) -- the DFlash drafter's window of a long
+  // prefill -- and *taps_out is then [size][n - tap_row0][H].
+  // A prefill IN WINDOWS (forward_embeddings_taps_batch): one call runs
+  // the layers [begin, end) of one sequence, the next continues where it
+  // stopped -- the residual stream is the caller's `x`, updated in place.
+  // The first window reserves the sequence's KV slots and records them
+  // here; later windows reuse them. The CALLER holds streamed layers
+  // resident across a window.
+  struct PrefillChunk {
+    std::size_t page_off;
+    int slot;
+    int src_off;
+    int cnt;
+  };
+  struct PrefillWindow {
+    int begin = 0;
+    int end = 0;
+    bool reserved = false;
+    std::vector<PrefillChunk> chunks;
+    int q_offset = 0;
+  };
+
+  // A long plain prefill in balanced pieces of at most prefill_piece_()
+  // rows, each run against the K/V the pieces before it wrote -- the
+  // mid-context path a second chat turn takes. Bounds the transient
+  // activations (Ministral-3's MLP alone is ~96 KB a row) by the piece,
+  // not the prompt. The last piece's logits.
+  std::vector<float> forward_pieces_(ContextId cid,
+                                     const metal_compute::SharedBuffer& x,
+                                     int n);
+  static int prefill_piece_();
+  // A hyper-connection prefill of n rows: its pieces' rows (balanced, at
+  // most hc_piece_rows).
+  int hc_piece_(int n) const;
+  // Whether the prefill-attention set serves an n-row chunk: every 256-
+  // wide one; a 128-wide one from 1536 rows on 64-aligned pages, tuned by
+  // tune_prefill_set_ at the first such chunk rather than at load.
+  bool prefill_set_serves_(int n) const;
+  void tune_prefill_set_(int n);
   std::vector<float> forward_chunk_(
       ContextId cid, const metal_compute::SharedBuffer& x, int n,
       const metal_compute::SharedBuffer* mrope_cos,
@@ -800,7 +1356,9 @@ private:
       const std::vector<int>* tap_layers = nullptr,
       metal_compute::SharedBuffer* taps_out = nullptr,
       int key_valid_len = 0, int stop_after_layer = -1,
-      const DeepstackInject* deepstack = nullptr);
+      const DeepstackInject* deepstack = nullptr,
+      PrefillWindow* win = nullptr, int tap_row0 = 0);
+
 
   // ---- Batched (N-branch parallel) decode --------------------------
   // VQA fanout: N branched contexts that share a prefix each decode one
@@ -831,6 +1389,18 @@ private:
   BScratch _bdec;   // cached batched-decode scratch (reused across steps)
 
   struct Layer;     // defined below; fwd-declared for encode_moe_mlp_ (ref arg)
+  // One hyper-connection gated residual (Qwen4ExpTextGatedResidual): its
+  // grouped norm (f32, 1 + w, [hc*H]), the input mixer's down projection
+  // ([lowrank, hc*H]) and up projection ([hc*H, lowrank]), and the
+  // injection weights ([hc, hc*H]; empty on the final mixer), all w8g64.
+  struct HcBlock {
+    metal_compute::SharedBuffer norm;
+    // down, and with `inject` the injection's S rows after its R: one
+    // [R + S, S*H] projection (one GEMV a decode step, one GEMM a prefill).
+    metal_compute::SharedBuffer dw, ds, db;
+    metal_compute::SharedBuffer uw, us, ub;
+    bool inject = false;
+  };
 
   // Size-based quantized-matmul entrance: y[M,Nout] = x[M,K] @ dequant(w)^T,
   // picking the kernel by the row count M (what MLX's quantized_matmul does
@@ -840,11 +1410,29 @@ private:
   // 8-bit weights have no batched-GEMV -> qmv (M==1) / steel. This is THE
   // place the batched decode adapts to the (shrinking) active branch count.
   static constexpr int kQmvBatchMaxRows = 8;
-  // MoE grouped-GEMM GEMV->steel crossover (prefill row count above which the
-  // matrix-tiled steel expert GEMM beats the bandwidth GEMV). Machine-dependent
-  // (matrix cores shift it down); default 1024, VPIPE_QWEN_MOE_STEEL_MIN sets
-  // it, and a future per-machine probe can resolve it at load.
-  int _moe_steel_min = 1024;
+  // The verify's long-context attention, all its rows in one dispatch,
+  // takes up to this many key splits (its partials are pooled at it).
+  static constexpr int kVerifyRowsAttnSplits = 256;
+  // MoE grouped-GEMM GEMV->steel crossover, by ROUTING DENSITY: the steel
+  // tier's 32-row tiles from kMoeSteelDensity routed rows an expert on
+  // average (moe_steel_). MEASURED on the M4 Pro, Qwen3.6-35B-A3B (256
+  // experts, top-8), prefill tok/s GEMV / steel: 96 tokens 476 / 454, 128
+  // 502 / 522, 256 544 / 677, 512 562 / 802, 768 558 / 841 -- below ~4
+  // rows an expert a tile is mostly padding. (MLX takes its sorted
+  // gather_qmm at the same density.) The same rule with the expert cache:
+  // a cached model must take the resident one's tiers to stay bit-
+  // identical to it. Its price in bf16 is the staged weights' rounding --
+  // on Qwen3.8-Flash-Next's image turns 0.2138 -> 0.2268 and 0.1060 ->
+  // 0.1114 from fp32 (its reference's own bf16 0.2869 / 0.1105).
+  // VPIPE_QWEN_MOE_STEEL_MIN=<rows> pins a row line (0: the rule).
+  int _moe_steel_min = 0;
+  static constexpr int kMoeSteelDensity = 4;
+  bool moe_steel_(int rows) const
+  {
+    if (_moe_steel_min > 0) { return rows >= _moe_steel_min; }
+    return (long long)rows * _cfg.top_k >=
+           (long long)kMoeSteelDensity * _cfg.n_experts;
+  }
   // Grouped-prefill scratch (counting sort by expert + segmented MAXM-batched
   // expert GEMV). When passed to encode_moe_mlp_ the expert compute reads each
   // expert's weight once per MAXM-row tile instead of once per routed token.
@@ -852,6 +1440,9 @@ private:
     const metal_compute::SharedBuffer *hist = nullptr, *boff = nullptr,
         *curs = nullptr, *t2e = nullptr, *ntile = nullptr, *srow = nullptr,
         *sdst = nullptr, *gact = nullptr, *gdout = nullptr;
+    // The matrix-core twins' 64-row work items (maxtiles ints; the steel
+    // tier on an M5).
+    const metal_compute::SharedBuffer* items = nullptr;
     int npad = 0, maxtiles = 0, maxm = 4;
     // steel: matrix-tiled grouped GEMM (BM=maxm=32 tiles) for large prefill;
     // else the bandwidth GEMV grouping (maxm=2). The steel tier fuses the
@@ -957,6 +1548,8 @@ private:
   // branches share (identical page ids); when set and N>1 and head_dim==256,
   // the full-attn layers read that shared prefix once (phase A) and merge each
   // branch's private pages (phase B). 0 => the per-branch SDPA path.
+  // `head` false leaves the N final-normed hiddens in bs.hn and runs no
+  // lm_head (decode_batched_embedding_hidden).
   void encode_batched_step_(
       metal_compute::ComputeEncoder& enc, BScratch& bs,
       std::span<const ContextId> cids,
@@ -964,7 +1557,7 @@ private:
       const std::vector<std::size_t>& page_offs,
       const std::vector<int>& n_pages_v,
       const std::vector<int>& rope_pos_v,
-      int shared_pages);
+      int shared_pages, bool head = true);
 
   struct Layer {
     bool is_full = false;
@@ -1040,6 +1633,10 @@ private:
     int se_bits = 4;   // shared expert gate|up (interleaved, so they agree)
     int sd_bits = 4;   // shared expert down (its own tensor, own dispatch)
     int r_bits = 8;    // router (mlp.gate); w8 in every pack seen so far
+    // The routed experts' affine group (64, or 32 in MLX's 4-bit packs of
+    // Qwen3.8-Flash-Next): with the widths it picks their kernels
+    // (expert_fns_).
+    int e_group = 64;
     // Set when gate and up disagree in width: they cannot share one
     // interleaved slab, so each keeps its own [E, I, H] slab at its NATIVE
     // width and the mixed-width fused kernel widens in registers. Costs no
@@ -1066,6 +1663,10 @@ private:
        kqkv_t = KQ::kNone, kqz_t = KQ::kNone, kqout_t = KQ::kNone,
        kqgate_t = KQ::kNone, kqup_t = KQ::kNone, kqdown_t = KQ::kNone;
     int kqk_n = 0;   // rows in the fused q|k buffer (2*qd + kd)
+    // NVFP4 with an AWQ pre_quant_scale on o_proj: f32 [qd], applied to
+    // the attention output before the projection (scale_cols_). The MLP
+    // down projection's is folded into up_proj's rows at load.
+    metal_compute::SharedBuffer o_pq;
 
     // ---- Q4_K -> affine-g32 decode repack (VPIPE_QWEN_Q4K_AFFINE) -------
     // The native qmv_q4k is ~1.9x slower than the affine qmv (its hierarchical
@@ -1079,6 +1680,14 @@ private:
     metal_compute::SharedBuffer qk_aw, qk_as, qk_ab;   // fused q|k affine
     metal_compute::SharedBuffer o_aw, o_as, o_ab;      // attn o_proj affine
     bool qk_q4k_aff = false, o_q4k_aff = false;
+
+    // ---- Hyper-connections (_cfg.hc()) --------------------------------
+    // The gated residual around the attention / linear-attention sublayer
+    // and around the MoE (HcBlock, below). in_ln / post_ln are unused.
+    HcBlock hc_attn, hc_mlp;
+    // The QSA indexer (full layers): its q|k projection [(heads + 1) * d,
+    // H] (w8g64) and the two head norms (f32, 1 + w).
+    metal_compute::SharedBuffer ixw, ixs, ixb, ix_qn, ix_kn;
   };
 
   Config _cfg;
@@ -1090,6 +1699,9 @@ private:
       // scratch, then dense matmul2d on the hardware matrix units; plus the
       // matrix-core flash attention (head_dim 256).
       _lib_dequant, _lib_dense_mma, _lib_sdpa_mma,
+      // Matrix-core (M5+) MoE grouped expert GEMMs (NAX twins of the steel
+      // grouped kernels; affine_qmm_grouped_nax.metal).
+      _lib_moe_nax,
       // Native k-quant (GGUF): plain dense f16 GEMM/GEMV (dense_gemm.metal),
       // M4-capable -- the prefill stage of kqmm_ after the typed dequant.
       // On M5 dense_gemm_ instead routes the dequant'd GEMM onto the
@@ -1099,7 +1711,7 @@ private:
       // MLX steel register-resident flash attention (attn_steel, half-only):
       // the bd256 instantiation drives Qwen full-attn FRESH prefill (contiguous
       // K/V). Invalid for bf16 models -> the paged path stays the fallback.
-      _lib_attn;
+      _lib_attn, _lib_attn_nax;   // _lib_attn_nax: M5 NAX (prefill set)
   metal_compute::ComputeFunction _fn_qmv, _fn_qmv_add, _fn_qmv_swiglu, _fn_qmm,
       _fn_qmm_swiglu,
       // Q4_K->affine-g32 decode repack: the affine 4-bit g32 qmv (+fused-add)
@@ -1114,9 +1726,13 @@ private:
       _fn_qmv8, _fn_qmv8_add, _fn_qmm8, _fn_dequant8, _fn_qmv8_batch,
       _fn_requant_w8w4,
       _fn_transpose,
-      _fn_rms, _fn_swiglu, _fn_residual, _fn_rope_partial, _fn_rms_rope,
+      _fn_rms, _fn_swiglu, _fn_residual, _fn_rope_partial, _fn_rope_qscale,
+      _fn_rms_rope,
       _fn_mul_sigmoid, _fn_bias_add,
       _fn_head_slice, _fn_sdpa_paged, _fn_sdpa_paged_kvl,
+      // A few rows' paged attention, each row's keys split across 16
+      // simdgroups (Qwen3.8-Flash-Next's decode and verify).
+      _fn_sdpa_paged_split,
       _fn_sdpa_paged_mb256, _fn_sdpa_paged_mb,
       _fn_sdpa_paged_qtile,
       // simdgroup_matrix key-split flash prefill (head_dim 256, drop-in for
@@ -1125,7 +1741,7 @@ private:
       // MLX steel register-softmax flash with a paged K/V tg loader (mid-
       // context prefill, q_offset>0 -- no de-paged kfull scratch). No function
       // constants (bounds/causal handled in-kernel) -> a plain cached function.
-      _fn_steel_paged,
+      _fn_steel_paged, _fn_steel_paged128,
       // Shared-prefix batched decode attention (head_dim 256): phase A reads
       // the N branches' shared prefix once, phase B merges per-branch private.
       _fn_sdpa_shared_mb256, _fn_sdpa_merge_mb256,
@@ -1164,6 +1780,8 @@ private:
       _fn_smp_max_partial, _fn_smp_max_combine,
       _fn_smp_zhist_partial, _fn_smp_zhist_combine,
       _fn_smp_thresh, _fn_smp_pick_partial, _fn_smp_pick_combine,
+      // A DFlash verify's penalty seen-sets from its ids (VerifyOpts).
+      _fn_seen_rows,
       // On-GPU Leviathan-Chen MTP correction (lc_sample / lc_accept): the
       // nucleus + accept/residual that the host L-C path used to grind over the
       // full vocab on the CPU, done one-threadgroup-per-row on the GPU.
@@ -1178,6 +1796,9 @@ private:
       // the MAXM=2 form's 2 grid.z tiles; the k-quant depth-2 cliff). _qmv4_*.
       _fn_qmv_q4k_batch4, _fn_qmv_q5k_batch4, _fn_qmv_q6k_batch4,
       _fn_dequant_q4k, _fn_dequant_q5k, _fn_dequant_q6k, _fn_copy,
+      // NVFP4 (KQ::kNVFP4): its qmv, the batched pair, its dequant.
+      _fn_qmv_nvfp4, _fn_qmv_nvfp4_batch, _fn_qmv_nvfp4_batch4,
+      _fn_dequant_nvfp4, _fn_scale_cols,
       _fn_dequant_w4g32,   // affine g32 prefill dequant (Q4_K->affine repack)
       // Mixture-of-Experts (Qwen3.5-MoE): on-GPU router (softmax+top-k+renorm),
       // gathered expert gate|up+SwiGLU and down GEMVs (index a 3D expert slab),
@@ -1189,6 +1810,7 @@ private:
       // reads each expert's weight once per tile instead of once per token.
       _fn_moe_grouped_swiglu, _fn_moe_grouped_down, _fn_moe_ifill,
       _fn_moe_hist, _fn_moe_sort_setup, _fn_moe_scatter, _fn_moe_scatter_back,
+      _fn_moe_tile_items,   // the NAX twins' 64-row items over the tiles
       // Steel (matrix-tiled) grouped expert GEMM + the sorted-row gather.
       _fn_moe_qmm_grouped, _fn_moe_qmm_grouped_swiglu,
       // 8-bit twins of the routed-expert kernels above (selected at dispatch
@@ -1201,10 +1823,70 @@ private:
       _fn_qmv_swiglu8, _fn_qmm_swiglu8,
       _fn_moe_grouped_swiglu_w8, _fn_moe_grouped_down_w8,
       _fn_moe_qmm_grouped_w8, _fn_moe_qmm_grouped_swiglu_w8,
+      // 5-bit twins of the six routed-expert kernels (MLX affine w5 g64:
+      // Qwen3.8-Flash-Next's oQ packs). Loaded when the experts are w5.
+      _fn_moe_gather_swiglu_w5, _fn_moe_gather_down_w5,
+      _fn_moe_grouped_swiglu_w5, _fn_moe_grouped_down_w5,
+      _fn_moe_qmm_grouped_w5, _fn_moe_qmm_grouped_swiglu_w5,
+      // The steel grouped GEMMs' matrix-core twins, per width (same buffers,
+      // same sorted tiles; invalid where the GPU has no matrix cores).
+      _fn_moe_nax_swiglu_w4, _fn_moe_nax_swiglu_w5, _fn_moe_nax_swiglu_w8,
+      _fn_moe_nax_down_w4, _fn_moe_nax_down_w5, _fn_moe_nax_down_w8,
+      // Hyper-connections + the n-gram PLE (qwen4_hc.metal) and the MoE
+      // output written rather than added (metal-qwen-hc.cc).
+      _fn_hc_rms, _fn_hc_act, _fn_hc_mix, _fn_hc_inject, _fn_hc_tile,
+      _fn_hc_rms8,   // a prefill's rows, 8 values a load
+      _fn_hc_act_fused,   // the down | inject output split and activated
+      // A prefill's block on the matrix units in three launches: the norm
+      // with the pending injection and the inject projection (qwen4_hc.metal
+      // hc_group_rms8_pre_f16), then the down GEMM with silu and the up
+      // GEMM with the stream mix in their stores (dense_gemm_mma.metal).
+      _fn_hc_rms8_pre, _fn_hc_down_silu, _fn_hc_up_mix,
+      // A decode's and a verify's mixer block in two launches, a row a
+      // grid slice: [RPS / HPS 1, 2, 4] (qwen4_hc.metal hcf_*).
+      _fn_hcf_pre[3], _fn_hcf_up[3],
+      // ...and its MoE in two launches after the routing (affine_qmv.metal
+      // affine_moe_*_fused_w5g64: w5 experts, a w8 shared expert).
+      _fn_moe_up_fused, _fn_moe_down_fused,
+      // ...and its GDN layers between the projections in two (the conv, the
+      // q / k norms, g / beta; the step, its norm and gate).
+      _fn_gdn_prework, _fn_gdn_step_ng,
+      // ...and its full-attention rows into the attention, and back.
+      _fn_hc_attn_prework, _fn_hc_attn_post,
+      // The GDN conv a (token, channel) a thread, then its state tail.
+      _fn_gdn_conv1d_rows, _fn_gdn_conv1d_tail,
+      // A verify's rows on the GDN ring in one conv and one step, each
+      // row's state to its slot.
+      _fn_gdn_conv1d_ring, _fn_gdn_step_ring,
+      _fn_hc_stream_mean,   // a DFlash drafter's tap: the streams' mean
+      _fn_moe_finalize_set, _fn_ple_gate, _fn_ple_conv, _fn_ple_state,
+      _fn_hc_qmv8_b4,
+      // The mixers' 10240-wide projections, split along K (affine_qmv.metal
+      // qmv_splitk_w8_impl): 8 runs a row for many outputs, 16 for few.
+      _fn_hc_qmv8_sk8, _fn_hc_qmv8_sk16,
+      // A verify's few router rows in one dispatch (dense_gemm.metal).
+      _fn_hc_dense_gemv_rows,
+      // The QSA token indexer (qwen4_hc.metal).
+      _fn_qsa_store, _fn_qsa_pool, _fn_qsa_query, _fn_qsa_score,
+      _fn_qsa_select, _fn_qsa_attn,
+      _fn_qsa_attn_split,   // a threadgroup a (head, row): 21x past 2051
+      _fn_qsa_attn_part, _fn_qsa_attn_comb,   // ...its keys in chunks
+      _fn_qsa_attn_mma,     // a prefill's rows: a kv head's q-heads as tiles
+      _fn_qsa_score_mma,    // a prefill's rows' block scores as tiles
+      _fn_qsa_score_simd,   // a few rows': a simdgroup a (block, row)
+      _fn_qsa_topk_chunk, _fn_qsa_topk_merge,   // ...their two-phase select
+      _fn_qsa_attn_nax,     // ... on the matrix units (M5, sdpa_mma.metal)
+      _fn_qsa_attn_nax2,    // ... two simdgroups a row, for occupancy
       // Dense f16 MoE gather GEMVs (raw-HF bf16 MoE): the dense twins of the
       // affine gather_swiglu / gather_down / moe_gate above.
       _fn_moe_gather_swiglu_dense, _fn_moe_gather_down_dense,
       _fn_moe_gate_dense,
+      // Block-FP8 routed experts (_fp8_experts) and the interleaved SwiGLU
+      // the dense shared expert's many-row GEMM feeds.
+      _fn_moe_gather_swiglu_fp8, _fn_moe_gather_down_fp8, _fn_swiglu_il,
+      // ...and their grouped steel GEMMs, the prefill's (each expert's
+      // weight read once a tile, not once a routed row).
+      _fn_moe_qmm_grouped_swiglu_fp8, _fn_moe_qmm_grouped_fp8,
       _fn_dense_gemv, _fn_dense_gemm;
   // Decode full-attn switches to the multi-simdgroup paged kernel once
   // the context reaches this length (scalar wins at short ctx).
@@ -1282,6 +1964,66 @@ private:
   };
   QmvPlan _qmv_plan[kQmvBatchMaxRows + 1] = {};
   bool _qmv_plan_probed = false;
+  // Split-K GEMV tiles (affine_qmv_ks<r>_w4g64 + SwiGLU twins, indexed by
+  // the tile's row count 2/3/4/6): KP=2 simdgroups each reduce half of K
+  // over 4 output columns, with x kept in its storage type, so 4 rows
+  // read a weight about as fast as one row does -- where the ladder
+  // above pays ~1.7x (M4 Pro, 27B lm_head: 3.20 vs 5.40 ms at m=4). The
+  // rows sum in another order: NOT bit-identical to the single-row qmv
+  // (within an ulp), so a greedy run can split a near-tie with serial.
+  // They engage by CALLER -- the speculative verify (MTP, DFlash) and
+  // batched decode, both by default; never the single-row decode.
+  // VPIPE_QMV_KSPLIT=0 off, 1 verify only, 2 verify + batched decode
+  // (default); set_qmv_ksplit() overrides.
+  enum class KsScope : std::uint8_t { kNone, kVerify, kBatched };
+  metal_compute::ComputeFunction _fn_qmv_ks[9], _fn_qmv_ks_swiglu[9];
+  // The 8-bit twins (affine_qmv_ks<r>_w8g64): a mixed (OptiQ) model's
+  // 8-bit tensors -- 43% of the 27B's bytes -- verified on the batch
+  // tiles at 170-590 GB/s on an M5 Ultra where its 4-bit ones ran split-K
+  // at ~1 TB/s (DFlash's 8-row round 80 ms, 37 of them those GEMVs).
+  metal_compute::ComputeFunction _fn_qmv8_ks[9];
+  // y = r + x @ W^T twins of both (affine_qmv_ks<r>_add_w{4,8}g64): a
+  // verify folds each layer's two residual adds into its GEMVs.
+  metal_compute::ComputeFunction _fn_qmv_ks_add[9], _fn_qmv8_ks_add[9];
+  bool _ks_loaded = false, _ks_verify = false, _ks_batched = false;
+  bool _ks8_loaded = false, _ks_add_loaded = false;
+  // Decode's affine GEMVs on the ONE-row split-K tile (affine_qmv_ks1_*):
+  // 4 output columns a threadgroup, K split over two simdgroups -- 4x the
+  // threadgroups of the 8-row qmv_fast tile, which an M5 Ultra's 80 cores
+  // need for the narrow projections; and a row's arithmetic is the split-K
+  // verify's, so decode and verify agree byte for byte.
+  // [0] plain, [1] residual-add, by width (4, 8); and the 4-bit SwiGLU.
+  // VPIPE_QWEN_DECODE_KS=0: decode on qmv_fast whatever the verify runs.
+  metal_compute::ComputeFunction _fn_ks1[2][2], _fn_ks1_swiglu;
+  bool _decode_ks = false, _ks1_ok = false;
+  // 7..8 rows: one 8-row tile (VPIPE_QMV_KS_TALL=1) or two 4-row tiles
+  // (the default: 32 accumulators a thread cost the tall one occupancy).
+  bool _ks_tall = false;
+  KsScope _ks_scope = KsScope::kNone;
+  mutable std::uint64_t _ks_dispatches = 0;
+  // Marks which caller is encoding for the span of one encode.
+  class KsScopeGuard {
+  public:
+    KsScopeGuard(MetalQwenModel& m, KsScope s) : _m(m), _prev(m._ks_scope)
+    {
+      m._ks_scope = s;
+    }
+    ~KsScopeGuard() { _m._ks_scope = _prev; }
+    KsScopeGuard(const KsScopeGuard&) = delete;
+    KsScopeGuard& operator=(const KsScopeGuard&) = delete;
+
+  private:
+    MetalQwenModel& _m;
+    KsScope _prev;
+  };
+  bool ks_dispatch_(metal_compute::ComputeEncoder& enc, int m,
+                    const metal_compute::SharedBuffer& w,
+                    const metal_compute::SharedBuffer& s,
+                    const metal_compute::SharedBuffer& b,
+                    const metal_compute::SharedBuffer& xin,
+                    const metal_compute::SharedBuffer& y,
+                    int Kk, int Nout, bool swiglu, int bits = 4,
+                    const metal_compute::SharedBuffer* radd = nullptr) const;
   void qmv_ladder_defaults_();
   void autotune_qmv_ladder_();
   // Matrix-core prefill path (M5+). Set at load when the GPU has matrix
@@ -1291,8 +2033,21 @@ private:
   // units) instead of the steel quantized GEMM; decode + small M stay on
   // the existing paths. Off -> behaviour is byte-identical to before.
   bool _use_mma = false;
+  // The MoE matrix-core routes are available (moe_nax_gemms /
+  // moe_shared_mma_gemms count them); VPIPE_QWEN_MOE_NAX=0 keeps a forward
+  // on steel (the A/B, read per forward).
+  bool _moe_nax = false;
+  std::uint64_t _moe_nax_gemms = 0, _moe_shared_mma_gemms = 0;
+  std::uint64_t _moe_nax64_gemms = 0, _hc_fused_blocks = 0;
+  std::uint64_t _qsa_nax2_layers = 0;
+  // A section profile's mark (VPIPE_QWEN_HC_PROFILE=2): encode_moe_mlp_
+  // calls it after the routing (0), the routed experts (1) and the shared
+  // expert with the combine (2). Null otherwise.
+  const std::function<void(int)>* _moe_prof = nullptr;
   // Dynamic-int8 accelerated prefill GEMMs (set_i8_gemm); null when off.
   std::unique_ptr<I8GemmContext> _i8;
+  std::uint64_t _i8_count = 0;
+  int _i8_want = -1;   // the last set_i8_gemm's `on` (-1: none yet)
   // Split-K for the very deep down_proj contraction (Qwen3.6-27B, K=17408).
   // Inert on every other checkpoint -- it keys on the exact depth.
   MmaSplitK _splitk;
@@ -1334,6 +2089,12 @@ private:
   // within-process profiler can toggle the duplicated category between
   // passes); production never pays the per-step getenv.
   bool _catprof = false;
+
+  // x[r, c] *= s[c] for `rows` rows of `cols` (s f32): an NVFP4
+  // projection's AWQ scale on its input (Layer::o_pq).
+  void scale_cols_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xoff,
+                   const metal_compute::SharedBuffer& s, int cols, int rows);
 
   // ---- Native k-quant (GGUF) decode/prefill dispatch ------------------
   // Decode (M=1): one qmv per typed weight into an output offset.
@@ -1380,12 +2141,40 @@ private:
                    const metal_compute::SharedBuffer& w,
                    const metal_compute::SharedBuffer& x,
                    const metal_compute::SharedBuffer& y, int K, int N, int M);
+  // Prism rotation of `rows` rows of width K (element offsets; x == y in
+  // place unless `grouped`): y = H (s . x), or x = s . (H y) with
+  // `inverse`; `grouped` reads a GDN output tiled -> grouped first.
+  void prism_rows_(metal_compute::ComputeEncoder& enc,
+                   const metal_compute::SharedBuffer& x, std::size_t xoff,
+                   const metal_compute::SharedBuffer& y, std::size_t yoff,
+                   int rows, int K, bool inverse = false,
+                   bool grouped = false) const;
+  const metal_compute::SharedBuffer* prism_signs_(int K) const;
   // Raw k-quant embed gather: out[t,:] = dequant(_embed_q6k[ids[t], :]).
   // Picks the Q4_K / Q6_K gather kernel by _embed_kqt (the _embed_q6k buffer
   // holds the raw table for either family).
   void embed_q6k_(metal_compute::ComputeEncoder& enc,
                   const metal_compute::SharedBuffer& ids, std::size_t ioff,
                   const metal_compute::SharedBuffer& out, int n);
+  // The token embedding of `n` ids (int32 at byte `ids_off`) into `out`
+  // [n, hidden], encoded into the caller's encoder -- the muxer's table
+  // and kernel, so the same rows as its fetch_text, without a command
+  // buffer (and a queue) of its own. False, nothing encoded, where the
+  // kernel did not load.
+  bool encode_embed_ids_(metal_compute::ComputeEncoder& enc,
+                         const metal_compute::SharedBuffer& ids,
+                         std::size_t ids_off,
+                         const metal_compute::SharedBuffer& out, int n);
+  bool embed_in_stream_ok_() const;
+  // The rows a prefill's matmul2d GEMM takes in one dispatch at a piece of
+  // `n` rows; 0 the whole piece. Measured per box by tune_mma_band_ (its
+  // own command streams: call it with no encoder open).
+  int mma_band_rows_(int n) const;
+  void tune_mma_band_(int n);
+  static constexpr int kMmaBand = 4096;
+  // tune_mma_band_'s answers by row bucket (up to 6144, past it): -1 not
+  // measured, 0 whole, else the band.
+  int _mma_band[2] = {-1, -1};
 
   // ---- Mixed-precision affine (OptiQ) dispatch ------------------------
   // Dequant ONE affine projection part (`bits` 4 or 8, group 64) into the
@@ -1442,13 +2231,27 @@ private:
   // round), so it never perturbs the main model's KV. All linears here are
   // 4-bit affine (uniform) regardless of the main model's mixed precision.
   struct MtpHead {
+    // Its context's one page, in tokens: the prompt it is seeded with (at
+    // most the newest three quarters of a page) and the decode after it.
+    // 2048 had left a 4k prompt's seed 16 slots of room, so a few rounds
+    // in, the overflow wiped it -- prompt and all -- and the head drafted
+    // from the decode alone. 4 KB a token on the 27B (32 MB).
+    static constexpr int kCtxTokens = 8192;
     bool ok = false;
     Layer lyr;                                 // the full-attn decoder layer
     // The eh-fusion fc, [H, 2H], split at load into its embedding/hidden
     // halves (each [H, H], contiguous): combined = fc_e @ norm_e(emb) +
     // fc_h @ norm_h(hidden). Splitting avoids interleaving the two normed
     // inputs into a [n, 2H] buffer (rms can't write a strided sub-row).
+    // Dense (fc_e, fc_h), or -- an affine drafter's, fc_bits its width --
+    // the halves' codes, scales and biases (fc_e*, fc_h*); mtp_fc_ runs
+    // either.
     metal_compute::SharedBuffer fc_e, fc_h;
+    metal_compute::SharedBuffer fc_ew, fc_es, fc_eb, fc_hw, fc_hs, fc_hb;
+    int fc_bits = 0;
+    // Matrix cores: the head's width's dequant (affine_dequant_w<bits>g64)
+    // for the prompt seed's thousands of rows (head_qmm_).
+    metal_compute::ComputeFunction deq;
     metal_compute::SharedBuffer prenorm_e;     // pre_fc_norm_embedding [H]
     metal_compute::SharedBuffer prenorm_h;     // pre_fc_norm_hidden    [H]
     metal_compute::SharedBuffer final_norm;    // mtp.norm [H]
@@ -1466,6 +2269,7 @@ private:
   // Last-position pre-final-norm hidden of the most recent prefill / verify
   // forward [H] -- the main-model hidden the MTP drafter consumes.
   metal_compute::SharedBuffer _mtp_h;
+  std::function<void(int, int)> _prefill_progress;
   // MTP prefix seed (opt-in, _mtp_seed_enabled): the last text prefill's
   // per-position POST-final-norm main hiddens [s, H] (f16) + its token ids, so
   // mtp_decode can populate the MTP head's self-attention KV with the prompt
@@ -1493,8 +2297,146 @@ private:
   // Allocated once per mtp_decode and reused across rounds.
   struct GdnVerifyCache {
     std::vector<int>                         layers;
+    // `qkv` holds each row's pre-conv qkv, or -- `full`, the forward ran
+    // the fused layer (qwen3_5_gdn_prework / step_norm_gate) -- the in-
+    // projection's whole row (qkv | z | a | b), so the replay runs those
+    // same two kernels on the same bytes.
     std::vector<metal_compute::SharedBuffer> qkv, gbuf, betabuf;
+    bool                                     full = false;
   };
+
+  // What the DFlash decode adds to mtp_verify_chunk_.
+  struct VerifyOpts {
+    // Encoded FIRST in the verify's encoder, before the layer stack: the
+    // previous round's GDN replay, the drafter's ingest + draft, and the
+    // embed gather that fills `x` from the drafted ids -- so a whole round
+    // is one command buffer.
+    std::function<void(metal_compute::ComputeEncoder&)> prologue;
+    // Snapshot the residual stream after each of these layers into `taps`
+    // [tap_layers.size()][n][H], layer-major (HF hidden_states[L + 1]).
+    const std::vector<int>*            tap_layers = nullptr;
+    const metal_compute::SharedBuffer* taps = nullptr;
+    // GDN batched over the n rows, reading ring slot 0 and writing slot 1,
+    // with the step inputs captured into the gcache for a replay of the
+    // kept prefix (encode_gdn_replay2_). Needs the ring on (depth >= 1).
+    bool gdn_ring2 = false;
+    // Penalised sampling: the per-position seen-sets [n][vocab], written
+    // on the GPU by the prologue (seen_rows_from_ids), in place of the
+    // host's _mtp_seen_rows.
+    const metal_compute::SharedBuffer* seen_rows = nullptr;
+    // The MTP head's THIRD chained application (depth 3, with mtp_preds2):
+    // its drafts at each row. Not under Leviathan-Chen (no third q).
+    std::vector<std::int32_t>* mtp_preds3 = nullptr;
+  };
+
+  // Re-advance every GDN layer from ring slot 0 to slot 1 over the first
+  // `keep` rows of the last verify's captured inputs (gc): the partial-
+  // accept half of VerifyOpts::gdn_ring2, encoded into the caller's
+  // encoder. Same kernels, same inputs -> the state a keep-row verify
+  // would have left. The caller advances the ring cursor afterwards.
+  void encode_gdn_replay2_(metal_compute::ComputeEncoder& enc, ContextId cid,
+                           int keep, const GdnVerifyCache& gc);
+  // The speculative verify's scratch, kept across calls: slot `slot`, at
+  // least `bytes`. A fresh set every round left an M5 Ultra's GPU idle
+  // ~5.5 ms before the round's first command buffer could start (the
+  // driver mapping and zeroing their pages), against ~35 ms of work. A
+  // verify waits for its buffers before it returns, so the next one finds
+  // them idle. Slots 0..39 and 42.. the verify's, 40..41 the replay's it
+  // encodes.
+  const metal_compute::SharedBuffer& verify_scratch_(std::size_t slot,
+                                                     std::size_t bytes);
+  std::deque<metal_compute::SharedBuffer> _vscratch;
+  metal_compute::SharedBuffer _vnone;   // the empty one a slot not used binds
+  // The verify's clocks, per model (two models verify on two threads).
+  struct VerifyStats {
+    // VPIPE_MTP_VPROFILE: main forward / verifier head / MTP head, each
+    // segment committed, waited for and timed.
+    double vp_main = 0.0, vp_vhead = 0.0, vp_mtp = 0.0;
+    long   vp_n = 0;
+    // VPIPE_DFLASH_PROFILE: scratch made, encoded, committed + waited.
+    double alloc = 0.0, enc = 0.0, wait = 0.0;
+    long   n = 0;
+    // VPIPE_MC_GPU_TIME=2: each verify's entry and its wait's return, on
+    // CommandStream::host_seconds' clock; the newest kMaxMarks kept.
+    static constexpr std::size_t kMaxMarks = 65536;
+    std::vector<std::pair<double, double>> marks;
+  };
+  VerifyStats _vstats;
+  // The verifier's lm_head is being encoded (VPIPE_VERIFY_SKIP: "head").
+  bool _vs_head = false;
+  // set_row_hashes: the hashes, and the verifier's rows copied before the
+  // MTP head reuses its logits buffer.
+  bool _row_hash_on = false;
+  std::unordered_map<std::uint64_t, std::uint64_t> _row_hashes;
+  metal_compute::SharedBuffer _row_hash_buf;
+  void note_row_hash_(ContextId cid, int pos, const void* row,
+                      std::size_t bytes);
+  // The speculative loops' command stream (one queue), kept across
+  // rounds: on a NEW queue the driver spent ~5.5 ms on a round's first
+  // command buffer before the GPU could start it (an M5 Ultra; ~0.05 ms
+  // on the buffers after it), the GPU idle meanwhile -- every round, as
+  // the verify made a stream a call. The synchronous decode steps take
+  // it too (decode_step_fast, forward, decode_batched_step), which made a
+  // queue a token. Each user commits and waits before the next encodes,
+  // so they never share an open buffer.
+  metal_compute::CommandStream& spec_stream_();
+  // The RMSNorm kernel for a row of Hd at these byte offsets: the vector
+  // one (rms_norm_vec_f16) for a hidden-size row -- 1024 <= Hd <= 8192,
+  // Hd % 4 == 0, 8-byte aligned -- else rms_norm_fast_f16 (a head's, which
+  // must match decode's rms_rope). Every norm of the model's goes through
+  // here, so decode, verify and prefill reduce alike.
+  // VPIPE_QWEN_RMS_VEC=0: always the scalar one.
+  const metal_compute::ComputeFunction& rms_fn_(int Hd, std::size_t xoff,
+                                                std::size_t yoff) const;
+  metal_compute::ComputeFunction _fn_rms_vec;
+  metal_compute::CommandStream _spec_stream;
+  // The GDN q|k L2 norms of `heads` q heads at qoff and as many k heads
+  // right after them (koff), in place: one fused dispatch
+  // (qwen3_5_gdn_qk_norm, as decode runs it) where k follows q, else the
+  // two weighted RMS norms. Every multi-row GDN path calls this -- the
+  // verify and both replays -- so a replayed state is the verify's.
+  void encode_gdn_qk_norm_(metal_compute::ComputeEncoder& enc,
+                           const metal_compute::SharedBuffer& buf,
+                           std::size_t qoff, std::size_t koff,
+                           int heads) const;
+
+  // ---- DFlash state ----
+  // The adaptive round length (dflash_decode with block 0): what a round
+  // of each candidate length COSTS on this machine (an EMA of its wall
+  // time) against what it YIELDS (the acceptance of draft i given every
+  // draft before it accepted), picking the length with the most tokens a
+  // millisecond. Kept across decodes; reset on attach. Verifying a row
+  // costs nearly a decode step on a GPU without matrix cores and a
+  // fraction of one with them, so the answer is the machine's, not the
+  // drafter's.
+  struct DFlashTuner {
+    std::vector<int>    cand;      // candidate lengths, ascending
+    std::vector<double> cost;      // EMA ms a round, per candidate
+    std::vector<int>    seen;      // rounds measured, per candidate
+    std::vector<long>   reach;     // per draft position i (index i)
+    std::vector<long>   hit;
+    long                rounds = 0;
+    int                 last = -1; // candidate index of the last pick
+    void reset(int trained);
+    int  pick(int budget);         // a length <= budget, >= 1
+    void record(int L, double ms, int run);
+    double expect(int L) const;    // tokens a round of length L yields
+  };
+  DFlashTuner _dflash_tuner;
+  std::unique_ptr<MetalDFlashDrafter> _dflash;
+  // The target context the drafter's context cache describes; a prefill
+  // or decode on another context resets it.
+  ContextId _dflash_cid{};
+  class DFlashHooks;                       // DFlashTarget over this model
+  std::unique_ptr<DFlashHooks> _dflash_hooks;
+  // Prefill rows worth tapping for the drafter: its widest window (every
+  // row when a layer attends the full context).
+  int dflash_tap_rows_(int n) const;
+  // Point the drafter at `cid`, resetting its cache on a switch.
+  void dflash_bind_ctx_(ContextId cid);
+  // An embedding / multimodal prefill on `cid`, which the drafter does
+  // not tap: resets it when the prefill starts a fresh context.
+  void dflash_untapped_(ContextId cid);
 
   // (The sibling mtp.safetensors is loaded inline in load(), reusing the same
   // weight reader + 4-bit qtri/fuse/interleave helpers as the main layers.)
@@ -1523,6 +2465,23 @@ private:
              const metal_compute::SharedBuffer& b, int bits,
              const metal_compute::SharedBuffer& xin,
              const metal_compute::SharedBuffer& y, int K, int N);
+  // An affine MTP-head projection over m rows: vqmm_, or -- from
+  // _mma_min_m rows on matrix cores, the prompt seed's -- dequantized into
+  // _w_deq for the dense matmul2d, as the prefill's projections are.
+  void head_qmm_(metal_compute::ComputeEncoder& enc, int m,
+                 const metal_compute::SharedBuffer& w,
+                 const metal_compute::SharedBuffer& s,
+                 const metal_compute::SharedBuffer& b, int bits,
+                 const metal_compute::SharedBuffer& xin,
+                 const metal_compute::SharedBuffer& y, int K, int N);
+  // The MTP head's fc over m rows: fc_e @ ne into `out`, fc_h @ nh into
+  // `tmp` (the caller adds them). Dense halves on dense_gemm_, affine ones
+  // on head_qmm_.
+  void mtp_fc_(metal_compute::ComputeEncoder& enc, int m,
+               const metal_compute::SharedBuffer& ne,
+               const metal_compute::SharedBuffer& nh,
+               const metal_compute::SharedBuffer& out,
+               const metal_compute::SharedBuffer& tmp);
   // Single-token flash-decode attention via the MLX sdpa_vector 2-pass kernels
   // (vec2 pass-1 + coalesced merge2), shared by the single-token decode, the
   // MTP per-draft verify loop, and the batched per-branch fallback. Writes the
@@ -1586,7 +2545,8 @@ private:
                          const metal_compute::SharedBuffer* mtp_cond = nullptr,
                          const std::function<
                              void(metal_compute::ComputeEncoder&)>&
-                             pre_commit = {});
+                             pre_commit = {},
+                         const VerifyOpts* vo = nullptr);
 
   // Partial-accept GDN rollback. With every linear layer's conv/ssm recurrent
   // state restored to the round's S0 snapshot, replay conv1d -> qk_norm ->
@@ -1625,6 +2585,55 @@ private:
   int  _pinned_layers = 0;       // leading layers kept resident
   bool _stream_decode_warned = false;   // decode-on-streamed, reported once
 
+  // Raw-source layers (metal-qwen-raw-layers.cc). RawLayer is one layer's
+  // raw checkpoint tensors plus the products built from them; RawStream
+  // owns the slots, the residency policy and the wired-pool window.
+  struct RawLayer;
+  struct RawStream;
+  struct HybLayout;
+  struct NvLayout;
+  friend struct RawStream;
+  std::unique_ptr<RawStream> _rs;
+  bool _raw = false;
+  bool _raw_quant = false;
+  bool _raw_pack = false;    // the source is an affine w8g64 pack
+  bool _raw_nv = false;      // the source is NVFP4, served per build
+  static bool raw_eligible_(const Config& c);
+  // An NVFP4 dense stack's slot layout (metal-qwen-raw-layers.h), off the
+  // checkpoint alone: false unless every layer under `layer_prefix` holds
+  // its seven projections in NVFP4 of one spelling throughout, each a
+  // multiple of 256 inputs, an AWQ scale on o_proj / down_proj at most.
+  static bool nv_layout_(const MetalLlamaWeights& wts,
+                         const std::string& layer_prefix, int n_layers,
+                         NvLayout* out);
+  // An NVFP4 `c` the raw path serves over `wts`: a layout whose shapes
+  // are the config's.
+  static bool nv_servable_(const MetalLlamaWeights& wts, const Config& c);
+  // Whether `wts` stores the stack of `c` in NVFP4 (its first MLP gate).
+  static bool nvfp4_stack_(const MetalLlamaWeights& wts, const Config& c);
+  // An affine w8 group-64 pack whose layers a RawStream can stream: every
+  // projection a (u32 codes, scales, biases) triple of one width that a
+  // refill can place, and a hidden size whose rows copy in 32-bit words.
+  static bool pack_streamable_(const MetalLlamaWeights& wts, const Config& c);
+  // A HYBRID stack's slot layout (metal-qwen-raw-layers.h), off the
+  // checkpoint alone: false unless every layer under `layer_prefix` is a
+  // gated-DeltaNet or a full-attention one in float, at least one of each
+  // kind's tensors in place, its small tensors one shape throughout.
+  static bool hyb_layout_(const MetalLlamaWeights& wts,
+                          const std::string& layer_prefix, int n_layers,
+                          HybLayout* out);
+  // A hybrid `c` the raw path serves over `wts`: a layout, with the
+  // config's layer kinds and fused widths.
+  static bool hyb_servable_(const MetalLlamaWeights& wts, const Config& c);
+  metal_compute::SharedBuffer raw_read_(const std::string& name);
+  // A raw tensor as the resident load DERIVES it: widened to f32 (A_log,
+  // dt_bias), or a zero-centred norm with its 1 folded in.
+  metal_compute::SharedBuffer raw_read_f32_(const std::string& name);
+  void raw_fold_one_(metal_compute::SharedBuffer& b);
+  // Buffers adopt_trunk() took. A deque, so a reference handed out stays
+  // valid as more arrive.
+  std::deque<metal_compute::SharedBuffer> _trunk_extra;
+
   std::vector<Layer> _layers;
   metal_compute::SharedBuffer _embed_w, _embed_s, _embed_b;   // tied lm_head
   metal_compute::SharedBuffer _lm_w, _lm_s, _lm_b;            // untied (9B)
@@ -1655,6 +2664,41 @@ private:
   // 0.196 rel vs the same model quantized from HF, against 0.011 for the
   // Q4_K_M sibling that got the strided flag.
   bool _gdn_strided_v = false;
+  // A ModelOpt NVFP4 checkpoint run natively: every NVFP4 linear (the
+  // projections, the untied head) on the k-quant route as KQ::kNVFP4, the
+  // rest as the HF checkpoint holds it -- a bf16 token table gathered
+  // dense (_kq_embed_dense), zero-centred norms given their +1, the GDN in
+  // its own (contiguous) value order. Set with _kquant.
+  // VPIPE_NVFP4_DENSE=1 runs the same checkpoint on the dense path instead,
+  // every NVFP4 weight dequantized to the compute dtype at load: the
+  // reference the native route is held to (3.5x the memory).
+  bool _nvfp4 = false;
+  // The k-quant route's token table is dense f16 (NVFP4's bf16 one), not a
+  // raw k-quant table: gathered by embed_gather_f16.
+  bool _kq_embed_dense = false;
+  // The gated-DeltaNet q / k normalization's eps, inside rsqrt(sum / Dk +
+  // eps) (MLX's rms form; the reference's l2norm adds its eps to the SUM).
+  float _gdn_qk_eps = 1e-6f;
+  // PRISM HADAMARD v1 (Ternary-Bonsai 2's GGUF; GgufQwen35Converter's
+  // prism.hadamard.* tensors): every ternary projection was trained on a
+  // ROTATED input, x' = H (s . x) -- H the normalized Sylvester Hadamard
+  // per block of 1024 of the input, s per-width signs -- and the token
+  // table holds the inverse, h = s . (H z). So each such projection's
+  // input is rotated first (prism_rows_; f32 inside, one rounding), the
+  // gathered text rows are taken back, and a GDN layer's dense a|b
+  // (which read the plain input in the file) are rotated ONCE at load so
+  // the whole in_proj reads one rotated row. _prism_grouped: the
+  // out_proj kept the training's grouped v-head order while the rest of
+  // the file is tiled (gdn_v_grouped), so its input is permuted as it is
+  // rotated.
+  bool _prism = false;
+  bool _prism_grouped = false;
+  std::vector<std::pair<int, metal_compute::SharedBuffer>> _prism_signs;
+  metal_compute::ComputeFunction _fn_prism;
+  // A GDN layer whose in_proj a|b are DENSE beside an affine q|k|v|z (the
+  // ternary GGUF: alpha / beta stored bf16): iqw holds q|k|v|z (Cd + vald
+  // rows), kqab the dense a|b [2 Hv, H].
+  bool _ab_dense = false;
   // q6_K decode qmv tuning: the loaded qmv_q6k_v2 variant's NSG (simdgroups/
   // threadgroup) and rows-per-threadgroup (RPS*NSG). Tuned to r2n8 (nsg=8,
   // rpt=16); fallbacks set nsg=2/rpt=8. Used by kqmv_'s q6_K dispatch.
@@ -1672,6 +2716,42 @@ private:
   // dispatches the dense GEMM/GEMV when the scales buffer is empty. Mutually
   // exclusive with _kquant / _mixed / is_moe().
   bool _dense = false;
+  // A _dense MoE whose ROUTED experts are block-FP8 per expert -- E4M3 codes
+  // with one f32 scale per 128x128 block, under mlp.experts.<e>.{gate,up,
+  // down}_proj.weight + .weight_scale_inv (Fish Audio Drama 3). The slabs
+  // keep the codes (eguw [E,2I,H] gate/up rows interleaved, edw [E,H,I]) and
+  // egus / eds the block scales (x256, see dense_moe_gather_swiglu_fp8);
+  // everything else in the layer is the plain dense path's.
+  bool _fp8_experts = false;
+  // Config::expert_cache_bytes engaged: the routed experts live in _xc
+  // (slots of the same layout as the resident slabs, which stay empty),
+  // read through _xranges (an MLX checkpoint's stacked tensors) or the
+  // per-expert tensors; the rest of the model wired through _xwire.
+  bool _xstream = false;
+  int _x_gb = 4, _x_db = 4;          // affine gate|up / down widths
+  int _x_group = 64;                 // ...and their group
+  std::unique_ptr<MoeExpertCache> _xc;
+  std::unique_ptr<SafetensorsRanges> _xranges;
+  std::unique_ptr<WiredPool> _xwire;
+  // READING AHEAD (a decode step, a verify's few rows): the next layer's
+  // router logits over this layer's input, a row each, and the experts
+  // they rank highest -- up to _x_ahead a row, which the cache reads
+  // behind this step (0: off).
+  metal_compute::SharedBuffer _x_pred_logits;
+  std::vector<std::int32_t> _x_rank, _x_ord;
+  int _x_ahead = 0;
+  bool _xc_failed = false;
+  static int x_ahead_rows_();
+  bool setup_expert_cache_(std::string* err);
+  void wire_for_experts_();
+  // ...or whose routed experts are GPTQ int4 per expert (qweight + scales,
+  // symmetric, group 128: fishaudio/drama-3-int4), converted at load to the
+  // affine w4 g64 slabs, so they take the affine MoE kernels (gather and
+  // grouped) inside an otherwise dense model.
+  bool _gptq_experts = false;
+  // Rows from which a block-FP8 MoE takes the grouped steel GEMMs rather
+  // than the per-pair gather (VPIPE_QWEN_MOE_FP8_GROUPED_MIN).
+  int _fp8_grouped_min = 96;
   // MOSS-TTS text artifact: an AFFINE backbone whose embed/tied-lm_head were
   // kept bf16 on disk (no .scales). The embed table + tied lm_head bind via
   // the dense f16 path (muxer gather + dense GEMV head) so the full-precision
@@ -1743,6 +2823,9 @@ private:
   static constexpr int kSampM = 64;
   static constexpr int kSampB = 1024;
   metal_compute::SharedBuffer _d_argmax_part;
+  metal_compute::SharedBuffer _hc_pick;   // HcRun::pick's id
+  // forward_hc_'s own scratch, a slot a call, kept between forwards.
+  std::vector<metal_compute::SharedBuffer> _hc_scratch;
   metal_compute::SharedBuffer _d_smp_maxpart, _d_smp_hpart, _d_smp_hist,
       _d_smp_maxl, _d_smp_wt, _d_smp_pickpart;
   // Flash-decode-GQA partials (f32): un-normalized O [Hq,split,D], m/l
@@ -1759,6 +2842,41 @@ private:
   // accuracy (0.63->0.88) on a fixed sequence, the whole vpipe->reference gap.
   // Set per-decode from VPIPE_MTP_NO_PERSIST in mtp_decode (default ON).
   bool _mtp_persist = false;
+  // HOW DEEP mtp_decode chains the head a round -- 1 to 3 applications,
+  // the next round's drafts -- measured on the run and kept across
+  // decodes: a round's ms at each depth (steady rounds only, those whose
+  // verify had that depth's drafts) and each draft position's kept share
+  // (halved every kHalve rounds). A block of kBlock rounds in every kEvery
+  // runs another depth, so every one stays measured -- and the depth
+  // past the best, never measured, gets its block as soon as the best has
+  // been.
+  struct MtpDepthChoice {
+    static constexpr int kMax = 3;
+    static constexpr int kEvery = 64;
+    static constexpr int kBlock = 3;
+    static constexpr int kHalve = 512;
+    double ms[kMax + 1] = {};
+    int nms[kMax + 1] = {};
+    // steady rounds seen at each depth: the first is not timed (its new
+    // row count's first dispatches cost more than every later one's)
+    int seen[kMax + 1] = {};
+    double reached[kMax] = {}, kept[kMax] = {};
+    std::uint64_t rounds = 0;
+    // an exploring block under way: its depth and the rounds left of it
+    int explore_depth = 0, explore_left = 0;
+    // The depth of most tokens a ms, at most `cap`.
+    int best(int cap) const;
+    // This round's depth, at most `cap`: the best, or another inside an
+    // exploring block (counts the round).
+    int next(int cap);
+    // A finished round: `rows` verified (drafts + 1), `depth` chained,
+    // `run` = 1 + the drafts the verifier agreed with, `ms` its time.
+    void note(int rows, int depth, int run, double ms);
+  };
+  MtpDepthChoice _mtp_dc;
+  // Penalised speculative sampling: the verify's per-position seen-sets
+  // ([n, vocab] uint8), set by mtp_decode for one verify; empty otherwise.
+  std::vector<std::uint8_t> _mtp_seen_rows;
   // _lc_mlogits2 holds the SECOND chained MTP-head application's logits (the
   // depth-2 draft q2); _lc_mlogits is the first (q1), _lc_vlogits the verifier.
   metal_compute::SharedBuffer _lc_vlogits, _lc_mlogits, _lc_mlogits2;
@@ -1774,6 +2892,319 @@ private:
   // Batched-sample (lc_sample_batch_f16) extras: _lc_ws_p is sized [K*vocab]
   // for the K concurrent rows; _lc_seed_in holds the per-row 32-bit seeds.
   metal_compute::SharedBuffer _lc_seed_in;
+
+  // ---- Qwen3.8-Flash-Next: hyper-connections (metal-qwen-hc.cc) ------
+  // Every hyper-connection model's forward -- prefill, decode, verify --
+  // is forward_hc_: one n-row pass, the layer kinds and the MoE block the
+  // Qwen3.5 code's, the residual hc_count streams wide.
+  metal_compute::ComputeLibrary _lib_hc;
+  HcBlock _hc_mix;                       // the final mixer (no injection)
+  // The n-gram PLE block on layer _cfg.ple_layer: key|value fused
+  // [hc*H + H, ple_dim] (w8g64), the three grouped norms (f32 1 + w), the
+  // dilated depthwise conv [hc*H, K]. The table (51B parameters) is read
+  // by ROW from its shards, through the page cache; the hash is the
+  // checkpoint's own (multipliers, per-head primes and offsets).
+  struct Ple {
+    metal_compute::SharedBuffer kvw, kvs, kvb;   // key|value, w8g64
+    metal_compute::SharedBuffer nk, nq, nc;      // f32, 1 + w
+    metal_compute::SharedBuffer conv;            // [hc*H, K] compute dtype
+    std::vector<std::int64_t> mult;              // per n-gram position
+    std::vector<std::int64_t> sizes, offsets;    // per hashed head
+    std::unique_ptr<SafetensorsRanges> rows;     // the table, cached reads
+    std::unique_ptr<SafetensorsRanges> rows_nc;  // ...and uncached
+    std::string shard;                 // "<..>.shards." -- then i + ".weight"
+    // each table shard's tensors' names (codes, scales, biases)
+    std::vector<std::string> wname, sname, bname;
+    std::size_t lookups = 0, distinct = 0;     // the last call's
+    std::int64_t shard_rows = 0;       // rows per table shard
+    int head_dim = 0;                  // values a row (ple_dim / heads)
+    int bits = 0, group = 0;           // the table's affine layout (bits
+                                       // 0: unquantized, dense_dtype)
+    std::string dense_dtype;
+    std::size_t row_w = 0, row_s = 0;  // a row's code / scale bytes
+    bool scales_bf16 = true;
+    float scale = 1.0f;                // ngram_embedding.weight_scale
+    int hist = 0;                      // conv history rows ((K-1) * dil)
+    // Byte offsets in the PLE layer's conv state, past its own GDN rows:
+    // the conv history [hist, hc*H], then the last two token ids (+1; 0 =
+    // none, which reads as EOS).
+    std::size_t hist_off = 0, ids_off = 0;
+    // The table in memory (Config::ple_resident): each shard's codes,
+    // scales and biases as stored (the weight set's derived entries, so
+    // the manager sees them), filled in shard order by `res_fill`; the
+    // rows of shards below `res_ready` read from here.
+    std::vector<metal_compute::SharedBuffer> res_w, res_s, res_b;
+    std::atomic<int> res_ready{0};
+    std::atomic<bool> res_stop{false};
+    std::thread res_fill;
+    ~Ple();   // stops and joins res_fill
+  };
+  std::unique_ptr<Ple> _ple;
+  // Fill _ple's table in memory (the res_fill thread's body).
+  void ple_fill_();
+  // Build layer L of a hyper-connection model / its model-level tensors
+  // (final mixer, PLE); every non-expert projection re-encoded to w8g64.
+  bool build_layer_hc_(int L, std::string* err);
+  bool load_hc_globals_(std::string* err);
+  // The n-row forward. `ids` always (the PLE hashes them; the embedding
+  // gathers them unless `embeds` [n, H] is given). rope_pos >= 0 places a
+  // one-row step at that RoPE position (post-image decode). Returns the
+  // last row's logits; `all_logits` (when set) receives every row's.
+  // What a speculative verify keeps of its forward, for a partial accept:
+  // every gated-DeltaNet layer's step inputs (encode_gdn_replay2_ re-runs
+  // the kept prefix from them), the PLE's normed rows (its conv history
+  // likewise), and the residual streams after the last layer (the MTP
+  // head's input). The GDN state is read from ring slot 0 and written to
+  // slot 1 when this is given.
+  struct HcVerify {
+    GdnVerifyCache gdn;
+    metal_compute::SharedBuffer gvn;     // [n, hc*H]
+    bool ring = false;                   // bind ring slots 0 -> 1
+  };
+  // What a forward runs beside the plain pass over the model's stack.
+  // A prefill piece's n-gram rows, read AHEAD under the piece before it
+  // (forward_hc_'s HcRun::ple_ahead): the ids they are for, the two tokens
+  // before them, and the read's state. Waits for its read when destroyed.
+  struct HcPleAhead {
+    std::vector<std::int32_t> ids;
+    std::int64_t h0 = 0, h1 = 0;
+    metal_compute::SharedBuffer rows;
+    std::string err;
+    bool ok = false;
+    void* group = nullptr;            // the read's dispatch group
+    void wait();
+    ~HcPleAhead() { wait(); }
+  };
+  static bool hc_ple_ahead_();
+  struct HcRun {
+    HcVerify* verify = nullptr;
+    // A prefill's n-gram rows read ahead: in, the rows of this forward's
+    // ids where `ple_ahead` holds them (else read here, as ever); out, the
+    // rows of `ple_next` (the next piece's ids) read into it once this
+    // forward's own are in.
+    HcPleAhead* ple_ahead = nullptr;
+    std::span<const std::int32_t> ple_next;
+    // The residual streams before the final mixer, copied out [n, hc*H]
+    // (what the MTP head reads).
+    metal_compute::SharedBuffer* resid = nullptr;
+    // The MTP head IN PLACE OF the stack: its streams are fc_hidden of
+    // these normed streams [n, hc*H] plus fc_embedding of the normed
+    // embedding of `ids` (the NEXT tokens), its KV the head's own context
+    // (`cid` names it there).
+    const metal_compute::SharedBuffer* mtp_in = nullptr;
+    // No final mixer or head: a pass that only fills the KV.
+    bool no_head = false;
+    // Every row's logits kept in _hc_logits (a verify's picks), not read
+    // back.
+    bool all_rows = false;
+    // With mROPE tables: the rows' 3-axis positions, axis-major [3][n] --
+    // the QSA indexer ropes its queries and its blocks' keys at them.
+    const std::int32_t* mrope_pos = nullptr;
+    // A DFlash drafter's taps: after each of these layers, the residual
+    // streams' MEAN over the hc_count streams (what DFlash 2 for this
+    // model was trained on: a completed layer's output, stream-averaged),
+    // rows [tap_row0, n) into `taps` [tap_layers->size()][n - tap_row0][H]
+    // layer-major, in the compute dtype.
+    const std::vector<int>* tap_layers = nullptr;
+    const metal_compute::SharedBuffer* taps = nullptr;
+    int tap_row0 = 0;
+    // The last row's argmax (the host's: the lowest index of the largest)
+    // picked on the GPU and written here, in place of its logits read back
+    // (an MTP draft's: 248320 of them converted for one id).
+    std::int32_t* pick = nullptr;
+    // Encoded after the head, before the forward's one wait: a verify's
+    // picks at every row (argmax, or a sample), which a command buffer of
+    // their own, committed and waited for, cost each round.
+    std::function<void(metal_compute::ComputeEncoder&)> tail;
+  };
+  std::vector<float> forward_hc_(ContextId cid,
+                                 std::span<const std::int32_t> ids,
+                                 const metal_compute::SharedBuffer* embeds,
+                                 const metal_compute::SharedBuffer* mrope_cos,
+                                 const metal_compute::SharedBuffer* mrope_sin,
+                                 int rope_pos,
+                                 std::vector<float>* all_logits,
+                                 const HcRun* run = nullptr);
+  // ---- The Lightning MTP head (mtp.*), the hyper-connection drafter ----
+  // fc_embedding(norm(embed(next))) added to fc_hidden of each normed
+  // residual stream (the main model's, before its final mixer), then ONE
+  // hyper-connection full-attention layer with its own 512 experts and
+  // QSA indexer, its own final mixer, and the shared lm_head. Its KV holds
+  // a pair (residual at main position q, token q + 1) for every committed
+  // q, at head position q -- primed with the prompt as it prefills.
+  struct HcMtp {
+    Layer ly;
+    HcBlock mix;
+    // fc_embedding, fc_hidden: w8 at the model's group, or dense
+    metal_compute::SharedBuffer few, fes, feb;
+    metal_compute::SharedBuffer fhw, fhs, fhb;
+    metal_compute::SharedBuffer ne, nh;          // pre-fc norms, f32 1 + w
+    std::unique_ptr<ContextManager> ctx;         // the head's KV + QSA keys
+    // Per main context: the head's context, which pairs every main
+    // position but the last, whose residual waits in `pending` for the
+    // token that follows it. `main_len` is the main length that holds for
+    // (-1: none -- the next decode starts the head empty).
+    struct Seq {
+      ContextId cid;
+      metal_compute::SharedBuffer pending;       // [hc*H]
+      int main_len = -1;
+    };
+    std::unordered_map<std::uint32_t, Seq> seqs;
+  };
+  std::unique_ptr<HcMtp> _hc_mtp;
+  // Load mtp.* when the checkpoint carries it (false only on a failure).
+  bool load_hc_mtp_(std::string* err);
+  // A layer of the hyper-connection kind, from the tensors under `p`.
+  bool build_hc_layer_(const std::string& p, bool full, Layer& ly,
+                       std::string* err);
+  // The head's sequence for main context `cid`, (re)started empty when it
+  // no longer matches `main_len` rows of the main context.
+  HcMtp::Seq& hc_mtp_seq_(ContextId cid, int main_len);
+  // Fold `n` rows of main residuals (`resid`, [n, hc*H] from row r0) with
+  // the tokens that follow them into the head's KV for `cid`, keeping the
+  // last row's residual pending; `ids` are the rows' OWN tokens. Called
+  // after a prefill (the prompt's pairs) with the main length after it.
+  bool hc_mtp_prime_(ContextId cid, const metal_compute::SharedBuffer& resid,
+                     std::span<const std::int32_t> ids, int main_len,
+                     std::vector<float>* logits);
+  // A verify's partial accept: every gated-DeltaNet layer re-advanced from
+  // ring slot 0 to slot 1 over the first `keep` rows of its captured
+  // inputs, with forward_hc_'s own kernels, and the PLE's history and last
+  // two ids likewise (`ids`: the verify's tokens).
+  void encode_hc_replay_(metal_compute::ComputeEncoder& enc, ContextId cid,
+                         int keep, const HcVerify& hv,
+                         std::span<const std::int32_t> ids);
+  bool mtp_decode_hc_(ContextId cid, std::int32_t first_token, int n_steps,
+                      std::vector<std::int32_t>& out_ids, long* accepted_out,
+                      long* rounds_out, const MtpDecodeCtl& ctl);
+  // HOW MANY DRAFTS A ROUND mtp_decode_hc_ verifies, measured on the run
+  // and kept across decodes: a verify's ms by its rows (a plain step's,
+  // and the others as their RATIO to it -- the two move together as the
+  // expert cache warms), a head pass's, and each draft position's kept
+  // share (halved every kHalve rounds).
+  struct HcDraftChoice {
+    static constexpr int kMax = 3;          // drafts a round, at most
+    static constexpr int kRows = 9;         // verify rows measured (copy's)
+    static constexpr int kExplore = 8;      // one round in this many tries
+    static constexpr int kHalve = 512;
+    double v[kRows + 1] = {};               // [1] ms; [r] ratio to [1]
+    int nv[kRows + 1] = {};
+    double d = 0.0;                         // a head pass's ms
+    int nd = 0;
+    double reached[kMax] = {}, kept[kMax] = {};
+    std::uint64_t rounds = 0;
+    // A verify of `rows` rows in ms (interpolated where unmeasured).
+    double verify_ms(int rows) const;
+    // The drafts of most tokens a ms, 0 to k_max.
+    int best(int k_max) const;
+  };
+  HcDraftChoice _hc_dc;
+  // dflash_decode for a hyper-connection model: a round drafts on the GPU,
+  // reads the drafts back (forward_hc_ takes host ids -- the PLE reads its
+  // n-gram rows by them), verifies with forward_hc_ tapping the drafter's
+  // layers, and leaves the next round's buffer the GDN / PLE replay of a
+  // partial accept and the kept rows' taps.
+  bool dflash_decode_hc_(ContextId cid, std::int32_t first_token,
+                         int n_steps, std::vector<std::int32_t>& out_ids,
+                         const MtpDecodeCtl& ctl, int block,
+                         SpecStats* stats);
+  // A hyper-connection prefill's DFlash taps, piece by piece: the rows the
+  // drafter's widest window sees (the last dflash_tap_rows_(n) of n), each
+  // piece's share tapped as it runs (hc_taps_piece_ sets `run`) and fed to
+  // the drafter at its positions after it (hc_taps_ingest_).
+  struct HcTaps {
+    int n = 0, trows = 0, pos0 = 0;
+    const std::vector<int>* layers = nullptr;
+    metal_compute::SharedBuffer buf;
+  };
+  HcTaps hc_taps_begin_(ContextId cid, int n, int piece);
+  void hc_taps_piece_(const HcTaps& t, int i0, int m, HcRun& run) const;
+  bool hc_taps_ingest_(const HcTaps& t, int i0, int m, const HcRun& run);
+  // A prefill from embeddings alone (multimodal splices, host-fed rows)
+  // has no token ids for the n-gram PLE to hash: refused, said once.
+  // Returns false (the caller returns no logits).
+  bool hc_refuse_embeddings_();
+  // An affine tensor's code width from its packed columns and input K.
+  int affine_bits_of_(const std::string& base, int K) const;
+  int affine_group_of_(const std::string& base, int K) const;
+public:
+  // A hyper-connection model's weight layout as loaded, one line ("" for
+  // any other model): the projections' group, the router, the experts'
+  // format, the shared expert, whether the decode's fused MoE launch
+  // serves it, and the MTP head's where it differs. Logged at load; the
+  // flavor tests assert it.
+  std::string hc_layout() const;
+private:
+  // A hyper-connection model's token table or head [vocab, hidden]: w8 at
+  // its group, as its projections (lossless); dense where the pack left it
+  // unquantized (`s` empty).
+  bool load_hc_table_(const std::string& base, metal_compute::SharedBuffer& w,
+                      metal_compute::SharedBuffer& s,
+                      metal_compute::SharedBuffer& b, std::string* err);
+
+  // ---- Routed-expert kernels by format --------------------------------
+  // One routed-expert format's kernels (width, group): the pair gathers,
+  // the grouped GEMVs and steel GEMMs, and their NAX twins (null where
+  // none: group 32). The group-64 widths 4 / 5 / 8 name the handles
+  // above, so a model on them dispatches as it always did; the others
+  // load on first use (ensure_expert_fns_, at layer build) and are owned
+  // here. The hyper-connection decode's fused MoE launch is keyed by the
+  // shared expert's group too (fused_moe_fns_).
+  struct ExpertFns {
+    const metal_compute::ComputeFunction* gather_swiglu = nullptr;
+    const metal_compute::ComputeFunction* gather_down = nullptr;
+    const metal_compute::ComputeFunction* grouped_swiglu = nullptr;
+    const metal_compute::ComputeFunction* grouped_down = nullptr;
+    const metal_compute::ComputeFunction* qmm_swiglu = nullptr;
+    const metal_compute::ComputeFunction* qmm_down = nullptr;
+    const metal_compute::ComputeFunction* nax_swiglu = nullptr;
+    const metal_compute::ComputeFunction* nax_down = nullptr;
+    // ... over 64-row work items (two tiles of one expert)
+    const metal_compute::ComputeFunction* nax64_swiglu = nullptr;
+    const metal_compute::ComputeFunction* nax64_down = nullptr;
+  };
+  struct FusedMoeFns {
+    const metal_compute::ComputeFunction* up = nullptr;
+    const metal_compute::ComputeFunction* down = nullptr;
+  };
+  std::unordered_map<int, ExpertFns> _xfns;       // width * 1000 + group
+  std::unordered_map<int, FusedMoeFns> _xfused;   // see fused_moe_fns_
+  std::deque<metal_compute::ComputeFunction> _xfn_own;
+  // Null when the format has no kernels (a width the gathers do not take).
+  const ExpertFns* expert_fns_(int bits, int group) const;
+  bool ensure_expert_fns_(int bits, int group);
+  void attach_nax64_fns_(int bits, int group, ExpertFns& f);
+  const FusedMoeFns* fused_moe_fns_(int bits, int group, int sgroup) const;
+  // forward_hc_'s head output ([rows, vocab], compute dtype) -- kept for
+  // the GPU sampler of a decode step -- and the once-per-model warning that
+  // the QSA indexer is not run.
+  metal_compute::SharedBuffer _hc_logits;
+  // The mROPE axis of each rotary pair ([rotary_dim / 2] int32, the
+  // interleaved sections) for the QSA kernels.
+  metal_compute::SharedBuffer _hc_axis;
+  bool _hc_qsa_warned = false;
+  bool _hc_embed_warned = false;
+  double _hc_prof[4] = {0, 0, 0, 0};    // VPIPE_QWEN_HC_PROFILE
+  long _qsa_two = 0;                    // two-phase QSA selects run
+  long _hc_prof_n = 0;
+  // The PLE rows [n, ple_dim] (compute dtype) of `ids`, continuing the
+  // context's hashed history (and advancing it).
+  bool ple_embed_(const metal_compute::SharedBuffer* state_in,
+                  const metal_compute::SharedBuffer* state_out,
+                  std::span<const std::int32_t> ids,
+                  metal_compute::SharedBuffer& out, std::string* err);
+  // Its parts: the context's last two tokens (EOS for none), the rows of
+  // `ids` after them (no state touched -- what a read ahead runs), and
+  // the last two tokens after `ids` noted in the state.
+  bool ple_prev_(const metal_compute::SharedBuffer* state_in,
+                 const metal_compute::SharedBuffer* state_out,
+                 std::int64_t* h0, std::int64_t* h1, std::string* err) const;
+  bool ple_rows_(std::int64_t h0, std::int64_t h1,
+                 std::span<const std::int32_t> ids,
+                 metal_compute::SharedBuffer& out, std::string* err);
+  void ple_note_(const metal_compute::SharedBuffer* state_out,
+                 std::int64_t h0, std::int64_t h1,
+                 std::span<const std::int32_t> ids) const;
 
   // The checkpoint, held for this model's whole life. The weights are
   // owned copies rather than views, so this is the reference count that

@@ -27,8 +27,14 @@
 #include "vpipe/pipeline-handle.h"
 #include "vpipe/status.h"
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <string>
 #include <string_view>
+
+#include "vpipe/export.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -53,6 +59,15 @@ public:
   // it; an inline spec carries no path, so that call reports
   // Status{1} until a path-taking `store_pipeline` sets one.
   virtual PipelineHandle load_pipeline(std::string_view spec) = 0;
+
+  // Load a pipeline from a spec document already in memory -- the
+  // document the JSON form parses into -- so a host that builds its
+  // graphs in code skips writing and re-parsing JSON. Otherwise as
+  // above: a null handle on failure, reported through the log delegate;
+  // no storage path. Needs common/flex-data.h. (Non-virtual: the library
+  // implements it for the sessions it creates, and the interface's
+  // vtable stays as it was.)
+  PipelineHandle load_pipeline(const FlexData& spec);
 
   // Create a new empty pipeline with the given id. The returned
   // handle is owned by this session and remains valid until the
@@ -132,8 +147,59 @@ public:
   // (Python's signal machinery; the binding releases the GIL with
   // periodic PyErr_CheckSignals), after which the caller's
   // exception path can sequentially issue stop_pipeline /
-  // unload_pipeline from the same thread that was blocked here.
+  // unload_pipeline from the same thread that was blocked here. A host
+  // with a control thread per pipeline waits with wait_pipeline (below).
   virtual Status wait_pipelines(int timeout_ms = -1) = 0;
+
+  // Block until ONE pipeline has reached data-driven idle, as
+  // wait_pipelines does for all of them -- for a host that drives
+  // several pipelines at once, each from a control thread of its own (a
+  // download beside a generation). wait_pipelines cannot serve that: it
+  // waits for every launched pipeline, so a thread never sees its own
+  // finish while another runs, and it holds raw pointers to the others,
+  // which their threads may stop and unload under it.
+  //
+  // `timeout_ms` as wait_pipelines'. Returns Status{0} once it is idle
+  // (or not launched), Status{4} on a timeout -- it still runs -- and
+  // Status{1} for an unknown handle.
+  //
+  // Thread-safety: safe while other threads launch, stop and unload
+  // OTHER pipelines of the session. Stopping or unloading THIS pipeline
+  // from another thread while the wait runs is the caller's to
+  // serialize, as for wait_pipelines. (Non-virtual, as progress() is:
+  // the interface's vtable stays as it was.)
+  Status wait_pipeline(PipelineHandle, int timeout_ms = -1);
+
+  // A CONVERSATION let go: the K/V that text-chat's conversation beats
+  // kept under `key` with its model (their `context`), dropped from
+  // memory now rather than when the model's warm hold ends -- the host's
+  // conversation is over. A context saved to the host's `context_dir`
+  // stays there: the folder is the host's. Status{0} when one was kept,
+  // Status{1} when none was. Non-virtual, as wait_pipeline.
+  Status drop_chat_context(std::string_view key);
+
+  // MODELS LET GO: every model checkpoint nothing holds at this moment --
+  // its weights, the copies a model made of them -- given back now,
+  // rather than kept for a later run, which then reads it from disk
+  // again. For a host that would rather have the memory than a faster
+  // next start.
+  //
+  // What decides it is what is HELD now, not which pipelines exist:
+  //   - A LOADED pipeline holds what its stages hold, launched or not.
+  //     One that finished but was not unloaded still has its models, so
+  //     unload it first.
+  //   - A RUNNING pipeline whose stage has let a model go for now (a
+  //     stage with `unload_when_idle`, between beats; a video model
+  //     released between clips on a small machine) loses it, and its
+  //     stage reads it from disk when it takes it back.
+  //   - The model text-chat keeps warm (keep_loaded) holds its own, and
+  //     stays, with its conversations.
+  // Without this, an UNLOADED pipeline's checkpoints are kept, PARKED --
+  // purgeable, so the kernel may take them -- until another load needs
+  // the room. Returns the bytes given back (0 without a model manager);
+  // a parked checkpoint counts in full, even where the kernel had
+  // already taken some of its pages. Non-virtual, as wait_pipeline.
+  std::size_t release_idle_models();
 
   // Runtime overrides on top of the boot-time `log.*` config block.
   // All four are rejected with Status{3} while any pipeline owned
@@ -167,6 +233,134 @@ public:
   // locale, NOT a per-stage model/ASR language hint.
   virtual Status set_language(std::string_view tag) = 0;
 
+  // ---- Progress ------------------------------------------------
+  //
+  // The live progress reports -- what stages open through
+  // SessionContextIntf::open_progress (a denoise counted per DiT
+  // block, a VAE decode per tile, a download per byte) and what the
+  // console footer and the web UI's status bar draw -- for a host that
+  // draws its own. The same document /api/io/progress serves:
+  //
+  //   {"version": u,
+  //    "items": [{"id": u, "desc": s, "done": u, "total": u,
+  //               "detail": s, "seq": u, "elapsed_ms": u}, ...]}
+  //
+  // Items are OLDEST-OPENED FIRST (a stable order as reports come and
+  // go); `total` 0 is INDETERMINATE; `seq` is bumped per update, so the
+  // highest is the most recently moved; `elapsed_ms` is the report's
+  // age at the snapshot. Ids are never reused and only grow, which is
+  // how a caller tells its run's reports from an earlier run's. A
+  // report lives from its stage opening it to closing it -- an empty
+  // list between phases is normal.
+  //
+  // Producers update without throttling and this reads one snapshot
+  // under one lock, so poll at whatever rate the host repaints (vpipe's
+  // own renderers use 10 Hz and 1 Hz); compare progress_version() first
+  // and skip the document when nothing moved. Safe from any thread.
+  // Needs common/flex-data.h. (Non-virtual, as load_pipeline(const
+  // FlexData&) is: the interface's vtable stays as it was.)
+  FlexData      progress() const;
+  std::uint64_t progress_version() const;
+
+  // ---- Reports, for a host to act on -----------------------------
+  //
+  // What a stage refused and why, as NUMBERS rather than the log's
+  // sentence: a host shows what a clip asked for and points at the
+  // setting that would make it fit, without parsing English that is
+  // free to change. The latest 32, oldest first:
+  //
+  //   {"version": u,
+  //    "items": [{"id": u, "kind": s, "data": {...}, "age_ms": u}, ...]}
+  //
+  // `kind` names the shape of `data` (common/host-report.h lists them:
+  // "memory", a refusal for lack of memory -- what it needed, part by
+  // part, and each budget's need and room; "memory-plan", the resource
+  // plan's peak by phase). Ids only grow and are never reused, and
+  // `version` is the newest: read reports_version() when a job starts
+  // and take the items above it when it ends. Safe from any thread.
+  // (Non-virtual, as progress() is.)
+  FlexData      reports() const;
+  std::uint64_t reports_version() const;
+
+  // ---- Memory, for a host to show ---------------------------------
+  //
+  // What the session holds in memory NOW, by what holds it -- a host's
+  // "what is in RAM" view, numbers only:
+  //
+  //   {"warm":    [{"kind": s, "dir": s, "bytes": u, "held_bytes": u,
+  //                 "kv_bytes": u, "seconds": f}, ...],
+  //    "weights": [{"dir": s, "bytes": u, "mapped_bytes": u,
+  //                 "holders": i, "parked": b}, ...],
+  //    "owned":   [{"dir": s, "kind": s, "use": s, "bytes": u}, ...],
+  //    "unowned_bytes": u,
+  //    "kv_bytes": u, "pooled_bytes": u,
+  //    "wired_used": u, "wired_limit": u, "gpu_allocated": u}
+  //
+  // `warm`: the models kept warm between runs, one a hold -- a language
+  // model kept loaded (`kind` "language-model": `bytes` its wired
+  // weights, 0 when it loaded unwired; `held_bytes`, where its load
+  // counted it (it loaded wired; absent otherwise), all that hold keeps
+  // as a launch weighs it beside itself -- the wired bytes, what a full
+  // wired pool left unwired, and what it filled after its load (an
+  // n-gram table held in memory, never wired); `kv_bytes` its K/V, its
+  // parked conversations' too) or a model a stage built (its kind,
+  // "flux2-dit", "qwen-text-encoder", ...; `bytes` as the stage kept it,
+  // 0 where it said none) -- and the seconds before each goes unless
+  // used. A hold's `bytes` and `held_bytes` say WHOSE the memory is; they
+  // are not additive with `weights` below, which counts what a model
+  // keeps through its checkpoint's weight set (that n-gram table, a
+  // DiT's trunk) too.
+  // `weights`: each checkpoint's weights resident through the model
+  // manager -- a language model's own are not among them, only what it
+  // keeps through its set; `holders` what holds its set, the models
+  // using it and those kept warm alike (0: nothing does); `parked`:
+  // handed to the kernel as purgeable.
+  // `owned`: WHOSE the Metal allocations are, as they were made -- each
+  // owner's live bytes by use. An owner is a checkpoint's `dir` and what
+  // holds it (`kind`): a stage's type for what a stage allocates as it
+  // runs (its largest declared checkpoint's dir; none for a stage holding
+  // none), "language-model" for a load the model manager makes, "weights"
+  // for what a weight set reads. `use`: "weights" (a tensor kept),
+  // "blocks" (read as a model streams, kept or in flight), "experts" (a
+  // mixture of experts' cache), "kv" (a context's K/V and recurrent
+  // state), "scratch" (all else -- activations, arenas, slots). Additive
+  // with each other, and the same bytes as `warm` and `weights` where
+  // those name them: one model's memory is its dirs' entries summed,
+  // never these and those added. `unowned_bytes`: what was made on a
+  // thread nothing owned (a model's own reader thread, a host's call).
+  // Counted process-wide, every session's together.
+  // `kv_bytes` every language model's K/V, the warm ones' included;
+  // `pooled_bytes` the checkpoints nothing holds, which the manager can
+  // drop now (a model kept warm holds its own, so letting it go frees
+  // its `warm` bytes, not these); the wired pool's use and limit;
+  // `gpu_allocated` this process's Metal allocations -- everything
+  // above and the stages' scratch alike -- where the session has a GPU.
+  //
+  // THE FIGURES OVERLAP, and only `gpu_allocated` is a total. A model a
+  // stage built keeps part of its checkpoint through the manager (a
+  // DiT's trunk, for one), so those bytes are in its `warm` entry AND in
+  // its checkpoint's `weights` entry: adding the two lists counts them
+  // twice. Only `{}` without a model manager. Safe from any thread.
+  // (Non-virtual, as reports() is.)
+  FlexData      memory_report() const;
+
+  // ---- The session's log, for a host ------------------------------
+  //
+  // Every line the session reports -- its stages' errors, warnings and
+  // info (what the UI delegate shows: the console's "[INFO] ..." lines)
+  // and its diagnostic log at or above the log level -- is ALSO handed
+  // to `listener` as it is reported, so a host can show vpipe's log in
+  // its own window rather than only on stdout. Nothing is diverted: the
+  // delegates see what they saw before.
+  //
+  // `level` is the log's: 0 error, 1 warn, 2 info, 3 normal, 4 verbose,
+  // 5 debug, 6 always. The listener runs on the reporting thread, any of
+  // them, while that thread waits: keep it quick, and thread-safe. One
+  // listener per session; an empty one removes it. (Non-virtual, as
+  // progress() is.)
+  using LogListener = std::function<void(int level, std::string_view)>;
+  void set_log_listener(LogListener listener);
+
   // ---- The wired pool ------------------------------------------
   //
   // The ceiling on memory this process makes UNSWAPPABLE -- model
@@ -197,6 +391,32 @@ public:
   // The effective limit in megabytes -- after the device cap and after
   // any ceiling the box turned out to grant. 0 when wiring is off.
   virtual std::size_t wired_pool_mb() const = 0;
+
+  // ---- The swap allowance --------------------------------------
+  //
+  // The OPPOSITE question to the wired pool: how much memory a run may
+  // plan to push OUT to the compressor or the swap file, in megabytes,
+  // on top of what the OS reports as reclaimable.
+  //
+  // A preflight otherwise sizes itself against free + purgeable +
+  // file-backed pages, which excludes dirty anonymous memory that would
+  // need swap. That is the right exclusion for a decision held for a
+  // whole run and too strict for one clip, so this allows a bounded
+  // amount of it to count -- bounded because the pages displaced belong
+  // to other processes, and spending them without limit is how a box
+  // starts thrashing.
+  //
+  // MUTABLE AT ANY TIME, in both directions, running or not: nothing is
+  // reserved or held, so there is nothing to give back and no
+  // shrink-while-running refusal. 0 is a real setting (gate on
+  // reclaimable RAM alone), not "use the default".
+  //
+  // Status{2} when there is no model manager (a non-Apple build).
+  virtual Status set_swap_allowance_mb(std::size_t mb) = 0;
+
+  // The allowance in megabytes. Honoured by the video preflight; the
+  // image stage still gates on the unwidened figure.
+  virtual std::size_t swap_allowance_mb() const = 0;
 
   // ---- Performance profiling -----------------------------------
   //
@@ -237,5 +457,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

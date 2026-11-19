@@ -2,12 +2,22 @@
 #define GENERATIVE_MODELS_FLUX2_METAL_FLUX2_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/metal-sol-attention.h"
+#include "generative-models/shared/sol-attention.h"
+#include "generative-models/shared/runtime-lora.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/wired-pool.h"
+#include "generative-models/shared/ane-ffn.h"
 #include "generative-models/shared/dit-block-progress.h"
+#include "generative-models/shared/dit-flops.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/flex-data.h"
 
 #include <functional>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <string>
@@ -74,6 +84,45 @@ class MetalFlux2Transformer {
     // matrix-core GPUs at int8 quality (rel-L2 ~1e-2 per GEMM). Env
     // VPIPE_I8_GEMM=0|1 overrides.
     bool  i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
+    // ...and its tier (I8GemmContext::Tier): 0 accurate (groups of 64),
+    // 1 fast (the image stream's projections held as rotated int8 at a
+    // coarse group), 2 token (int8 per channel x per token, both
+    // operands Hadamard-rotated in blocks of 256), 3 token unrotated.
+    // The double blocks' TEXT stream stays accurate: its rows sit under
+    // the int8 floor, where a fast weight would only be dequantized
+    // back. VPIPE_I8_TIER / VPIPE_I8_TOKEN_ROT override it.
+    int   i8_tier = 0;
+    // A w4 pack's block projections on the fast / token tiers: HOLD
+    // their int8 layout (true; twice their bytes, the fastest) or keep
+    // the pack and convert it before each GEMM into one scratch (false,
+    // the default; a streamed block always does). The engine's call --
+    // generate-image sets it where the box has room.
+    bool i8_hold_w4 = false;
+    // SageAttention: the QK^T product in int8. Independent of i8_gemm
+    // beside it -- that one chooses how the block's GEMMs are computed
+    // and this one how the attention between them is.
+    sage::Config sage;
+    // Sol-Attn (LOSSY block routing), from generate-image's `sol_attn*`
+    // keys. Off by default.
+    //
+    // ROUTED ONLY WHERE THE KEYS ARE THE QUERIES. FLUX.2's joint
+    // attention is self-attention -- [text, generated] and, with
+    // references but WITHOUT `klein_kv`, [text, generated, refs] -- and
+    // that is the shape Sol needs. Under `klein_kv` it is not: a fill
+    // step runs two query groups (reference queries over reference keys
+    // alone) and a cached step attends QA queries over seq + spliced
+    // reference keys, so tq != tkv in both. forward_dit therefore gates
+    // on the GEOMETRY (QA == seq == KL, no split) rather than on the
+    // flag, and those steps stay dense.
+    //
+    // The text prefix is the exact SINK: a centroid over prompt tokens
+    // is a prompt half-read. Reference tokens are image content and are
+    // routed like the generated ones.
+    sol::Config sol;
     // The FLUX.2-klein-9b-kv RECIPE. It is a property of the CHECKPOINT, not
     // an optimization: that DiT is distilled with reference tokens isolated
     // from the rest of the sequence, so running it under the plain
@@ -92,7 +141,101 @@ class MetalFlux2Transformer {
     // Isolating the references is also what makes their K/V independent of
     // the denoising step, which is what KvCache then exploits.
     bool  klein_kv = false;
+
+    // ---- the ANE tier (generate-image's `ane_ffn`) ---------------------
+    //
+    // Row splits on the shared runtime-weight machinery (shared/ane-ffn.h),
+    // armed on the first forward:
+    //   * the double blocks' image SwiGLU feed-forward;
+    //   * with `ane_qkv`, the double blocks' image q|k|v, stacked;
+    //   * the single blocks' to_qkv_mlp_proj -- q|k|v and the MLP's
+    //     gate|up, the single block's widest projection -- as one matmul
+    //     scattered into its five planes, the SwiGLU then on the GPU.
+    // A null `session` is OFF. `ane_rows` is the ANE's share of a split's
+    // rows (0 = balanced from measured rates, and a split the GPU beats
+    // turns itself off); `ane_layers` caps the blocks that use it, counted
+    // double then single (0 = all). to_out stays on the GPU: it reads the
+    // attention output as well as the MLP, which no row split can hand
+    // over before the attention has run.
+    const SessionContextIntf* session = nullptr;
+    float ane_rows   = 0.0f;
+    int   ane_layers = 0;
+    bool  ane_qkv    = false;
+    // The ANE's modules in ROTATED INT8 (W8A8; AneFeedForward::Options::
+    // int8): generate-image's `ane_int8`. LOSSY -- the GPU token tier's
+    // arithmetic on the ANE's rows; a module that cannot take it keeps
+    // fp16 and says so. VPIPE_ANE_INT8 overrides it.
+    bool  ane_int8   = false;
+    // ...unrotated: the GPU token_plain tier's arithmetic (generate-image's
+    // `ane_int8_tier: token_plain`). Only with ane_int8.
+    bool  ane_int8_plain = false;
   };
+
+  // What the ANE tiers hold for `cfg`, summed over the ones it turns on: the
+  // weight slots, staging and one chunk of host rows each. Independent of
+  // the clip, so a plan-time claim can ask it. A config whose derived FF
+  // widths are still 0 (before load) uses `mlp_ratio`, which is how the
+  // checkpoint builds them.
+  // `image_rows` is the clip's image token count when the caller knows it
+  // (width/16 * height/16); it sizes the chunk, and so the host rows.
+  static std::size_t ane_runtime_bytes(const Config& cfg,
+                                       int image_rows = 0) noexcept;
+  // What a forward allocates beyond the weights, for the plan's denoise
+  // phase: img_rows image tokens (references counted) beside txt_rows of
+  // prompt, `quant_bits` the checkpoint's (0 dense), `matrix_cores` for
+  // the tiers that need them. klein is distilled: one forward a step.
+  static std::size_t forward_scratch_bytes(const Config& c, int img_rows,
+                                           int txt_rows, int quant_bits,
+                                           bool matrix_cores);
+  // The chunk a tier over `rows` predicts in. With the share left to the
+  // tier (ane_rows 0) and no VPIPE_FLUX2_ANE_CHUNK, ONE chunk of 62.5% of the
+  // rows, rounded up to 256: MEASURED on klein-9B at 1024x1024 (M4 Pro), the
+  // GPU half was the slow one at 50%, and a smaller chunk to move rows over
+  // cost the ANE ~25% per row -- one 2560-row chunk took the double stack
+  // 1.70 s -> 1.53 s and the forward 8.0 s -> 7.6 s. Never above
+  // ane_chunk_cap(): past it the tier takes several chunks. A pinned share
+  // keeps the fixed chunk, which it is a multiple of.
+  static int ane_chunk_for_(int rows, float ane_rows) noexcept;
+  // The most rows one chunk may hold (VPIPE_FLUX2_ANE_CHUNK_MAX overrides):
+  // what bounds each tier's host rows and module shape. See ane_chunk_for_.
+  static constexpr int kAneChunkCap = 3072;
+  static int ane_chunk_cap() noexcept;
+  // The structural dims (heads, head dim -> hidden, block counts, mlp_ratio)
+  // from `model_dir`/config.json into `cfg`, for a caller sizing the model
+  // before it loads. False when the file is missing or unreadable; `cfg`
+  // then keeps what it held.
+  static bool read_dims(const std::string& model_dir, Config* cfg);
+  static int ane_chunk_rows() noexcept;
+  bool ane_attempted() const noexcept { return _ane_tried; }
+  // What the forwards have encoded for perf-flops, credited to the GPU
+  // as each block retires (generative-models/shared/dit-flops.h).
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+  bool ane_armed() const noexcept
+  {
+    return _ane_dff != nullptr || _ane_dqkv != nullptr ||
+           _ane_sproj != nullptr;
+  }
+  // Whether a tier LOST rows on some block and has stayed on the GPU
+  // since (AneFeedForward::gpu_only): the rows were recomputed on
+  // the GPU, and no later block split.
+  bool ane_gpu_only() const noexcept
+  {
+    return (_ane_dff != nullptr && _ane_dff->gpu_only()) ||
+           (_ane_dqkv != nullptr && _ane_dqkv->gpu_only()) ||
+           (_ane_sproj != nullptr && _ane_sproj->gpu_only());
+  }
+  // How many of the armed modules run int8 (Config::ane_int8, where the
+  // module and the OS could take it): rotated per token, or with `plain`
+  // unrotated (Config::ane_int8_plain).
+  int ane_int8_modules(bool plain = false) const noexcept
+  {
+    int n = 0;
+    for (const auto* a : {_ane_dff.get(), _ane_dqkv.get(),
+                          _ane_sproj.get()}) {
+      n += a != nullptr && a->int8() && a->int8_plain() == plain ? 1 : 0;
+    }
+    return n;
+  }
 
   // What a CALLER chooses for a FLUX.2 run, as against Config, which is
   // read from the checkpoint. It lives here rather than in the driving
@@ -147,10 +290,18 @@ class MetalFlux2Transformer {
   };
 
   // `stream_blocks` (memory-bounded, for small boxes): the double + single
-  // blocks are NOT preloaded; each is re-read from the retained source mmap
-  // just before use in forward_dit and freed after, so peak block RAM is ~one
-  // block instead of the whole DiT (the embedders / modulation / final layer
+  // blocks are NOT preloaded; each is re-read from the checkpoint just
+  // before use in forward_dit, so peak block RAM is a couple of blocks per
+  // stack instead of the whole DiT (the embedders / modulation / final layer
   // are still preloaded). ~2-3x slower per step (weights re-read per forward).
+  //
+  // The read goes through shared/block-slots.h: two reusable destinations
+  // per stack, refilled in place with pread(2), with the next block's read
+  // issued under the current block's GPU work. Two stacks means two slot
+  // pairs, and the single-block pair also holds the raw to_qkv_mlp_proj its
+  // fused halves are built from -- see each_single_tensor_. On a 17 GB
+  // checkpoint on internal SSD that is 1.47x the forward against the
+  // per-block-allocation route (VPIPE_FLUX2_NO_SLOTS), byte-identical.
   //
   // THE PINNED PREFIX IS RETIRED. BlockResidency replaces it.
   //
@@ -164,9 +315,36 @@ class MetalFlux2Transformer {
   // What replaces it measures: admission against the live budget, a
   // probe read off the room actually free, doubling while the box stays
   // healthy, and a shed the moment the pages kept are found outside RAM.
+  // A runtime adapter. RUNTIME rather than fused because fusing writes
+  // A*B into the base weights, and this base is QUANTIZED -- so the sum
+  // is rounded back to 4/8-bit affine, which is exactly the precision a
+  // small correction cannot spare. Runtime also makes the strength a
+  // knob rather than a rebuild.
+  //
+  // Named at LOAD because it changes how the weights are BUILT. FLUX.2
+  // has TWO fused projections a pre-activation delta cannot reach --
+  // `ff.linear_in` (gate|up, interleaved for the fused-SwiGLU epilogue)
+  // and the single blocks' `to_qkv_mlp_proj` (sliced into an attention
+  // qkv and an interleaved gate|up) -- so an adapter that names either
+  // has to be known before the blocks are built. See the `_fuse_ff`
+  // gate in the loader.
+  struct LoraSpec {
+    std::string path;          // one .safetensors of lora_A/B pairs
+    float       scale = 1.0f;  // 1.0 = as trained; 0 = exactly off
+  };
+
+  // How many adapters may ride the DiT at once: the shared Stack's eight,
+  // e.g. a distillation or identity adapter beside style ones. They stay
+  // SEPARATE slots rather than one merged set of factors -- concatenating
+  // them on the rank axis is exact arithmetic and free in the forward, but
+  // it folds every strength into A and so turns the live knob back into a
+  // rebuild. See lora::Stack.
+  static constexpr int kMaxLoraSlots = genai::lora::Stack::kMax;
+
   static std::unique_ptr<MetalFlux2Transformer>
   load(const std::string& model_dir, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const std::vector<LoraSpec>& loras = {});
 
   // Prefer this overload: the set is the manager's shared,
   // reference-counted view of the checkpoint, so two pipelines running
@@ -174,13 +352,49 @@ class MetalFlux2Transformer {
   // overload opens a PRIVATE set (tests, and callers with no session).
   static std::unique_ptr<MetalFlux2Transformer>
   load(std::shared_ptr<WeightSet> ws, metal_compute::MetalCompute* mc,
-       const Config& cfg, bool stream_blocks = false);
+       const Config& cfg, bool stream_blocks = false,
+       const std::vector<LoraSpec>& loras = {});
+
+  // How many projections carry a runtime adapter, summed over the slots
+  // that bound (0 = none attached).
+  int lora_modules() const;
+  // The same for ONE slot, so a caller can report which adapter took.
+  int lora_modules(int slot) const;
+  // Slots that bound. Indices below this are live; the rest are not.
+  int lora_slots() const { return static_cast<int>(_lora_slots.size()); }
+
+  // The adapter's strength, per FORWARD. Live because it can be: the
+  // factors are the adapter's and the strength is the request's, so it
+  // rides the GEMM as a constant rather than being folded into A.
+  // Turning it costs nothing and needs no reload. 0 skips both GEMMs, so
+  // "off" is exactly off.
+  // Per SLOT, because two adapters are two requests. An index past what
+  // bound is ignored.
+  void set_lora_scale(int slot, float s);
+  float lora_scale(int slot) const;
+
+  // Every projection a runtime adapter can name, and the base dims its
+  // factors have to fit, for a model of this shape.
+  //
+  // Public and static so the names can be checked against a real
+  // checkpoint without loading one -- a module name that matches
+  // nothing binds nothing, which is indistinguishable at runtime from
+  // an adapter that had no effect. Derived from the same tables
+  // bind_lora_ walks, so the two cannot drift apart.
+  struct LoraModule {
+    std::string name;          // `<name>.weight` is the base tensor
+    int         n = 0, k = 0;  // out, in
+  };
+  static std::vector<LoraModule> lora_module_list(const Config& cfg);
+
+  // Does `path` name a projection the fused paths would swallow? Public
+  // and static for the same reason: it is the FLUX.2-specific half of
+  // the adapter contract, it reads only a file header, and getting it
+  // wrong costs an adapter that silently does not apply.
+  static bool lora_forbids_fusion(const std::string& path);
 
   ~MetalFlux2Transformer();
 
-  // Leading blocks pinned resident in streaming mode (double + single;
-  // 0 = pure streaming, or preloaded). For logging the RAM-for-speed decision.
-  int pinned_blocks() const { return _pinned_d + _pinned_s; }
 
   // ---- adaptive block residency (streaming mode) ----------------------
   //
@@ -194,10 +408,71 @@ class MetalFlux2Transformer {
   // forward still needs; 0 (the default) disables growth entirely, which
   // is the pure-streaming behaviour this model had before.
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+
+  // What Sol-Attn holds for a `seq`-token forward AFTER the two buffers
+  // the forward lends it, which is what a residency reserve has to leave
+  // clear. 0 when the tier is off or every layer is dense.
+  //
+  // FLUX.2 lends LESS than Krea-2 does -- `nrm` and `ob` are one hidden
+  // width each, where Krea-2's `g` is a feed-forward width -- so most of
+  // Sol's scratch here is its own allocation rather than a carve, and a
+  // reserve that ignored it would let a promoted block grow into memory
+  // the attention is about to want.
+  std::size_t sol_scratch_bytes(int seq) const;
+  // Size the residency rates for the schedule that is about to run. The
+  // defaults are tuned for ~30 steps and are wrong for a 5-step turbo
+  // one in the same direction -- see BlockResidency::set_schedule. Call
+  // AFTER set_residency_reserve (the probe is sized against what is left
+  // once the reserve is taken) and before the first forward.
+  void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  // The streaming slot pairs, while they exist (BlockSlots::held_bytes).
+  std::size_t slot_bytes() const
+  {
+    return _double_slots.held_bytes() + _single_slots.held_bytes();
+  }
   int resident_block_count() const { return _resid.count(); }
+  // Drop what a forward keeps for the next one -- the dense stand-in,
+  // split-K planes and the int8 context's buffers; each regrows on
+  // demand. The stage calls it after a
+  // generation on a bounded box, before the decode wants the room.
+  void release_forward_scratch();
+  // A STREAMED stack residency has kept whole gives its slot pair
+  // back (BlockSlots::release_if_saturated) -- between generations; a
+  // forward does the same at its top. Returns the bytes freed.
+  std::size_t release_idle_slots()
+  {
+    return _double_slots.release_if_saturated(_double) +
+           _single_slots.release_if_saturated(_single);
+  }
+  // Streamed blocks BUILT into their slot because the slot was laid
+  // out for another (a mixed pack's other width; BlockSlots::Ops::
+  // same_layout), over the model's life. For a test to show the slots
+  // crossed widths -- and did not give up and stream without them.
+  // Block projections the model holds in the fast or token layout from
+  // a pack at `bits` (4 or 8), over the blocks it HOLDS (all of them,
+  // preloaded): a test's proof that a tier took every width of a mixed
+  // pack rather than leaving one on the accurate tier.
+  int fast_weights(int bits) const;
+  // Of those, w4 projections HELD in the layout rather than converted
+  // per GEMM -- over the blocks the model keeps. A streamed run that
+  // holds the layout gets there only by promotion (keep_double_ /
+  // keep_single_), which is what a test of that path counts.
+  int held_w4_layouts() const;
+  int slot_relayouts() const {
+    return _double_slots.relaid() + _single_slots.relaid();
+  }
+  // Whether the block projections run in the signed int8 layout (see
+  // _sgn) -- what a test asserts before it compares anything.
+  bool signed_layout() const { return _sgn; }
+  // Whether the image-stream projections run the int8 FAST or TOKEN
+  // tier (see _fast), at which group (I8GemmContext::kTokenGroup on the
+  // token tier; 0 off both), and the token GEMM kernel the context took.
+  bool fast_tier() const { return _fast; }
+  int fast_group() const;
+  std::string i8_token_kernel() const;
   // Hand back at least `bytes` of promoted blocks. Never touches the
-  // configured pinned prefix; returns what was actually freed.
+  // returns what was actually freed.
   std::size_t release_resident_blocks(std::size_t bytes);
 
   // Cooperative stop polled per block in streaming mode, so a pipeline stop is
@@ -280,6 +555,27 @@ class MetalFlux2Transformer {
     bool quantized = false;
     int  bits = 0;                                     // 4 | 8 (per-weight)
     int  n = 0, k = 0;                                 // out, in dims
+    // codes/qbias are in the SIGNED layout (I8GemmContext::gemm_signed):
+    // q ^ 0x80 / 0x8 and b' = b + 128 s / 8 s. Only the int8 route and
+    // the signed dequant read it; see _sgn.
+    bool sgn = false;
+    // THE FAST TIER's layout (I8GemmContext::gemm_fast) when gc > 0:
+    // `codes` holds int8 [n, k] in the group-rotated basis and `cscales`
+    // [n, k/gc] (f32 [n] at kTokenGroup). A streamed slot also keeps the
+    // raw scales / qbias its refill lands, which post_refill converts
+    // from.
+    int gc = 0;
+    metal_compute::SharedBuffer cscales;
+    // A w4 pack's weight kept AS STORED (its codes / scales / qbias) and
+    // converted per GEMM (fast_operand_); false for a layout held, w4 or
+    // w8 (Config::i8_hold_w4).
+    bool pc = false;
+    // A DENSE checkpoint's weight in the fast layout in a STREAMED slot:
+    // `w` keeps the raw bf16 a refill lands (the source) and post_refill
+    // quantizes it into codes / cscales, exactly as a preloaded block's
+    // entry was built. A promotion keeps only the layout, as the entry
+    // does -- the source is the slot's alone.
+    bool ds = false;
     bool empty() const { return quantized ? codes.empty() : w.empty(); }
   };
 
@@ -317,7 +613,58 @@ class MetalFlux2Transformer {
   // whole DiT back in RAM on the box least able to hold it.
   enum class Retain { Cached, Streamed };
 
-  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r);
+  // `sign`: a BLOCK projection, which takes the signed layout when _sgn
+  // is set; the model-level linears run at a row or two and stay as the
+  // checkpoint has them.
+  // `fast`: an IMAGE-stream projection (the double blocks' image half,
+  // every single block), which takes the fast or token layout when
+  // _fast is set.
+  QWeight load_qw_(WeightSet& ws, const std::string& name, Retain r,
+                   bool sign = false, bool fast = false);
+  // Convert a quantized weight the model OWNS (a refilled slot) to the
+  // signed layout in place, and say so on it. False touches nothing.
+  bool sign_(QWeight& w) const;
+  // ...to the fast tier's layout, on the GPU, in place (a refilled slot
+  // whose build chose it); a weight not in that layout is untouched.
+  bool fast_(QWeight& w) const;
+  // The same conversion encoded on `e`, for a caller converting a whole
+  // block in one command buffer (post_refill). True with nothing encoded
+  // for a weight not in that layout.
+  bool encode_fast_(metal_compute::ComputeEncoder& e, QWeight& w) const;
+  // The fast-layout operands of a weight on the fast / token tier: its
+  // own codes and scales, or -- a w4 pack's weight, held as stored -- the
+  // context's scratch it is converted into here, on `enc`, for the GEMM
+  // encoded right after (I8GemmContext::encode_to_fast_scratch). False
+  // with nothing encoded where the conversion declines.
+  bool fast_operand_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                     const metal_compute::SharedBuffer** codes,
+                     const metal_compute::SharedBuffer** scales) const;
+  // A fast-layout weight dequantized into `out` [N, K] -- the values the
+  // fast GEMM reads, for a route that does not read the layout.
+  bool fast_dense_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                   const metal_compute::SharedBuffer& out, int N,
+                   int K) const;
+  // THE FAST TIER over one input for several projections (the image
+  // q|k|v): one activation quantizer, then each GEMM -- what gemm_mma_
+  // would run per projection, less the repeated quantizer. False with
+  // NOTHING encoded unless every one is in the fast layout at one group
+  // with no adapter attached (the caller then runs each as before).
+  struct FastOut {
+    const QWeight* w;
+    const metal_compute::SharedBuffer* y;
+    std::size_t ye;
+    int n;                       // the projection's output width
+    bool adapted;                // a LoRA stack is attached
+  };
+  bool fast_shared_(metal_compute::ComputeEncoder& enc,
+                    const metal_compute::SharedBuffer& x, std::size_t xe,
+                    int M, int K, std::initializer_list<FastOut> outs);
+  // The dense [N, K] operand of a signed (or fast) weight, dequantized into
+  // _w_deq: for the routes the int8 GEMM declines. Null when the
+  // scratch cannot be had.
+  const metal_compute::SharedBuffer*
+  dequant_signed_(metal_compute::ComputeEncoder& enc, const QWeight& w,
+                  int N, int K);
   // bf16 view of a checkpoint tensor. Cached ones go through the weight
   // set so a second model over this checkpoint shares them; streamed
   // ones are rebuilt per forward and retained by nobody.
@@ -334,8 +681,31 @@ class MetalFlux2Transformer {
                       const QWeight& src, int start, int count, Retain r);
   bool load_double_(WeightSet& ws, const std::string& pre,
                     DoubleBlock& b, Retain r);
+  // `keep_split` suppresses the release of the raw to_qkv_mlp_proj that
+  // the fused path normally drops once qkv + mlp_gu exist. A REFILLABLE
+  // block has to keep it: the two fused halves are a slice and a row
+  // permutation of it, so they have no checkpoint name of their own and
+  // must be rebuilt out of the raw tensor after every read.
   bool load_single_(WeightSet& ws, const std::string& pre,
-                    SingleBlock& b, Retain r);
+                    SingleBlock& b, Retain r, bool keep_split = false);
+
+  // ---- the ANE tiers (Config::session) ----------------------------------
+  // Built together on the first forward, each of them only where it has a
+  // chunk of rows and something stageable: the double feed-forward and
+  // q|k|v over the image rows, the single projection over the joint rows.
+  std::unique_ptr<AneFeedForward> _ane_dff, _ane_dqkv, _ane_sproj;
+  bool _ane_tried  = false;
+  bool _ane_warned = false;
+  void ane_setup_(int image_rows, int joint_rows);
+  // Blocks are counted double then single against `ane_layers`.
+  bool ane_layer_ok_(int flat) const noexcept;
+  static bool ane_stageable_(const QWeight& q) noexcept;
+  bool ane_dff_ok_(int L, const DoubleBlock& b);
+  bool ane_dqkv_ok_(const DoubleBlock& b) const noexcept;
+  bool ane_sproj_ok_(const SingleBlock& b) const noexcept;
+  void ane_stage_dff_(int L, const DoubleBlock& b);
+  void ane_stage_dqkv_(int L, const DoubleBlock& b);
+  void ane_stage_sproj_(int L, const SingleBlock& b);
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -352,25 +722,116 @@ class MetalFlux2Transformer {
   QWeight _mod_img, _mod_txt, _mod_single;   // Flux2Modulation.linear (no bias)
   QWeight _proj_out;                                 // proj_out (hidden->out_ch)
   QWeight _norm_out_lin;      // AdaLayerNormContinuous.linear (hidden->2*hidden)
-  std::vector<DoubleBlock> _double;   // pinned prefix (all when preloaded)
-  std::vector<SingleBlock> _single;   // pinned prefix (all when preloaded)
+  std::vector<DoubleBlock> _double;   // promoted blocks (all when preloaded)
+  std::vector<SingleBlock> _single;   // promoted blocks (all when preloaded)
 
-  // Streaming mode: blocks past the pinned prefix (_pinned_d double, _pinned_s
+  // Streaming mode: blocks not yet promoted by residency (both stacks
   // single) are loaded on demand from the weight set per forward and
   // freed after use.
   bool _stream_blocks = false;
   BlockResidency _resid;
-  int _pinned_d = 0;                  // pinned leading double blocks (streaming)
-  int _pinned_s = 0;                  // pinned leading single blocks (streaming)
+  // This model's window onto the manager's process-wide wired pool. A
+  // kept block is the coldest memory in the process -- read once a step,
+  // never written -- so without mlock it is the first thing the
+  // compressor takes, and the run spends the schedule admitting, being
+  // measured out, shedding and re-admitting the same blocks. See
+  // shared/wired-pool.h.
+  WiredPool _wire;
+  // One block's bytes, from the checkpoint's tensor table rather than
+  // from a loaded block -- set_residency_schedule computes it, and the
+  // per-forward wire retry is gated on the box having freed at least
+  // this much since the refusal. Zero until the schedule is set, which
+  // is the honest answer: nothing has been kept yet either.
+  std::size_t _wire_block_hint = 0;
+  // Wire (mlock) or unwire every buffer of one block / of everything this
+  // model holds that is NOT a streamed block, returning the bytes the
+  // pool took or gave back.
+  std::size_t wire_block_(DoubleBlock& b, bool on);
+  std::size_t wire_block_(SingleBlock& b, bool on);
+  std::size_t wire_fixed_(bool on);
+  std::size_t wire_retry_slack_() const;
   // Free the highest resident block -- singles before doubles. Returns
-  // its bytes, or 0 when nothing is left. `allow_pinned` lets it take one
-  // out of the pinned prefix (shrinking the count to match), which is
-  // only right when a measurement says that prefix is no longer in RAM.
-  std::size_t evict_tail_block_(bool allow_pinned = false);
+  // its bytes, or 0 when nothing is left.
+  std::size_t evict_tail_block_();
   // Pages of the resident set examined, and how many are still in RAM.
   void resident_pages_(std::size_t* examined, std::size_t* incore) const;
   static std::size_t double_bytes_(const DoubleBlock& b);
   static std::size_t single_bytes_(const SingleBlock& b);
+  // THREE ANSWERS FOR A SINGLE BLOCK, because a slot holds the raw
+  // to_qkv_mlp_proj as well as the qkv and gate|up split out of it and
+  // the three questions have different answers. (A double block riffles
+  // in place, so double_bytes_ answers the first two for it.)
+  //
+  //   single_bytes_          what this block holds RIGHT NOW. Wiring
+  //                          and eviction, which act on what exists.
+  //   single_read_bytes_     what a refill READS: the raw one only.
+  //                          Counting the held bytes here would report
+  //                          the drive running at twice its rate, which
+  //                          is the one number this path exists to move.
+  //   kept_single_bytes_     what promotion KEEPS: the raw one is
+  //                          dropped (below).
+  static std::size_t single_read_bytes_(const SingleBlock& b);
+  // ...and what a PROMOTION keeps, for either stack: the single block's
+  // raw projection dropped (the fused split), a dense source and dead
+  // pack scales dropped, a w4 pack whose layout is held converted into
+  // it (Config::i8_hold_w4). Admission and the wired pool ask this,
+  // because a grant smaller than the ask is how the pool learns the box
+  // refused -- and reporting a refusal that never happened stops
+  // residency growing at the first promoted block.
+  std::size_t kept_double_bytes_(const DoubleBlock& b) const;
+  std::size_t kept_single_bytes_(const SingleBlock& b) const;
+  // Make a PROMOTED block what the preload holds, in place: the dense
+  // sources and dead pack scales dropped, a held w4 layout converted
+  // (all of a block's in one command buffer). A clone out of a slot
+  // already left the first two behind; a block MOVED out of the
+  // per-block fallback (no slots) arrives as read. False when a
+  // conversion failed -- the weight then stays converted per GEMM.
+  bool keep_double_(DoubleBlock& b) const;
+  bool keep_single_(SingleBlock& b) const;
+  bool keep_weights_(std::initializer_list<QWeight*> ws) const;
+  // A refilled slot's fast-layout conversions, in one command buffer on
+  // _cvt_stream.
+  bool post_refill_fast_(std::initializer_list<QWeight*> ws) const;
+  // post_refill's conversions, on a stream the reader thread keeps (a
+  // fresh queue's first commit costs ~1-2 ms; a dozen a block added up).
+  // One for both stacks: their reads never overlap.
+  mutable metal_compute::CommandStream _cvt_stream;
+
+  // ---- two reusable destinations per stack (shared/block-slots.h) -----
+  //
+  // Two sets rather than one because the stacks hold different types,
+  // and the singles run only after every double is done -- so the two
+  // never have a read outstanding at the same time and each keeps its
+  // own pair.
+  //
+  // Enumerate every (checkpoint name, destination, placement) of block
+  // L. The four lists that describe a block -- these, double_bytes_/
+  // single_bytes_, wire_block_ and clone -- must agree, or a tensor is
+  // read into a buffer nothing counts or counted into one nothing fills.
+  void each_double_tensor_(int L, DoubleBlock& b,
+                           const BlockSlots<DoubleBlock>::TensorFn& fn) const;
+  void each_single_tensor_(int L, SingleBlock& b,
+                           const BlockSlots<SingleBlock>::TensorFn& fn) const;
+  bool clone_double_(const DoubleBlock& s, DoubleBlock& d, bool copy) const;
+  bool clone_single_(const SingleBlock& s, SingleBlock& d, bool copy) const;
+  metal_compute::SharedBuffer rebuild_one_(const std::string& nm,
+                                           Placement how);
+  // Turn a [2*INNER, K] weight that a raw read just landed in the
+  // checkpoint's own gate-then-up order into the INTERLEAVED order the
+  // fused-SwiGLU epilogue reads -- IN PLACE, so a refillable block pays
+  // no staging buffer for the largest tensor it holds.
+  bool riffle_rows_(QWeight& qw) const;
+  // Rebuild a single block's fused halves out of the raw to_qkv_mlp_proj
+  // it kept: rows [0, 3H) become qkv, the rest becomes the interleaved
+  // gate|up. Both destinations already exist, which is the point.
+  bool split_single_(SingleBlock& b) const;
+  // Is block L stored at the widths `b` was built for? (A mixed pack;
+  // see BlockSlots::Ops::same_layout.)
+  bool same_layout_(int L, const DoubleBlock& b) const;
+  bool same_layout_(int L, const SingleBlock& b) const;
+  void configure_slots_();
+  BlockSlots<DoubleBlock> _double_slots;
+  BlockSlots<SingleBlock> _single_slots;
   // Zero-copy mmap of the quantized weight tensors (codes/scales/qbias) as
   // read-only views aliasing the weight set's mmap, instead of owned
   // copies. The pages are clean + file-backed, so the OS can reclaim the
@@ -441,6 +902,97 @@ class MetalFlux2Transformer {
       _fn_qmm_swiglu4_bm64_rs_a16, _fn_qmm_swiglu8_bm64_rs_a16, _fn_swiglu_rs;
   bool _fuse_ff = false;
   bool _ff_acc16 = true;
+  // THE SIGNED-CODE LAYOUT for the blocks' quantized projections: with
+  // i8_gemm on a matrix-core box they run int8 x int8 off the layout
+  // (I8GemmContext::gemm_signed) instead of the unsigned native route --
+  // 1.01-1.09x a bf16 weight under i8 per GEMM, where the native route
+  // ran 0.90-1.02x (gemm_i8.w8_against_bf16_routes, M5 Pro). Converted
+  // once: at load into the entries the set keeps, after every refill in
+  // the slot. OFF where something else reads the codes: the ANE tier's
+  // stager and the fused-SwiGLU steel qmm both assume them unsigned.
+  // VPIPE_I8_SIGNED=0 for the A/B.
+  bool _sgn = false;
+  // THE FAST OR TOKEN TIER for the IMAGE-stream projections
+  // (Config::i8_tier; both hold I8GemmContext's fast layout, at gc or
+  // kTokenGroup): g64 packs converted -- in the derived entry a
+  // retained block keeps, in the slot after every refill; a w4 weight is
+  // then held at int8's size, twice its nibbles' -- and bf16
+  // checkpoints quantized once into the entry (a streamed bf16 block
+  // stays on the accurate tier). Off under the ANE tier and the
+  // fused-SwiGLU weave, which read the codes as affine. A GEMM the tier
+  // declined after its input was quantized latches _fast_failed and the
+  // forward reports it.
+  bool _fast = false;
+  bool _fast_failed = false;
+
+  // ---- runtime LoRA ------------------------------------------------
+  //
+  // The module names ARE the diffusers spelling, which is what the
+  // checkpoint itself carries -- the double blocks keep to_q / to_k /
+  // to_v / to_out.0 and their add_* twins split, and the single blocks
+  // really do have ONE Linear named `to_qkv_mlp_proj` in the model, not
+  // three that this loader happened to fuse. So an adapter trained
+  // against diffusers names the same modules this binds, and nothing
+  // has to be de-fused to find them.
+  //
+  // Scope is the transformer BLOCKS. The embedders, the shared
+  // modulation and proj_out are deliberately not bound: no style
+  // adapter touches them, and the ones that do (control adapters that
+  // widen x_embedder's input) change a SHAPE, which is a different
+  // conversation than a rank-r side GEMM.
+  struct DoubleLora {
+    genai::lora::Factors q, k, v, o;          // image attention
+    genai::lora::Factors aq, ak, av, ao;      // text attention
+    genai::lora::Factors ff_in, ff_out;       // image FF
+    genai::lora::Factors cff_in, cff_out;     // text FF
+  };
+  struct SingleLora {
+    genai::lora::Factors qkv_mlp, o;
+  };
+  // The tables. Each row names a module, the base dims its factors must
+  // fit, the block it belongs to, and WHERE the factors land -- so
+  // nothing has to be kept in step by hand between a name and its
+  // destination.
+  struct DoubleLoraModule {
+    std::string name;
+    int n = 0, k = 0, block = 0;
+    genai::lora::Factors DoubleLora::*dst = nullptr;
+  };
+  struct SingleLoraModule {
+    std::string name;
+    int n = 0, k = 0, block = 0;
+    genai::lora::Factors SingleLora::*dst = nullptr;
+  };
+  static std::vector<DoubleLoraModule> lora_double_modules_(const Config& c);
+  static std::vector<SingleLoraModule> lora_single_modules_(const Config& c);
+  // ONE attached adapter: its factors for both block stacks, its live
+  // strength, and its share of the [rows, rank] scratch.
+  struct LoraSlot {
+    std::vector<DoubleLora> dbl;
+    std::vector<SingleLora> sgl;
+    int   modules  = 0;
+    int   max_rank = 0;
+    float scale    = 1.0f;
+    // Ranks of the slots BEFORE this one. The scratch is [rows, sum of
+    // ranks], so this slot's region starts at `rows * rank_prefix` --
+    // which needs the row count, a forward-time number.
+    int   rank_prefix = 0;
+  };
+  bool bind_lora_(const LoraSpec& spec, LoraSlot& slot, std::string* err);
+  // The live adapters for one projection of one block, named by the
+  // member that holds it. Two overloads because the two block stacks
+  // hold different structs.
+  genai::lora::Stack lora_at_(int block,
+                              genai::lora::Factors DoubleLora::*dst) const;
+  genai::lora::Stack lora_at_(int block,
+                              genai::lora::Factors SingleLora::*dst) const;
+  std::vector<LoraSlot>   _lora_slots;
+  genai::lora::Applier    _lora;
+  // Summed max ranks: what the scratch holds for all slots at once, and
+  // the stride that turns a rank prefix into an offset.
+  int         _lora_rank_total   = 0;
+  // Rows the scratch was last sized for. Set with it, read by lora_at_.
+  std::size_t _lora_scratch_rows = 0;
 
   // Steel flash-attention (head_dim 128, GQA-aware). Best-effort; scalar SDPA
   // fallback when absent or VPIPE_FLUX2_NO_STEEL_ATTN is set.
@@ -470,6 +1022,16 @@ class MetalFlux2Transformer {
   // Dynamic-int8 accelerated GEMMs (Config::i8_gemm / VPIPE_I8_GEMM);
   // null when off. Tried first in gemm_mma_ for qualifying shapes.
   std::unique_ptr<I8GemmContext> _i8;
+  // The int8 QK prologue. Null when the box has no matrix cores or the
+  // config did not ask; every use is guarded.
+  std::unique_ptr<MetalSageAttention> _sage;
+  // Sol-Attn's kernels and scratch. Null unless Config::sol.enabled and
+  // the kernels validated; every use is guarded.
+  std::unique_ptr<MetalSolAttention> _sol;
+  // perf-flops: GEMMs and attention counted as encoded, credited at
+  // retire; Sol's exact half at the keep ratio it realizes.
+  GpuFlopsTally _flops;
+  SolFlops _sol_flops;
   bool _use_mma2 = false;
   int  _mma_min_m = 64;   // matmul2d only wins once M amortizes the 128 tile
   metal_compute::SharedBuffer _w_deq;   // reusable [N,K] f16 dequant scratch

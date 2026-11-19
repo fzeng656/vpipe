@@ -21,7 +21,13 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/model-memory.h"
 #include "stages/text-chat-stage.h"
+#include "generative-models/generative-model-manager.h"
+#ifdef VPIPE_BUILD_APPLE_SILICON
+#include "generative-models/model-loader.h"
+#include "generative-models/qwen3/metal-qwen-model.h"
+#endif
 
 #include "common/media-line.h"
 
@@ -170,6 +176,40 @@ TEST(text_chat_stage, stream_answer_only_config) {
     TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
     EXPECT_TRUE(s.config_error().empty());
     EXPECT_TRUE(s.stream_answer_only());
+  }
+}
+
+// The streaming out-port's chunk: ~20 words by default (speakable units),
+// 0 for every decoded piece as it comes. Pure config parse.
+TEST(text_chat_stage, stream_words_config) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.stream_words() == 20);
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/tmp/chat-fake-model","stream_words":0})");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
+    EXPECT_TRUE(s.stream_words() == 0);
+  }
+}
+
+// stream_speed: pure config parse -- off unless asked.
+TEST(text_chat_stage, stream_speed_config) {
+  Session sess;
+  CerrSilencer hush;
+  {
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, basic_cfg_());
+    EXPECT_TRUE(s.config_error().empty());
+  }
+  {
+    FlexData cfg = FlexData::from_json(
+        R"({"hf_dir":"/tmp/chat-fake-model","stream_speed":true})");
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    EXPECT_TRUE(s.config_error().empty());
   }
 }
 
@@ -328,7 +368,8 @@ public:
   static constexpr const char* kTypeName = "ut-chat-stream-sink";
   using TypedStage::TypedStage;
 
-  struct Beat { std::string text; bool eor; };
+  // `speed`: the beat's live speed (stream_speed), null when it has none.
+  struct Beat { std::string text; bool eor; FlexData speed; };
 
   std::vector<Beat> take()
   {
@@ -348,6 +389,7 @@ public:
           ? std::string(o.at("text").as_string("")) : std::string();
       b.eor = o.contains("end_of_response")
           && o.at("end_of_response").as_bool(false);
+      if (o.contains("speed")) { b.speed = o.at("speed"); }
       lock_guard<mutex> g(_mu);
       _beats.push_back(std::move(b));
     }
@@ -419,6 +461,44 @@ TEST(text_chat_stage, mtp_flag_parsed) {
   }
 }
 
+// A drafter's verify keeps its scratch for the model's life, so the plan
+// books it -- the figure MetalQwenModel::verify_scratch_bytes gives for
+// MTP's three rows -- and books nothing when no drafter will run.
+// Reads the checkpoint's config only. VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH (a
+// model carrying its MTP head).
+TEST(text_chat_stage, a_drafter_s_verify_scratch_is_planned) {
+  const char* path = std::getenv("VPIPE_QWEN_OPTIQ_TEST_MODEL_PATH");
+  if (path == nullptr || *path == 0) { return; }
+  Session sess;
+  CerrSilencer hush;
+  auto booked = [&](bool mtp) -> std::size_t {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(path));
+    cfg.as_object().insert("mtp", FlexData::make_bool(mtp));
+    TextChatStage s(&sess, "chat", vector<InEdge>{}, std::move(cfg));
+    std::size_t bytes = 0;
+    for (const ResourceClaim& c : s.declare_resources()) {
+      if (c.kind != model_memory::kScratchKind
+          || c.key.rfind("spec-verify:", 0) != 0) {
+        continue;
+      }
+      bytes = (std::size_t)std::stoull(c.key.substr(c.key.rfind('|') + 1));
+    }
+    return bytes;
+  };
+#ifdef VPIPE_BUILD_APPLE_SILICON
+  genai::ModelLoader loader(&sess);
+  const auto mc = loader.load_config(path);
+  ASSERT_TRUE(mc.has_value());
+  const std::size_t want = genai::MetalQwenModel::verify_scratch_bytes(
+      genai::MetalQwenModel::config_from(*mc), 3, /*mtp_head=*/true);
+  std::printf("[text_chat] MTP verify scratch planned %zu, want %zu\n",
+              booked(true), want);
+  EXPECT_TRUE(want > 0 && booked(true) == want);
+#endif
+  EXPECT_TRUE(booked(false) == 0);
+}
+
 TEST(text_chat_stage, metal_chat_smoke) {
   const char* path = std::getenv("VPIPE_METAL_LM_SMOKE_MODEL");
   if (!path || !*path) {
@@ -477,6 +557,22 @@ TEST(text_chat_stage, metal_chat_smoke) {
                 static_cast<long long>(ctx_pos), text.c_str());
     if (!text.empty()) { found = true; }
     EXPECT_TRUE(ctx_pos > 0);
+    // A plain prompt's prefill is counted, as a conversation's is.
+    const std::int64_t prefilled = root.contains("prefilled")
+        ? root.at("prefilled").as_int(0) : 0;
+    EXPECT_TRUE(prefilled > 0 && prefilled < ctx_pos);
+    // Where a drafter decoded, its drafts are counted and some kept.
+    if (root.contains("rounds") && root.at("rounds").as_int(0) > 1) {
+      const std::int64_t drafted = root.at("drafted").as_int(0);
+      std::printf("[text_chat_stage.metal_smoke] %s: %lld rounds, "
+                  "%lld/%lld drafts kept\n",
+                  std::string(root.at("drafter").as_string("")).c_str(),
+                  static_cast<long long>(root.at("rounds").as_int(0)),
+                  static_cast<long long>(root.at("accepted").as_int(0)),
+                  static_cast<long long>(drafted));
+      EXPECT_TRUE(drafted > 0);
+      EXPECT_TRUE(root.at("accepted").as_int(0) <= drafted);
+    }
   }
   EXPECT_TRUE(found);
 }
@@ -808,6 +904,225 @@ TEST(text_chat_stage, metal_chat_stream_answer_only) {
     expected.erase(s, (e + te.size()) - s);
     EXPECT_TRUE(streamed == expected);
     EXPECT_TRUE(!streamed.empty());   // "Paris" survives the fold
+  }
+}
+
+namespace {
+
+// An environment variable set for a scope and put back as it was on every
+// way out: a test that fails an assert part way leaves the process as it
+// found it for the tests after it.
+struct ChatEnvScope {
+  std::string name;
+  bool had = false;
+  std::string old;
+  ChatEnvScope(const char* n, const char* v) : name(n)
+  {
+    if (const char* e = std::getenv(n)) {
+      had = true;
+      old = e;
+    }
+    ::setenv(n, v, 1);
+  }
+  ~ChatEnvScope()
+  {
+    if (had) {
+      ::setenv(name.c_str(), old.c_str(), 1);
+    } else {
+      ::unsetenv(name.c_str());
+    }
+  }
+  ChatEnvScope(const ChatEnvScope&) = delete;
+  ChatEnvScope& operator=(const ChatEnvScope&) = delete;
+};
+
+// One stream_speed turn of `prompt` on the model at `path`: out-port 1's
+// beats, and the turn's own decode rate (out-port 0's decoded /
+// decode_ms).
+struct SpeedRun {
+  bool launched = false;
+  std::vector<StreamSink::Beat> beats;
+  double turn_tps = 0.0;
+};
+SpeedRun
+speed_run_(const char* path, const std::string& prompt, int stream_words,
+           int max_new)
+{
+  SpeedRun out;
+  const char* dt = std::getenv("VPIPE_CHAT_SPEED_TEST_DTYPE");
+  ChatEnvScope backend("VPIPE_LLM_BACKEND", "metal");
+  Session  sess;
+  Pipeline pl("chat-stream-speed", &sess);
+  auto src = make_unique<OnePromptSource>(
+      &sess, "prompt", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->prompt = prompt;
+  auto* promptsrc = static_cast<OnePromptSource*>(
+      pl.insert_stage(std::move(src)));
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype",
+             FlexData::make_string(dt != nullptr && *dt ? dt : "f16"));
+    o.insert("max_new_tokens", FlexData::make_int(max_new));
+    o.insert("max_pages", FlexData::make_int(96));
+    o.insert("disable_thinking", FlexData::make_bool(true));
+    o.insert("mtp", FlexData::make_bool(false));
+    o.insert("stream_words", FlexData::make_int(stream_words));
+    o.insert("stream_speed", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(pl.insert_stage(std::move(ch)));
+  auto turnsk = make_unique<TurnSink>(
+      &sess, "turn", vector<InEdge>{ { chat, 0 } }, FlexData::make_object());
+  auto* turnsink = static_cast<TurnSink*>(pl.insert_stage(std::move(turnsk)));
+  auto strsk = make_unique<StreamSink>(
+      &sess, "stream", vector<InEdge>{ { chat, 1 } },
+      FlexData::make_object());
+  auto* streamsink = static_cast<StreamSink*>(
+      pl.insert_stage(std::move(strsk)));
+  PipelineRuntime rt(&pl, &sess);
+  out.launched = rt.launch();
+  if (!out.launched) { return out; }
+  rt.wait_idle();
+  rt.stop();
+  out.beats = streamsink->take();
+  double turn_decoded = 0.0, turn_ms = 0.0;
+  for (const auto& fd : turnsink->take()) {
+    if (!fd.is_object()) { continue; }
+    FlexData d = fd;
+    auto o = d.as_object();
+    if (o.contains("decoded")) { turn_decoded = o.at("decoded").as_real(0); }
+    if (o.contains("decode_ms")) { turn_ms = o.at("decode_ms").as_real(0); }
+  }
+  out.turn_tps = turn_ms > 0 ? turn_decoded * 1000.0 / turn_ms : 0.0;
+  return out;
+}
+
+double
+speed_num_(const FlexData& sp, const char* k)
+{
+  if (!sp.is_object()) { return -1.0; }
+  FlexData d = sp;
+  auto o = d.as_object();
+  return o.contains(k) ? o.at(k).as_real(-1.0) : -1.0;
+}
+
+std::string
+speed_phase_(const FlexData& sp)
+{
+  if (!sp.is_object()) { return std::string(); }
+  FlexData d = sp;
+  auto o = d.as_object();
+  return o.contains("phase") ? std::string(o.at("phase").as_string(""))
+                             : std::string();
+}
+
+}  // namespace
+
+// stream_speed: a reader's live meter.
+//   - THE PREFILL: a prompt of a few thousand tokens read in pieces
+//     (VPIPE_QWEN_PREFILL_CHUNK=1024, the MTP seed off so the prompt is not
+//     read in one forward) sends a beat of no text a piece, each its
+//     piece's tokens and speed, the last at the prompt's end; the decode's
+//     beats count its tokens and carry its speed over the last 128 -- held
+//     to the turn's own decode rate (out-port 0's decoded / decode_ms).
+//     The piece size is read at each prefill, so a test before this one
+//     that prefilled at the default (8192) does not decide it.
+//   - A DECODE THAT SENDS NOTHING ELSE still moves the meter: with
+//     stream_words 200 the text goes out a beat in a couple of hundred
+//     words, and a beat of no text goes out where none has for 250 ms --
+//     so no stretch of the decode goes unreported for more than about a
+//     quarter second's tokens. MEASURED (Bonsai 2 27B, M4 Pro): 25 decode
+//     beats over 159 tokens, the widest gap 7 (bound 13); MUTATION, the
+//     heartbeat taken out: one beat, a gap of 159 -- fails.
+// Env: VPIPE_CHAT_SPEED_TEST_MODEL_PATH, a Qwen-family chat model (a GGUF
+// one's folder too); VPIPE_CHAT_SPEED_TEST_DTYPE its compute dtype (f16).
+TEST(text_chat_stage, metal_chat_stream_speed) {
+  const char* path = std::getenv("VPIPE_CHAT_SPEED_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    std::printf("  SKIP: VPIPE_CHAT_SPEED_TEST_MODEL_PATH unset\n");
+    return;
+  }
+  {
+    ChatEnvScope chunk("VPIPE_QWEN_PREFILL_CHUNK", "1024");
+    ChatEnvScope seed("VPIPE_MTP_NO_SEED", "1");
+    std::string prompt = "Here are notes on rivers:\n";
+    for (int i = 0; i < 150; ++i) {
+      prompt += "River number " + std::to_string(i) +
+                " flows north through green valleys, past old stone "
+                "bridges and quiet farms.\n";
+    }
+    prompt += "Write a long story, at least 300 words, about one of them.";
+    const SpeedRun run = speed_run_(path, prompt, 0, 300);
+    ASSERT_TRUE(run.launched);
+    int prefill_beats = 0, prefill_total = 0, last_done = 0;
+    bool done_rises = true;
+    double last_decode_tps = -1.0;
+    int decoded = 0, last_decoded = 0;
+    bool decoded_rises = true;
+    for (const auto& b : run.beats) {
+      if (!b.speed.is_object()) { continue; }
+      if (speed_phase_(b.speed) == "prefill") {
+        ++prefill_beats;
+        EXPECT_TRUE(b.text.empty());
+        EXPECT_TRUE(speed_num_(b.speed, "prefill_tps") > 0.0);
+        EXPECT_TRUE(speed_num_(b.speed, "prefill_tokens") > 0.0);
+        const int done = (int)speed_num_(b.speed, "prefill_done");
+        done_rises = done_rises && done > last_done;
+        last_done = done;
+        prefill_total = (int)speed_num_(b.speed, "prefill_total");
+      } else if (speed_phase_(b.speed) == "decode") {
+        decoded = (int)speed_num_(b.speed, "decoded");
+        decoded_rises = decoded_rises && decoded >= last_decoded;
+        last_decoded = decoded;
+        if (speed_num_(b.speed, "decode_tps") > 0.0) {
+          last_decode_tps = speed_num_(b.speed, "decode_tps");
+        }
+      }
+    }
+    std::printf("[text_chat_stage.stream_speed] %zu beats: %d prefill "
+                "(prompt %d tokens, the last done %d), %d decoded, the "
+                "meter's last %.1f tok/s against the turn's %.1f\n",
+                run.beats.size(), prefill_beats, prefill_total, last_done,
+                decoded, last_decode_tps, run.turn_tps);
+    // Several pieces, each a beat, the last at the prompt's end.
+    EXPECT_TRUE(prefill_beats >= 2);
+    EXPECT_TRUE(done_rises && last_done == prefill_total &&
+                prefill_total > 2048);
+    // The decode counted, its speed near the turn's own.
+    EXPECT_TRUE(decoded_rises && decoded > 128);
+    EXPECT_TRUE(last_decode_tps > 0.5 * run.turn_tps &&
+                last_decode_tps < 2.0 * run.turn_tps);
+  }
+  {
+    const SpeedRun run = speed_run_(
+        path, "Write a long story, at least 300 words, about a river.",
+        200, 160);
+    ASSERT_TRUE(run.launched);
+    int decode_beats = 0, quiet = 0, last = 0, gap = 0, decoded = 0;
+    bool rated = true;
+    for (const auto& b : run.beats) {
+      if (speed_phase_(b.speed) != "decode") { continue; }
+      ++decode_beats;
+      if (b.text.empty() && !b.eor) { ++quiet; }
+      decoded = (int)speed_num_(b.speed, "decoded");
+      gap = std::max(gap, decoded - last);
+      last = decoded;
+      rated = rated && (decoded == 0 ||
+                        speed_num_(b.speed, "decode_tps") > 0.0);
+    }
+    // At most twice the tokens a quarter second holds, and a couple more,
+    // between two beats.
+    const int bound = (int)(2.0 * 0.25 * run.turn_tps) + 2;
+    std::printf("[text_chat_stage.stream_speed] stream_words 200: %d decode "
+                "beats (%d of no text) over %d tokens, the widest gap %d "
+                "tokens (bound %d at the turn's %.1f tok/s)\n",
+                decode_beats, quiet, decoded, gap, bound, run.turn_tps);
+    EXPECT_TRUE(decoded > 64 && quiet > 0 && rated);
+    EXPECT_TRUE(decode_beats >= 8 && gap <= bound);
   }
 }
 
@@ -1271,7 +1586,8 @@ namespace {
 // Run one prompt through a fresh {source -> text-chat -> sink} mini-
 // pipeline against `model_path` and return the collected turn texts.
 std::vector<std::string>
-run_chat_turn_(const std::string& model_path, const std::string& prompt)
+run_chat_turn_(const std::string& model_path, const std::string& prompt,
+               const FlexData& extra = FlexData())
 {
   ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
   Session  sess;
@@ -1291,6 +1607,11 @@ run_chat_turn_(const std::string& model_path, const std::string& prompt)
     o.insert("compute_dtype", FlexData::make_string("f16"));
     o.insert("max_new_tokens", FlexData::make_int(96));
     o.insert("max_pages", FlexData::make_int(8));
+    if (extra.is_object()) {
+      for (const auto& [k, v] : extra.as_object()) {
+        o.insert(std::string(k), v);
+      }
+    }
   }
   auto ch = make_unique<TextChatStage>(
       &sess, "chat", vector<InEdge>{ { promptsrc, 0 } }, std::move(cfg));
@@ -1374,6 +1695,129 @@ TEST(text_chat_stage, metal_chat_media_image_turn) {
     if (lower_(t).find("red") != std::string::npos) { has_red = true; }
   }
   EXPECT_TRUE(has_red);
+}
+
+// DeepSeek-V4.1 (its synthetic checkpoint, tools/dump_deepseek_v41_golden.py
+// small): a picture through the stage -- the marker parsed, the picture
+// decoded, its span encoded by the DeepSeek tower and spliced with the ids
+// kept -- and a text turn after it in the same context. The weights are
+// random, so the replies are only required to exist.
+TEST(text_chat_stage, metal_chat_deepseek_v41_turns) {
+  const char* gd = std::getenv("VPIPE_DSV41_SMALL_GOLDEN");
+  if (!gd || !*gd) {
+    return;
+  }
+  const std::string model = std::string(gd) + "/model";
+  const std::string img = write_red_ppm_();
+  auto texts = run_chat_turn_(
+      model, "Look: " + vpipe::media_line::make_fs_marker(
+                            vpipe::media_line::Modality::Image, img) +
+                 " What colour is it?");
+  ASSERT_TRUE(!texts.empty());
+  std::size_t chars = 0;
+  for (const auto& t : texts) { chars += t.size(); }
+  std::printf("[text_chat_stage.deepseek_v41] %zu turn texts, %zu chars\n",
+              texts.size(), chars);
+  EXPECT_TRUE(chars > 0);
+}
+
+// DeepSeek-V4.1-Flash itself (VPIPE_DSV41_TEST_MODEL_PATH: the release or
+// an MLX pack): a picture turn and a text turn through the stage, each
+// answered in the model's chat mode.
+TEST(text_chat_stage, metal_chat_deepseek_v41_answers) {
+  const char* path = std::getenv("VPIPE_DSV41_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  const std::string img = write_red_ppm_();
+  auto texts = run_chat_turn_(
+      path, "Look at this image: " +
+                vpipe::media_line::make_fs_marker(
+                    vpipe::media_line::Modality::Image, img) +
+                " What is the dominant color of the image? Answer in one "
+                "word.");
+  bool has_red = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.deepseek_v41] picture: '%s'\n",
+                t.c_str());
+    has_red = has_red || lower_(t).find("red") != std::string::npos;
+  }
+  EXPECT_TRUE(has_red);
+  texts = run_chat_turn_(path, "What is the capital of France? Answer in "
+                               "one word.");
+  bool has_paris = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.deepseek_v41] text: '%s'\n", t.c_str());
+    has_paris = has_paris || lower_(t).find("paris") != std::string::npos;
+  }
+  EXPECT_TRUE(has_paris);
+}
+
+// LFM3-VL (VPIPE_LFM3_TEST_MODEL_PATH): a picture turn and a text turn
+// through the stage, thinking off, each answered; and a thinking turn,
+// whose answer follows its reasoning.
+TEST(text_chat_stage, metal_chat_lfm3_answers) {
+  const char* path = std::getenv("VPIPE_LFM3_TEST_MODEL_PATH");
+  if (!path || !*path) {
+    return;
+  }
+  FlexData off = FlexData::make_object();
+  off.as_object().insert("disable_thinking", FlexData::make_bool(true));
+  const std::string img = write_red_ppm_();
+  auto texts = run_chat_turn_(
+      path, "Look at this image: " +
+                vpipe::media_line::make_fs_marker(
+                    vpipe::media_line::Modality::Image, img) +
+                " What is the dominant color of the image? Answer in one "
+                "word.", off);
+  bool has_red = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.lfm3] picture: '%s'\n", t.c_str());
+    has_red = has_red || lower_(t).find("red") != std::string::npos;
+  }
+  EXPECT_TRUE(has_red);
+  texts = run_chat_turn_(path, "What is the capital of France? Answer in "
+                               "one word.", off);
+  bool has_paris = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.lfm3] text: '%s'\n", t.c_str());
+    has_paris = has_paris || lower_(t).find("paris") != std::string::npos;
+  }
+  EXPECT_TRUE(has_paris);
+  FlexData think = FlexData::make_object();
+  think.as_object().insert("max_new_tokens", FlexData::make_int(400));
+  texts = run_chat_turn_(path, "What is 17 * 23? Answer with the number.",
+                         think);
+  bool has_391 = false;
+  for (const auto& t : texts) {
+    std::printf("[text_chat_stage.lfm3] thinking: '%s'\n", t.c_str());
+    has_391 = has_391 || t.find("391") != std::string::npos;
+  }
+  EXPECT_TRUE(has_391);
+}
+
+// DeepSeek-V4.1 with `mtp`: the stage loads the DSpark head (the model's
+// own directory named as its drafter) and decodes speculatively -- a
+// greedy reply the same text as without it.
+TEST(text_chat_stage, metal_chat_deepseek_v41_dspark_reply_is_the_same) {
+  const char* gd = std::getenv("VPIPE_DSV41_SMALL_GOLDEN");
+  if (!gd || !*gd) {
+    return;
+  }
+  const std::string model = std::string(gd) + "/model";
+  const std::string prompt = "Name three colours of the rainbow.";
+  // `mtp` is on by default: the plain turn turns it off
+  FlexData off = FlexData::make_object();
+  off.as_object().insert("mtp", FlexData::make_bool(false));
+  const auto plain = run_chat_turn_(model, prompt, off);
+  FlexData extra = FlexData::make_object();
+  extra.as_object().insert("mtp", FlexData::make_bool(true));
+  const auto spec = run_chat_turn_(model, prompt, extra);
+  ASSERT_TRUE(!plain.empty() && !spec.empty());
+  std::printf("[text_chat_stage.deepseek_v41] dspark reply %s the plain one "
+              "(%zu chars)\n", plain == spec ? "is" : "DIFFERS from",
+              plain.empty() ? 0 : plain[0].size());
+  EXPECT_TRUE(plain == spec);
 }
 
 // An attachment whose modality the model does not provide (audio on
@@ -1493,6 +1937,251 @@ TEST(text_chat_stage, metal_chat_media_gemma_image_audio_turn) {
     if (lower_(t).find("red") != std::string::npos) { has_red = true; }
   }
   EXPECT_TRUE(has_red);
+}
+
+// ---- CONVERSATION beats -------------------------------------------
+//
+// A host that runs a graph per turn sends the whole conversation as an
+// object beat; the context the turn ends on is kept under its key with
+// the model (kept warm), taken back by the next graph and only the new
+// messages prefilled; saved to the host's folder when the model must go
+// and read back from there. The host's tools are called back, not run.
+
+namespace {
+
+// Emits one FlexData object beat, then signals done.
+class ObjectBeatSource : public TypedStage<ObjectBeatSource> {
+public:
+  static constexpr const char* kTypeName = "ut-chat-object-source";
+  using TypedStage::TypedStage;
+
+  FlexData beat;
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (_sent) { ctx.signal_done(); co_return; }
+    _sent = true;
+    co_await ctx.write(0, make_payload<FlexDataPayload>(beat));
+  }
+
+private:
+  bool _sent = false;
+};
+
+// One graph -- source, text-chat, sink -- on `sess`, as a host runs a
+// turn: the turn record, or null.
+FlexData
+run_conversation_turn_(Session& sess, const char* path, const string& beat)
+{
+  Pipeline pl("chat-conversation", &sess);
+  auto src = make_unique<ObjectBeatSource>(
+      &sess, "beat", vector<InEdge>{}, FlexData::make_object());
+  src->allocate_oports(1);
+  src->beat = FlexData::from_json(beat);
+  auto* bsrc = static_cast<ObjectBeatSource*>(pl.insert_stage(std::move(src)));
+  FlexData cfg = FlexData::make_object();
+  {
+    auto o = cfg.as_object();
+    o.insert("hf_dir", FlexData::make_string(path));
+    o.insert("compute_dtype", FlexData::make_string("f16"));
+    o.insert("max_new_tokens", FlexData::make_int(96));
+    o.insert("page_tokens", FlexData::make_int(16));
+    o.insert("max_pages", FlexData::make_int(512));
+    o.insert("keep_loaded", FlexData::make_real(60.0));
+    o.insert("disable_thinking", FlexData::make_bool(true));
+  }
+  auto ch = make_unique<TextChatStage>(
+      &sess, "chat", vector<InEdge>{ { bsrc, 0 } }, std::move(cfg));
+  auto* chat = static_cast<TextChatStage*>(pl.insert_stage(std::move(ch)));
+  auto sk = make_unique<TurnSink>(
+      &sess, "sink", vector<InEdge>{ { chat, 0 } }, FlexData::make_object());
+  auto* sink = static_cast<TurnSink*>(pl.insert_stage(std::move(sk)));
+  ::setenv("VPIPE_LLM_BACKEND", "metal", 1);
+  PipelineRuntime rt(&pl, &sess);
+  const bool launched = rt.launch();
+  ::unsetenv("VPIPE_LLM_BACKEND");
+  if (!launched) { return FlexData(); }
+  rt.wait_idle();
+  rt.stop();
+  auto turns = sink->take();
+  return turns.empty() ? FlexData() : turns.back();
+}
+
+string
+field_(const FlexData& t, const char* key)
+{
+  if (!t.is_object() || !t.as_object().contains(key)) { return {}; }
+  const FlexData v = t.as_object().at(key);
+  return v.is_string() ? string(v.as_string()) : v.to_json();
+}
+
+int64_t
+int_field_(const FlexData& t, const char* key)
+{
+  if (!t.is_object() || !t.as_object().contains(key)) { return -1; }
+  return t.as_object().at(key).as_int(-1);
+}
+
+// A message as JSON.
+string
+msg_(const string& role, const string& content)
+{
+  FlexData m = FlexData::make_object();
+  {
+    auto o = m.as_object();
+    o.insert("role", FlexData::make_string(role));
+    o.insert("content", FlexData::make_string(content));
+  }
+  return m.to_json();
+}
+
+string
+conv_beat_(const vector<string>& msgs, const string& key,
+           const string& dir, const string& tools = "")
+{
+  string s = "{\"messages\":[";
+  for (size_t i = 0; i < msgs.size(); ++i) {
+    s += (i ? "," : "") + msgs[i];
+  }
+  s += "],\"context\":\"" + key + "\"";
+  if (!dir.empty()) { s += ",\"context_dir\":\"" + dir + "\""; }
+  if (!tools.empty()) { s += ",\"tools\":" + tools; }
+  return s + "}";
+}
+
+}  // namespace
+
+TEST(text_chat_stage, metal_chat_conversation_kept_saved_read_back) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<SilentUi>());
+  const auto dir = std::filesystem::temp_directory_path()
+      / ("vpipe-conv-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(dir);
+  const string d = dir.string();
+
+  vector<string> msgs = {
+      msg_("system", "You are a terse assistant. Answer in a few words."),
+      msg_("user", "My name is Ada. Reply with just: OK")};
+  const FlexData r1 = run_conversation_turn_(sess, path,
+                                             conv_beat_(msgs, "conv", d));
+  std::printf("[conversation] 1: '%s' restored=%s prefilled=%lld\n",
+              field_(r1, "text").c_str(), field_(r1, "restored").c_str(),
+              (long long)int_field_(r1, "prefilled"));
+  ASSERT_TRUE(!field_(r1, "text").empty());
+  EXPECT_TRUE(field_(r1, "restored") == "new");
+  EXPECT_TRUE(field_(r1, "finish") == "stop");
+  // Its speed, as a host shows it: the tokens decoded beside the time.
+  EXPECT_TRUE(int_field_(r1, "decoded") >= 1);
+  EXPECT_TRUE(int_field_(r1, "prefilled") > 0);
+
+  // The next turn: what it held is reused, the new message prefilled.
+  msgs.push_back(msg_("assistant", field_(r1, "text")));
+  msgs.push_back(msg_("user", "What is my name? One word."));
+  const FlexData r2 = run_conversation_turn_(sess, path,
+                                             conv_beat_(msgs, "conv", d));
+  std::printf("[conversation] 2: '%s' restored=%s reused=%lld "
+              "prefilled=%lld\n", field_(r2, "text").c_str(),
+              field_(r2, "restored").c_str(),
+              (long long)int_field_(r2, "reused"),
+              (long long)int_field_(r2, "prefilled"));
+  EXPECT_TRUE(field_(r2, "restored") == "memory");
+  EXPECT_TRUE(int_field_(r2, "reused") > int_field_(r1, "prefilled"));
+  EXPECT_TRUE(int_field_(r2, "prefilled") < int_field_(r1, "prefilled"));
+  EXPECT_TRUE(field_(r2, "text").find("Ada") != string::npos);
+  // What the kept context holds is what the conversation rendered again
+  // reads: a fresh context of the same messages prefills as many tokens
+  // as the kept one reused and prefilled.
+  const FlexData r2f = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "conv-fresh", ""));
+  std::printf("[conversation] 2 fresh: '%s' prefilled=%lld\n",
+              field_(r2f, "text").c_str(),
+              (long long)int_field_(r2f, "prefilled"));
+  EXPECT_TRUE(field_(r2f, "restored") == "new");
+  EXPECT_TRUE(int_field_(r2f, "prefilled")
+              == int_field_(r2, "reused") + int_field_(r2, "prefilled"));
+  EXPECT_TRUE(sess.drop_chat_context("conv-fresh").code == 0);
+
+  // The model must go (a launch claims other weights and does not fit
+  // beside it): the conversation is saved to its folder first ...
+  auto* mgr = sess.generative_model_manager();
+  ASSERT_TRUE(mgr != nullptr);
+  mgr->clear_declarations();
+  mgr->declare_weights("/nonexistent/another-model", 1 << 20);
+  EXPECT_TRUE(mgr->release_warm_unclaimed() == 1);
+  mgr->clear_declarations();
+  const auto file = dir / "conv.vctx";
+  EXPECT_TRUE(std::filesystem::exists(file));
+  // ... and the next turn, the model loaded again, reads it back.
+  msgs.push_back(msg_("assistant", field_(r2, "text")));
+  msgs.push_back(msg_("user", "Spell my name backwards."));
+  const FlexData r3 = run_conversation_turn_(sess, path,
+                                             conv_beat_(msgs, "conv", d));
+  std::printf("[conversation] 3: '%s' restored=%s reused=%lld "
+              "prefilled=%lld\n", field_(r3, "text").c_str(),
+              field_(r3, "restored").c_str(),
+              (long long)int_field_(r3, "reused"),
+              (long long)int_field_(r3, "prefilled"));
+  EXPECT_TRUE(field_(r3, "restored") == "disk");
+  EXPECT_TRUE(int_field_(r3, "reused") > int_field_(r2, "reused"));
+  EXPECT_TRUE(!std::filesystem::exists(file));
+
+  // Messages that do not begin with what it holds: a new context.
+  vector<string> other = {msg_("user", "Say hello.")};
+  const FlexData r4 = run_conversation_turn_(sess, path,
+                                             conv_beat_(other, "conv", d));
+  EXPECT_TRUE(field_(r4, "restored") == "new");
+  EXPECT_TRUE(sess.drop_chat_context("conv").code == 0);
+  EXPECT_TRUE(sess.drop_chat_context("conv").code != 0);
+  std::filesystem::remove_all(dir);
+}
+
+TEST(text_chat_stage, metal_chat_conversation_calls_the_host_tools) {
+  const char* path = std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH");
+  if (!path || !*path) { return; }
+  Session sess;
+  sess.set_ui_delegate(std::make_unique<SilentUi>());
+  const string tools = R"([{"name":"set_title",
+      "description":"Sets the title of the current slide.",
+      "parameters":{"type":"object",
+        "properties":{"title":{"type":"string"}},"required":["title"]}}])";
+  vector<string> msgs = {
+      msg_("system", "You edit slides with the tools you are given."),
+      msg_("user", "Set the slide's title to Water.")};
+  const FlexData r1 = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "tools", "", tools));
+  std::printf("[conversation.tools] 1: '%s' finish=%s calls=%s\n",
+              field_(r1, "text").c_str(), field_(r1, "finish").c_str(),
+              field_(r1, "tool_calls").c_str());
+  EXPECT_TRUE(field_(r1, "finish") == "tool_calls");
+  const string calls = field_(r1, "tool_calls");
+  EXPECT_TRUE(calls.find("set_title") != string::npos);
+  EXPECT_TRUE(calls.find("Water") != string::npos);
+  // Its result back as a tool message: the reply continues from it.
+  msgs.push_back(msg_("assistant", field_(r1, "text")));
+  msgs.push_back(msg_("tool", R"({"ok":true,"title":"Water"})"));
+  const FlexData r2 = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "tools", "", tools));
+  std::printf("[conversation.tools] 2: '%s' finish=%s restored=%s\n",
+              field_(r2, "text").c_str(), field_(r2, "finish").c_str(),
+              field_(r2, "restored").c_str());
+  EXPECT_TRUE(field_(r2, "restored") == "memory");
+  EXPECT_TRUE(field_(r2, "finish") == "stop");
+  // The host's tools change: the kept context advertises the old ones,
+  // so the conversation starts again in a new one.
+  const string tools2 = tools.substr(0, tools.size() - 1)
+      + R"(,{"name":"set_color","description":"Sets the text color.",
+      "parameters":{"type":"object",
+        "properties":{"color":{"type":"string"}}}}])";
+  msgs.push_back(msg_("assistant", field_(r2, "text")));
+  msgs.push_back(msg_("user", "Thanks."));
+  const FlexData r3 = run_conversation_turn_(
+      sess, path, conv_beat_(msgs, "tools", "", tools2));
+  std::printf("[conversation.tools] 3 (tools changed): restored=%s\n",
+              field_(r3, "restored").c_str());
+  EXPECT_TRUE(field_(r3, "restored") == "new");
+  EXPECT_TRUE(sess.drop_chat_context("tools").code == 0);
 }
 
 #endif  // VPIPE_BUILD_APPLE_SILICON

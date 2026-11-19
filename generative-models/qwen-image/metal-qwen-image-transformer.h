@@ -2,6 +2,11 @@
 #define GENERATIVE_MODELS_QWEN_IMAGE_METAL_QWEN_IMAGE_TRANSFORMER_H
 
 #include "generative-models/shared/block-residency.h"
+#include "generative-models/shared/i8-gemm.h"
+#include "generative-models/shared/metal-sage-attention.h"
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/block-slots.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/shared/dit-block-progress.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
@@ -48,26 +53,27 @@ class MetalQwenImageTransformer {
     float norm_eps     = 1e-6f;
     int   rope_theta   = 10000;
     int   axes[3]      = {16, 56, 56};   // axes_dims_rope (sum = head_dim)
-    // Whether the TEXT stream is rotated. Qwen-Image-Edit gives text a
-    // contiguous position band above the image grid; Mage-Flow shares this
-    // exact topology but leaves text unrotated (its transformer config sets
-    // apply_text_rotary_emb=false), which is an identity rotation on the
-    // text rows. See metal-mage-flow-transformer.h.
-    bool  rotate_txt   = true;
-    // Round the sinusoidal timestep FREQUENCY table to bf16 before forming
-    // the angle. Qwen-Image follows diffusers and keeps fp32 frequencies
-    // (false); Mage-Flow vendors a get_timestep_embedding that downcasts the
-    // table to the timestep dtype, and was TRAINED with that rounding, so it
-    // needs true. It matters a lot: the angle reaches sigma*1000 ~ 750 rad,
-    // where a 0.4% frequency error is radians of phase -- leaving it fp32
-    // knocked temb 7.6% off and cascaded into every block's modulation.
-    bool  bf16_time_freqs = false;
-    // Round the TIMESTEP itself to bf16 before forming the sinusoid angle --
-    // what `timesteps.to(img.dtype)` does when the model runs bf16. Separate
-    // from bf16_time_freqs (that is the frequency TABLE) because they are
-    // independent choices, and this one is invisible to any golden pinned at
-    // a bf16-exact sigma. See time_proj_.
-    bool  bf16_timestep = false;
+    // Dynamic-int8 GEMMs for the block matmuls (LOSSY, opt-in). This
+    // family reached matmul2d long before it reached int8, which is why
+    // the key existed on the stage and did nothing here.
+    //
+    // It sits INSIDE gemm_mma_, on the dense weight the dequant-once
+    // path already produced, so the caller's row-broadcast bias add
+    // follows it unchanged -- QIE's projections are all biased, and a
+    // biasless int8 GEMM plus that existing pass is the same shape
+    // flux2 and krea2 use.
+    bool i8_gemm = false;
+    // Whether the kernel tuners MEASURE (the accel key `autotune`,
+    // accel-keys.h): false takes the choice believed fastest on this
+    // GPU, timing nothing.
+    bool autotune = true;
+
+    // SageAttention: the QK^T product in int8. It rides on the
+    // matrix-core flash entry, which this family takes by default
+    // wherever the GPU has matrix cores -- so on such a box this is the
+    // only switch, and on an M4 it says so once and runs dense.
+    // VPIPE_QIE_NO_ATTN_NAX turns both off together.
+    sage::Config sage;
     // config.json `zero_cond_t` (true for Qwen-Image-Edit-2511). When set, the
     // REFERENCE tokens are adaLN-modulated at timestep 0 -- they are clean, not
     // noisy -- while the generated tokens use the current sigma. diffusers does
@@ -136,9 +142,6 @@ class MetalQwenImageTransformer {
     _block_progress = std::move(fn);
   }
 
-  // Leading blocks pinned resident in streaming mode (0 = pure streaming, or
-  // preloaded). For logging the RAM-for-speed decision.
-  int pinned_blocks() const { return _pinned; }
 
   // ---- the resident set, grown by measuring -----------------------------
   //
@@ -152,8 +155,33 @@ class MetalQwenImageTransformer {
   // ram decided before the run and therefore blind to the machine it
   // lands on.
   void set_residency_reserve(std::size_t bytes) { _resid.set_reserve(bytes); }
+  // Size the residency rates for the schedule that is about to run. The
+  // defaults are tuned for ~30 steps and are wrong for a 5-step turbo
+  // one in the same direction -- see BlockResidency::set_schedule. Call
+  // AFTER set_residency_reserve (the probe is sized against what is left
+  // once the reserve is taken) and before the first forward.
+  void set_residency_schedule(int steps);
   std::size_t resident_block_bytes() const { return _resid.bytes(); }
+  // The streaming slot pair, while it exists (BlockSlots::held_bytes).
+  std::size_t slot_bytes() const { return _slots.held_bytes(); }
   int resident_block_count() const { return _resid.count(); }
+  // Drop what a forward keeps for the next one -- the dense stand-in,
+  // split-K planes and the int8 context's buffers; each regrows on
+  // demand. The stage calls it after a
+  // generation on a bounded box, before the decode wants the room.
+  void release_forward_scratch();
+  // A STREAMED stack residency has kept whole gives its slot pair
+  // back (BlockSlots::release_if_saturated) -- between generations; a
+  // forward does the same at its top. Returns the bytes freed.
+  std::size_t release_idle_slots()
+  {
+    return _slots.release_if_saturated(_blocks);
+  }
+  // Streamed blocks BUILT into their slot because the slot was laid
+  // out for another (a mixed pack's other width; BlockSlots::Ops::
+  // same_layout), over the model's life. For a test to show the slots
+  // crossed widths -- and did not give up and stream without them.
+  int slot_relayouts() const { return _slots.relaid(); }
   // Give back at least `bytes` of resident blocks, for a peer that needs
   // the room now.
   std::size_t release_resident_blocks(std::size_t bytes);
@@ -162,6 +190,12 @@ class MetalQwenImageTransformer {
   // GEMMs (supports_matrix_cores() + kernels loaded + VPIPE_QIE_NO_MMA2 unset).
   // For the mma-vs-steel A/B test to assert the path actually engaged.
   bool uses_mma2() const { return _use_mma2; }
+  // Which flash kernel the attention runs. Exposed so an A/B can assert
+  // the arm it thinks it measured: without it a forced-ALU run on a box
+  // that has no matrix cores compares the same kernel with itself and
+  // passes.
+  bool uses_attn_nax() const { return _use_attn_nax; }
+  bool uses_sage_attn() const { return (bool)_sage; }
 
   // One denoiser step. `hidden` is the packed [gen_seq, in_channels] noisy
   // image (gen_seq = grid_h*grid_w); `txt` the [txt_seq, txt_dim] encoder
@@ -262,6 +296,28 @@ class MetalQwenImageTransformer {
   // Used both to preload and, in streaming mode, per-block inside forward().
   bool load_block_(WeightSet& ws, int L, Block& b, Retain r);
 
+  // ---- the streamed block's reusable destinations --------------------
+  //
+  // See shared/block-slots.h. The four callbacks below are everything
+  // that class cannot know about this model's blocks.
+  //
+  // NOTE the three tensor lists this model now carries -- block_bytes_,
+  // wire_block_ and each_block_tensor_ -- must agree about what a block
+  // is made of. They are checked against each other by the streaming
+  // equality test rather than by the type system.
+  void each_block_tensor_(
+      int L, Block& b,
+      const BlockSlots<Block>::TensorFn& fn) const;
+  bool clone_block_(const Block& src, Block& dst, bool copy) const;
+  // Is block L stored at the widths `b` was built for? (A mixed pack;
+  // see BlockSlots::Ops::same_layout.)
+  bool same_layout_(int L, const Block& b) const;
+  metal_compute::SharedBuffer rebuild_one_(
+      const std::string& nm, Placement how);
+  void configure_slots_();
+
+  BlockSlots<Block> _slots;
+
   static std::size_t qw_bytes_(const QWeight& w);
   static std::size_t block_bytes_(const Block& b);
   // How much of the RESIDENT set is still in RAM. Sampled inside each
@@ -272,7 +328,7 @@ class MetalQwenImageTransformer {
   // Drop the LAST resident block, returning its bytes. Evicting from the
   // tail keeps what remains a contiguous prefix, which for a cyclic scan
   // is as good as any other choice and keeps the bookkeeping trivial.
-  std::size_t evict_tail_block_(bool allow_pinned = false);
+  std::size_t evict_tail_block_();
 
   metal_compute::MetalCompute* _mc = nullptr;
   Config _cfg;
@@ -288,11 +344,29 @@ class MetalQwenImageTransformer {
   std::vector<Block> _blocks;                            // empty when streaming
 
   // Streaming mode (stream_blocks): _blocks holds only the pinned prefix
-  // (_pinned blocks, possibly 0); blocks L >= _pinned are loaded from the
+  // nothing at load; every block not yet promoted is loaded from the
   // retained source mmap on demand in forward() and freed after use.
   bool _stream_blocks = false;
-  int _pinned = 0;                  // pinned leading blocks (streaming only)
   BlockResidency _resid;
+  // This model's window onto the manager's process-wide wired pool. A
+  // kept block is the coldest memory in the process -- read once a step,
+  // never written -- so without mlock it is the first thing the
+  // compressor takes, and the run spends the schedule admitting, being
+  // measured out, shedding and re-admitting the same blocks. See
+  // shared/wired-pool.h.
+  WiredPool _wire;
+  // One block's bytes, from the checkpoint's tensor table rather than
+  // from a loaded block -- set_residency_schedule computes it, and the
+  // per-forward wire retry is gated on the box having freed at least
+  // this much since the refusal. Zero until the schedule is set, which
+  // is the honest answer: nothing has been kept yet either.
+  std::size_t _wire_block_hint = 0;
+  // Wire (mlock) or unwire every buffer of one block / of everything this
+  // model holds that is NOT a streamed block, returning the bytes the
+  // pool took or gave back.
+  std::size_t wire_block_(Block& b, bool on);
+  std::size_t wire_fixed_(bool on);
+  std::size_t wire_retry_slack_() const;
   // The checkpoint, held for this model's whole life -- it is where the
   // streamed blocks are read from, so streaming is the manager's
   // business rather than a private mmap this class kept to itself.
@@ -315,7 +389,7 @@ class MetalQwenImageTransformer {
   // Libraries + kernel functions. The whole DiT runs in bf16 (the residual
   // stream reaches ~1e7, far past f16's 65504) -> the *_bf16 metallib variants.
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa,
-      _lib_rope, _lib_qmm, _lib_attn;
+      _lib_rope, _lib_qmm, _lib_attn, _lib_attn_nax;
   metal_compute::ComputeFunction _fn_gemm, _fn_gemm_bias, _fn_rms, _fn_layernorm,
       _fn_silu, _fn_gelu, _fn_residual, _fn_transpose, _fn_sdpa, _fn_rope_table,
       _fn_adaln, _fn_gated,
@@ -337,6 +411,12 @@ class MetalQwenImageTransformer {
   // kernel is unavailable (VPIPE_QIE_NO_STEEL_ATTN forces the scalar path).
   metal_compute::SharedBuffer _attn_params;
   bool _steel_attn_ok = false;
+  // The matrix-core flash entry: on by default where the GPU has matrix
+  // cores, as in every sibling DiT. VPIPE_QIE_NO_ATTN_NAX forces the ALU
+  // steel kernel.
+  bool _use_attn_nax = false;
+  std::unique_ptr<MetalSageAttention> _sage;
+  std::unique_ptr<I8GemmContext>      _i8;
   // Affine qmm (loaded only when quantized): w4g64 / w8g64 (bf16 variant) +
   // the row-broadcast bias add applied after the (bias-less) qmm.
   metal_compute::ComputeFunction _fn_qmm4, _fn_qmm8, _fn_bias_add;

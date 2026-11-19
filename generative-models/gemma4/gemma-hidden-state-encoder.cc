@@ -8,6 +8,7 @@
 #include "generative-models/hidden-state-encoder.h"
 
 #include "generative-models/gemma4/metal-gemma-model.h"
+#include "generative-models/shared/accel-settings.h"
 #include "generative-models/model-loader.h"
 #include "generative-models/weight-set.h"
 
@@ -58,7 +59,8 @@ public:
 
     std::string e;
     auto buf = _m->forward_embeddings_taps(_cid, ids, req.indices,
-                                           req.key_valid_len, &e);
+                                           req.key_valid_len, &e,
+                                           req.skip_final_norm);
     if (buf.empty()) {
       if (err != nullptr) { *err = std::move(e); }
       return false;
@@ -138,6 +140,9 @@ make_(const HiddenStateEncoderArgs& args)
   MetalGemmaModel::Config gcfg = MetalGemmaModel::config_from(mc);
   gcfg.stream_layers = args.stream_layers;
   gcfg.pin_frac      = args.pin_frac;
+  // The caller's word on its kernel tuners (accel::kAutotune in `extra`):
+  // absent, they measure, as before the key.
+  gcfg.autotune = accel::flag(&args.extra, accel::kAutotune, true);
   auto model = MetalGemmaModel::load(ws, args.metal, gcfg);
   if (!model) {
     warn("could not build the model from '" + args.dir + "'");

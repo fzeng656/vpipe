@@ -1,11 +1,13 @@
 #ifndef GENERATIVE_MODELS_MINIMAX_H3_MINIMAX_H3_DENOISE_H
 #define GENERATIVE_MODELS_MINIMAX_H3_MINIMAX_H3_DENOISE_H
 
+#include "common/flex-data.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace vpipe {
 namespace genai {
@@ -33,6 +35,91 @@ namespace genai {
 //     20+ times over a latent that starts as unit noise, and the
 //     reference steps in float32 for exactly that reason; the bf16 round
 //     trip happens per forward, not per accumulation.
+//
+// How the loop takes a step. Every one is ONE forward a step, which is
+// the only kind worth having on a 33B model.
+enum class StepUpdate : int {
+  // What the loop does with nothing asked: an adapter's sampling
+  // contract's update where one is live (Pika H3 Flex: re-noising), a
+  // refine's plain Euler, else Euler.
+  kAuto = 0,
+  kEuler,
+  // x0 = x + sigma v at each sigma, then put at the next one with FRESH
+  // noise -- diffusers' `stochastic_sampling`, and the update a DMD-style
+  // few-step student takes (the sampler spec's `dmd`).
+  kRenoise,
+  // ComfyUI's `res_multistep`: second order in log-sigma off the previous
+  // step's x0 (MiniMaxH3Scheduler::step_res).
+  kResMultistep,
+  // Euler in its VELOCITY form, x + (sigma - sigma_next) v on the grid's
+  // float sigmas (MiniMaxH3Scheduler::step_velocity): what MiniMax-H3-
+  // Image's heads were distilled with. Not a sampler-spec method.
+  kVelocity,
+};
+
+// "euler" / "renoise" / "res_multistep" / "velocity"; "auto" for kAuto.
+const char* step_update_name(StepUpdate u);
+
+// A `diffusion-sampler-select` spec, read for THIS model. H3 cannot run
+// the shared FlowSampler -- its velocity points the other way, its
+// timesteps run 1 - sigma, and it steps two schedules in lockstep over
+// rows that are never all stepped -- so the spec's method is mapped onto
+// the updates its own scheduler has: `euler`, `dmd` (the same update as
+// kRenoise) and `res_multistep`.
+struct SamplerChoice {
+  StepUpdate    update = StepUpdate::kAuto;
+  // The spec's re-noise seed; 0 names none, and the clip's seed runs.
+  std::uint64_t seed   = 0;
+  // The method as the spec spelled it.
+  std::string   method;
+  // What the spec carries that this model does not read (a `dmd`
+  // conditioning_sigma: H3 runs its own grid). Empty when nothing.
+  std::string   note;
+};
+
+// False -- with the reason in `why` and `out->update` left kAuto -- for
+// a method H3 does not run (heun, dpmpp_2m and dpmpp_sde take two
+// forwards a step; unipc; a name this tree does not know) or a beat that
+// is not a spec. The caller WARNS and the default runs: spec-keys.h's
+// rule for a value a reader does not run. eta and s_noise are
+// dpmpp_sde's and are not read.
+bool sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
+                              std::string* why = nullptr);
+
+// What one denoise() holds on the HOST beside the forward, f32 over the
+// GENERATED rows it steps -- for a caller judging a clip against
+// physical RAM (generate-video hands it to its preflight as pageable
+// memory). The velocity read back each step; ONE more state for the
+// update's own -- a re-noising step's fresh noise or a res_multistep
+// step's previous x0, never both -- counted whatever the update, so on
+// an Euler run it is a bound by that state; MotionCache's residual when
+// `motion_cache`; a preview's clean estimate (video only) when
+// `preview`. Not the caller's `video` / `audio` buffers, which it owns.
+std::size_t denoise_host_bytes(const minimax_h3::PackedLayout& L,
+                               const MetalMiniMaxH3Transformer::Config& cfg,
+                               bool motion_cache, bool preview);
+
+// What a denoise did, for a caller that wants to report or assert it.
+// `forwards` is the transformer calls that RAN; `reused` the steps
+// MotionCache answered from its residual instead. They sum to `steps`.
+// `motion_cache` says the cache was ARMED for the clip, which is what
+// tells "asked, and nothing was close enough to reuse" from "asked, and
+// the geometry turned it off".
+struct DenoiseReport {
+  int  steps        = 0;
+  int  forwards     = 0;
+  int  reused       = 0;
+  bool motion_cache = false;
+  // The steps re-noised (an adapter's sampling contract, or asked for)
+  // rather than stepped by Euler.
+  bool renoise      = false;
+  // The update that RAN (never kAuto), and the two schedules it ran
+  // over, terminal 0 included.
+  StepUpdate update = StepUpdate::kEuler;
+  std::vector<float> video_sigmas;
+  std::vector<float> audio_sigmas;
+};
+
 struct DenoiseRequest {
   MetalMiniMaxH3Transformer*      dit    = nullptr;
   const minimax_h3::PackedLayout* layout = nullptr;
@@ -49,7 +136,99 @@ struct DenoiseRequest {
   // [num_audio_rows, audio_channels].
   float* audio = nullptr;
 
+  // The GENERATED video's latent grid, patches not pixels. Only VDN's
+  // hybrid attention reads it -- its window is over whole frames and its
+  // short conv is a (t, h, w) stencil, neither of which can be recovered
+  // from a row count -- and left at zero the hybrid stays off. So a
+  // driver that forgets it does not get a wrong answer, it gets the
+  // unhybridised model; which is the failure worth having, and the
+  // reason the transformer's own switch is the same field.
+  int    video_grid_h = 0;
+  int    video_grid_w = 0;
+
+  // Denoising steps -- one transformer FORWARD each, which is what
+  // diffusers' `num_inference_steps` and ComfyUI's `steps` count: N steps
+  // run N forwards over the N + 1 sigmas of linspace(1, 0, N + 1), the
+  // last of them the terminal zero.
+  //
+  // MiniMax's own reference scheduler counts differently -- its
+  // `num_inference_steps` is the number of GRID POINTS, terminal zero
+  // included, so it runs one forward fewer than it says -- and
+  // MiniMaxH3Scheduler::set_timesteps keeps that signature so it can be
+  // checked against the reference directly. The loop asks it for
+  // num_steps + 1 points. Matching the tools people come from matters
+  // more than matching one reference's argument: a step count copied from
+  // a ComfyUI workflow, or a Turbo adapter's "4-step" / "8-step" name,
+  // means forwards, and read the other way it lands one short -- off the
+  // grid a few-step distillation was trained on.
   int    num_steps   = 32;
+  // An explicit RAW sigma grid (1 -> 0, unshifted), overriding
+  // `num_steps`. Each modality pushes it through its own shift, as with
+  // the linspace grid.
+  //
+  // Left empty, a live FLOW-MAP adapter on the DiT supplies its own --
+  // the grid it was distilled on is a property of its weights, the way
+  // upstream's loader configures the pipeline from the file -- and
+  // `num_steps` is ignored. So does an adapter's SAMPLING CONTRACT
+  // (its grid shifted in double, and its update: re-noising, see
+  // `seed`). An explicit grid here still wins, stepped by Euler.
+  std::vector<float> sigma_grid;
+  // The VIDEO's sigmas AS RUN, terminal 0 included -- what ComfyUI hands
+  // its sampler as SIGMAS -- overriding `num_steps`, `sigma_grid`, a
+  // flow-map adapter's grid and a sampling contract's (stepped by Euler
+  // unless `update` says otherwise). The AUDIO runs ComfyUI's mapping of
+  // each: back to the shared base grid through `video_shift`, out
+  // through `audio_shift` (MiniMaxH3Scheduler::set_sigmas_mapped).
+  // Strictly decreasing from at most 1 to exactly 0. A refine's
+  // `refine_sigmas` take its place: they are the same thing for a
+  // refine, the video's sigmas as run.
+  std::vector<double> video_sigmas;
+  // How a step is taken (StepUpdate). Named, it overrides a sampling
+  // contract's update. A flow-map adapter's step IS its jump to the next
+  // sigma, so under a live one anything but Euler is refused.
+  StepUpdate update = StepUpdate::kAuto;
+  // Step i through the DiT's per-step output head i
+  // (MetalMiniMaxH3Transformer::set_step_heads; MiniMax-H3-Image), in
+  // place of its own head. Needs a head for every step.
+  bool step_heads = false;
+  // A REFINE -- Open-H3-Regenerate-2K's: the video's sigmas AS RUN (no
+  // shift, overriding `num_steps` and `sigma_grid`), stepped by the
+  // reference's plain Euler (MiniMaxH3Scheduler::step_plain), and the
+  // AUDIO HELD CLEAN: every audio row rides at `condition_audio_timestep`
+  // and none is stepped -- the release conditions its refine on a fixed
+  // encoded silence. The caller puts the re-noised state in `video`
+  // itself, (1 - sigma[0]) x + sigma[0] noise. Under a live flow-map
+  // adapter (Open-H3-Regenerate-2K-IC: the tail of HyperFlow's grid)
+  // step i jumps to sigma[i + 1]: the generated rows carry
+  // (1 - sigma[i], 1 - sigma[i + 1]), every held row r = t. A sampling
+  // contract is refused.
+  std::vector<double> refine_sigmas;
+  // The seed of the FRESH NOISE a re-noising sampler draws each step
+  // (MetalMiniMaxH3Transformer::SamplingContract): the video's
+  // generated rows, then the audio's, every step but the last. Its own
+  // stream, so the initial noise a caller drew from the same seed is not
+  // repeated. Unused by the Euler samplers.
+  std::uint64_t seed = 0;
+  // Leading steps whose attention runs DENSE with Sol-Attn on (see
+  // Step::dense_attention). 0 routes every step.
+  int sol_dense_steps = 0;
+  // Sol-Attn's tau STEP BY STEP (Step::sol_routing): entry i for step i,
+  // the last for every step past the list; the threshold form stays the
+  // DiT's. Empty: the DiT's own tau every step. A step sol_dense_steps
+  // leaves dense stays dense.
+  std::vector<float> sol_tau_steps;
+  // VDN's REACH step by step (Step::vdn_radius): entry i for step i, the
+  // last for every step past the list, -1 the checkpoint's. Empty: the
+  // DiT's own (set_vdn_radius) every step. Without a linear branch,
+  // nothing.
+  std::vector<int> vdn_range_steps;
+  // The acceleration bag (shared/accel-settings.h), for the tiers the
+  // SAMPLING LOOP implements rather than the transformer -- MotionCache
+  // (shared/motion-cache.h), which decides per step whether to run the
+  // forward at all. Borrowed; null reads as every default, i.e. off.
+  const FlexData* accel = nullptr;
+  // Filled when set.
+  DenoiseReport* report = nullptr;
   double video_shift = 12.0;
   double audio_shift = 3.0;
   // The timestep the pinned keyframe rows are conditioned on. They are
@@ -69,6 +248,19 @@ struct DenoiseRequest {
   // whatever steps have run.
   std::function<bool(int step, int total)> progress;
 
+  // A LATENT PREVIEW. After step `step` (1-based, of `total`) for which
+  // `preview_due` says yes, `preview` gets the model's clean estimate
+  // x0 = x + sigma * v of the GENERATED video rows --
+  // [num_video_rows, video_patch_elems] f32, in packed order, the tail
+  // `video` holds past its conditioning rows. Borrowed for the call.
+  //
+  // x0 rather than the state: the state is mostly noise for the first
+  // half of the schedule, and x0 is what the model currently believes
+  // the clip is. Asking first means a step nobody previews builds
+  // nothing; both empty is no previews.
+  std::function<bool(int step, int total)> preview_due;
+  std::function<void(int step, int total, const float* x0)> preview;
+
   // Adopt a caller's per-generation choices. Here rather than at each
   // call site so a field added to GenerationParams reaches the loop
   // without every driver having to be found and updated -- which is the
@@ -80,8 +272,30 @@ struct DenoiseRequest {
     audio_shift = p.audio_shift;
     condition_timestep = (float)p.condition_timestep;
     condition_audio_timestep = (float)p.condition_audio_timestep;
+    video_sigmas = p.sigmas;
   }
 };
+
+// MotionCache's view of this loop's packed state (shared/motion-cache.h):
+// the offsets that pick its subsampled grids out of the GENERATED tails.
+//
+// Video is [C][T][H'][W'] over every `subsample`-th latent ROW and
+// COLUMN -- not patch; that is what the reference's [..., ::f, ::f]
+// keeps -- mapped through the packing: row t * gh * gw + cell, element
+// (c * patch_h + y) * patch_w + x. Audio is every `subsample`-th latent
+// step of each stereo channel, all lanes; its rows are channel-major in
+// time. False, with the reason, when the geometry has no such view.
+struct MotionCacheGathers {
+  std::vector<std::uint32_t> video;
+  std::vector<std::uint32_t> audio;
+  int channels = 0;
+  int frames   = 0;
+  int plane    = 0;   // H' * W'
+};
+bool motion_cache_gathers(const MetalMiniMaxH3Transformer::Config& cfg,
+                          int grid_h, int grid_w, int video_rows,
+                          int audio_rows, int subsample,
+                          MotionCacheGathers* out, std::string* why);
 
 // Run the loop. False on failure, with a reason in `err`. On success the
 // request's `video` / `audio` hold the denoised latents, still in packed

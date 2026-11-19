@@ -8,6 +8,10 @@
 #include <span>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe { namespace metal_compute { class SharedBuffer; } }
 
 namespace vpipe::genai {
@@ -28,7 +32,9 @@ namespace vpipe::genai {
 struct TokenRef {
   enum class Kind : std::uint8_t { Text, ImageTokens, AudioTokens };
   Kind                    kind                = Kind::Text;
-  // Text variant.
+  // Text variant. A media row may carry the placeholder id it replaces
+  // (the image / video pad; 0 = not given): a model that hashes the token
+  // stream -- Qwen3.8-Flash-Next's n-gram embedding -- reads it there.
   std::int32_t            text_id             = 0;
   // Image / Audio token row index into the encoder's output sequence.
   int                     image_token_offset  = 0;
@@ -47,5 +53,7 @@ struct TokenRef {
 
 
 }
+
+VPIPE_API_END
 
 #endif

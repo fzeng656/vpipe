@@ -4,23 +4,31 @@
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/generation-input.h"
+#include "stages/lora-slots.h"
 
 // The video denoisers (MetalWanTransformer, MetalMiniMaxH3Transformer) are
 // from-scratch metal-compute modules on the VPIPE_BUILD_APPLE_SILICON axis.
 // On non-Apple builds the stage is an inert stub.
 #ifdef VPIPE_BUILD_APPLE_SILICON
 #include "generative-models/krea2/flow-sampler.h"
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/shared/sol-attention.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/minimax-h3-image.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/video-model-registry.h"
 #include "generative-models/wan/metal-wan-transformer.h"
+#include "stages/latent-preview.h"
 #include "stages/model-memory.h"
 #include "stages/model-registry.h"
 #endif
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -154,6 +162,19 @@ struct TensorBeat;
 //           {latents_per_second} -- what `audio-vae-decode` reads. Never
 //           written by a family that does not generate audio, so a graph
 //           that leaves it unconnected is not doing anything wrong.
+//   oport2  OPTIONAL live PREVIEW of the clip being denoised: planar U8
+//           RGB [F, 3, H, W] (the `rgb-clip` shape), one beat per rendered
+//           step, sideband {frames, fps, fps_num, fps_den, step, steps,
+//           preview}. The model's clean estimate at that step, decoded by
+//           a tiny autoencoder named on the family's config source
+//           (`preview_vae`, with `preview_every` / `preview_max_edge` /
+//           `preview_frames`) -- so a `preview` stage wired here plays the
+//           clip forming. PUSH-STYLE like rtsp-capture's: DropOldest,
+//           written from a thread of this stage's, so a preview nobody
+//           reads is dropped and never holds the generation up; that
+//           policy takes ONE consumer. Unwired, or with no preview VAE,
+//           nothing is loaded and nothing is decoded. Rendered by
+//           minimax-h3 today; the other families leave it silent.
 //
 // Config (FlexData object):
 //   hf_dir           (string, OPTIONAL) -- the Wan model root
@@ -169,7 +190,9 @@ struct TensorBeat;
 //                              re-authored. The adjustment is logged.
 //   fps              (real) -- stamped on the latent for the decoder
 //   steps            (int)  -- denoising steps
-//   seed             (int)  -- initial-noise RNG seed
+//   seed             (int)  -- initial-noise RNG seed of the first clip
+//   seed_sequence    (string) -- increment|randomize|keep: the seed of
+//                              each later clip of the run
 //   unload_when_idle (string) -- auto|always|never
 //
 // Everything family-specific lives on iport9 instead; see the config
@@ -218,10 +241,119 @@ public:
 
   const StageSpec& spec() const noexcept override;
 
+  // How many keyframe anchors a MiniMax-H3 request takes: 0 for
+  // text-to-video, 1 for a first frame, 2 for first AND last. Sets
+  // `*ignored` when a keyframe was wired and had to be dropped.
+  //
+  // `have_references` is a property of the REQUEST rather than of the
+  // checkpoint, and it has to be: Ref2VA-like runs the reference layout
+  // on FL2VA weights, so a partition that takes keyframes can also be
+  // handed references, and the two layouts stay mutually exclusive.
+  //
+  // Public and static for the reason VideoRefEncoderStage::
+  // media_from_beat is: this is the part of the port contract that
+  // fails SILENTLY when it is wrong -- a request with references takes
+  // no anchors at all, so a wired keyframe is read and goes nowhere --
+  // and that deserves a test which needs neither a 33B model nor a
+  // runtime.
+  static int h3_anchor_count(bool have_references, bool have_keyframe,
+                             int ref_frames, bool* ignored);
+
+  // Which end of the clip each of those anchors pins, in packed order
+  // (anchor k is conditioning frame k of the keyframe latent): none,
+  // {first}, {first, last}, or {last} when `last_only` -- a LAST frame
+  // with no first, the `l2va` request both references take (diffusers'
+  // `last_image` alone, vllm-omni's keyframe signature (-1,)). A lone
+  // last frame is ONE anchor whatever its latent's frame count.
+  enum class H3AnchorEnd { kFirst, kLast };
+  static std::vector<H3AnchorEnd> h3_anchor_ends(bool have_references,
+                                                 int ref_frames,
+                                                 bool last_only,
+                                                 bool* ignored);
+
+  // How many `ref2va` reference rows a row beat carries: its row count,
+  // or -1 when a NON-EMPTY beat is not `want_elems` wide. `*data` points
+  // at the rows when there are any, else null. A missing or non-matrix
+  // beat carries 0.
+  //
+  // An EMPTY beat is 0 whatever its width. It is how video-ref-encoder
+  // says a modality is absent, and with no rows there is nothing a wrong
+  // width could misread; the row COUNT is still checked against the
+  // layout. Public and static for the same reason as the one above: it
+  // is what refused every request of stills, and a test of it needs
+  // neither a model nor a runtime.
+  static int h3_reference_rows(const class TensorBeatPayload* t,
+                               int want_elems, const float** data);
+
+  // Which layout a MiniMax-H3 request is packed with, from what its
+  // conditioning SAID about references and which partition is resident.
+  //
+  // `said` is whether the sideband carried a `references` ARRAY at all,
+  // and it is the whole point: an ABSENT list on the Ref2VA partition is
+  // what a mis-wired graph delivers, and is refused, while an explicitly
+  // EMPTY one is Ref2VA's prompt-only form and runs. On FL2VA an empty
+  // list is just t2va / fl2va, keyframes and all.
+  //
+  // Public and static for the same reason as the two above: the
+  // difference between "nobody asked" and "asked for none" is one bool,
+  // it fails silently in either direction (a refused request, or a 33B
+  // denoise conditioned on nothing), and a test of it needs neither a
+  // model nor a runtime.
+  enum class H3Route {
+    kRefuse,      // Ref2VA weights, and nothing said which request
+    kKeyframe,    // [text | keyframe conditions | audio | video]
+    kReference,   // [text | reference blocks | audio | video]
+  };
+  static H3Route h3_reference_route(bool said, int num_references,
+                                    const std::string& partition);
+
+  // MiniMax-H3's two memory questions, asked as its DiT loads. The first
+  // is whether its blocks stream for want of room: the denoise phase,
+  // against the irreversible cushion. `bounded` keys on it. The second is
+  // whether the box is tight enough that the DiT goes after each clip:
+  // the launch's peak, against the revisable cushion.
+  //
+  // Each names this stage's checkpoint and NO PEER'S. The text encoder
+  // and the VAEs count only through the manager: the declaration of the
+  // stage that holds one, in the phase it gave, or a set held open. A
+  // graph handed its conditioning has no conditioning stage, so nothing
+  // declares the encoder. Named here anyway, its size on disk was added
+  // to the box. MEASURED by a host, the second rank of a split on a 64 GB
+  // Max: 63.6 GB of footprint, so the rank's blocks streamed for want of
+  // room, it kept none of them, and its DiT went after every clip.
+  //
+  // Public and static for the reason the ones above are: the mistake
+  // reads a box with room as tight, silently, and a test of it needs
+  // neither a model nor a runtime.
+  static model_memory::StreamPlan h3_stream_plan(
+      const SessionContextIntf* session, const std::string& dit_dir,
+      std::size_t dit_retires);
+  static bool h3_box_bounded(const SessionContextIntf* session);
+
   // Test-only accessors.
   const std::string& hf_dir()          const noexcept { return _hf_dir; }
   std::uint64_t      latents_emitted() const noexcept { return _emitted; }
   int                latent_frames()   const noexcept;
+  // The RESOLVED Sol-Attn config, after the key-block validation. Test-
+  // only, and the reason it exists: whether a rejected block size falls
+  // back or is silently kept is not visible from config_error(), because
+  // a perf knob spelled wrong warns rather than failing the stage.
+  const genai::sol::Config& sol_config() const noexcept { return _sol; }
+  // The bag itself, which is what a plugin family gets. A test seam like
+  // sol_config() beside it, and the one that can check the two agree.
+  const FlexData& accel_settings() const noexcept { return _accel; }
+  // The model_config beat as the stage holds it now.
+  const FlexData& model_config() const noexcept { return _model_cfg; }
+  // MiniMax-H3's packed sequence as the launch plan books it
+  // (h3_plan_seq_).
+  int planned_h3_rows() const { return h3_plan_seq_(); }
+  // ...and the prompt's rows within it.
+  int planned_h3_text_rows() const
+  {
+    int t = 0;
+    (void)h3_plan_seq_(&t);
+    return t;
+  }
 
 private:
   // Which DiT family the resident checkpoint is, from its `_class_name`
@@ -229,6 +361,46 @@ private:
   // config that predates the split still means what it did.
   std::string   _family = "wan";
   std::string   _hf_dir;
+  // MiniMax-H3 only: a DiT checkpoint in place of the one under _hf_dir
+  // (the text encoder and the VAEs still come from there). See h3_dit_.
+  std::string   _dit_dir;
+  std::string h3_dit_(const std::string& root,
+                      const std::string& partition) const;
+  // The VDN-H3 release root the DiT was BUILT with, or empty for the
+  // stock attention. Latched from the model_config beat like a LoRA
+  // path -- see the `linear_branch` key on `minimax-h3-model-config`,
+  // which is where it is configured. Not a key on this stage: it is a
+  // fact about one family and nothing else here reads it.
+  std::string   _vdn_dir;
+
+  // The branch the CONFIG asks for, straight out of the beat.
+  //
+  // Apart from `_vdn_dir` because they answer different questions at
+  // different times: this one serves declare_resources(), which is
+  // const and runs before any driver, so it reads the folded constant
+  // rather than a value the runtime latch has not set yet.
+  std::string vdn_dir_() const;
+  // The MiniMax-H3 ANE feed-forward tier: the plan's key for its module,
+  // the bytes it books for the planned clip, and carrying the granted tier
+  // onto _h3_cfg. See apply_h3_ane_().
+  std::string ane_claim_label_() const;
+  std::size_t h3_ane_bytes_() const;
+  // MiniMax-H3's packed sequence at the planned geometry (a 512-row
+  // prompt, the two conditioning frames -- none for a refine, and a
+  // refine in context's 768P draft), and the forward's activations
+  // there -- the denoise phase's scratch in both ledgers. `text`: the
+  // prompt's rows within it (the 512, and a presentation's tokens --
+  // an edit's picture, an in-context refine's draft).
+  int h3_plan_seq_(int* text = nullptr) const;
+  std::size_t h3_forward_scratch_bytes_(const std::string& dit) const;
+  // The runtime adapters the model config names, resolved as the load
+  // resolves them -- read off the pre-launch constant, so the plan books
+  // their factors and their scratch before anything loads.
+  std::vector<std::string> h3_plan_lora_files_() const;
+  // The graph refines a clip (init_latent wired): no soundtrack leaves
+  // the stage, and the silence it holds is encoded at the denoise.
+  bool refines_() const;
+  void apply_h3_ane_();
   int           _height = 480;
   int           _width  = 832;
   int           _frames = 81;
@@ -236,26 +408,114 @@ private:
   int           _steps  = 40;
   // LOSSY dynamic-int8 block GEMMs (opt-in; minimax-h3 only)
   bool        _i8_gemm{};
-  std::uint64_t _seed   = 0;
+  bool        _autotune = true;      // kernel tuners measure (kAutotune)
+  int         _i8_tier{};            // i8_gemm_tier: 0 accurate, 1 fast,
+                                     // 2 token, 3 token_plain
+  // Sol-Attn, family-agnostic beside _i8_gemm; see the config docs.
+  genai::sol::Config _sol{};
+  // Leading denoising steps Sol leaves dense (minimax-h3's loop only).
+  int _sol_dense_steps = 0;
+  // `sol_tau_steps`: Sol-Attn's tau per denoising step; empty = sol_tau.
+  std::vector<float> _sol_tau_steps;
+  // VDN's softmax window, in chunks either side (`vdn_range`; -1: the
+  // checkpoint's).
+  int _vdn_range = -1;
+  // `vdn_range_steps`: the reach per denoising step; empty = vdn_range.
+  std::vector<int> _vdn_range_steps;
+  // SageAttention, family-agnostic beside _sol and _i8_gemm. Carried to
+  // plugin families too (VideoModelCreateArgs::sage), because the
+  // families out of tree run the same flash kernel.
+  genai::sage::Config _sage{};
+  // THE SAME THREE, as the open bag a plugin family reads -- one object,
+  // owned here and pointed at by both VideoGenRequest and
+  // VideoModelCreateArgs, so a family that decides at load and one that
+  // decides per forward cannot see different answers.
+  //
+  // It is the bag that is authoritative: the typed members above are
+  // read back out of it after it is filled. See
+  // generative-models/shared/accel-settings.h for why the boundary is a
+  // bag and not fields.
+  FlexData _accel{};
+  // THE SEED. `_seed_base` is what the graph configured; `_seed` is what
+  // THIS clip uses, settled at the top of each generation by
+  // `seed_sequence` (stages/generation-input.h), so every family below
+  // reads `_seed` and none has to know which clip of the run it is.
+  SeedSequence  _seed_seq  = SeedSequence::kIncrement;
+  std::uint64_t _seed_base = 0;
+  std::uint64_t _seed      = 0;
+  // Generations started this run, the one in progress included.
+  std::uint64_t _generation = 0;
   std::uint64_t _emitted = 0;
 
   bool _model_latched     = false;
-  bool _sampler_latched   = false;
-  bool _scheduler_latched = false;
-  bool _cfg_latched       = false;
+
+  // THE GENERATION INPUTS (stages/generation-input.h): one beat and the
+  // end of its stream serves every clip of the run, a stream that keeps
+  // sending is consumed a beat per clip, and the run ends when a
+  // consumed stream does. Each is HELD between clips, which is what lets
+  // a single first-frame picture serve every prompt. The negative
+  // (iport1) is not an input of its own: the conditioner emits it just
+  // before the positive it belongs to, and only for prompts that have
+  // one, so it is read with each fresh conditioning and held with it.
+  GenerationInput _cond_in, _sampler_in, _scheduler_in, _cfg_in;
+  GenerationInput _ref0_in, _ref1_in, _ref_video_in, _ref_audio_in,
+                  _audio_cond_in, _init_in, _guide_in, _guide_audio_in;
+  std::unique_ptr<BeatPayloadIntf> _cond_beat, _neg_beat;
+  std::unique_ptr<BeatPayloadIntf> _ref0_beat, _ref1_beat, _ref_video_beat,
+                                   _ref_audio_beat, _audio_cond_beat,
+                                   _init_beat, _guide_beat,
+                                   _guide_audio_beat;
 
   // The last model-config beat, held UNPARSED. Which family's parser
   // reads it is not known until the checkpoint resolves, and a config
   // beat can arrive before the model does.
   FlexData _model_cfg;
-  // A runtime LoRA for the MiniMax-H3 DiT, off the model_config beat.
-  // Load-time, not per-step: see the LoraSpec note in the transformer.
-  std::string _h3_lora;
-  double      _h3_lora_scale = 1.0;
+  // `tensor_parallel` as configured (null: not split).
+  FlexData _tp_cfg;
+  // The same beat as delivered BEFORE launch (apply_constant), held until
+  // reset_run_state() puts it back: the runtime resets a stage after it
+  // has delivered its constants.
+  FlexData _model_cfg_launch;
+  // The runtime LoRA SLOTS for the MiniMax-H3 DiT, off the model_config
+  // beat, in the order the DiT binds them. Eight (`lora` .. `lora8`,
+  // stages/lora-slots.h), so a few-step Turbo distillation and style or
+  // identity adapters can ride together -- see kMaxLoraSlots in the
+  // transformer. The PATH is load-time; the STRENGTH is not, and each
+  // slot's moves on its own.
+  struct H3LoraSlot {
+    std::string path;
+    double      scale = 1.0;
+    // "auto" | "flat" | "per_head"; empty is auto. LOAD-time like the
+    // path -- the rows are permuted once at bind, not per forward -- and
+    // per SLOT because the row order is a property of the FILE.
+    std::string qkv;
+  };
+  std::vector<H3LoraSlot> _h3_lora;
+  // Config slot -> the DiT's adapter slot, as the load PACKED them (-1:
+  // not loaded). The load drops an empty or unresolvable slot rather than
+  // leaving a hole, so `lora2` named alone is the DiT's slot 0 -- and a
+  // live strength has to go through this, or it lands on an empty slot.
+  std::array<int, lora_slots::kSlots> _h3_lora_model_slot;
+  // The DiT slot holding a TaoMate-H3 adapter (recognised from its
+  // tensors at load), or -1. With `taomate` auto/on in the model config
+  // the clip is made by that method rather than the ordinary denoise.
+  int _h3_taomate_slot = -1;
 
 #ifdef VPIPE_BUILD_APPLE_SILICON
   genai::FlowSamplerSpec   _sampler_spec;
   genai::FlowSchedulerSpec _scheduler_spec;
+  // The sampler port read for MINIMAX-H3, which cannot run the shared
+  // FlowSampler and maps the spec's method onto its own scheduler's
+  // steps (genai::sampler_choice_from_spec). kAuto with nothing wired.
+  genai::SamplerChoice _h3_sampler;
+  // Said once a run: the update was dropped for a flow-map adapter, the
+  // config's sigmas replace the stage's `steps`.
+  bool _h3_sampler_flow_said = false;
+  bool _h3_sigmas_steps_said = false;
+  // The step count a MiniMax-H3 clip runs: its model config's `sigmas`
+  // set it when they are given (one forward a sigma but the last), else
+  // `steps`. Reads `_model_cfg`, so the plan and the run agree.
+  int h3_steps_() const;
 
   // The resident family's per-generation parameters, as ITS model layer
   // defines them. Both are held for the same reason the two DiTs are:
@@ -263,6 +523,28 @@ private:
   // would describe neither.
   genai::MetalWanTransformer::GenerationParams _wan_params;
   genai::MetalMiniMaxH3Transformer::GenerationParams _h3_params;
+  // P-H3-Image (generative-models/minimax-h3/p-h3-image.h): an H3 IMAGE
+  // model -- one latent frame, two discarded audio latents, the
+  // manifest's grid unshifted, no soundtrack out. Set by resolve_config_
+  // from the root's manifest.
+  bool _ph3 = false;
+  genai::ph3::Manifest _ph3_manifest;
+  // MiniMax-H3-Image (generative-models/minimax-h3/minimax-h3-image.h):
+  // its manifest, and the size the picture is RETURNED at (the request's,
+  // or the default) where the canvas it is generated on (_height /
+  // _width) may be larger.
+  bool _h3i = false;
+  genai::h3i::Manifest _h3i_manifest;
+  int _h3i_out_h = 0, _h3i_out_w = 0;
+  // The smallest area generated (minimax-h3-model-config
+  // `min_generation_area`), 0 the model's default.
+  std::int64_t _h3i_min_area = 0;
+  // The canvas from the size returned and `min_generation_area`, into
+  // _height / _width.
+  void h3i_canvas_();
+  // Whether the graph named a canvas (`width` / `height`): P-H3-Image
+  // defaults text-to-image to 2912x2912 and an edit to its picture's.
+  bool _size_set = false;
   // Re-parse `_model_cfg` into the family that is now resident, and
   // reconcile it with what the checkpoint itself says. Called whenever
   // either input changes -- a new config beat, or a model that just
@@ -280,7 +562,41 @@ private:
   // DiTs: the two have different forward signatures (one packed
   // sequence with per-row timesteps against a 4-D latent) and an
   // interface wide enough for both would describe neither.
-  std::unique_ptr<genai::MetalMiniMaxH3Transformer> _h3_dit;
+  // Shared, so it may be handed to the manager's WARM HOLD as the stage
+  // ends (keep_loaded) and taken back by the next graph's.
+  std::shared_ptr<genai::MetalMiniMaxH3Transformer> _h3_dit;
+  // `keep_loaded`: seconds the DiT stays built after this stage lets it
+  // go (a clip's end, the graph's), where the box has room for it --
+  // GenerativeModelManager::keep_model_warm. The key names what built it;
+  // `_h3_may_keep` whether this build may be kept at all (the box not
+  // tight -- its blocks not streamed for want of room -- and no VDN
+  // branch, TaoMate or H3-Image heads riding on it).
+  double      _keep_loaded = 0.0;
+  std::string _h3_warm_key;
+  bool        _h3_may_keep = false;
+  // Kept warm now, if there was room: the DiT then is the manager's.
+  bool keep_h3_warm_();
+  // What a RANK holds (`tensor_parallel`; 0 when not split), as the
+  // transformer books it (tp_held_bytes): at the int8 tier this stage
+  // loads with, the bake's tables for four rows a step of the most steps
+  // the clip can run (its adapters' grids and contracts included). With
+  // `hold_w4`, a w4 pack's shares in the int8 layout (Config::
+  // i8_hold_w4), else as their pack -- the load asks both to weigh the
+  // layout's growth on this rank's share. Every block kept; `floor`, the
+  // rank streaming at the least (tp_held_bytes).
+  std::size_t h3_tp_held_bytes_(const std::string& dit,
+                                bool hold_w4 = false,
+                                std::size_t* floor = nullptr) const;
+  // A rank's share against `c`'s widths -- inactive when not split --
+  // for its adapters' cut (lora_footprint).
+  genai::TpShare h3_tp_share_(
+      const genai::MetalMiniMaxH3Transformer::Config& c) const;
+  // The directory the hold is filed under: the one this stage declares to
+  // the planner, so the next launch claiming it keeps the hold.
+  const std::string& h3_warm_dir_() const
+  {
+    return _dit_dir_declared_.empty() ? _h3_dit_dir_ : _dit_dir_declared_;
+  }
   genai::MetalMiniMaxH3Transformer::Config _h3_cfg;
 
   // A family contributed by a PLUGIN, from genai::VideoModelRegistry.
@@ -297,6 +613,31 @@ private:
   // beat goes down unread in the request. See video-model-registry.h.
   genai::VideoModelFamily*              _plugin_family = nullptr;
   std::unique_ptr<genai::VideoGenerator> _plugin_gen;
+  // Corrects this stage's plan holding from _plugin_gen->resident_bytes(),
+  // after load and after every clip; `when` is for the log line. The
+  // floor it fixed at load (0 until then), and the preload it last
+  // revised the plan to, so a clip that moved nothing does not replan.
+  void correct_plugin_holding_(const char* when);
+  std::size_t _plugin_load_floor_ = 0;
+  // The int8 layout's growth a PRELOADED H3 holds beside its files when
+  // its w4 projections' layout is held (Config::i8_hold_w4); 0 when it
+  // converts per projection or streams. Set at load, read by
+  // declare_memory().
+  std::size_t _h3_i8_hold_growth_ = 0;
+  // A RANK's (`tensor_parallel`) growth when it holds them: its share's
+  // (h3_tp_held_bytes_ with the layout and without), beside the share.
+  // Apart from the unsplit figure, so neither reads the other's at a
+  // later launch's plan. Set at load, read by declare_resources() and
+  // declare_memory().
+  std::size_t _h3_tp_hold_growth_ = 0;
+  // The STREAMED H3 DiT's holding as residency grows it, corrected in
+  // both ledgers after every clip (correct_h3_holding_): the set sees only
+  // the cached trunk, and the promoted blocks are the model's own buffers.
+  std::string _h3_dit_dir_;
+  std::size_t _h3_load_floor_ = 0;
+  std::size_t _h3_revised_ = 0;
+  void correct_h3_holding_();
+  std::size_t _plugin_revised_    = 0;
   // The plugin branch of process(), mirroring run_h3_: builds the
   // request from the beats already read and publishes what came back.
   // False means the family warned and produced nothing.
@@ -316,6 +657,22 @@ private:
   ResolvedModel _resolved;
   bool _have_cfg    = false;
   bool _two_experts = false;
+  // Said ONCE: a keyframe anchor wired alongside references. A
+  // continuous graph makes one clip per beat, and the wiring cannot
+  // change between them, so repeating it per request would bury every
+  // other line.
+  bool _kf_on_ref2va_said = false;
+  // Said ONCE, for the same reason: references running on the FL2VA
+  // partition (upstream's Ref2VA-like mode), and a non-image reference
+  // inside one.
+  bool _ref2va_like_said = false;
+  bool _ref2va_like_media_said = false;
+  // Said ONCE: a prompt-only Ref2VA request (an explicitly empty list).
+  bool _ref2va_prompt_only_said = false;
+  // Said-once guard for the memory-gate arithmetic (allowance, supply,
+  // margin). A denoise consults the gate on every block, and the figures
+  // are a property of the box rather than of the forward.
+  bool _swap_room_said = false;
   std::string _root;
 
   // Load expert `which`, dropping whichever is resident first. The drop
@@ -348,6 +705,17 @@ private:
   // this is read from the packaging -- see
   // MetalMiniMaxH3Transformer::partition_of.
   std::string _h3_partition;
+  // A PRUNED DiT's released timestep MLP: `root`'s own DiT for the
+  // partition, when it carries one (Config::time_mlp_dir); "" else.
+  std::string h3_time_mlp_dir_(
+      const std::string& root, const std::string& partition,
+      const genai::MetalMiniMaxH3Transformer::Config& dit) const;
+
+  // The per-row modality tags a KEYFRAME presentation's conditioning
+  // carries (diffusion-conditioner showed Qwen3-VL the keyframes, whose
+  // vision rows MiniMax-H3 tags video), read per beat; empty for a
+  // prompt alone, which is text throughout.
+  std::vector<int> _h3_cond_tags;
 
   // The `ref2va` conditioning that arrives beside the prompt embeds,
   // from a `video-ref-encoder`. It is one request split over three
@@ -356,6 +724,11 @@ private:
   // are megabytes, and every reference is encoded at a resolution of
   // its own, so rows are the only shape they share).
   struct H3References {
+    // The sideband carried a `references` ARRAY -- which an empty one
+    // does too. That is Ref2VA's prompt-only form, and it is what tells
+    // a video-ref-encoder that was asked for no references apart from a
+    // conditioning that never came from one.
+    bool said = false;
     std::vector<genai::minimax_h3::Reference> refs;
     // Borrowed from the beats, which outlive the forward.
     const float* video_rows   = nullptr;
@@ -367,6 +740,9 @@ private:
     // reads this, so it cannot be assumed uniform the way a text-only
     // prompt's can.
     std::vector<int> text_tags;
+    // Per reference, the posterior's draws off the request's generator
+    // (cond_sideband::kPosteriorDraws), 0 where none was said.
+    std::vector<std::int64_t> posterior_draws;
   };
   // The minimax-h3 branch of process(): builds the packed layout, runs
   // genai::denoise, and unpatchifies both modalities back to latents.
@@ -382,32 +758,119 @@ private:
   // refusing beats proceeding on a 16 GB box.
   // The idle-unload decision, made after the load so it can use the
   // streaming verdict. See the note on its definition.
-  void resolve_unload_policy_h3_(bool streamed);
-  bool preflight_h3_scratch_(int seq, int text_rows);
+  void resolve_unload_policy_h3_(bool tight);
+  // A RANK of a split DiT (`tensor_parallel`): the channel for ONE
+  // generation, from the transport the config names (tensor-parallel.h:
+  // opened as a clip's denoise starts, let go when it ends). Null, with
+  // `err`, when there is no such transport or it refuses (or throws).
+  std::shared_ptr<genai::TpChannel> open_tp_channel_(std::string* err);
+  // `L` and the PATCH grid are here because the VDN branch's scratch is
+  // sized by the video geometry rather than by the packed sequence, and
+  // it is the half of the forward's memory that used to go unplanned.
+  bool preflight_h3_scratch_(int seq, int text_rows,
+                             const genai::minimax_h3::PackedLayout& L,
+                             int grid_h,
+                             int grid_w,
+                             std::size_t pageable = 0);
   // `r2v` is the `ref2va` request when there is one; null is the
   // `t2va` / `fl2va` path, where `ref` carries the keyframe anchors
   // instead. The two are mutually exclusive by construction -- they are
   // different checkpoints.
   // Read a `ref2va` plan off the conditioning beat's sideband and pair
-  // it with the two reference-row beats. Leaves `out->refs` empty (and
-  // returns true) when the conditioning carries no references at all --
-  // that is a `t2va` / `fl2va` request, not a malformed one. False only
-  // on a plan that IS present and does not add up, after warning.
+  // it with the two reference-row beats. Leaves `out->said` false (and
+  // returns true) when the conditioning carries no `references` at all
+  // -- that is a `t2va` / `fl2va` request, not a malformed one. An
+  // EMPTY array sets `said` with no refs: the prompt-only form. False
+  // only on a plan that IS present and does not add up, after warning.
   bool parse_h3_references_(const FlexData& sideband,
                             const class TensorBeatPayload* video_rows,
                             const class TensorBeatPayload* audio_rows,
                             H3References* out) const;
 
+  // A REFINE request (iport11, Open-H3-Regenerate-2K): the clip to put
+  // back to `sigmas[0]` and denoise again, [z, T, lh, lw] whitened, the
+  // frame count its latents stand for, the soundtrack it is conditioned
+  // on (encoded silence, held clean) and the sigmas as run.
+  struct H3Refine {
+    const float* latent = nullptr;
+    int lt = 0, lh = 0, lw = 0;
+    int frames = 0;                  // aligned pixel frames (17n + 5)
+    std::vector<float>  audio_rows;  // [2 * alat, 32], DiT space
+    std::vector<double> sigmas;
+  };
+  // A GUIDE (iport12 / iport13): latent frames and their soundtrack,
+  // pinned from pixel frame `frame` of the clip (minimax_h3::Guide).
+  // Borrowed from the beats. `video` f32 [z, frames, lh, lw]; `audio`
+  // f32 [2, channels, audio_stride] of which the first `audio_latents`
+  // are read -- the beat cut where the generated soundtrack ends.
+  struct H3Guide {
+    int frame = 0;
+    const float* video = nullptr;
+    int frames = 0;
+    const float* audio = nullptr;
+    int audio_latents = 0;
+    int audio_stride  = 0;
+  };
+  // Read the guide beats against this clip: `frame` resolved (negative
+  // from the end), the latent's geometry checked, the audio cut to the
+  // soundtrack. False when there is no usable guide, after warning for
+  // one that is malformed.
+  bool parse_h3_guide_(const class TensorBeatPayload* video,
+                       const class TensorBeatPayload* audio,
+                       H3Guide* out);
+  // `ref_last_only`: `ref` holds a LAST-frame anchor alone (l2va).
   bool run_h3_(const void* cond, int text_rows, const float* ref,
-               int ref_frames, const H3References* r2v,
+               int ref_frames, bool ref_last_only, const H3References* r2v,
                std::vector<float>* video_out, std::vector<int>* video_shape,
-               std::vector<float>* audio_out, std::vector<int>* audio_shape);
+               std::vector<float>* audio_out, std::vector<int>* audio_shape,
+               const H3Refine* refine = nullptr,
+               const H3Guide* guide = nullptr);
+  bool _guide_ignored_said = false;
+  // The soundtrack a refine is conditioned on: `frames` frames of
+  // silence at `fps` through the checkpoint's audio VAE (its posterior
+  // mean), whitened into DiT rows -- what the release's encode_silence
+  // makes. Cached per length; the VAE is loaded for it and let go.
+  bool h3_silence_rows_(int frames, double fps, std::vector<float>* rows,
+                        int* alat);
+  bool _refine_ref2va_said = false, _refine_audio_said = false;
+  bool _refine_in_context_said = false;
+  std::vector<float> _h3_silence;
+  int    _h3_silence_frames = 0;
+  double _h3_silence_fps    = 0.0;
+  int    _h3_silence_alat   = 0;
+
+  // TaoMate-H3's streaming method (generative-models/minimax-h3/
+  // minimax-h3-taomate.h): the base model's soundtrack, then the
+  // adapter's video in chunks against a clean-K/V cache, in whole
+  // 5-second requests. The same outputs as run_h3_.
+  bool run_h3_taomate_(const void* cond, int text_rows, int slot,
+                       std::vector<float>* video_out,
+                       std::vector<int>* video_shape,
+                       std::vector<float>* audio_out,
+                       std::vector<int>* audio_shape);
+  // The slot to run TaoMate with this beat, from the config's `taomate`
+  // key and the slot found at load; -1 for the ordinary denoise.
+  int taomate_slot_() const;
+
+  // The live-preview renderer (oport2). Built on the first model_config
+  // latch and kept, so its TAE survives from clip to clip; its keys are
+  // read from the same beat as the family's own.
+  std::unique_ptr<LatentPreviewer> _preview;
+  // Said once: a plugin family handed back a preview_x0 of the wrong
+  // shape. Per clip it would bury everything else.
+  bool _preview_shape_said = false;
+  // The TAE the folded model_config names, for the plan: its weights and
+  // its decode scratch, booked like every other model this stage holds.
+  std::vector<ResourceClaim> preview_claims_(int w, int h,
+                                             int frames) const;
 
   model_memory::UnloadPolicy _unload_cfg = model_memory::UnloadPolicy::kAuto;
   // What decide_resources() named in its phase claim. Mutable because
   // that method is const by the Stage contract and this is a note to
   // self, not state the plan reads back.
   mutable std::string _dit_dir_declared_;
+  // The adapter files decide_resources() phased with it.
+  mutable std::vector<std::string> _lora_files_declared_;
   bool _unload_idle     = false;
   bool _unload_resolved = false;
 #endif

@@ -93,6 +93,22 @@ make_tensor_(int H, int W, float v = 0.5f)
   return tb;
 }
 
+// RGBA, with a uniform alpha. Neither the still PNG nor H.264 carries
+// alpha, so the stage composites it over a checkerboard.
+TensorBeat
+make_tensor_rgba_(int H, int W, float v, float a)
+{
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::F32;
+  tb.shape = {4, H, W};
+  tb.resize_contiguous(static_cast<size_t>(4) * H * W);
+  float* p = tb.as_f32();
+  const size_t plane = static_cast<size_t>(H) * W;
+  for (size_t i = 0; i < 3 * plane; ++i) { p[i] = v; }
+  for (size_t i = 0; i < plane; ++i) { p[3 * plane + i] = a; }
+  return tb;
+}
+
 // A video-type frame: carries an fps sideband (as video-to-rgb tags its
 // output). The preview stage treats such a source as video, never image.
 TensorBeat
@@ -467,3 +483,112 @@ TEST(preview_stage, video_plus_audio)
 }
 
 #endif  // __APPLE__ && __arm64__
+
+// ---- RGBA ------------------------------------------------------------
+//
+// An RGBA still reaches the preview. Neither of the two things the
+// stage can send carries alpha -- a PNG still could, but the H.264
+// fragments cannot, and one flattening keeps the two consistent -- so
+// the beat is composited over a checkerboard before either sees it.
+//
+// A four-channel beat used to be dropped by the shape test in
+// process(), which showed up as a preview that stayed black forever
+// while the generation it was watching completed normally.
+TEST(preview_stage, rgba_still_is_accepted_and_flattened)
+{
+  Session sess;
+
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  // Half transparent, so the composite has something to do.
+  src_u->tb    = make_tensor_rgba_(240, 320, 0.5f, 0.5f);
+  src_u->count = 1;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatSource*>(pl->insert_stage(std::move(src_u)));
+
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  Collected c = run_preview_(sess, *pl, pv, 2500);
+  EXPECT_TRUE(c.cfg_video);
+  EXPECT_TRUE(c.init >= 1);
+  // THE FRAME WAS TAKEN. Dropped, the stage would never adopt a
+  // resolution and would still be sending its pre-input black.
+  EXPECT_TRUE(pv->output_width() == 320);
+  EXPECT_TRUE(pv->output_height() == 240);
+  EXPECT_TRUE(c.image >= 1);
+  EXPECT_TRUE(c.last_image.size() > 8);
+  if (c.last_image.size() > 8) {
+    EXPECT_TRUE(c.last_image[0] == 0x89 && c.last_image[1] == 'P'
+                && c.last_image[2] == 'N' && c.last_image[3] == 'G');
+  }
+}
+
+namespace {
+
+// A [F, 3, H, W] U8 clip whose frames differ, so a player stuck on one
+// frame and a player that loops are distinguishable downstream.
+TensorBeat
+make_clip_(int F, int H, int W, int fps)
+{
+  TensorBeat tb;
+  tb.dtype = TensorBeat::DType::U8;
+  tb.shape = {F, 3, H, W};
+  tb.resize_contiguous(static_cast<size_t>(F) * 3 * H * W);
+  uint8_t* p = tb.as_u8();
+  for (int f = 0; f < F; ++f) {
+    std::memset(p + static_cast<size_t>(f) * 3 * H * W,
+                static_cast<int>(40 + 40 * f), static_cast<size_t>(3) * H * W);
+  }
+  FlexData sb = FlexData::make_object();
+  sb.as_object().insert("fps_num", FlexData::make_uint(fps));
+  sb.as_object().insert("fps_den", FlexData::make_uint(1));
+  sb.as_object().insert("frames", FlexData::make_int(F));
+  tb.sideband = std::move(sb);
+  return tb;
+}
+
+}  // namespace
+
+// A rank-4 beat is a CLIP: held, played at its own rate from frame 0, and
+// looped -- one beat, many frames out. A denoise preview arrives this way
+// (one clip per rendered step) and would otherwise show only its last
+// frame, the way a burst of frames is sampled.
+TEST(preview_stage, a_clip_is_looped_at_its_fps)
+{
+  Session sess;
+  auto pl = make_unique<Pipeline>("p", &sess);
+  auto src_u = make_unique<RepeatSource>(
+      &sess, "src", vector<InEdge>{}, FlexData::make_object());
+  src_u->tb    = make_clip_(4, 96, 128, 10);
+  src_u->count = 1;
+  src_u->allocate_oports(1);
+  auto* src = static_cast<RepeatSource*>(pl->insert_stage(std::move(src_u)));
+  auto pv_u = make_unique<PreviewStage>(
+      &sess, "pv", vector<InEdge>{{src, 0}}, FlexData::make_object());
+  auto* pv = static_cast<PreviewStage*>(pl->insert_stage(std::move(pv_u)));
+
+  Collected c = run_preview_(sess, *pl, pv, 1500);
+  EXPECT_TRUE(pv->clips_in() == 1);
+  EXPECT_TRUE(pv->clip_frames() == 4);
+  EXPECT_TRUE(pv->cadence_fps() == 10);
+  // Played as video however slowly it arrived: a clip is never a still.
+  EXPECT_TRUE(!pv->image_mode_active());
+  EXPECT_TRUE(c.image == 0);
+  EXPECT_TRUE(c.fragment >= 2);
+  EXPECT_TRUE(pv->output_width() == 128);
+  EXPECT_TRUE(pv->output_height() == 96);
+}
+
+// The port's tag set takes both shapes, so generate-video's preview
+// (rgb-clip) and vae-decode's frames (rgb-frames) both wire to it.
+TEST(preview_stage, the_frames_port_accepts_a_clip)
+{
+  Session sess;
+  PreviewStage pv(&sess, "pv", {}, FlexData::make_object());
+  const auto& in = pv.spec().iports[0];
+  EXPECT_TRUE(port_tags_compatible("rgb-clip", in.tags));
+  EXPECT_TRUE(port_tags_compatible("rgb-frames", in.tags));
+}

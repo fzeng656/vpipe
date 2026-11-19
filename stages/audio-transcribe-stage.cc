@@ -119,6 +119,11 @@ AudioTranscribeStage::AudioTranscribeStage(
 }
 
 namespace {
+// The compute precisions the LM loader accepts, for the editor's
+// dropdown; the loader stays the authority.
+constexpr SpecExtra kComputeDtypeChoices[] = {
+  {spec_key::kChoices, "bf16,f16,f32"},
+};
 constexpr ConfigKey kAttrs[] = {
   {.key = "hf_dir", .type = ConfigType::String, .required = true,
    .doc = "ASR-LM model: a models-DB key (the huggingface.co path "
@@ -126,7 +131,8 @@ constexpr ConfigKey kAttrs[] = {
           "wins over a same-named path.",
    .suggest_db = kModelRegistryDb},
   {.key = "compute_dtype", .type = ConfigType::String,
-   .doc = "bf16 | f16 | f32", .def_str = "f16"},
+   .doc = "bf16 | f16 | f32", .def_str = "f16",
+   .extra = kComputeDtypeChoices},
   {.key = "page_tokens", .type = ConfigType::Int,
    .doc = "ContextManager K/V page size", .def_int = 512},
   {.key = "max_pages", .type = ConfigType::Int,
@@ -800,7 +806,7 @@ AudioTranscribeStage::slice_and_transcribe_(std::uint64_t start_us,
     session()->warn(fmt(
         "AudioTranscribeStage('{}'): segment marker arrived before any "
         "timestamped PCM beat; cannot slice -- check that audio-to-pcm "
-        "is emitting sideband.timestamp_us"));
+        "is emitting sideband.timestamp_us", this->id()));
     return false;
   }
   const std::uint64_t buf_end_us =

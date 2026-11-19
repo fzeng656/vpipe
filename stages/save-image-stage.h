@@ -1,9 +1,11 @@
 #ifndef VPIPE_STAGES_SAVE_IMAGE_STAGE_H
 #define VPIPE_STAGES_SAVE_IMAGE_STAGE_H
 
+#include "apple-silicon/tensor-beat.h"
 #include "common/job.h"
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
+#include "stages/output-path.h"
 
 #include <cstdint>
 #include <span>
@@ -18,19 +20,27 @@ class BeatPayloadIntf;
 // Save-image sink: writes each planar U8 RGB TensorBeat [3, H, W]
 // (channel order R, G, B, 0..255 -- the format load-image / vae-decode
 // emit) to an image file via FFmpeg's still-image encoders. The inverse
-// of load-image.
+// of load-image. On Apple, ImageIO writes what FFmpeg would where FFmpeg
+// cannot be loaded -- every format but WebP -- so an application that
+// ships no FFmpeg still saves its pictures (VPIPE_NO_FFMPEG=1 makes a
+// process behave so).
 //
 //   iport0  TensorBeatPayload, U8 [3, H, W] planar RGB. Non-matching
 //           beats are warned + dropped. EOS ends the stage.
 //   (no oports -- it is a sink.)
 //
 // Config (FlexData object on the 4th constructor parameter):
-//   path        (string, required) -- output file path. May contain a
-//                 printf integer conversion (e.g. "out/frame-%04d.png"):
-//                 it is formatted with the 0-based beat index so a stream
-//                 of images lands in distinct files. Without a conversion
-//                 the first image writes to `path` verbatim and each later
-//                 image gets a "-NNNNNN" suffix before the extension.
+//   path        (string, required) -- output file path, a template: see
+//                 stages/output-path.h. A printf integer conversion
+//                 ("out/frame-%04d.png") takes the 0-based index, "%t"
+//                 takes the local time, and without a conversion the
+//                 first image writes `path` verbatim while each later
+//                 one gets a "-NNNNNN" suffix before the extension.
+//   no_overwrite (bool, default false) -- never write over a file that
+//                 is already there: the sequence number starts past
+//                 every name on disk instead of at 0. Off by default
+//                 because the usual graph WANTS the same name rewritten
+//                 -- it is the file somebody has open in a viewer.
 //   format      (string, default from the path extension, else "png") --
 //                 png | jpeg (jpg) | webp | bmp | tiff.
 //   quality     (int, default 90) -- lossy codecs (jpeg, lossy webp),
@@ -68,10 +78,6 @@ private:
   bool encode_(const BeatPayloadIntf& beat, const std::string& out_path,
                std::span<const std::uint8_t> exif_tiff = {});
 
-  // Materialise the output path for the `index`-th beat (printf token or
-  // suffix rule -- see the class doc).
-  std::string resolve_path_(std::uint64_t index) const;
-
   std::string av_err_(int rc) const;
 
   std::string _path;
@@ -80,8 +86,30 @@ private:
   int         _compression = 6;
   bool        _lossless    = false;
 
+  bool            _no_overwrite = false;
+  outpath::Tokens _tok;         // which template tokens `path` carries
+  // Who ran the graph ("ExampleApp 1.0"): written ahead of vpipe's own
+  // line in EXIF Software, which then goes in brackets.
+  std::string     _software_host;
+  // 8 or 16 bits per component for png / tiff; 0 = from the picture
+  // (16 for F16, 8 for U8). 16 bits, OpenEXR and F16 pictures are
+  // encoded by ImageIO (Apple), with the colour the picture is tagged.
+  int             _bit_depth = 0;
+
+  // The ImageIO path: a picture as deep as it is, its colour embedded.
+  bool encode_apple_(const TensorBeat& pic,
+                     std::vector<std::uint8_t>* bytes);
+  // Whether this stage can write its format here: with FFmpeg, or with
+  // ImageIO where FFmpeg cannot be loaded (Apple, every format but WebP).
+  bool can_write_() const noexcept;
+  bool write_file_(const std::vector<std::uint8_t>& bytes,
+                   const std::string& out_path);
+
+  // Null where FFmpeg cannot be loaded (ffmpeg_if_present_).
   const FFmpegLibraries* _libs = nullptr;
-  std::uint64_t          _seen    = 0;   // beats consumed (index source)
+  // The filename index lives in the picker now (it was `_seen`), so the
+  // numbering rule and the no-overwrite scan cannot drift apart.
+  outpath::SeqPicker     _seq;
   std::uint64_t          _written = 0;   // files successfully written
 };
 

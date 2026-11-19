@@ -75,6 +75,54 @@ make_wav_()
   return out;
 }
 
+// A 0.25 s, 8 kHz, s16 WAV of `channels` channels, a 440 Hz sine at
+// ~0.5 in every one. `mask` non-zero writes WAVE_FORMAT_EXTENSIBLE with
+// that speaker mask (a NATIVE layout); zero, plain PCM, whose layout
+// past two channels FFmpeg leaves unnamed.
+vector<uint8_t>
+make_wav_channels_(int channels, uint32_t mask)
+{
+  constexpr int kRate = 8000, kFrames = kRate / 4;
+  const uint32_t data_len = (uint32_t)kFrames * channels * 2;
+  const uint32_t fmt_len = mask != 0 ? 40 : 16;
+  vector<uint8_t> out;
+  auto u32 = [&](uint32_t v) {
+    for (int i = 0; i < 4; ++i) {
+      out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xff));
+    }
+  };
+  auto u16 = [&](uint16_t v) {
+    out.push_back(static_cast<uint8_t>(v & 0xff));
+    out.push_back(static_cast<uint8_t>(v >> 8));
+  };
+  auto tag = [&](const char* t) { out.insert(out.end(), t, t + 4); };
+  tag("RIFF"); u32(4 + (8 + fmt_len) + (8 + data_len)); tag("WAVE");
+  tag("fmt "); u32(fmt_len);
+  u16(mask != 0 ? 0xFFFE : 1);
+  u16((uint16_t)channels);
+  u32(kRate);
+  u32((uint32_t)kRate * channels * 2);
+  u16((uint16_t)(channels * 2));
+  u16(16);
+  if (mask != 0) {
+    u16(22);                    // cbSize
+    u16(16);                    // valid bits
+    u32(mask);
+    // KSDATAFORMAT_SUBTYPE_PCM
+    u32(0x00000001); u16(0x0000); u16(0x0010);
+    const uint8_t tail[8] = {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71};
+    out.insert(out.end(), tail, tail + 8);
+  }
+  tag("data"); u32(data_len);
+  for (int i = 0; i < kFrames; ++i) {
+    const double v = 0.5 * std::sin(2.0 * M_PI * 440.0 * i / kRate);
+    for (int c = 0; c < channels; ++c) {
+      u16(static_cast<uint16_t>(static_cast<int16_t>(v * 32767.0)));
+    }
+  }
+  return out;
+}
+
 }
 
 TEST(media_decode, image_bytes_to_planar_rgb) {
@@ -265,6 +313,82 @@ TEST(media_decode, audio_bytes_to_planar_stereo) {
               er / static_cast<double>(n));
 }
 
+// resample_pcm is for the waveform that did NOT come through a decoder
+// -- one that arrived on a port at its producer's rate -- and the thing
+// it has to get right is the thing a length check cannot see: the PITCH.
+// Reinterpreting 44.1 kHz samples as 32 kHz produces a buffer of exactly
+// the right shape carrying a tone a fourth too high, which is what a
+// reference soundtrack fed to MiniMax-H3's 32 kHz audio VAE without this
+// was doing. So the assertion is the frequency, counted from zero
+// crossings, and not merely the sample count.
+TEST(media_decode, resample_pcm_keeps_the_pitch_and_the_planes) {
+  Session s;
+  const FFmpegLibraries* libs = nullptr;
+  try {
+    libs = s.ffmpeg_libraries();
+  } catch (...) {
+    return;   // no FFmpeg on this box -- skip vacuously
+  }
+  if (!libs || !libs->valid()) { return; }
+
+  // One second at 44100: LEFT a 440 Hz sine, RIGHT a 220 Hz one. Two
+  // different tones so a swapped or duplicated plane is a failure and
+  // not a coincidence.
+  constexpr int kIn = 44100, kOut = 32000, kN = 44100;
+  vector<float> pcm(2 * kN);
+  for (int i = 0; i < kN; ++i) {
+    pcm[i]      = 0.5f * (float)std::sin(2.0 * M_PI * 440.0 * i / kIn);
+    pcm[kN + i] = 0.5f * (float)std::sin(2.0 * M_PI * 220.0 * i / kIn);
+  }
+  // Zero crossings per second == 2x the frequency of a pure tone.
+  auto hz = [](const float* p, int n, int rate) {
+    int cross = 0;
+    for (int i = 1; i < n; ++i) {
+      if ((p[i - 1] < 0.0f) != (p[i] < 0.0f)) { ++cross; }
+    }
+    return 0.5 * (double)cross * (double)rate / (double)n;
+  };
+  EXPECT_TRUE(std::fabs(hz(pcm.data(), kN, kIn) - 440.0) < 2.0);
+
+  vector<float> out;
+  int got = 0;
+  string err;
+  ASSERT_TRUE(resample_pcm(libs, pcm.data(), 2, kN, kIn, kOut, 2, &out,
+                           &got, &err));
+  // The length follows the RATIO, within the filter's edge slack.
+  EXPECT_TRUE(got > 31900 && got < 32100);
+  EXPECT_TRUE(out.size() == (size_t)2 * (size_t)got);
+  // ...and so does the pitch, which is the part that was wrong. Reading
+  // these samples at 32 kHz has to give 440 and 220 again; had they been
+  // reinterpreted rather than resampled it would read 606 and 303.
+  const double l = hz(out.data(), got, kOut);
+  const double r = hz(out.data() + got, got, kOut);
+  EXPECT_TRUE(std::fabs(l - 440.0) < 4.0);
+  EXPECT_TRUE(std::fabs(r - 220.0) < 4.0);
+  // Planar out, planar in: the two tones stayed in their own halves.
+  EXPECT_TRUE(std::fabs(l - r) > 100.0);
+
+  // Upsampling is the same call in the other direction.
+  vector<float> up;
+  int upn = 0;
+  ASSERT_TRUE(resample_pcm(libs, pcm.data(), 2, kN, kIn, 48000, 2, &up,
+                           &upn, &err));
+  EXPECT_TRUE(upn > 47800 && upn < 48200);
+  EXPECT_TRUE(std::fabs(hz(up.data(), upn, 48000) - 440.0) < 4.0);
+
+  // Mono in, mono out -- the plane arithmetic must not read past the
+  // single plane it was given.
+  vector<float> mono;
+  int mn = 0;
+  ASSERT_TRUE(resample_pcm(libs, pcm.data(), 1, kN, kIn, kOut, 1, &mono,
+                           &mn, &err));
+  EXPECT_TRUE(mono.size() == (size_t)mn);
+  EXPECT_TRUE(std::fabs(hz(mono.data(), mn, kOut) - 440.0) < 4.0);
+
+  std::printf("[media_decode] resample 44100->32000: %d samples, "
+              "L %.1f Hz, R %.1f Hz\n", got, l, r);
+}
+
 TEST(media_decode, video_file_frames_rate_and_bound) {
   Session s;
   const FFmpegLibraries* libs = nullptr;
@@ -306,6 +430,11 @@ TEST(media_decode, video_file_frames_rate_and_bound) {
   ASSERT_TRUE(cut.has_value());
   EXPECT_TRUE(cut->num_frames <= 5);
   EXPECT_TRUE(cut->num_frames >= 3);
+  // Which of the two stopped at a cap rather than at the stream's end --
+  // what tells a caller its soundtrack (decoded whole) may run past the
+  // last frame.
+  EXPECT_FALSE(v->cut_short);
+  EXPECT_TRUE(cut->cut_short);
   std::printf("[media_decode] y4m: %d frames at %.2f fps %dx%d; a 0.125 s "
               "bound reads %d\n", v->num_frames, v->fps, v->width, v->height,
               cut->num_frames);
@@ -372,4 +501,48 @@ TEST(media_decode, probe_classifies_by_content) {
   EXPECT_TRUE(media_kind_name(MediaKind::Video) == "video");
   EXPECT_TRUE(media_kind_name(MediaKind::Audio) == "audio");
   EXPECT_TRUE(media_kind_name(MediaKind::Unknown) == "unknown");
+}
+
+// A source of more than two channels decodes, downmixed to what was
+// asked. The input layout used to be MONO with its count overwritten --
+// a NATIVE layout naming one channel -- which swr_alloc_set_opts2
+// refused (rc -22, "ichl channel layout is invalid"), so no 5.1 or 3.0
+// file decoded at all. Three sources: 6 channels with no speaker mask
+// (an UNSPEC layout), 6 with the 5.1 mask (the frame's own NATIVE
+// layout is taken), and 3 with no mask.
+TEST(media_decode, a_source_of_more_than_two_channels_decodes) {
+  Session s;
+  const FFmpegLibraries* libs = nullptr;
+  try {
+    libs = s.ffmpeg_libraries();
+  } catch (...) {
+    return;
+  }
+  if (!libs || !libs->valid()) {
+    return;
+  }
+  struct Case { int channels; uint32_t mask; };
+  for (const Case c : {Case{6, 0}, Case{6, 0x3F}, Case{3, 0}}) {
+    const auto wav = make_wav_channels_(c.channels, c.mask);
+    for (const int out_ch : {2, 1}) {
+      string err;
+      auto au = decode_audio_bytes(
+          libs, span<const uint8_t>(wav.data(), wav.size()), 16000, &err,
+          out_ch);
+      if (!au) { printf("[media_decode] %s\n", err.c_str()); }
+      ASSERT_TRUE(au.has_value());
+      if (!au) { continue; }
+      EXPECT_TRUE(au->channels == out_ch && au->sample_rate == 16000);
+      // 0.25 s at 16 kHz = 4000 frames a channel, planar.
+      const size_t n = au->pcm.size() / (size_t)out_ch;
+      EXPECT_TRUE(n > 3900 && n < 4100);
+      double sq = 0.0;
+      for (float v : au->pcm) { sq += (double)v * v; }
+      const double rms = std::sqrt(sq / (double)max<size_t>(1,
+                                                            au->pcm.size()));
+      printf("[media_decode] %d ch (mask 0x%X) -> %d ch: %zu frames, rms "
+             "%.3f\n", c.channels, (unsigned)c.mask, out_ch, n, rms);
+      EXPECT_TRUE(rms > 0.05);
+    }
+  }
 }

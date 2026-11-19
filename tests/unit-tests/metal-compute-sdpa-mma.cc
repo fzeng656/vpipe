@@ -11,13 +11,16 @@
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
 #include "common/session.h"
+#include "generative-models/shared/kernel-sets/prefill-gqa-attn-set.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace vpipe;
@@ -525,9 +528,10 @@ TEST(sdpa_mma, full_mma2_vae_tile_sweep) {
 // despite the shared name prefix: [n, Hq*D] INTERLEAVED layout (no q/k/v/o
 // transposes), BQ=32, one extra constant (q_offset at 10, kv_stride at 11), and
 // the caller pads q/k/v by BQ rows because the last K/V block is matmul-read
-// before it is masked. It carries the bf16 vision tower's attention (Mage-Flow
-// and Boogu cast their whole text encoder, and the steel/NAX flash kernels are
-// f16-only, so this is the DEFAULT there) and is opt-in in f16.
+// before it is masked. It carries the bf16 vision tower's attention (Boogu and
+// other wrapped checkpoints cast their whole text encoder, and the steel/NAX
+// flash kernels are f16-only, so this is the DEFAULT there) and is opt-in in
+// f16.
 TEST(sdpa_mma, full_mma2_d64_vit_matches_oracle) {
   Session sess;
   auto* mc = get_mc_(sess);
@@ -1140,6 +1144,590 @@ TEST(sdpa_mma, qwen_paged_flash_d256) {
                 cf.tag, n, n_pages, rel, ms_f, ms_q,
                 ms_q > 0 ? ms_q / ms_f : 0.0);
     EXPECT_TRUE(rel < 5e-2);
+  }
+}
+
+// Qwen3.5 full-attention PREFILL (16 q / 4 kv heads, head_dim 256, f16,
+// causal, fresh) -- our production kernels against MLX #3842's head-dim SPLIT
+// NAX attention and the plain NAX kernel at the same width. Our side is what
+// PrefillGqaAttnSet can pick (flash, steel, M5 mma), and the set itself is
+// tuned as the model tunes it so its per-n choice is printed. One KV page
+// (page_tokens = n rounded up to 64) makes the paged kernels and the NAX
+// kernels read the same bytes; every arm is checked against flash, which
+// qwen_paged_flash_d256 validates against a CPU oracle.
+// VPIPE_QWEN_ATTN_BENCH=1 (full: + 16384).
+TEST(sdpa_mma, qwen_prefill_d256_vs_nax_split) {
+  const char* gate = std::getenv("VPIPE_QWEN_ATTN_BENCH");
+  if (gate == nullptr) { return; }
+  const bool full = std::string(gate) == "full";
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib_sdpa = mc->load_library("sdpa");
+  ComputeLibrary lib_attn = mc->load_library("attn_steel");
+  ComputeLibrary lib_mma = mc->load_library("sdpa_mma");
+  ComputeLibrary lib_nax = mc->load_library("attn_steel_nax");
+  const bool m5 = mc->supports_matrix_cores();
+
+  const int D = 256, Hq = 16, Hkv = 4;
+  genai::PrefillGqaAttnSet set;
+  set.load(lib_sdpa, &lib_attn, &lib_mma, m5);
+  genai::TuningReport rep;
+  set.prepare(mc, {D, Hq, Hkv}, rep);
+
+  enum Arm { kFlash, kSteel, kMma, kNax, kSplit, kArms };
+  const char* name[kArms] = {"flash", "steel", "mma", "nax", "nax-split"};
+  std::vector<int> ns = full ? std::vector<int>{1024, 2048, 4096, 8192, 16384}
+                             : std::vector<int>{1024, 2048, 4096, 8192};
+  for (int n : ns) {
+    const int pt = (n + 63) / 64 * 64;
+    std::mt19937 rng(71 + n);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    SharedBuffer qb = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    SharedBuffer kb = mc->make_shared_buffer((size_t)Hkv * pt * D * 2);
+    SharedBuffer vb = mc->make_shared_buffer((size_t)Hkv * pt * D * 2);
+    SharedBuffer ptb = mc->make_shared_buffer(3 * 4);
+    std::vector<SharedBuffer> ob;
+    for (int a = 0; a < kArms; ++a) {
+      ob.push_back(mc->make_shared_buffer((size_t)Hq * n * D * 2));
+    }
+    if (qb.empty() || kb.empty() || vb.empty()) { continue; }
+    {
+      auto* q = static_cast<std::uint16_t*>(qb.contents());
+      for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
+        q[i] = f32_to_h(d(rng) * 0.2f);
+      }
+      auto* k = static_cast<std::uint16_t*>(kb.contents());
+      auto* v = static_cast<std::uint16_t*>(vb.contents());
+      std::memset(k, 0, (size_t)Hkv * pt * D * 2);
+      std::memset(v, 0, (size_t)Hkv * pt * D * 2);
+      for (int h = 0; h < Hkv; ++h) {
+        for (int t = 0; t < n; ++t) {
+          for (int e = 0; e < D; ++e) {
+            const size_t i = ((size_t)h * pt + t) * D + e;
+            k[i] = f32_to_h(d(rng) * 0.2f);
+            v[i] = f32_to_h(d(rng) * 0.2f);
+          }
+        }
+      }
+      const int tab[3] = {0, n, 0};
+      std::memcpy(ptb.contents(), tab, sizeof(tab));
+    }
+    const float scale = 1.0f / std::sqrt((float)D);
+
+    // The NAX parameter block (steel attn AttnParams).
+    struct P {
+      int B, H, D, qL, kL, gqa_factor;
+      float scale;
+      int NQ, NK, NQ_aligned, NK_aligned, qL_rem, kL_rem, qL_off;
+      std::int64_t Q_strides[3], K_strides[3], V_strides[3], O_strides[3];
+    };
+    SharedBuffer pb = mc->make_shared_buffer(sizeof(P));
+    {
+      auto* p = static_cast<P*>(pb.contents());
+      const int BQ = 64, BK = 32;
+      p->B = 1; p->H = Hq; p->D = D; p->qL = n; p->kL = n;
+      p->gqa_factor = Hq / Hkv; p->scale = scale;
+      p->NQ = (n + BQ - 1) / BQ; p->NK = (n + BK - 1) / BK;
+      p->NQ_aligned = n / BQ; p->NK_aligned = n / BK;
+      p->qL_rem = n - p->NQ_aligned * BQ;
+      p->kL_rem = n - p->NK_aligned * BK;
+      p->qL_off = 0;
+      p->Q_strides[0] = (std::int64_t)Hq * n * D;
+      p->Q_strides[1] = (std::int64_t)n * D;
+      p->Q_strides[2] = D;
+      p->K_strides[0] = (std::int64_t)Hkv * pt * D;
+      p->K_strides[1] = (std::int64_t)pt * D;
+      p->K_strides[2] = D;
+      for (int i = 0; i < 3; ++i) {
+        p->V_strides[i] = p->K_strides[i];
+        p->O_strides[i] = p->Q_strides[i];
+      }
+    }
+    FunctionConstants fc;
+    fc.set_bool(200, (n % 64) == 0).set_bool(201, (n % 32) == 0)
+        .set_bool(300, false).set_bool(301, true).set_bool(302, false);
+    ComputeFunction fn[kArms] = {
+        lib_sdpa.function("sdpa_paged_flash_f16"),
+        lib_attn.valid() ? lib_attn.function("attn_steel_paged_bd256")
+                         : ComputeFunction(),
+        (m5 && lib_mma.valid()) ? lib_mma.function("sdpa_mma_f16")
+                                : ComputeFunction(),
+        (m5 && lib_nax.valid()) ? lib_nax.function("attn_steel_nax_h_bd256", fc)
+                                : ComputeFunction(),
+        (m5 && lib_nax.valid())
+            ? lib_nax.function("attn_steel_nax_dsplit_h_bd256", fc)
+            : ComputeFunction()};
+    if (!fn[kFlash].valid()) { continue; }
+
+    auto encode = [&](ComputeEncoder& enc, int a) {
+      enc.set_function(fn[a]);
+      enc.set_buffer(0, qb); enc.set_buffer(1, kb); enc.set_buffer(2, vb);
+      enc.set_buffer(3, ob[(size_t)a]);
+      const unsigned nu = (unsigned)n, H = (unsigned)Hq;
+      if (a == kNax || a == kSplit) {
+        enc.set_buffer(4, pb);
+        const unsigned wn = a == kSplit ? 2u : 1u;
+        enc.dispatch({32 * ((nu + 63) / 64), 4 * H, wn}, {32, 4, wn});
+        return;
+      }
+      enc.set_constant(4, scale); enc.set_constant(5, D);
+      enc.set_constant(6, Hq); enc.set_constant(7, Hkv);
+      enc.set_constant(8, n); enc.set_constant(9, 0);
+      enc.set_constant(10, pt); enc.set_constant(11, 1);
+      enc.set_buffer(12, ptb);
+      switch (a) {
+        case kSteel:   // head-dim split: (32, 4, 2)
+          enc.dispatch({32 * ((nu + 31) / 32), 4 * H, 2}, {32, 4, 2});
+          break;
+        case kMma:
+          enc.dispatch({128, H, (nu + 15) / 16}, {128, 1, 1});
+          break;
+        default:
+          enc.dispatch({256, H, (nu + 7) / 8}, {256, 1, 1});
+          break;
+      }
+    };
+    auto once = [&](int a) {
+      const auto t0 = std::chrono::steady_clock::now();
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute(); encode(enc, a); }
+      st.commit().wait();
+      return secs_(t0, std::chrono::steady_clock::now()) * 1e3;
+    };
+    for (int a = 0; a < kArms; ++a) {
+      if (fn[a].valid()) { once(a); once(a); }
+    }
+    // Agreement against flash.
+    double rel[kArms] = {0.0};
+    const auto* ref = static_cast<const std::uint16_t*>(ob[kFlash].contents());
+    for (int a = 1; a < kArms; ++a) {
+      if (!fn[a].valid()) { continue; }
+      const auto* o = static_cast<const std::uint16_t*>(ob[(size_t)a].contents());
+      double num = 0.0, den = 0.0;
+      for (size_t i = 0; i < (size_t)Hq * n * D; i += 7) {
+        const double x = h_to_f32(ref[i]), y = h_to_f32(o[i]);
+        num += (x - y) * (x - y); den += x * x;
+      }
+      rel[a] = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      EXPECT_TRUE(rel[a] < 5e-2);
+    }
+    std::vector<double> ms[kArms];
+    for (int r = 0; r < 5; ++r) {
+      for (int a = 0; a < kArms; ++a) {
+        if (fn[a].valid()) { ms[a].push_back(once(a)); }
+      }
+    }
+    std::printf("[qwen_d256] n=%5d  set picks %-5s |", n, set.kernel_name(n));
+    double best_ours = 1e30;
+    for (int a = 0; a < kArms; ++a) {
+      if (ms[a].empty()) { continue; }
+      std::sort(ms[a].begin(), ms[a].end());
+      const double med = ms[a][ms[a].size() / 2];
+      if (a <= kMma) { best_ours = std::min(best_ours, med); }
+      std::printf(" %s %.1fms", name[a], med);
+      if (a > 0) { std::printf(" (%.0e)", rel[a]); }
+      std::printf(" |");
+    }
+    if (!ms[kSplit].empty()) {
+      const double sp = ms[kSplit][ms[kSplit].size() / 2];
+      std::printf(" split vs best ours %.2fx", best_ours / sp);
+    }
+    std::printf("\n");
+  }
+}
+
+// PrefillGqaAttnSet's NAX members against its flash member over a real PAGED
+// pool: 192-token pages with a partial last page, lengths off the 64 grid, and
+// MID-CONTEXT prefill (q_offset > 0, so the gather copies the prefix too and
+// the kernel's causal offset is live). The benchmark above uses one page and a
+// fresh prompt; this is the contract the model actually drives. On a GPU
+// without the NAX members they are simply refused.
+// Both head dims the set serves: Qwen3.5's (256, 16q/4kv) and Ministral-3's
+// (128, 32q/8kv), whose members are the bd128 entry points (no qtile, no
+// head-dim-split NAX). 192-token pages are 64-aligned, which the D=128
+// flash member needs. And both element types: a bf16 model (YuE2's AR
+// stack) reaches the bf16 NAX entries through the same set.
+TEST(sdpa_mma, qwen_prefill_set_nax_matches_flash) {
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib_sdpa = mc->load_library("sdpa");
+  ComputeLibrary lib_attn = mc->load_library("attn_steel");
+  ComputeLibrary lib_mma = mc->load_library("sdpa_mma");
+  ComputeLibrary lib_nax = mc->load_library("attn_steel_nax");
+  // A bf16 model hands the set the bf16 sdpa / sdpa_mma libraries and no
+  // steel (half-only), as MetalQwenModel does.
+  ComputeLibrary lib_sdpa_b = mc->load_library("sdpa_bf16");
+  ComputeLibrary lib_mma_b = mc->load_library("sdpa_mma_bf16");
+  const bool m5 = mc->supports_matrix_cores();
+  auto enc16 = [](float v, bool bf16) -> std::uint16_t {
+    if (!bf16) { return f32_to_h(v); }
+    std::uint32_t u; std::memcpy(&u, &v, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  auto dec16 = [](std::uint16_t b, bool bf16) -> float {
+    if (!bf16) { return h_to_f32(b); }
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f; std::memcpy(&f, &u, 4); return f;
+  };
+  struct Layout { int D, Hq, Hkv; };
+  for (const bool bf16 : {false, true}) {
+  for (const Layout lay : {Layout{256, 16, 4}, Layout{128, 32, 8}}) {
+  const int D = lay.D, Hq = lay.Hq, Hkv = lay.Hkv, page_tokens = 192;
+
+  ::setenv("VPIPE_QWEN_PREFILL_AUTOTUNE", "0", 1);
+  genai::PrefillGqaAttnSet set;
+  set.load(bf16 ? lib_sdpa_b : lib_sdpa, bf16 ? nullptr : &lib_attn,
+           bf16 ? &lib_mma_b : &lib_mma, m5, &lib_nax, bf16, D);
+  genai::TuningReport rep;
+  set.prepare(mc, {D, Hq, Hkv}, rep);
+  ::unsetenv("VPIPE_QWEN_PREFILL_AUTOTUNE");
+  ASSERT_TRUE(set.ready());
+  if (!set.ready()) { return; }
+
+  // A BRANCHED layout is what ContextManager::branch() leaves: the parent's
+  // partial tail page frozen, so the next page starts mid-sequence and
+  // position / page_tokens is no longer the page. Inner pages here hold 100
+  // and 37 keys. The flash reference is itself held to a CPU oracle there.
+  struct Case { int n, q_offset; bool branched; };
+  const Case cases[] = {{300, 0, false}, {700, 0, false}, {1500, 0, false},
+                        {2085, 0, false}, {1000, 900, false},
+                        {37, 2000, false}, {1024, 1024, false},
+                        {2085, 0, true}, {1000, 900, true},
+                        {300, 600, true}};
+  for (const Case& cs : cases) {
+    const int n = cs.n, qoff = cs.q_offset, kL = qoff + n;
+    std::vector<int> nvs;                        // keys per page, in order
+    for (int g = 0; g < kL;) {
+      int nv = std::min(page_tokens, kL - g);
+      const int p = (int)nvs.size();
+      if (cs.branched && p == 1) { nv = std::min(nv, 100); }
+      if (cs.branched && p == 3) { nv = std::min(nv, 37); }
+      nvs.push_back(nv);
+      g += nv;
+    }
+    const int n_pages = (int)nvs.size();
+    std::vector<float> kg((size_t)Hkv * kL * D), vg((size_t)Hkv * kL * D);
+    std::mt19937 rng(91 + n + 7 * qoff);
+    std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+    SharedBuffer qb = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    // Pages allocated out of order (page ids reversed), so the gather has to
+    // follow the table rather than assume pid == page index.
+    const size_t pool = (size_t)n_pages * Hkv * page_tokens * D * 2;
+    SharedBuffer kb = mc->make_shared_buffer(pool);
+    SharedBuffer vb = mc->make_shared_buffer(pool);
+    SharedBuffer ptb = mc->make_shared_buffer((size_t)n_pages * 3 * 4);
+    if (qb.empty() || kb.empty() || vb.empty() || ptb.empty()) { continue; }
+    {
+      auto* q = static_cast<std::uint16_t*>(qb.contents());
+      for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
+        q[i] = enc16(d(rng) * 0.2f, bf16);
+      }
+      std::memset(kb.contents(), 0, pool);
+      std::memset(vb.contents(), 0, pool);
+      auto* k = static_cast<std::uint16_t*>(kb.contents());
+      auto* v = static_cast<std::uint16_t*>(vb.contents());
+      auto* pt = static_cast<std::int32_t*>(ptb.contents());
+      int gstart = 0;
+      for (int p = 0; p < n_pages; ++p) {
+        const int pid = n_pages - 1 - p;
+        const int nvalid = nvs[(size_t)p];
+        pt[p * 3] = pid; pt[p * 3 + 1] = nvalid; pt[p * 3 + 2] = gstart;
+        for (int h = 0; h < Hkv; ++h) {
+          for (int sl = 0; sl < nvalid; ++sl) {
+            for (int e = 0; e < D; ++e) {
+              const size_t i = (((size_t)pid * Hkv + h) * page_tokens + sl) * D
+                               + e;
+              k[i] = enc16(d(rng) * 0.2f, bf16);
+              v[i] = enc16(d(rng) * 0.2f, bf16);
+              const size_t gi = ((size_t)h * kL + gstart + sl) * D + e;
+              kg[gi] = dec16(k[i], bf16);
+              vg[gi] = dec16(v[i], bf16);
+            }
+          }
+        }
+        gstart += nvalid;
+      }
+    }
+    genai::PrefillGqaAttnSet::Attn a;
+    a.qt = &qb; a.kpool = &kb; a.vpool = &vb; a.page_table = &ptb;
+    a.n = n; a.q_offset = qoff; a.page_tokens = page_tokens;
+    a.n_pages = n_pages; a.scale = 1.0f / std::sqrt((float)D);
+
+    auto run = [&](const char* member, SharedBuffer& out) {
+      a.out = &out;
+      bool ok = false;
+      CommandStream st = mc->make_command_stream();
+      { ComputeEncoder enc = st.begin_compute();
+        ok = set.dispatch_member(enc, a, member); }
+      st.commit().wait();
+      return ok;
+    };
+    SharedBuffer ref = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    ASSERT_TRUE(run("flash", ref));
+    const auto* r = static_cast<const std::uint16_t*>(ref.contents());
+    if (cs.branched) {
+      // Flash against a CPU oracle on sampled rows, so the members below
+      // are measured against a reference that walks these pages right.
+      const auto* qh = static_cast<const std::uint16_t*>(qb.contents());
+      const float sc = 1.0f / std::sqrt((float)D);
+      double num = 0.0, den = 0.0;
+      for (const int h : {0, Hq - 1}) {
+        const int kvh = h / (Hq / Hkv);
+        for (const int row : {0, n / 2, n - 1}) {
+          const int qpos = qoff + row;
+          std::vector<double> w((size_t)qpos + 1);
+          double mx = -1e300;
+          for (int g = 0; g <= qpos; ++g) {
+            double dot = 0.0;
+            for (int e = 0; e < D; ++e) {
+              dot += (double)dec16(qh[((size_t)h * n + row) * D + e], bf16) *
+                     kg[((size_t)kvh * kL + g) * D + e];
+            }
+            w[(size_t)g] = dot * sc;
+            mx = std::max(mx, w[(size_t)g]);
+          }
+          double l = 0.0;
+          for (double& x : w) { x = std::exp(x - mx); l += x; }
+          for (int e = 0; e < D; ++e) {
+            double o = 0.0;
+            for (int g = 0; g <= qpos; ++g) {
+              o += w[(size_t)g] * vg[((size_t)kvh * kL + g) * D + e];
+            }
+            o /= l;
+            const double got = dec16(r[((size_t)h * n + row) * D + e], bf16);
+            num += (got - o) * (got - o); den += o * o;
+          }
+        }
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      std::printf("[qwen_set] %s D=%d n=%4d q_offset=%4d branched flash vs "
+                  "oracle rel-L2 %.2e\n", bf16 ? "bf16" : "f16 ", D, n, qoff,
+                  rel);
+      EXPECT_TRUE(rel < 1e-2);
+    }
+    for (const char* member : {"steel", "nax", "nax-split", "mma"}) {
+      SharedBuffer out = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+      const bool ran = run(member, out);
+      const std::string mb(member);
+      const bool expect = mb == "steel" ? (!bf16 && lib_attn.valid())
+                        : mb == "nax-split" ? (m5 && D == 256)
+                        : m5;
+      if (!expect) {
+        if (mb != "steel") { EXPECT_FALSE(ran); }
+        continue;
+      }
+      ASSERT_TRUE(ran);
+      if (!ran) { continue; }
+      const auto* o = static_cast<const std::uint16_t*>(out.contents());
+      double num = 0.0, den = 0.0;
+      for (size_t i = 0; i < (size_t)Hq * n * D; ++i) {
+        const double x = dec16(r[i], bf16), y = dec16(o[i], bf16);
+        num += (x - y) * (x - y); den += x * x;
+      }
+      const double rel = den > 0.0 ? std::sqrt(num / den) : std::sqrt(num);
+      std::printf("[qwen_set] %s D=%d n=%4d q_offset=%4d pages=%2d%s %-9s "
+                  "vs flash rel-L2 %.2e\n", bf16 ? "bf16" : "f16 ", D, n,
+                  qoff, n_pages, cs.branched ? " branched" : "", member, rel);
+      // f16 lands 2-5e-4 from flash and bf16 1.2-2.2e-3 (its rounding
+      // floor) on the M5.
+      EXPECT_TRUE(rel < 5e-3);
+    }
+  }
+  }  // layouts
+}  // dtypes
+}
+
+// Long-context PREFILL attention through PrefillGqaAttnSet as the model
+// drives it: Qwen3.8-27B's heads (24 q / 4 kv, head_dim 256, f16), 512-token
+// pages, a piece of `n` rows at q_offset into the prompt -- what each
+// 8192-row piece of a 32k prompt runs. Each member's time and causal
+// TFLOP/s (4 Hq D sum over rows of the keys it sees), and the set's pick,
+// which it tunes on fresh pieces. VPIPE_QWEN_ATTN_LONG_BENCH=1.
+TEST(sdpa_mma, qwen_prefill_set_long_context) {
+  if (std::getenv("VPIPE_QWEN_ATTN_LONG_BENCH") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr) { return; }
+  ComputeLibrary lib_sdpa = mc->load_library("sdpa");
+  ComputeLibrary lib_attn = mc->load_library("attn_steel");
+  ComputeLibrary lib_mma = mc->load_library("sdpa_mma");
+  ComputeLibrary lib_nax = mc->load_library("attn_steel_nax");
+  const bool m5 = mc->supports_matrix_cores();
+  const int D = 256, Hq = 24, Hkv = 4, page_tokens = 512;
+  genai::PrefillGqaAttnSet set;
+  set.load(lib_sdpa, &lib_attn, &lib_mma, m5, &lib_nax, false, D);
+  genai::TuningReport rep;
+  set.prepare(mc, {D, Hq, Hkv}, rep);
+  ASSERT_TRUE(set.ready());
+  if (!set.ready()) { return; }
+  struct Case { int n, q_offset; };
+  const Case cases[] = {{4096, 0}, {8192, 0}, {8192, 8192}, {8192, 24576}};
+  std::mt19937 rng(17);
+  std::uniform_real_distribution<float> d(-1.0f, 1.0f);
+  for (const Case& cs : cases) {
+    const int n = cs.n, qoff = cs.q_offset, kL = qoff + n;
+    const int n_pages = (kL + page_tokens - 1) / page_tokens;
+    const size_t pool = (size_t)n_pages * Hkv * page_tokens * D * 2;
+    SharedBuffer qb = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    SharedBuffer kb = mc->make_shared_buffer(pool);
+    SharedBuffer vb = mc->make_shared_buffer(pool);
+    SharedBuffer ptb = mc->make_shared_buffer((size_t)n_pages * 3 * 4);
+    SharedBuffer out = mc->make_shared_buffer((size_t)Hq * n * D * 2);
+    if (qb.empty() || kb.empty() || vb.empty() || out.empty()) { continue; }
+    auto fill = [&](SharedBuffer& b, size_t elems) {
+      auto* h = static_cast<std::uint16_t*>(b.contents());
+      std::uint16_t lut[256];
+      for (int i = 0; i < 256; ++i) { lut[i] = f32_to_h(d(rng) * 0.2f); }
+      std::uint32_t x = 2463534242u;
+      for (size_t i = 0; i < elems; ++i) {
+        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+        h[i] = lut[x & 255u];
+      }
+    };
+    fill(qb, (size_t)Hq * n * D);
+    fill(kb, pool / 2);
+    fill(vb, pool / 2);
+    auto* pt = static_cast<std::int32_t*>(ptb.contents());
+    for (int p = 0; p < n_pages; ++p) {
+      pt[p * 3] = p;
+      pt[p * 3 + 1] = std::min(page_tokens, kL - p * page_tokens);
+      pt[p * 3 + 2] = p * page_tokens;
+    }
+    genai::PrefillGqaAttnSet::Attn a;
+    a.qt = &qb; a.kpool = &kb; a.vpool = &vb; a.page_table = &ptb;
+    a.out = &out; a.n = n; a.q_offset = qoff; a.page_tokens = page_tokens;
+    a.n_pages = n_pages; a.scale = 1.0f / std::sqrt((float)D);
+    const double flop = 4.0 * Hq * D *
+        ((double)n * qoff + (double)n * (n + 1) / 2.0);
+    CommandStream st = mc->make_command_stream();
+    auto time_ms = [&](const char* member) {
+      std::vector<double> ms;
+      for (int r = 0; r < 4; ++r) {
+        bool ok = true;
+        { ComputeEncoder enc = st.begin_compute();
+          if (member == nullptr) { set.dispatch(enc, a); }
+          else { ok = set.dispatch_member(enc, a, member); } }
+        CommandStream::Fence f = st.commit();
+        f.wait();
+        if (!ok) { return -1.0; }
+        if (r > 0) { ms.push_back(f.gpu_times().gpu_s * 1e3); }
+      }
+      std::sort(ms.begin(), ms.end());
+      return ms[ms.size() / 2];
+    };
+    std::printf("[qwen_long] n=%d q_offset=%5d set picks %-9s",
+                n, qoff, set.kernel_name(n));
+    const double tset = time_ms(nullptr);
+    std::printf(" %.1f ms %.1f TF |", tset, flop / tset * 1e-9);
+    for (const char* m : {"flash", "steel", "mma", "nax", "nax-split"}) {
+      const double t = time_ms(m);
+      if (t > 0.0) {
+        std::printf(" %s %.1f ms %.1f TF |", m, t, flop / t * 1e-9);
+      }
+    }
+    std::printf("\n");
+    std::fflush(stdout);
+  }
+}
+
+// The dense matmul2d prefill GEMMs at Qwen3.8-27B's shapes, by row count,
+// in one dispatch and in row bands over the same buffers (what
+// MetalQwenModel::tune_mma_band_ chooses between). GPU time, TFLOP/s; the
+// banded output must be the whole dispatch's byte for byte. M5 only.
+// VPIPE_QWEN_GEMM_ROWS=1.
+TEST(sdpa_mma, qwen27_prefill_gemm_rows) {
+  if (std::getenv("VPIPE_QWEN_GEMM_ROWS") == nullptr) { return; }
+  Session sess;
+  auto* mc = get_mc_(sess);
+  if (mc == nullptr || !mc->supports_matrix_cores()) { return; }
+  ComputeLibrary lib = mc->load_library("dense_gemm_mma");
+  ComputeFunction f128 = lib.function("dense_gemm_mma_t_n128_f16");
+  ComputeFunction f256 = lib.function("dense_gemm_mma_t_n128x256_f16");
+  ASSERT_TRUE(f128.valid() && f256.valid());
+  struct Shape { const char* name; int N, K; };
+  const Shape shapes[] = {{"gate|up", 34816, 5120}, {"qkv", 14336, 5120},
+                          {"gdn_in", 16480, 5120}, {"o_proj", 5120, 6144},
+                          {"down", 5120, 17408}};
+  const int Ms[] = {2048, 3072, 4096, 6144, 8192};
+  auto fill = [](SharedBuffer& b, std::size_t elems, std::uint32_t seed) {
+    auto* h = static_cast<std::uint16_t*>(b.contents());
+    std::uint32_t x = seed;
+    for (std::size_t i = 0; i < elems; ++i) {
+      x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+      h[i] = f32_to_h(((float)(x & 1023u) / 1023.0f - 0.5f) * 0.1f);
+    }
+  };
+  CommandStream st = mc->make_command_stream();
+  for (const Shape& sh : shapes) {
+    const bool deep = sh.K >= 6144;
+    const int BN = deep ? 256 : 128;
+    SharedBuffer w = mc->make_shared_buffer((size_t)sh.N * sh.K * 2);
+    fill(w, (size_t)sh.N * sh.K, 7);
+    std::printf("[gemm_rows] %-8s N=%5d K=%5d tile 128x%d |", sh.name, sh.N,
+                sh.K, BN);
+    std::printf("\n");
+    for (const int M : Ms) {
+      SharedBuffer x = mc->make_shared_buffer((size_t)M * sh.K * 2);
+      SharedBuffer y = mc->make_shared_buffer((size_t)M * sh.N * 2);
+      SharedBuffer y0 = mc->make_shared_buffer((size_t)M * sh.N * 2);
+      fill(x, (size_t)M * sh.K, 11);
+      std::printf("[gemm_rows]   M=%5d |", M);
+      {
+        std::vector<double> ms;
+        for (int r = 0; r < 4; ++r) {
+          { ComputeEncoder enc = st.begin_compute();
+            enc.set_function(deep ? f256 : f128);
+            enc.set_buffer(0, x); enc.set_buffer(1, w);
+            enc.set_buffer(2, w); enc.set_buffer(3, y0);
+            enc.set_constant(4, sh.K); enc.set_constant(5, sh.N);
+            enc.set_constant(6, M); enc.set_constant(7, 0);
+            enc.dispatch({(unsigned)(((sh.N + BN - 1) / BN) * 256),
+                          (unsigned)((M + 127) / 128), 1}, {256, 1, 1}); }
+          CommandStream::Fence f = st.commit();
+          f.wait();
+          if (r > 0) { ms.push_back(f.gpu_times().gpu_s * 1e3); }
+        }
+        std::sort(ms.begin(), ms.end());
+        const double t = ms[ms.size() / 2];
+        const double tf = 2.0 * M * sh.N * (double)sh.K / t * 1e-9;
+        std::printf(" whole %6.2f ms %5.1f TF |", t, tf);
+      }
+      // the plain order in row BANDS of B rows: dispatches over offsets of
+      // the same buffers, one command buffer
+      for (const int B : {2048, 3072, 4096}) {
+        if (B >= M) { continue; }
+        std::vector<double> ms;
+        for (int r = 0; r < 4; ++r) {
+          { ComputeEncoder enc = st.begin_compute();
+            for (int r0 = 0; r0 < M; r0 += B) {
+              const int rows = std::min(B, M - r0);
+              enc.set_function(deep ? f256 : f128);
+              enc.set_buffer(0, x, (size_t)r0 * sh.K * 2);
+              enc.set_buffer(1, w); enc.set_buffer(2, w);
+              enc.set_buffer(3, y, (size_t)r0 * sh.N * 2);
+              enc.set_constant(4, sh.K); enc.set_constant(5, sh.N);
+              enc.set_constant(6, rows); enc.set_constant(7, 0);
+              enc.dispatch({(unsigned)(((sh.N + BN - 1) / BN) * 256),
+                            (unsigned)((rows + 127) / 128), 1},
+                           {256, 1, 1});
+            } }
+          CommandStream::Fence f = st.commit();
+          f.wait();
+          if (r > 0) { ms.push_back(f.gpu_times().gpu_s * 1e3); }
+        }
+        // a tile is a tile wherever its band starts: bit-identical
+        EXPECT_TRUE(std::memcmp(y.contents(), y0.contents(),
+                                (size_t)M * sh.N * 2) == 0);
+        std::sort(ms.begin(), ms.end());
+        const double t = ms[ms.size() / 2];
+        const double tf = 2.0 * M * sh.N * (double)sh.K / t * 1e-9;
+        std::printf(" band%d %6.2f ms %5.1f TF |", B, t, tf);
+      }
+      std::printf("\n");
+    }
+    std::fflush(stdout);
   }
 }
 

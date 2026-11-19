@@ -1,15 +1,21 @@
 #include "generative-models/minimax-h3/minimax-h3-denoise.h"
 
 #include "generative-models/minimax-h3/minimax-h3-scheduler.h"
+#include "generative-models/shared/motion-cache.h"
+#include "generative-models/shared/sage-attention.h"
+#include "generative-models/spec-keys.h"
+#include "common/perf-flops.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -40,14 +46,158 @@ bf16_to_f32_(std::uint16_t b)
 }  // namespace
 
 bool
+motion_cache_gathers(const MetalMiniMaxH3Transformer::Config& cfg,
+                     int grid_h, int grid_w, int video_rows,
+                     int audio_rows, int subsample,
+                     MotionCacheGathers* out, std::string* why)
+{
+  auto no = [&](std::string m) {
+    if (why != nullptr) { *why = std::move(m); }
+    return false;
+  };
+  const int ph = cfg.patch_h, pw = cfg.patch_w;
+  const int PE = cfg.video_patch_elems();
+  const int cells = grid_h * grid_w;
+  const int f = std::max(1, subsample);
+  if (grid_h <= 0 || grid_w <= 0) {
+    return no("the request carries no video grid");
+  }
+  if (video_rows <= 0 || video_rows % cells != 0) {
+    return no(fmt("{} generated rows are not whole {}x{} frames",
+                  video_rows, grid_h, grid_w)());
+  }
+  if (cfg.patch_t != 1) { return no("a temporal patch is not supported"); }
+  if ((std::uint64_t)video_rows * (std::uint64_t)PE > 0xffffffffull) {
+    return no("the video state is past 32-bit offsets");
+  }
+  const int lt = video_rows / cells;
+  const int H = grid_h * ph, W = grid_w * pw;
+  out->channels = cfg.video_channels;
+  out->frames   = lt;
+  out->plane    = ((H + f - 1) / f) * ((W + f - 1) / f);
+  out->video.clear();
+  out->video.reserve((std::size_t)out->channels * lt * out->plane);
+  for (int c = 0; c < cfg.video_channels; ++c) {
+    for (int t = 0; t < lt; ++t) {
+      for (int y = 0; y < H; y += f) {
+        for (int x = 0; x < W; x += f) {
+          const std::size_t row = (std::size_t)t * cells +
+                                  (std::size_t)(y / ph) * grid_w +
+                                  (std::size_t)(x / pw);
+          const std::size_t el =
+              ((std::size_t)c * ph + (std::size_t)(y % ph)) * pw +
+              (std::size_t)(x % pw);
+          out->video.push_back((std::uint32_t)(row * PE + el));
+        }
+      }
+    }
+  }
+  out->audio.clear();
+  const int AC = cfg.audio_channels;
+  if (audio_rows > 0 && audio_rows % minimax_h3::kAudioChannels == 0) {
+    const int alat = audio_rows / minimax_h3::kAudioChannels;
+    for (int ch = 0; ch < minimax_h3::kAudioChannels; ++ch) {
+      for (int t = 0; t < alat; t += f) {
+        for (int k = 0; k < AC; ++k) {
+          out->audio.push_back(
+              (std::uint32_t)(((std::size_t)ch * alat + t) * AC + k));
+        }
+      }
+    }
+  }
+  return true;
+}
+
+const char*
+step_update_name(StepUpdate u)
+{
+  switch (u) {
+    case StepUpdate::kAuto:         return "auto";
+    case StepUpdate::kEuler:        return "euler";
+    case StepUpdate::kRenoise:      return "renoise";
+    case StepUpdate::kResMultistep: return "res_multistep";
+    case StepUpdate::kVelocity:     return "velocity";
+  }
+  return "auto";
+}
+
+bool
+sampler_choice_from_spec(const FlexData& spec, SamplerChoice* out,
+                         std::string* why)
+{
+  namespace k = sampler_spec;
+  *out = SamplerChoice{};
+  auto no = [&](std::string m) {
+    if (why != nullptr) { *why = std::move(m); }
+    out->update = StepUpdate::kAuto;
+    return false;
+  };
+  if (!spec.is_object()) { return no("the beat is not a sampler spec"); }
+  const auto o = spec.as_object();
+  // A spec with no method names the spec's own default, euler.
+  out->method = o.contains(k::kMethod)
+      ? std::string(o.at(k::kMethod).as_string("")) : std::string(k::kEuler);
+  if (o.contains(k::kSeed)) {
+    out->seed = (std::uint64_t)o.at(k::kSeed).as_int(0);
+  }
+  const std::string& m = out->method;
+  if (m == k::kEuler) {
+    out->update = StepUpdate::kEuler;
+  } else if (m == k::kDmd || m == "dmd_student" || m == "turbo") {
+    // The DMD student's step is this model's re-noising one: the clean
+    // estimate at each sigma, then fresh noise to the next. The spec's
+    // conditioning_sigma shapes ITS schedule; H3 runs its own.
+    out->update = StepUpdate::kRenoise;
+    if (o.contains(k::kConditioningSigma) &&
+        o.at(k::kConditioningSigma).as_real(0.0) != 0.0) {
+      out->note = fmt("its conditioning_sigma {} is not read -- minimax-h3 "
+                      "runs its own grid",
+                      o.at(k::kConditioningSigma).as_real(0.0))();
+    }
+  } else if (m == k::kResMultistep) {
+    out->update = StepUpdate::kResMultistep;
+  } else if (m == k::kHeun || m == k::kDpmpp2m || m == k::kDpmppSde ||
+             m == "dpm++_2m" || m == "dpm++_sde") {
+    return no(fmt("'{}' is not one minimax-h3 runs: it runs euler, dmd "
+                  "(re-noising) and res_multistep, one forward a step "
+                  "each{}", m,
+                  m == k::kDpmpp2m || m == "dpm++_2m"
+                      ? "" : " -- this one takes two")());
+  } else {
+    return no(fmt("'{}' is not one minimax-h3 runs: it runs euler, dmd "
+                  "(re-noising) and res_multistep", m)());
+  }
+  return true;
+}
+
+std::size_t
+denoise_host_bytes(const minimax_h3::PackedLayout& L,
+                   const MetalMiniMaxH3Transformer::Config& cfg,
+                   bool motion_cache, bool preview)
+{
+  const std::size_t v =
+      (std::size_t)L.num_video_rows * (std::size_t)cfg.video_patch_elems();
+  const std::size_t a =
+      (std::size_t)L.num_audio_rows * (std::size_t)cfg.audio_channels;
+  // vel_v / vel_a; rn_v / rn_a or vprev / aprev; MotionCache's rv / ra;
+  // preview_x0.
+  std::size_t n = 2 * (v + a);
+  if (motion_cache) { n += v + a; }
+  if (preview) { n += v; }
+  return n * sizeof(float);
+}
+
+bool
 denoise(const DenoiseRequest& req, std::string* err)
 {
   auto fail = [&](std::string m) {
     if (err != nullptr) { *err = std::move(m); }
     return false;
   };
+  // A layout with no audio rows (MiniMax-H3-Image) has no audio state.
   if (req.dit == nullptr || req.layout == nullptr || req.text == nullptr ||
-      req.video == nullptr || req.audio == nullptr) {
+      req.video == nullptr ||
+      (req.audio == nullptr && !req.layout->audio_indices.empty())) {
     return fail("denoise: incomplete request");
   }
   const minimax_h3::PackedLayout& L = *req.layout;
@@ -77,21 +227,131 @@ denoise(const DenoiseRequest& req, std::string* err)
 
   MiniMaxH3Scheduler sv(req.video_shift);
   MiniMaxH3Scheduler sa(req.audio_shift);
+  std::vector<float> vprev, aprev;
+  // A FLOW-MAP adapter conditions each step on where it lands, so the
+  // loop hands the DiT (t, r) pairs rather than t alone -- and runs the
+  // grid the adapter was distilled on unless the caller named another.
+  const bool two_time = req.dit->two_time_active();
+  const MetalMiniMaxH3Transformer::FlowMap* fm = req.dit->flow_map();
+  const bool refine = !req.refine_sigmas.empty();
+  // The video's sigmas as given, below a refine's (which are the same
+  // thing for a refine) and above every other grid.
+  const bool given = !refine && !req.video_sigmas.empty();
+  const std::vector<float>* grid =
+      given ? nullptr
+      : !req.sigma_grid.empty() ? &req.sigma_grid
+      : (two_time && fm != nullptr && !fm->sigmas.empty()) ? &fm->sigmas
+                                                           : nullptr;
+  // An adapter's SAMPLING CONTRACT: its grid, shifted in double, and its
+  // update. Below an explicit grid and a flow map (load() refuses a
+  // contract beside one). VPIPE_H3_RENOISE=0 keeps the grid and steps it
+  // by Euler, for the A/B the release says is not equivalent.
+  const MetalMiniMaxH3Transformer::SamplingContract* sc =
+      grid == nullptr && !given ? req.dit->sampling_contract() : nullptr;
+  bool renoise = sc != nullptr && sc->renoise;
+  if (const char* e = std::getenv("VPIPE_H3_RENOISE")) {
+    renoise = renoise && std::atoi(e) != 0;
+  }
   // `res_multistep` -- the second-order sampler the reference template
   // ships -- against the first-order Euler this loop has always used.
-  // Under measurement rather than default-on: it changes BOTH modalities'
-  // output, and the video at 4 steps is already good.
-  const bool res_ms = std::getenv("VPIPE_H3_RES_MULTISTEP") != nullptr;
-  std::vector<float> vprev, aprev;
-  if (!sv.set_timesteps(req.num_steps) || !sa.set_timesteps(req.num_steps)) {
+  // Not the default: it changes BOTH modalities' output, and the video
+  // at 4 steps is already good. The env var is the dev A/B; a sampler
+  // spec asks for it by name.
+  bool res_ms =
+      !refine && std::getenv("VPIPE_H3_RES_MULTISTEP") != nullptr;
+  // An update asked for by name replaces the loop's own choice.
+  switch (req.update) {
+    case StepUpdate::kAuto: break;
+    case StepUpdate::kEuler:
+      renoise = false;
+      res_ms = false;
+      break;
+    case StepUpdate::kRenoise:
+      renoise = true;
+      res_ms = false;
+      break;
+    case StepUpdate::kResMultistep:
+      renoise = false;
+      res_ms = true;
+      break;
+    case StepUpdate::kVelocity:
+      renoise = false;
+      res_ms = false;
+      break;
+  }
+  const bool vel_form = req.update == StepUpdate::kVelocity;
+  if (req.step_heads && req.dit->step_heads() <= 0) {
+    return fail("denoise: per-step heads asked for and the DiT has none "
+                "(set_step_heads)");
+  }
+  // A flow map's velocity is its AVERAGE over the jump to the next sigma,
+  // so Euler lands where it was trained to; read as an instantaneous
+  // velocity (an x0 estimate, a multistep's history) it lands elsewhere.
+  if (two_time && (req.update == StepUpdate::kRenoise ||
+                   req.update == StepUpdate::kResMultistep)) {
+    return fail(fmt("denoise: a flow-map adapter ({}) steps by its jump, "
+                    "Euler; it cannot run {}", fm != nullptr ? fm->version
+                                                             : "live",
+                    step_update_name(req.update))());
+  }
+  if (refine) {
+    // A flow-map adapter runs here too (Open-H3-Regenerate-2K-IC: the
+    // last steps of HyperFlow's grid from the upscaled draft): each step
+    // jumps from sigma i to sigma i + 1, so the generated rows carry
+    // (1 - sigma_i, 1 - sigma_i+1) -- set_sigmas_as_run's timesteps and
+    // endpoints -- and the rows a refine holds, r = t.
+    if (sc != nullptr) {
+      return fail("denoise: a refine names its own sigmas and cannot run "
+                  "an adapter's sampling contract (" + sc->release + ")");
+    }
+    if (!sv.set_sigmas_as_run(req.refine_sigmas)) {
+      return fail(fmt("denoise: the refine's {} sigmas are not a strictly "
+                      "decreasing grid from at most 1 to exactly 0",
+                      req.refine_sigmas.size())());
+    }
+  } else if (given) {
+    std::string why;
+    if (!MiniMaxH3Scheduler::sigmas_ok(req.video_sigmas, &why)) {
+      return fail("denoise: the video's sigmas: " + why);
+    }
+    if (!sv.set_sigmas_mapped(req.video_sigmas, req.video_shift) ||
+        !sa.set_sigmas_mapped(req.video_sigmas, req.video_shift)) {
+      return fail(fmt("denoise: the video's {} sigmas do not stay a "
+                      "strictly decreasing grid mapped to the audio's "
+                      "shift ({:.4g} from {:.4g})", req.video_sigmas.size(),
+                      req.audio_shift, req.video_shift)());
+    }
+  } else if (sc != nullptr) {
+    if (!sv.set_sigmas_shifted(sc->sigmas) ||
+        !sa.set_sigmas_shifted(sc->sigmas)) {
+      return fail(fmt("denoise: the sampling contract's grid ({} points) "
+                      "is not a strictly decreasing 1 -> 0 grid under "
+                      "shifts {:.4g}/{:.4g}", sc->sigmas.size(),
+                      req.video_shift, req.audio_shift)());
+    }
+  } else if (grid != nullptr) {
+    if (!sv.set_sigmas(*grid) || !sa.set_sigmas(*grid)) {
+      return fail(fmt("denoise: the {} sigma grid ({} points) is not a "
+                      "strictly decreasing 1 -> 0 grid under shifts "
+                      "{:.4g}/{:.4g}",
+                      grid == &req.sigma_grid ? "requested" : "adapter's",
+                      grid->size(), req.video_shift, req.audio_shift)());
+    }
+  } else if (req.num_steps < 1 ||
+             !sv.set_timesteps(req.num_steps + 1) ||
+             !sa.set_timesteps(req.num_steps + 1)) {
+    // `num_steps` counts FORWARDS, and the scheduler takes grid POINTS:
+    // N steps is the N + 1 points of linspace(1, 0, N + 1), the terminal
+    // zero included. See DenoiseRequest::num_steps for why the two differ.
     return fail("denoise: bad step count " + std::to_string(req.num_steps));
   }
   // The shift collapses duplicate sigmas, and it does so at whichever
   // grid points ITS shift happens to collide -- so the two schedules can
   // come back with different lengths from the same request. Step i of
   // one has to pair with step i of the other, so run the shorter.
-  const int steps = std::min(sv.num_inference_steps(),
-                             sa.num_inference_steps());
+  const int steps = refine ? sv.num_inference_steps()
+                           : std::min(sv.num_inference_steps(),
+                                      sa.num_inference_steps());
   if (steps <= 0) { return fail("denoise: empty schedule"); }
 
   metal_compute::MetalCompute* mc = req.dit->metal_compute();
@@ -112,8 +372,28 @@ denoise(const DenoiseRequest& req, std::string* err)
   const bool prof =
       sess != nullptr && std::getenv("VPIPE_H3_DENOISE_PROFILE") != nullptr;
 
-  std::vector<float> uniq;
+  std::vector<float> uniq, uniq_r;
   std::vector<int>   row_idx;
+  // The one place a step's row plan is built, so the bake below and the
+  // forward in the loop cannot disagree about it.
+  auto plan = [&](int i, std::vector<float>* u, std::vector<float>* ur,
+                  std::vector<int>* ri) {
+    const float tv = sv.timesteps()[(std::size_t)i];
+    // A refine's audio is clean at every step.
+    const float ta = refine ? req.condition_audio_timestep
+                            : sa.timesteps()[(std::size_t)i];
+    if (two_time) {
+      // Held audio stays where it is: r = t.
+      const float ra = refine ? ta : sa.endpoints()[(std::size_t)i];
+      minimax_h3::build_row_time_pairs(
+          L, tv, sv.endpoints()[(std::size_t)i], ta, ra,
+          req.condition_timestep, u, ur, ri, req.condition_audio_timestep);
+    } else {
+      minimax_h3::build_row_timesteps(L, tv, ta, req.condition_timestep, u,
+                                      ri, req.condition_audio_timestep);
+      ur->clear();
+    }
+  };
 
   // Precompute every step's modulation before the loop, which is the one
   // place that can: the two schedules are fully built by now and the
@@ -127,15 +407,14 @@ denoise(const DenoiseRequest& req, std::string* err)
   // because this is a memory optimization and not a correctness step.
   bool baked = false;
   {
-    std::vector<std::vector<float>> sched;
+    std::vector<std::vector<float>> sched, sched_r;
     sched.reserve((std::size_t)steps);
     for (int i = 0; i < steps; ++i) {
-      std::vector<float> u;
+      std::vector<float> u, ur;
       std::vector<int>   ri;
-      minimax_h3::build_row_timesteps(
-          L, sv.timesteps()[(std::size_t)i], sa.timesteps()[(std::size_t)i],
-          req.condition_timestep, &u, &ri, req.condition_audio_timestep);
+      plan(i, &u, &ur, &ri);
       sched.push_back(std::move(u));
+      sched_r.push_back(std::move(ur));
     }
     std::string berr;
     // The A/B. Baking trades a per-step read of 55% of the checkpoint for
@@ -148,14 +427,210 @@ denoise(const DenoiseRequest& req, std::string* err)
       berr = "disabled by VPIPE_H3_NO_ADALN_BAKE";
       baked = false;
     } else {
-      baked = req.dit->bake_adaln(sched, &berr);
+      baked = req.dit->bake_adaln(sched, &berr,
+                                  two_time ? &sched_r : nullptr);
     }
     if (!baked && sess != nullptr) {
       sess->log_normal(fmt("denoise: AdaLN not baked ({}); running the "
                            "projections per step", berr));
     }
+    // A rank of a split DiT holds no AdaLN projection (load() leaves it
+    // in the checkpoint): its modulation is the bake's or nothing.
+    if (!baked && req.dit->config().tp.active()) {
+      return fail("denoise: a rank of a split DiT needs the AdaLN bake ("
+                  + berr + ")");
+    }
   }
 
+  // MotionCache: a step whose forward a cached residual predicts well
+  // enough runs no forward at all. The window is a fraction of the
+  // sampling range mapped through the VIDEO shift -- the schedule the
+  // reference's sampler carries, the audio being mapped onto it -- and
+  // the estimator reads the generated rows only, through gathers that
+  // undo this loop's patch packing.
+  motion_cache::Config mcfg = motion_cache::config_from_flex(req.accel);
+  // Not on a rank of a split DiT: whether a step's forward is skipped is
+  // judged from this rank's own sums, which differ from the others' by
+  // rounding -- one rank skipping a forward its peer runs would leave
+  // the two out of step at their next exchange.
+  if (mcfg.enabled && req.dit->config().tp.active()) {
+    mcfg.enabled = false;
+    if (sess != nullptr) {
+      sess->info(fmt("h3-denoise: MotionCache off on a rank of a split "
+                     "DiT"));
+    }
+  }
+  // Sage's int8 P*V from this step on (sage::Config::pv8_from_step): the
+  // steps before, which settle a clip's layout, keep the int8 QK alone.
+  // Unsaid, the first quarter of the steps.
+  const sage::Config sage_cfg = sage::config_from_flex(req.accel);
+  const int pv8_from_cfg = sage_cfg.pv8_from_step;
+  const int pv8_from =
+      pv8_from_cfg >= 0 ? pv8_from_cfg : (req.num_steps + 3) / 4;
+  if (sess != nullptr && sage_cfg.pv8) {
+    sess->info(fmt("h3-denoise: sage_pv8 from step {} of {}{}, {}",
+                   pv8_from, req.num_steps,
+                   pv8_from_cfg >= 0 ? "" : " (default)",
+                   sage_cfg.pv8_all_rows ? "every row"
+                                         : "the video's rows"));
+  }
+  motion_cache::Cache mcache;
+  if (mcfg.enabled) {
+    std::string why;
+    MotionCacheGathers mg;
+    if (!mcache.begin(
+            req.accel,
+            motion_cache::percent_to_sigma(mcfg.start, req.video_shift),
+            motion_cache::percent_to_sigma(mcfg.end, req.video_shift),
+            /*x0_sign=*/1.0f)) {
+      why = fmt("the window {:.2f}-{:.2f} is empty", mcfg.start,
+                mcfg.end)();
+    } else if (!motion_cache_gathers(cfg, req.video_grid_h,
+                                     req.video_grid_w, nvid, naud,
+                                     mcache.subsample(), &mg, &why)) {
+      mcache = motion_cache::Cache();
+    }
+    if (why.empty()) {
+      mcache.set_video(mg.video.data(), mg.channels, mg.frames, mg.plane,
+                       (std::size_t)nvid * PE);
+      if (!mg.audio.empty()) {
+        mcache.set_audio(mg.audio.data(), mg.audio.size(),
+                         (std::size_t)naud * AC);
+      }
+      if (sess != nullptr) {
+        sess->info(fmt("h3-denoise: motion_cache on -- {}",
+                       mcache.describe()));
+      }
+    } else if (sess != nullptr) {
+      sess->warn(fmt("h3-denoise: motion_cache is OFF for this clip: {}",
+                     why));
+    }
+  }
+  // Only a computed step fills these; a reused one is filled by the
+  // cache. Held across steps so a reuse has somewhere to land.
+  std::vector<float> vel_v((std::size_t)nvid * PE);
+  std::vector<float> vel_a((std::size_t)naud * AC);
+  // Whether the cached residual covers the audio -- a computed step
+  // whose head wrote none leaves nothing to reuse there.
+  bool cached_audio = false;
+  int forwards = 0, reused_steps = 0, steps_run = 0;
+
+  // A preview's clean estimate, filled only on a step that renders one.
+  std::vector<float> preview_x0;
+  // The re-noising sampler's FRESH NOISE: a stream of its own off the
+  // request's seed (the initial noise a caller drew from the same seed
+  // is not repeated), drawn each step but the last -- the video's
+  // generated rows, then the audio's, as the reference draws them.
+  std::mt19937_64 rn_rng;
+  {
+    std::seed_seq ss{(std::uint32_t)req.seed,
+                     (std::uint32_t)(req.seed >> 32), 0x72656e6fu};
+    rn_rng.seed(ss);
+  }
+  std::normal_distribution<float> rn_nd(0.0f, 1.0f);
+  std::vector<float> rn_v, rn_a;
+  auto draw = [&](std::vector<float>* out, std::size_t n) {
+    out->resize(n);
+    for (float& v : *out) { v = rn_nd(rn_rng); }
+  };
+  // A DEV PROBE of Sol-Attn's routing, step by step and TEACHER-FORCED:
+  // VPIPE_H3_SOL_PROBE="diag:1,1.5,2;exact:1.5,1.75,2" runs every step
+  // dense (the trajectory the run keeps), then the same step's input
+  // again under each (threshold, tau) arm, and logs each arm's
+  // generated-video velocity against the dense one, the share of key
+  // blocks it kept and its forward's wall time. The DiT has to have been
+  // loaded with sol_attn on (its dense_layers and key block are the
+  // config's). Not a mode: a measurement.
+  struct SolArm { bool exact; float tau; };
+  std::vector<SolArm> sol_probe;
+  if (const char* e = std::getenv("VPIPE_H3_SOL_PROBE")) {
+    const std::string spec(e);
+    std::size_t p0 = 0;
+    while (p0 < spec.size()) {
+      std::size_t p1 = spec.find(';', p0);
+      if (p1 == std::string::npos) { p1 = spec.size(); }
+      const std::string part = spec.substr(p0, p1 - p0);
+      const std::size_t colon = part.find(':');
+      if (colon != std::string::npos) {
+        const bool ex = part.compare(0, colon, "exact") == 0;
+        std::size_t q0 = colon + 1;
+        while (q0 < part.size()) {
+          std::size_t q1 = part.find(',', q0);
+          if (q1 == std::string::npos) { q1 = part.size(); }
+          sol_probe.push_back(
+              {ex, std::strtof(part.substr(q0, q1 - q0).c_str(), nullptr)});
+          q0 = q1 + 1;
+        }
+      }
+      p0 = p1 + 1;
+    }
+    if (sess != nullptr) {
+      sess->info(fmt("h3-denoise: Sol probe -- every step dense, then {} "
+                     "routed arm(s) on the same input", sol_probe.size()));
+    }
+  }
+  if (!req.sol_tau_steps.empty() && sess != nullptr &&
+      req.dit->config().sol.enabled) {
+    std::string taus;
+    for (std::size_t k = 0; k < req.sol_tau_steps.size(); ++k) {
+      taus += fmt("{}{:.2f}", k > 0 ? ", " : "",
+                  (double)req.sol_tau_steps[k])();
+    }
+    sess->info(fmt("h3-denoise: Sol-Attn tau by step {} (the last for any "
+                   "step past it), threshold '{}'", taus,
+                   sol::threshold_name(req.dit->config().sol.thresh)));
+  }
+  if (!req.vdn_range_steps.empty() && sess != nullptr &&
+      req.dit->has_linear_branch()) {
+    std::string rs;
+    for (std::size_t k = 0; k < req.vdn_range_steps.size(); ++k) {
+      const int r = req.vdn_range_steps[k];
+      rs += fmt("{}{}", k > 0 ? ", " : "",
+                r < 0 ? req.dit->vdn_checkpoint_radius() : r)();
+    }
+    sess->info(fmt("h3-denoise: VDN softmax window by step {} chunk(s) "
+                   "either side (the last for any step past it), the "
+                   "linear half beyond", rs));
+  }
+  // How the steps are taken and on what grid, whenever either is not
+  // the loop's plain default: the line that says a sampler or a grid the
+  // graph named actually ran.
+  if (sess != nullptr &&
+      (renoise || res_ms || given || req.update != StepUpdate::kAuto)) {
+    const char* how =
+        renoise ? "RE-NOISED (x0 at each sigma, then fresh noise to the "
+                  "next)"
+        : res_ms ? "by res_multistep"
+        : vel_form ? "by Euler in its velocity form"
+        : refine ? "by the refine's plain Euler"
+                 : "by Euler";
+    const std::string whose =
+        vel_form && req.step_heads
+            ? std::string("as the checkpoint's per-step heads were "
+                          "distilled")
+        : req.update != StepUpdate::kAuto ? std::string("as the sampler asks")
+        : sc != nullptr && renoise
+            ? fmt("as {}'s sampling contract asks", sc->release)()
+        : res_ms ? std::string("VPIPE_H3_RES_MULTISTEP")
+                 : std::string("the default");
+    std::string on;
+    auto list = [](const std::vector<float>& g) {
+      std::string r;
+      for (float x : g) {
+        r += fmt("{}{:.4f}", r.empty() ? "" : ", ", (double)x)();
+      }
+      return r;
+    };
+    if (given) {
+      on = fmt(", on the video's sigmas as given [{}], the audio's mapped "
+               "through shifts {:.4g}/{:.4g} [{}]", list(sv.sigmas()),
+               req.video_shift, req.audio_shift, list(sa.sigmas()))();
+    } else if (sc != nullptr) {
+      on = fmt(", on {}'s grid", sc->release)();
+    }
+    sess->info(fmt("h3-denoise: {} steps {}, {}{}", steps, how, whose,
+                   on));
+  }
   for (int i = 0; i < steps; ++i) {
     // Every row's timestep, this step. The conditioning rows keep their
     // own value while the generated video and audio rows walk their two
@@ -165,45 +640,186 @@ denoise(const DenoiseRequest& req, std::string* err)
     // t = 1 - sigma, t = 1 meaning CLEAN. The transformer consumes it
     // unscaled and recovers sigma itself; feeding a pure-noise latent
     // t = 0 would tell the model it is already done.
-    const float tv = sv.timesteps()[(std::size_t)i];
-    const float ta = sa.timesteps()[(std::size_t)i];
-    const float tc = req.condition_timestep;
-    minimax_h3::build_row_timesteps(L, tv, ta, tc, &uniq, &row_idx,
-                                    req.condition_audio_timestep);
-
-    {
-      auto* d = static_cast<std::uint16_t*>(vb.contents());
-      for (std::size_t k = 0; k < (std::size_t)vrows * PE; ++k) {
-        d[k] = f32_to_bf16_(req.video[k]);
+    plan(i, &uniq, &uniq_r, &row_idx);
+    // Which ROLE each distinct entry serves, first and last step: the
+    // one line that shows the two schedules and the pinned references
+    // actually landed on the rows they were meant for, in a layout that
+    // interleaves them. Roles, not tags -- a vision block's prompt rows
+    // are tagged VIDEO and would otherwise read as generated video.
+    if (prof && (i == 0 || i + 1 == steps)) {
+      enum { kText, kRefVid, kGenVid, kRefAud, kGenAud, kRoles };
+      std::vector<int> role((std::size_t)L.seq_len, kText);
+      for (int k = 0; k < vrows; ++k) {
+        role[(std::size_t)L.video_indices[(std::size_t)k]] =
+            k < ncond ? kRefVid : kGenVid;
       }
-    }
-    if (arows > 0) {
-      // Every audio row, reference blocks included -- they are what the
-      // generated rows attend to. Uploading only the generated count
-      // would leave the tail of the buffer whatever the allocation had
-      // in it, which is how a reference request turns into NaN.
-      auto* d = static_cast<std::uint16_t*>(ab.contents());
-      for (std::size_t k = 0; k < (std::size_t)arows * AC; ++k) {
-        d[k] = f32_to_bf16_(req.audio[k]);
+      for (int k = 0; k < arows; ++k) {
+        role[(std::size_t)L.audio_indices[(std::size_t)k]] =
+            k < ncaud ? kRefAud : kGenAud;
       }
+      std::vector<std::array<int, kRoles>> cnt(uniq.size(),
+                                               std::array<int, kRoles>{});
+      for (std::size_t k = 0; k < row_idx.size(); ++k) {
+        ++cnt[(std::size_t)row_idx[k]][(std::size_t)role[k]];
+      }
+      std::string s;
+      for (std::size_t e = 0; e < uniq.size(); ++e) {
+        const auto& c = cnt[e];
+        s += fmt(" | t {:.6f}", uniq[e])();
+        if (two_time) { s += fmt(" r {:.6f}", uniq_r[e])(); }
+        s += fmt(": text {} refvid {} genvid {} refaud {} genaud {}",
+                 c[kText], c[kRefVid], c[kGenVid], c[kRefAud], c[kGenAud])();
+      }
+      sess->info(fmt("h3-denoise step {} row plan ({} entries){}", i + 1,
+                     uniq.size(), s));
     }
 
-    MetalMiniMaxH3Transformer::Step st;
-    st.video  = &vb;
-    st.audio  = &ab;
-    st.text   = req.text;
-    st.layout = &L;
-    st.timesteps          = &uniq;
-    st.row_timestep_index = &row_idx;
-    st.schedule_index     = baked ? i : -1;
-    std::string ferr;
+    float* vx = req.video + (std::size_t)ncond * PE;
+    float* ax = req.audio + (std::size_t)ncaud * AC;
+    const double sigma_v = sv.sigmas()[(std::size_t)i];
+    // Before anything is uploaded: a reused step never touches the GPU.
+    const bool reuse =
+        mcache.armed() && mcache.decide(sigma_v, vx, naud > 0 ? ax : nullptr);
+    bool have_aud = false;
     const auto t_fwd0 = std::chrono::steady_clock::now();
-    MetalMiniMaxH3Transformer::Velocity v = req.dit->forward(st, &ferr);
-    const auto t_fwd1 = std::chrono::steady_clock::now();
-    if (v.empty()) {
-      return fail("denoise: step " + std::to_string(i) + ": " +
-                  (ferr.empty() ? std::string("forward failed") : ferr));
+    // The GPU's credited work over the forward, for the profile's rate
+    // (credited at retire, and the forward has retired by the time its
+    // velocity is read).
+    const std::uint64_t gpu_f0 =
+        prof && perf_flops::available()
+            ? perf_flops::totals(perf_flops::kGpu).flops
+            : 0;
+    if (reuse) {
+      mcache.predict(vx, vel_v.data(), cached_audio ? ax : nullptr,
+                     cached_audio ? vel_a.data() : nullptr);
+      have_aud = cached_audio;
+      ++reused_steps;
+    } else {
+      {
+        auto* d = static_cast<std::uint16_t*>(vb.contents());
+        for (std::size_t k = 0; k < (std::size_t)vrows * PE; ++k) {
+          d[k] = f32_to_bf16_(req.video[k]);
+        }
+      }
+      if (arows > 0) {
+        // Every audio row, reference blocks included -- they are what the
+        // generated rows attend to. Uploading only the generated count
+        // would leave the tail of the buffer whatever the allocation had
+        // in it, which is how a reference request turns into NaN.
+        auto* d = static_cast<std::uint16_t*>(ab.contents());
+        for (std::size_t k = 0; k < (std::size_t)arows * AC; ++k) {
+          d[k] = f32_to_bf16_(req.audio[k]);
+        }
+      }
+
+      MetalMiniMaxH3Transformer::Step st;
+      st.video  = &vb;
+      st.audio  = &ab;
+      st.text   = req.text;
+      st.layout = &L;
+      st.timesteps          = &uniq;
+      st.row_timestep_index = &row_idx;
+      st.endpoints          = two_time ? &uniq_r : nullptr;
+      st.schedule_index     = baked ? i : -1;
+      st.out_head           = req.step_heads ? i : -1;
+      st.dense_attention    = i < req.sol_dense_steps || !sol_probe.empty();
+      if (!req.sol_tau_steps.empty()) {
+        st.sol_routing = true;
+        st.sol_tau = req.sol_tau_steps[std::min<std::size_t>(
+            (std::size_t)i, req.sol_tau_steps.size() - 1)];
+        st.sol_exact =
+            req.dit->config().sol.thresh == sol::Threshold::kExact;
+      }
+      if (!req.vdn_range_steps.empty()) {
+        const std::size_t k = std::min<std::size_t>(
+            (std::size_t)i, req.vdn_range_steps.size() - 1);
+        st.vdn_radius = std::max(-1, req.vdn_range_steps[k]);
+      }
+      st.sage_pv8_off       = i < pv8_from;
+      st.video_grid_h       = req.video_grid_h;
+      st.video_grid_w       = req.video_grid_w;
+      std::string ferr;
+      MetalMiniMaxH3Transformer::Velocity v = req.dit->forward(st, &ferr);
+      if (v.empty()) {
+        return fail("denoise: step " + std::to_string(i) + ": " +
+                    (ferr.empty() ? std::string("forward failed") : ferr));
+      }
+      ++forwards;
+      // The GENERATED tails only. The head writes every row it was given,
+      // conditioning included, and those are never stepped.
+      {
+        const auto* g =
+            static_cast<const std::uint16_t*>(v.video.contents()) +
+            (std::size_t)ncond * PE;
+        for (std::size_t k = 0; k < vel_v.size(); ++k) {
+          vel_v[k] = bf16_to_f32_(g[k]);
+        }
+      }
+      if (naud > 0 && !v.audio.empty()) {
+        const auto* g =
+            static_cast<const std::uint16_t*>(v.audio.contents()) +
+            (std::size_t)ncaud * AC;
+        for (std::size_t k = 0; k < vel_a.size(); ++k) {
+          vel_a[k] = bf16_to_f32_(g[k]);
+        }
+        have_aud = true;
+      }
+      // The probe's arms, on the input the dense forward just read (the
+      // buffers are uploaded once a step and not written by a forward).
+      if (!sol_probe.empty() && sess != nullptr) {
+        sess->info(fmt("[sol-probe] step {} sigma {:.4f} dense: {:.0f} ms",
+                       i, (double)sigma_v,
+                       std::chrono::duration<double, std::milli>(
+                           std::chrono::steady_clock::now() - t_fwd0)
+                           .count()));
+      }
+      for (const SolArm& arm : sol_probe) {
+        MetalMiniMaxH3Transformer::Step sp = st;
+        sp.dense_attention = false;
+        sp.sol_routing = true;
+        sp.sol_tau = arm.tau;
+        sp.sol_exact = arm.exact;
+        const auto t0 = std::chrono::steady_clock::now();
+        MetalMiniMaxH3Transformer::Velocity pv = req.dit->forward(sp, &ferr);
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count();
+        if (pv.empty()) {
+          return fail("denoise: Sol probe at step " + std::to_string(i) +
+                      ": " + ferr);
+        }
+        const auto* g = static_cast<const std::uint16_t*>(
+                            pv.video.contents()) +
+                        (std::size_t)ncond * PE;
+        double dd = 0.0, nn = 0.0;
+        for (std::size_t k = 0; k < vel_v.size(); ++k) {
+          const double a = (double)bf16_to_f32_(g[k]) - (double)vel_v[k];
+          dd += a * a;
+          nn += (double)vel_v[k] * (double)vel_v[k];
+        }
+        if (sess != nullptr) {
+          sess->info(fmt("[sol-probe] step {} sigma {:.4f} {} tau {:.2f}: "
+                         "video velocity {:.4f} from dense, kept {:.1f}% of "
+                         "key blocks, {:.0f} ms",
+                         i, (double)sigma_v, arm.exact ? "exact" : "diag",
+                         (double)arm.tau,
+                         nn > 0.0 ? std::sqrt(dd / nn) : 0.0,
+                         100.0 * req.dit->sol_kept_fraction(), ms));
+        }
+      }
+      // With the state the forward ran ON -- the scheduler has not
+      // stepped it yet.
+      if (mcache.armed()) {
+        mcache.update(sigma_v, vx, vel_v.data(), have_aud ? ax : nullptr,
+                      have_aud ? vel_a.data() : nullptr);
+        cached_audio = have_aud;
+      }
     }
+    const auto t_fwd1 = std::chrono::steady_clock::now();
+    const std::uint64_t gpu_f1 =
+        prof && perf_flops::available()
+            ? perf_flops::totals(perf_flops::kGpu).flops
+            : 0;
 
     // Step ONLY the generated tail. The conditioning rows lead the video
     // block precisely so this is a contiguous slice -- writing them
@@ -213,10 +829,8 @@ denoise(const DenoiseRequest& req, std::string* err)
     double vrms = 0.0, arms = 0.0, xrms = 0.0, vxcorr = 0.0;
     double xarms = 0.0, axcorr = 0.0;
     {
-      const auto* g = static_cast<const std::uint16_t*>(v.video.contents());
-      std::vector<float> vel((std::size_t)nvid * PE);
+      std::vector<float>& vel = vel_v;
       for (std::size_t k = 0; k < vel.size(); ++k) {
-        vel[k] = bf16_to_f32_(g[(std::size_t)ncond * PE + k]);
         vrms += (double)vel[k] * (double)vel[k];
       }
       vrms = vel.empty() ? 0.0 : std::sqrt(vrms / (double)vel.size());
@@ -227,38 +841,47 @@ denoise(const DenoiseRequest& req, std::string* err)
       // corr near -1: x0 = x + sigma*v then collapses to a rescaling of
       // the input noise, which is prompt-independent noise out.
       {
-        const float* xb = req.video + (std::size_t)ncond * PE;
         double sxy = 0.0, sxx = 0.0;
         for (std::size_t k = 0; k < vel.size(); ++k) {
-          sxy += (double)vel[k] * (double)xb[k];
-          sxx += (double)xb[k] * (double)xb[k];
+          sxy += (double)vel[k] * (double)vx[k];
+          sxx += (double)vx[k] * (double)vx[k];
         }
-        const double den = std::sqrt(sxx) * std::sqrt((double)vel.size()) * vrms;
+        const double den =
+            std::sqrt(sxx) * std::sqrt((double)vel.size()) * vrms;
         vxcorr = den > 0.0 ? sxy / den : 0.0;
       }
-      float* vx = req.video + (std::size_t)ncond * PE;
+      // The clean estimate, taken before the step overwrites the state it
+      // is estimated from.
+      if (req.preview && req.preview_due && req.preview_due(i + 1, steps)) {
+        preview_x0.resize(vel.size());
+        if (!sv.estimate_x0(vel.data(), i, vx, preview_x0.data(),
+                            vel.size())) {
+          preview_x0.clear();
+        }
+      }
+      const bool vlast = sv.sigmas()[(std::size_t)i + 1] == 0.0f;
+      if (renoise && !vlast) { draw(&rn_v, vel.size()); }
       const bool vok =
-          res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
-                 : sv.step(vel.data(), i, vx, vel.size());
+          renoise ? sv.step_renoise(vel.data(), i, vx,
+                                    vlast ? nullptr : rn_v.data(),
+                                    vel.size())
+          : res_ms ? sv.step_res(vel.data(), i, vx, vel.size(), &vprev)
+          : vel_form ? sv.step_velocity(vel.data(), i, vx, vel.size())
+          : refine ? sv.step_plain(vel.data(), i, vx, vel.size())
+                   : sv.step(vel.data(), i, vx, vel.size());
       if (!vok) {
         return fail("denoise: video step " + std::to_string(i) + " failed");
       }
-      const float* x = req.video + (std::size_t)ncond * PE;
       for (std::size_t k = 0; k < vel.size(); ++k) {
-        xrms += (double)x[k] * (double)x[k];
+        xrms += (double)vx[k] * (double)vx[k];
       }
       xrms = vel.empty() ? 0.0 : std::sqrt(xrms / (double)vel.size());
     }
-    if (naud > 0 && !v.audio.empty()) {
-      // The head writes every audio row it was given, reference rows
-      // included; only the generated tail is stepped, so both the
-      // velocity and the state are read from `ncaud` on.
-      const auto* g = static_cast<const std::uint16_t*>(v.audio.contents()) +
-                      (std::size_t)ncaud * AC;
-      float* ax = req.audio + (std::size_t)ncaud * AC;
-      std::vector<float> vel((std::size_t)naud * AC);
+    if (have_aud && !refine) {
+      // Only the generated tail is stepped, so both the velocity and the
+      // state are read from `ncaud` on.
+      std::vector<float>& vel = vel_a;
       for (std::size_t k = 0; k < vel.size(); ++k) {
-        vel[k] = bf16_to_f32_(g[k]);
         arms += (double)vel[k] * (double)vel[k];
       }
       arms = vel.empty() ? 0.0 : std::sqrt(arms / (double)vel.size());
@@ -280,9 +903,15 @@ denoise(const DenoiseRequest& req, std::string* err)
             std::sqrt(sxx) * std::sqrt((double)vel.size()) * arms;
         axcorr = den > 0.0 ? sxy / den : 0.0;
       }
+      const bool alast = sa.sigmas()[(std::size_t)i + 1] == 0.0f;
+      if (renoise && !alast) { draw(&rn_a, vel.size()); }
       const bool aok =
-          res_ms ? sa.step_res(vel.data(), i, ax, vel.size(), &aprev)
-                 : sa.step(vel.data(), i, ax, vel.size());
+          renoise ? sa.step_renoise(vel.data(), i, ax,
+                                    alast ? nullptr : rn_a.data(),
+                                    vel.size())
+          : res_ms ? sa.step_res(vel.data(), i, ax, vel.size(), &aprev)
+          : vel_form ? sa.step_velocity(vel.data(), i, ax, vel.size())
+                   : sa.step(vel.data(), i, ax, vel.size());
       if (!aok) {
         return fail("denoise: audio step " + std::to_string(i) + " failed");
       }
@@ -291,6 +920,7 @@ denoise(const DenoiseRequest& req, std::string* err)
       }
       xarms = vel.empty() ? 0.0 : std::sqrt(xarms / (double)vel.size());
     }
+    ++steps_run;
 
     // Per-step trace. Timing alone cannot separate "the GPU work never
     // launched" from "it launched and returned garbage" -- a kernel that
@@ -304,17 +934,56 @@ denoise(const DenoiseRequest& req, std::string* err)
           std::chrono::duration<double, std::milli>(t_fwd1 - t_fwd0).count();
       const double tot_ms =
           std::chrono::duration<double, std::milli>(t_end - t_fwd0).count();
+      // What MotionCache made of the step, when it was asked: the score
+      // is the predicted relative change of the output, and the sum is
+      // what the threshold compares.
+      std::string mc;
+      if (mcache.armed()) {
+        mc = reuse ? "  REUSED" : "  computed";
+        if (mcache.last_score() >= 0.0) {
+          mc += fmt(" (score {:.5f}, accumulated {:.5f})",
+                    mcache.last_score(), mcache.accumulated())();
+        }
+      }
+      const double tf = (double)(gpu_f1 - gpu_f0) * 1e-12;
       sess->info(fmt(
           "h3-denoise step {:2}/{}  sigma {:.4f} -> {:.4f}  fwd {:7.1f} ms  "
-          "total {:7.1f} ms  |v_vid| {:.5f}  |x_vid| {:.5f} "
+          "total {:7.1f} ms  GPU {:.2f} TFLOP ({:.1f} TFLOP/s)  "
+          "|v_vid| {:.5f}  |x_vid| {:.5f} "
           "corr_vid {:+.5f}  |  |v_aud| {:.5f}  |x_aud| {:.5f} "
-          "corr_aud {:+.5f}",
+          "corr_aud {:+.5f}{}",
           i + 1, steps, sv.sigmas()[(std::size_t)i],
-          sv.sigmas()[(std::size_t)i + 1], fwd_ms, tot_ms, vrms, xrms,
-          vxcorr, arms, xarms, axcorr));
+          sv.sigmas()[(std::size_t)i + 1], fwd_ms, tot_ms, tf,
+          fwd_ms > 0.0 ? tf / (fwd_ms * 1e-3) : 0.0, vrms, xrms,
+          vxcorr, arms, xarms, axcorr, mc));
     }
 
+    if (!preview_x0.empty()) {
+      req.preview(i + 1, steps, preview_x0.data());
+      preview_x0.clear();
+    }
     if (req.progress && !req.progress(i + 1, steps)) { break; }
+  }
+  if (req.report != nullptr) {
+    req.report->steps    = steps_run;
+    req.report->forwards = forwards;
+    req.report->reused   = reused_steps;
+    req.report->motion_cache = mcache.armed();
+    req.report->renoise  = renoise;
+    req.report->update   = renoise ? StepUpdate::kRenoise
+                           : res_ms ? StepUpdate::kResMultistep
+                           : vel_form ? StepUpdate::kVelocity
+                                      : StepUpdate::kEuler;
+    req.report->video_sigmas = sv.sigmas();
+    req.report->audio_sigmas = sa.sigmas();
+  }
+  // The one line that says whether the setting did anything. The ratio
+  // is of FORWARDS, the dominant cost of a step, not of wall time.
+  if (mcache.armed() && sess != nullptr) {
+    sess->info(fmt("h3-denoise: motion_cache reused {} of {} steps -- {} "
+                   "forwards ran, {:.2f}x fewer", reused_steps, steps_run,
+                   forwards,
+                   forwards > 0 ? (double)steps_run / forwards : 1.0));
   }
   return true;
 }

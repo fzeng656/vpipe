@@ -13,8 +13,14 @@
 #include <string>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
+
 namespace vpipe {
 
+class CommandInbox;
 class EdgeReader;
 class InitBarrier;
 class OportBuffer;
@@ -142,6 +148,10 @@ private:
   // drivers have drained, so post-stop topology edits are permitted.
   std::vector<Stage*>                          _live_stages;
 
+  // One per stage that declares commands, for the span of the launch.
+  // Shut at stop() before anything waits on the drivers.
+  std::vector<std::shared_ptr<CommandInbox>>   _inboxes;
+
   // ---- the topological memory plan, and its revisions ------------------
   //
   // Held for the launch rather than computed and dropped, because the
@@ -164,6 +174,9 @@ private:
   std::vector<StageMemory>                     _plan_mem;
   MemoryPlan                                   _plan;
   bool                                         _plan_live = false;
+  // The stages' tags given an owner for the pool to put on their resumes
+  // (common/memory-owner.h): cleared as the launch ends.
+  std::vector<std::uint32_t>                   _memory_tags;
 
   std::vector<std::unique_ptr<OportBuffer>>    _oport_bufs;
   std::vector<std::unique_ptr<EdgeReader>>     _readers;
@@ -201,5 +214,7 @@ private:
 };
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

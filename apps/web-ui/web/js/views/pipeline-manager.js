@@ -1,11 +1,14 @@
-// Pipeline Manager view: three panes -- pipeline list (1/4), stage
-// graph (1/2), and the config panel (1/4).
+// Pipeline Manager view: the pipeline list beside the reusable editor,
+// which is the stage graph plus the configuration panel. The panel docks
+// BELOW the graph by default and can be moved to its right; either way a
+// divider sets the split. See the layout preferences below.
 
-import { el, clear, append, toast, openModal, openMenu, kbd }
+import { el, clear, append, toast, openModal, openErrorModal, openMenu, kbd }
   from '../dom.js';
 import { makeIcon } from '../icons.js';
 import { api, MODEL_REGISTRY_DB } from '../api.js';
-import { modelMatches, modalitiesPresent } from '../model-filter.js';
+import { modelMatches, modalitiesPresent, compatibleModels }
+  from '../model-filter.js';
 import { renderGraph, applyBufferStats, shortType, worldToPin }
   from '../graph.js';
 import { topoOrder, assignLanes, laneArt, laneX, gutterWidth }
@@ -14,6 +17,53 @@ import { openConnectEditor } from '../connect-editor.js';
 import { typesCompatible, tagsCompatible } from '../port-compat.js';
 import { t, tOr } from '../i18n.js';
 import { openFsDialog, filterForCategory, splitPath } from '../fs-dialog.js';
+
+// --- editor layout preferences --------------------------------------
+// Where the configuration pane docks, whether field documentation shows,
+// and whether the graph pane is pinned to the lane list. Per USER rather
+// than per pipeline: they describe how someone likes to work, not
+// anything about the graph, so they are not part of a pipeline file and
+// not part of a composer panel's config -- the same reasoning the theme
+// and the file dialog's preview toggle already follow. Every read and
+// write is guarded: storage is blocked in a private window, and a
+// layout toggle is not worth a thrown exception.
+const LS_DOCK  = 'vpipe_pe_cfg_dock';    // 'bottom' (default) | 'right'
+const LS_DOCS  = 'vpipe_pe_cfg_docs';    // '1' (default) | '0'
+const LS_LANES = 'vpipe_pe_lane_view';   // '1' | '0' (default)
+// WHAT A BARE WHEEL DOES ON THE CANVAS. Nothing in a wheel event says
+// whether a trackpad or a mouse sent it, and the right default differs
+// between them -- a two-finger swipe should move the canvas, a mouse's
+// one wheel should zoom it -- so it is a preference, not a heuristic.
+// Default 'pan', which is the trackpad this is mostly used from.
+const LS_WHEEL = 'vpipe_pe_wheel';       // 'pan' (default) | 'zoom'
+// THE SELECTOR : EDITOR SPLIT, as the selector's fraction of the view.
+// A fraction, like the stage:config split, so a window resize keeps the
+// proportion someone set rather than stranding a pixel width. Only the
+// full manager has a selector; the standalone editor ignores this.
+const LS_SELW  = 'vpipe_pm_sel_width';   // '0.19' by default (the CSS)
+// WHICH PIPELINE THE SELECTOR LAST HAD. Every view switch re-mounts this
+// view (app.js calls mount() again), so the selection cannot live in the
+// closure: leaving the Pipelines view for User I/O and coming back built
+// a fresh state with no selection and fell to the first pipeline, losing
+// whichever one was being edited.
+//
+// Advisory, like the rest: a pipeline can be unloaded or renamed from
+// anywhere, so a miss just means "no opinion" and the first pipeline is
+// used. Kept separate from the phone shell's own last-pipeline key
+// (phone-recent.js): that one steers which pipeline the phone's stage
+// panels open on, and a desktop selection should not quietly re-point
+// them.
+const LS_PIPE  = 'vpipe_pe_pipeline';    // '' when nothing is selected
+
+function prefGet(key, dflt) {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? dflt : v;
+  } catch (e) { return dflt; }
+}
+function prefSet(key, v) {
+  try { localStorage.setItem(key, v); } catch (e) { /* storage blocked */ }
+}
 
 export function mountPipelineManager(container) {
   return mountEditor(container, { showSelector: true, showControls: false });
@@ -47,6 +97,53 @@ function mountEditor(container, opts = {}) {
   // the divider; onSplit lets a host persist it as a view config.
   let split = clampN(
     Number.isFinite(opts.split) ? opts.split : 2 / 3, 0.2, 0.85);
+  // BOTTOM by default. A pipeline reads left to right, so width is what
+  // the canvas is always short of and height is what it has spare -- a
+  // configuration pane beside it takes the scarce axis to show a column
+  // of fields that does not need it. Docked below, the same form spreads
+  // into however many columns fit (see the .cfg grid) and the canvas
+  // keeps the full width.
+  let cfgDock = prefGet(LS_DOCK, 'bottom') === 'right' ? 'right' : 'bottom';
+  let showDocs = prefGet(LS_DOCS, '1') !== '0';
+  // The lane list is normally a FALLBACK the pane drops to when it is too
+  // narrow to draw a graph. This pins it on at any width: it says more
+  // about a long pipeline per vertical pixel than the canvas does, and
+  // someone reading topology rather than editing it may simply prefer it.
+  let forceLanes = prefGet(LS_LANES, '0') === '1';
+  let wheelMode = prefGet(LS_WHEEL, 'pan') === 'zoom' ? 'zoom' : 'pan';
+  // The CSS default (19%) is the fallback, so the two cannot disagree
+  // about where an unconfigured selector starts.
+  let selSplit = clampN(
+    parseFloat(prefGet(LS_SELW, '')) || 0.19, 0.08, 0.5);
+  // ONE step of undo for a configuration edit, which is the mistake this
+  // is for: a value typed over, a checkbox flipped, a field cleared --
+  // noticed immediately. {sid, before, after, undone}; `undone` says
+  // which way the pair currently points, so the same slot serves Redo
+  // rather than needing a second stack.
+  //
+  // The PUT replaces a stage's config outright (it is not a merge), so
+  // restoring `before` really does remove a key the edit added.
+  let cfgUndo = null;
+  // What the form on screen is known to hold, so the NEXT apply can pair
+  // itself against it. A render seeds it from the schema; each apply
+  // moves it on -- which is what keeps repeated auto-applies (one per
+  // blur) collapsing into a single step rather than pairing every edit
+  // against the state the form was first built from.
+  let cfgLast = null;    // {sid, cfg}
+  // The rendered pair of buttons, held so an apply can re-enable them
+  // WITHOUT a re-render. The auto-apply-on-blur path does not rebuild the
+  // form on purpose -- that would take the caret out of the field the
+  // user just tabbed into -- so without this the first edit of a session
+  // leaves Undo greyed out until something else redraws the header.
+  let undoBtns = null;   // {undo, redo}
+  // Which configuration render is the current one. renderConfig empties
+  // the header BEFORE awaiting the stage's config and fills it AFTER, so
+  // two overlapping renders interleave as clear, clear, fill, fill --
+  // and the header ends up holding two sets of buttons, then three,
+  // crowding the layout toggles out of the row. Anything that re-renders
+  // in bursts reaches this: a dock flip, or a panel dragged through the
+  // narrow crossover. Only the newest render may write.
+  let cfgSeq = 0;
   const state = {
     pipelines: [],        // summaries
     stageTypes: [],
@@ -182,10 +279,91 @@ function mountEditor(container, opts = {}) {
   // Live stage count, right-aligned in the Stages title bar. Updated by
   // renderGraphPane whenever the graph changes.
   const stagesCount = el('span', { class: 'stages-count' });
+  // The NARROW view's way in to the palette.
+  //
+  // Below the canvas crossover the pane shows the linearized lane list,
+  // and a docked toolbox there is the wrong shape twice over: it spends
+  // a third of an already-cramped pane on a permanent panel, and what it
+  // offers -- drag a chip onto the canvas -- cannot be done, because
+  // there is no canvas to drop onto. So the panel is hidden and this
+  // takes its place: one button, and a picker that opens on demand,
+  // filters, and adds on a single click.
+  //
+  // It is the SAME palette (see stageSections), so the two views cannot
+  // come to disagree about what can be added.
+  //
+  // Declared BEFORE the header that mounts it: `const` is in its
+  // temporal dead zone until this line runs, so appending it above
+  // would throw on mount rather than merely read oddly.
+  const addStageBtn = el('button', {
+    class: 'graph-add-stage', type: 'button',
+    title: tOr('pl.add_stage', 'Add stage'),
+    onclick: (e) => { e.stopPropagation(); openStagePicker(); },
+  }, '+');
+
+  // The documentation toggle, repeated in the GRAPH header.
+  //
+  // One column hides the configuration pane and the three layout toggles
+  // in its header with it, so turning documentation off while reading a
+  // narrow panel meant widening it, toggling, and narrowing it again.
+  //
+  // Only this one is repeated. With no pane there is nothing to dock,
+  // and the lane list is what this width draws whatever the lane toggle
+  // says -- so the other two would be buttons that do nothing here.
+  //
+  // Built with el() rather than the toolBtn helper below: `const` is in
+  // its temporal dead zone until its own line runs, and this is needed
+  // before the header is assembled.
+  const docsBtnHead = el('button', {
+    class: 'graph-head-tool', type: 'button',
+    onclick: (e) => { e.stopPropagation(); toggleDocs(); },
+  }, 'ⓘ');
+
   graphHead.append(
     el('span', { class: 'title' }, t('pl.stages')),
     el('span', { class: 'grow' }),
-    stagesCount);
+    stagesCount,
+    docsBtnHead,
+    addStageBtn);
+
+  function openStagePicker() {
+    if (!canEdit()) { return; }
+    const body = el('div', { class: 'sp-body' });
+    const filter = el('input', {
+      type: 'search', class: 'sp-filter', placeholder: t('pl.filter_ph'),
+      oninput: () => { clear(body); fill(); },
+    });
+    const pop = el('div', { class: 'stage-picker' }, filter, body);
+    const close = () => {
+      pop.remove();
+      document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('pointerdown', onAway, true);
+      window.removeEventListener('resize', close);
+    };
+    const fill = () => renderSections(body, filter.value || '', {
+      onPick: (type) => { close(); promptCreateStage(type); },
+    });
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); close(); }
+    };
+    const onAway = (e) => {
+      if (!pop.contains(e.target) && e.target !== addStageBtn) { close(); }
+    };
+    fill();
+    // Anchored under the button and clamped to the viewport, so it does
+    // not hang off the right edge of a narrow pane -- which is the only
+    // width this thing is ever opened at.
+    const r = addStageBtn.getBoundingClientRect();
+    (document.getElementById('modal-root') || document.body).append(pop);
+    const w = pop.offsetWidth || 260;
+    pop.style.left = Math.max(6, Math.min(r.right - w,
+      window.innerWidth - w - 6)) + 'px';
+    pop.style.top = (r.bottom + 4) + 'px';
+    document.addEventListener('keydown', onKey, true);
+    document.addEventListener('pointerdown', onAway, true);
+    window.addEventListener('resize', close);
+    setTimeout(() => filter.focus(), 0);
+  }
 
   // Toolbox: a filterable palette of every registered stage type.
   // Drag a chip onto the canvas (or double-click it) to add a stage.
@@ -257,9 +435,48 @@ function mountEditor(container, opts = {}) {
   // so they stay reachable no matter where a long form is scrolled.
   // renderConfig fills this per stage; it is empty when none is selected.
   const cfgActions = el('span', { class: 'pane-head-actions' });
+  // The three LAYOUT toggles, grouped at the far right of the same
+  // header: where this pane sits, whether its fields carry their
+  // documentation, and whether the graph pane draws a canvas or the lane
+  // list. They live here rather than on the graph header because all
+  // three are about the shape of the editor, and one group in one corner
+  // is easier to find again than three buttons in three places.
+  //
+  // Titles and pressed state are filled by the apply* functions below, so
+  // the button and the state it reports cannot be spelled twice.
+  const toolBtn = (glyph, onclick) => el('button', {
+    class: 'pe-tool', type: 'button', onclick,
+  }, glyph);
+  const dockBtn = toolBtn('', () => {
+    cfgDock = cfgDock === 'bottom' ? 'right' : 'bottom';
+    prefSet(LS_DOCK, cfgDock);
+    applyDock();
+    // The dock decides how much WIDTH the configuration costs, which is
+    // the input to the one-column crossover -- so the layout has to be
+    // re-decided here rather than waiting for the next resize.
+    renderGraphPane();
+    if (!state.oneColumn) { renderConfig(); }
+  });
+  // One flip, two buttons: this one and the graph header's copy for the
+  // one-column layout. A handler each would be two spellings of a single
+  // decision, which is how they come to disagree.
+  function toggleDocs() {
+    showDocs = !showDocs;
+    prefSet(LS_DOCS, showDocs ? '1' : '0');
+    applyDocs();
+  }
+  const docsBtn = toolBtn('ⓘ', () => toggleDocs());
+  const laneBtn = toolBtn('☰', () => {
+    forceLanes = !forceLanes;
+    prefSet(LS_LANES, forceLanes ? '1' : '0');
+    applyLanes();
+  });
+  const cfgTools = el('span', { class: 'pe-cfg-tools' },
+    dockBtn, docsBtn, laneBtn);
   const cfgPane = el('div', { class: 'pane' },
     el('div', { class: 'pane-head' },
-      el('span', { class: 'title' }, t('pl.configuration')), cfgActions),
+      el('span', { class: 'title' }, t('pl.configuration')),
+      cfgActions, cfgTools),
     cfgBody);
 
   // Run / pause / stop overlay pinned to the canvas top-left (standalone
@@ -281,12 +498,63 @@ function mountEditor(container, opts = {}) {
     graphPane.style.flexGrow = String(split);
     cfgPane.style.flexGrow = String(1 - split);
   }
+  // `split` is the GRAPH's share of whichever axis the dock chose, so one
+  // fraction serves both orientations and a dock flip keeps the
+  // proportion the operator set rather than resetting it.
+  function applyDock() {
+    const bottom = cfgDock === 'bottom';
+    editorArea.classList.toggle('dock-bottom', bottom);
+    dockBtn.textContent = bottom ? '⬓' : '◨';
+    dockBtn.title = bottom ? t('pl.dock_right') : t('pl.dock_bottom');
+    divider.title = bottom ? t('pl.resize_height') : t('pl.resize_width');
+    applySplit();
+  }
+  function applyDocs() {
+    // On the EDITOR, not the pane: the one-column layout renders the same
+    // form inline under a lane row, and a reader who turned the
+    // documentation off meant everywhere.
+    editorArea.classList.toggle('no-docs', !showDocs);
+    // Both copies: the pane header's, and the graph header's for the
+    // one-column layout. They are one setting, so they read the same.
+    for (const b of [docsBtn, docsBtnHead]) {
+      b.title = showDocs ? t('pl.docs_hide') : t('pl.docs_show');
+      b.setAttribute('aria-pressed', showDocs ? 'true' : 'false');
+    }
+    // The tooltip stands in for the documentation, so it exists exactly
+    // while the lines do not -- on whatever form is on screen already.
+    for (const k of editorArea.querySelectorAll('.field .key')) {
+      const d = k.dataset.doc || '';
+      if (!showDocs && d) { k.title = d; } else { k.removeAttribute('title'); }
+    }
+  }
+  // The button's own state, separate from acting on it: at mount there is
+  // no graph to re-render yet (renderGraphPane runs once the pipeline
+  // detail arrives), and spelling the pressed state twice is how the
+  // button and the layout come to disagree.
+  function applyLaneBtn() {
+    laneBtn.title = forceLanes ? t('pl.lane_view_off') : t('pl.lane_view_on');
+    laneBtn.setAttribute('aria-pressed', forceLanes ? 'true' : 'false');
+  }
+  function applyLanes() {
+    applyLaneBtn();
+    // Returning to the canvas: its pan/zoom was recorded against a
+    // viewport the lane list has since resized, so refit rather than
+    // restore (the resize watcher does the same on its own crossover).
+    if (!forceLanes) { state.graphView = {}; }
+    renderGraphPane();
+  }
   applySplit();
+  applyDock();
+  applyDocs();
+  applyLaneBtn();
   divider.addEventListener('pointerdown', (ev) => {
     ev.preventDefault();
     const r = editorArea.getBoundingClientRect();
+    // The divider resizes the axis the dock laid the panes out on.
+    const bottom = cfgDock === 'bottom';
     const mv = (e) => {
-      split = clampN((e.clientX - r.left) / r.width, 0.2, 0.85);
+      split = clampN(bottom ? (e.clientY - r.top) / r.height
+                            : (e.clientX - r.left) / r.width, 0.2, 0.85);
       applySplit();
     };
     const up = () => {
@@ -300,10 +568,47 @@ function mountEditor(container, opts = {}) {
     window.addEventListener('pointerup', up);
   });
 
+  // The selector : editor divider, the same affordance as the editor's
+  // own and deliberately the same class, because it is the same thing:
+  // a pipeline list is narrow until the names are long, and a canvas is
+  // short of width always. Only the full manager has one -- the
+  // standalone editor has no selector to resize against.
+  const selDivider = showSelector
+    ? el('div', { class: 'pe-divider pm-divider',
+                  title: t('pl.resize_selector') })
+    : null;
+  function applySelSplit() {
+    // flex-basis only: .pm > .pane keeps grow/shrink at 0 and the CSS
+    // min-width still floors it, so a hard drag left cannot squeeze the
+    // list into an unreadable sliver.
+    listPane.style.flexBasis = (selSplit * 100).toFixed(3) + '%';
+  }
+  if (selDivider) { applySelSplit(); }
+
   const pmRoot = showSelector
-    ? el('div', { class: 'pm' }, listPane, editorArea)
+    ? el('div', { class: 'pm' }, listPane, selDivider, editorArea)
     : el('div', { class: 'pm no-sel' }, editorArea);
   clear(container).append(pmRoot);
+
+  if (selDivider) {
+    selDivider.addEventListener('pointerdown', (ev) => {
+      ev.preventDefault();
+      const r = pmRoot.getBoundingClientRect();
+      const mv = (e) => {
+        selSplit = clampN((e.clientX - r.left) / r.width, 0.08, 0.5);
+        applySelSplit();
+      };
+      // Persisted on RELEASE, not per frame: a drag fires dozens of
+      // moves and localStorage is synchronous.
+      const up = () => {
+        window.removeEventListener('pointermove', mv);
+        window.removeEventListener('pointerup', up);
+        prefSet(LS_SELW, selSplit.toFixed(4));
+      };
+      window.addEventListener('pointermove', mv);
+      window.addEventListener('pointerup', up);
+    });
+  }
 
   // Watch the graph pane for the canvas/list crossover. Every cause of a
   // width change lands here -- the window, the stage:config divider, the
@@ -318,7 +623,7 @@ function mountEditor(container, opts = {}) {
     const ro = new ResizeObserver(() => {
       if (!document.body.contains(pmRoot)) { return; }
       const one = editorNarrow();
-      const now = one || isNarrow();
+      const now = laneMode(one);
       // Compared against WHAT IS ON SCREEN (recorded by renderGraphPane)
       // rather than against the last observation. The two differ at
       // mount: the pane is measured at 0 before layout, which isNarrow()
@@ -347,6 +652,15 @@ function mountEditor(container, opts = {}) {
     // canvas-vs-list, and a resize can move either without the other.
     ro.observe(graphBody);
     ro.observe(editorArea);
+  }
+  // The configuration's own width, which the window, the divider and the
+  // dock button all move. A SECOND observer because the one above
+  // returns early whenever the canvas/list decision is unchanged -- which
+  // is most of a divider drag, and exactly when the columns must reflow.
+  if (typeof ResizeObserver !== 'undefined') {
+    const cro = new ResizeObserver(() => layoutCfgColumns());
+    cro.observe(cfgBody);
+    cro.observe(editorArea);
   }
 
   function iconBtn(icon, label, onclick, key) {
@@ -394,6 +708,26 @@ function mountEditor(container, opts = {}) {
       }
       return;
     }
+    // Zoom the canvas. `-` and `=` are the UNSHIFTED pair, so neither
+    // needs a second finger; they drive the same step as the − / +
+    // buttons in the view-control cluster.
+    //
+    // ABOVE the showSelector return on purpose: the standalone editor
+    // (the composer's canvas) is the view with the most graph on screen
+    // and the least reason to reach for the mouse. The text-field guard
+    // is the one at the top of this function, which already covers
+    // INPUT / TEXTAREA / SELECT / contentEditable -- so typing a minus
+    // into a config field still types a minus.
+    if (e.key === '-' || e.key === '=') {
+      const gc = state.graphContainer;
+      if (gc && gc.zoomBy) {
+        e.preventDefault();
+        const step = gc.zoomStep || 1.2;
+        gc.zoomBy(e.key === '=' ? step : 1 / step);
+      }
+      return;
+    }
+
     // Pipeline-level shortcuts (create / load / save / unload) belong to
     // the selector; skip them in the standalone editor (no such buttons).
     if (!showSelector) { return; }
@@ -441,7 +775,15 @@ function mountEditor(container, opts = {}) {
     } catch (e) { toast(t('pl.list_failed', { msg: e.message }), 'error');
       return; }
     if (!keepSel || !state.pipelines.find((p) => p.id === state.selectedId)) {
-      state.selectedId = state.pipelines[0] ? state.pipelines[0].id : null;
+      // No selection to keep -- a fresh mount, or the selected pipeline
+      // is gone. Prefer the one this operator last chose, and fall back
+      // to the first when it is no longer loaded: the memory is a
+      // preference, never a reason to show nothing.
+      const want = prefGet(LS_PIPE, '');
+      const remembered = !!want && state.pipelines.some((p) => p.id === want);
+      state.selectedId = remembered
+          ? want
+          : (state.pipelines[0] ? state.pipelines[0].id : null);
       state.detail = null;
       state.selectedStage = null;
       state.laneOpen = null;      // fold the inline form with its stage
@@ -449,9 +791,20 @@ function mountEditor(container, opts = {}) {
       state.graphLayout = null;   // lay out the new pipeline clean (no glide)
       state.graphPins = new Map();
     }
+    rememberSelection();
     renderList();
     if (state.selectedId) { await loadDetail(state.selectedId); }
     else { renderGraphPane(); renderConfig(); }
+  }
+
+  // The selection, written down wherever it SETTLES rather than at each
+  // of the half-dozen places that move it (create, load, rename, rebind,
+  // a click in the list): those all end in refreshList or selectPipeline.
+  // The standalone editor is bound to its pipeline rather than choosing
+  // one, so it has no opinion to record.
+  function rememberSelection() {
+    if (!showSelector) { return; }
+    prefSet(LS_PIPE, state.selectedId || '');
   }
 
   async function loadDetail(id) {
@@ -469,6 +822,7 @@ function mountEditor(container, opts = {}) {
 
   async function selectPipeline(id) {
     state.selectedId = id;
+    rememberSelection();
     state.selectedStage = null;
     state.pending = null;
     state.selectedEdge = null;
@@ -659,8 +1013,19 @@ function mountEditor(container, opts = {}) {
       await api[op](id);
       toast(t('pl.op_done', { op: opLabel[op] || op, id }), 'ok');
     } catch (e) {
-      toast(t('pl.op_failed', { op: opLabel[op] || op, msg: e.message }),
-            'error');
+      // A refused START carries the runtime's reason for refusing it,
+      // which is the same kind of text a refused load carries; pause
+      // and stop fail with one line and stay toasts.
+      if (op === 'launch') {
+        openErrorModal({
+          title: t('pl.launch_failed_title'),
+          message: e.message,
+          okLabel: t('common.close'),
+        });
+      } else {
+        toast(t('pl.op_failed', { op: opLabel[op] || op, msg: e.message }),
+              'error');
+      }
     } finally {
       state.inflight.delete(id);
     }
@@ -761,8 +1126,30 @@ function mountEditor(container, opts = {}) {
   function editorNarrow() {
     const w = editorArea.clientWidth;
     if (w <= 0) { return false; }        // unmeasured -> wide, as above
-    return w < NARROW_PX + toolbox.offsetWidth + CFG_MIN_PX;
+    // A FIXED crossover, measured from the editor and NOTHING ELSE.
+    //
+    // It used to add `toolbox.offsetWidth`, which is a measurement of the
+    // decision's own outcome: the toolbox is hidden exactly when the lane
+    // list shows, so the moment this returned true the term went to zero
+    // and the next render answered false. The `+ CFG_MIN_PX` term hid
+    // that -- until the dock made it conditional, and a bottom-docked
+    // panel in the band between the two thresholds settled with the lane
+    // list drawn and `oneColumn` false, where clicking a row selected it
+    // and expanded nothing.
+    //
+    // Nor does the DOCK belong here any more. Where the configuration
+    // sits decides how much width it costs the canvas, but this decides
+    // something else: whether the panel is big enough to be worth
+    // splitting at all. Below this, there is one column and the form
+    // goes inline under its row, wherever the pane would have been.
+    return w < NARROW_PX + CFG_MIN_PX;
   }
+
+  // Whether the graph pane draws the lane list rather than the canvas.
+  // Three causes, one answer, so the renderer and the resize watcher
+  // cannot reach different ones: the editor is down to a single column,
+  // the operator pinned the list on, or the pane is below the crossover.
+  function laneMode(one) { return one || forceLanes || isNarrow(); }
 
   function renderGraphPane(o = {}) {
     if (state.missing) { renderRebindPane(); return; }
@@ -776,10 +1163,15 @@ function mountEditor(container, opts = {}) {
     // rendering the inline form has anywhere to live. A WIDE editor whose
     // divider has been dragged hard left still reaches it on its own
     // crossover, and keeps its configuration pane.
-    const narrow = one || isNarrow();
+    const narrow = laneMode(one);
     state.oneColumn = one;
     state.renderedNarrow = narrow;
     editorArea.classList.toggle('pe-narrow', one);
+    // One column HIDES the configuration pane, and a hidden pane keeps
+    // whatever its last render put in the header -- which would still be
+    // there, stale, when the panel widens again. Empty it on the way in
+    // so it is rebuilt from nothing on the way out.
+    if (one) { clear(cfgActions); undoBtns = null; }
     // The surviving pane has to be TOLD to take the whole width. Being the
     // only flex item is not enough: `split` is a fraction, and an item whose
     // flex-grow sums to less than 1 gets only that share of the free space.
@@ -792,6 +1184,15 @@ function mountEditor(container, opts = {}) {
     // the top-left regardless of graph/empty content (absolute-positioned).
     if (canvasControls) { renderControls(); graphBody.append(canvasControls); }
     const editable = canEdit();
+    // NARROW: the docked toolbox goes away and the header's + takes over
+    // (see openStagePicker). Both are driven off the SAME `narrow` the
+    // lane list is, so the panel cannot be left sitting beside a list
+    // there is no way to drag onto.
+    graphSplit.classList.toggle('tb-hidden', narrow);
+    addStageBtn.classList.toggle('show', narrow && editable);
+    // The documentation toggle appears here only where the pane's own
+    // copy is out of reach -- i.e. exactly when the pane is hidden.
+    docsBtnHead.classList.toggle('show', one);
     // Edit affordances only make sense while stopped; drop any stale
     // arming/selection when the pipeline isn't editable.
     if (!editable) { state.pending = null; state.selectedEdge = null; }
@@ -830,6 +1231,11 @@ function mountEditor(container, opts = {}) {
         onNodeMove,
         onAutoArrange: autoArrange,
         onNodeContext,
+        // Scroll-to-pan (trackpad) or scroll-to-zoom (mouse). The graph
+        // owns the toggle button -- it sits with the other view
+        // controls -- and this view owns the preference.
+        wheelMode,
+        onWheelMode: (m) => { wheelMode = m; prefSet(LS_WHEEL, m); },
         editable,
         pending: state.pending,
         pendingType: state.pending
@@ -920,8 +1326,12 @@ function mountEditor(container, opts = {}) {
       }, gut, text));
       if (open) { list.append(laneDetail(r, gutter)); }
     }
+    // The note says how to get the canvas back, and that differs by WHY
+    // the list is on screen: a pane that shrank into it asks to be
+    // widened, one the operator pinned asks for the button back.
     list.append(el('div', { class: 'lane-note' },
-      t(inline ? 'pl.narrow_note' : 'pl.narrow_note_pane')));
+      t(forceLanes && !inline ? 'pl.lane_note_pinned'
+        : (inline ? 'pl.narrow_note' : 'pl.narrow_note_pane'))));
     graphBody.append(list);
   }
 
@@ -992,7 +1402,7 @@ function mountEditor(container, opts = {}) {
                           'model-specific-config', 'audio', 'text',
                           'network', 'control', 'database', 'generic'];
 
-  function stageChip(s) {
+  function stageChip(s, opts = {}) {
     const ins = (s.iports || []).length;
     const outs = (s.oports || []).length;
     // Prefer the spec's human display name; the type name still drives
@@ -1009,6 +1419,16 @@ function mountEditor(container, opts = {}) {
       el('span', { class: 'tb-grip' }),
       el('span', { class: 'tb-name' }, label),
       el('span', { class: 'tb-io' }, ins + '→' + outs));
+    // PICK mode, for the narrow view's picker: there is no canvas to drop
+    // onto, so the chip is a button and one click adds the stage. Drag is
+    // turned off rather than left dangling -- a drag that can only end
+    // nowhere reads as a broken affordance.
+    if (opts.onPick) {
+      chip.removeAttribute('draggable');
+      chip.classList.add('pickable');
+      chip.addEventListener('click', () => opts.onPick(s.type));
+      return chip;
+    }
     chip.addEventListener('dragstart', (e) => {
       e.dataTransfer.setData('text/vpipe-stage-type', s.type);
       e.dataTransfer.setData('text/plain', s.type);
@@ -1020,18 +1440,28 @@ function mountEditor(container, opts = {}) {
     return chip;
   }
 
-  function renderToolbox() {
-    clear(toolboxBody);
-    const q = (toolboxFilter.value || '').toLowerCase();
+  // The palette's contents for a query, grouped and ordered. Shared by
+  // the side panel and the narrow view's picker so the two cannot come
+  // to offer different stages, or the same stages in a different order.
+  function stageSections(query) {
+    const q = (query || '').toLowerCase();
     // `plugin_enabled === false` means a loaded plugin the session has
     // switched off: its stages stay in state.stageTypes so an
     // already-placed instance still renders with its spec, and drop out
     // of the toolbox so nothing new can be built from them.
+    const hit = (v) => (v || '').toLowerCase().includes(q);
+    // The type name and the server's English are always searchable; so is
+    // what the toolbox actually SHOWS -- the localized label, doc and
+    // category heading. Without those last three a reader on a non-English
+    // locale can only search by text the UI is not displaying to them, and
+    // the display name is not in the English text either ("Frame Dropper"
+    // is neither the type nor a word in its doc).
     const match = state.stageTypes.filter((s) => !s.hidden
       && s.plugin_enabled !== false && (
-      s.type.toLowerCase().includes(q)
-      || (s.doc || '').toLowerCase().includes(q)
-      || (s.category || '').toLowerCase().includes(q)));
+      hit(s.type) || hit(s.doc) || hit(s.category)
+      || hit(tOr('stage.' + s.type + '.name', s.display_name))
+      || hit(tOr('stage.' + s.type + '.doc', ''))
+      || hit(tOr('cat.' + s.category, ''))));
     // Built-ins bucket by category; anything a PLUGIN contributed gets a
     // section of its own, named after the plugin, after the built-ins.
     //
@@ -1060,24 +1490,42 @@ function mountEditor(container, opts = {}) {
       const ib = CATEGORY_ORDER.indexOf(b);
       return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib) || a.localeCompare(b);
     });
+    const out = [];
     for (const c of cats) {
       const items = byCat.get(c).sort((a, b) => a.type.localeCompare(b.type));
-      toolboxBody.append(el('div', { class: 'tb-cat' },
-        tOr('cat.' + c, c) + ' (' + items.length + ')'));
-      for (const s of items) { toolboxBody.append(stageChip(s)); }
+      out.push({ label: tOr('cat.' + c, c) + ' (' + items.length + ')',
+                 plugin: false, items });
     }
     for (const p of [...byPlugin.keys()].sort((a, b) => a.localeCompare(b))) {
       const items = byPlugin.get(p).sort(
         (a, b) => a.type.localeCompare(b.type));
       // The plugin NAME is not translated -- it is a proper noun the
       // plugin chose. Only the "plugin" label around it is.
-      toolboxBody.append(el('div', { class: 'tb-cat tb-plugin' },
-        t('pl.plugin_group') + ' ' + p + ' (' + items.length + ')'));
-      for (const s of items) { toolboxBody.append(stageChip(s)); }
+      out.push({ label: t('pl.plugin_group') + ' ' + p
+                        + ' (' + items.length + ')',
+                 plugin: true, items });
     }
-    if (match.length === 0) {
-      toolboxBody.append(el('div', { class: 'tb-empty' }, t('pl.no_matches')));
+    return { sections: out, total: match.length };
+  }
+
+  // Render grouped sections into `body`. `opts` is passed through to
+  // stageChip, which is what makes the picker's chips click-to-add.
+  function renderSections(body, query, opts) {
+    const { sections, total } = stageSections(query);
+    for (const sec of sections) {
+      body.append(el('div',
+        { class: 'tb-cat' + (sec.plugin ? ' tb-plugin' : '') }, sec.label));
+      for (const st of sec.items) { body.append(stageChip(st, opts)); }
     }
+    if (total === 0) {
+      body.append(el('div', { class: 'tb-empty' }, t('pl.no_matches')));
+    }
+    return total;
+  }
+
+  function renderToolbox() {
+    clear(toolboxBody);
+    renderSections(toolboxBody, toolboxFilter.value || '', {});
   }
 
   // --- type helpers (for client-side connection validation) --------
@@ -1390,7 +1838,61 @@ function mountEditor(container, opts = {}) {
     if (!state.oneColumn) { await renderConfig(); }
   }
 
-  // --- right pane (config) -----------------------------------------
+  // How many columns the configuration form gets, and which fields
+  // start a row.
+  //
+  // MEASURED rather than declared: the panel is resized by the window,
+  // by the divider and by the dock button, and the answer has to follow
+  // all three. It is not a CSS auto-fill because two of the rules cannot
+  // be said that way -- never more columns than there are FIELDS (three
+  // fields in a wide panel are three columns, not five with two empty),
+  // and a one-field form takes the WHOLE width rather than a column's
+  // worth of it, which is what a text-prompt stage wants.
+  const CFG_COL_MIN = 280;   // a column worth having: ~250px of content
+  const CFG_FIELD_GAP = 12;  // .field's margin-bottom, in the stack sum
+  function layoutCfgColumns(scope) {
+    const root = scope || editorArea;
+    for (const grid of root.querySelectorAll('.cfg-fields')) {
+      const items = grid.children;
+      const n = items.length;
+      const w = grid.clientWidth;
+      // Detached (a form built before its panel is laid out) or empty:
+      // one column, and the next call measures for real.
+      let cols = 1;
+      if (w > 0 && n > 0) {
+        // What the panel can hold side by side...
+        const byWidth = Math.max(1, Math.floor(w / CFG_COL_MIN));
+        // ...and what it needs. HOW TALL THE FIELDS ARE AS ONE STACK
+        // against how much panel is left below them: a form that already
+        // fits stays a single column, however wide the panel gets, and
+        // only a stack that would scroll is split. Field heights barely
+        // move with the column width (a label may wrap), so this is an
+        // estimate -- which is all the decision needs.
+        let stack = 0;
+        for (let i = 0; i < n; i++) {
+          stack += items[i].offsetHeight + CFG_FIELD_GAP;
+        }
+        const scroller = grid.closest('.pane-body');
+        const avail = scroller
+            ? scroller.getBoundingClientRect().bottom
+                - grid.getBoundingClientRect().top
+            : 0;
+        // No height to measure against (detached, or a panel collapsed
+        // to nothing): fall back to what the width allows.
+        const byHeight = avail > 40 ? Math.ceil(stack / avail) : byWidth;
+        cols = Math.min(byWidth, Math.max(1, byHeight), n);
+      }
+      // Written only when it CHANGES. Re-styling the form is what the
+      // resize observer is watching for, so an unconditional write would
+      // keep waking it -- and a count that oscillates between two values
+      // would then never settle.
+      if (grid.style.getPropertyValue('--cols') !== String(cols)) {
+        grid.style.setProperty('--cols', String(cols));
+      }
+    }
+  }
+
+  // --- the configuration form --------------------------------------
   // `target` names where the form goes: the standalone pane by default,
   // or -- in the narrow layout, which has no such pane -- the block an
   // expanded lane row supplies. Everything else about the form (the
@@ -1403,11 +1905,51 @@ function mountEditor(container, opts = {}) {
     if (!target && state.oneColumn) { return; }
     const body = (target && target.body) || cfgBody;
     const cfgHead = (target && target.actions) || cfgActions;
-    // An inline block can be folded away while its request is in flight;
-    // it is then detached and there is nothing to fill.
-    const live = () => !target || body.isConnected;
+    const seq = ++cfgSeq;
+    // Whether THIS render may still write. Two ways it may not: an inline
+    // block folded away while its request was in flight (detached, so
+    // there is nothing to fill), or a newer render started meanwhile --
+    // which has already emptied the header this one is about to fill.
+    const live = () => (target ? body.isConnected : true) && seq === cfgSeq;
+    // WHAT THE USER IS DOING, remembered across the teardown.
+    //
+    // A rebuild replaces every control, so the focused one is removed
+    // from the document: focus falls back to <body> and the scroller
+    // jumps to the top. Tabbing through a form the user has EDITED then
+    // behaves nothing like tabbing through one they have not, which is
+    // the report this exists to answer.
+    //
+    // The key is captured rather than the element, because the element
+    // is exactly the thing that will not survive.
+    const scroller = body.closest('.pane-body') || body;
+    const prevTop = scroller.scrollTop;
+    const act = document.activeElement;
+    const prevKey = act && body.contains(act) ? act.dataset.cfgKey : null;
+    const prevSel = prevKey && typeof act.selectionStart === 'number'
+        ? [act.selectionStart, act.selectionEnd] : null;
+    const restore = () => {
+      // ONLY when the rebuild happened under the user's hands. Every
+      // other caller -- selecting another stage, coming back from the
+      // one-column layout -- is showing a DIFFERENT form, and putting
+      // the old scroll position on it would be its own bug.
+      if (!prevKey) { return; }
+      // Scroll first: focusing scrolls too, and doing it after would
+      // fight the browser's own scroll-into-view.
+      scroller.scrollTop = prevTop;
+      const next = body.querySelector(
+          `[data-cfg-key="${CSS.escape(prevKey)}"]`);
+      if (!next) { return; }
+      // preventScroll: the field is already where it was; letting the
+      // browser scroll to it would undo the line above.
+      try { next.focus({ preventScroll: true }); } catch (e) { next.focus(); }
+      if (prevSel && typeof next.setSelectionRange === 'function') {
+        try { next.setSelectionRange(prevSel[0], prevSel[1]); } catch (e) {}
+      }
+      scroller.scrollTop = prevTop;
+    };
     clear(body);
-    clear(cfgHead);   // header Apply/Remove; refilled below when editable
+    clear(cfgHead);   // header buttons; refilled below when editable
+    undoBtns = null;  // the ones just cleared are detached now
     if (!state.detail || !state.selectedStage) {
       body.append(el('div', { class: 'cfg' },
         el('div', { class: 'empty' }, t('pl.select_stage_config'))));
@@ -1431,18 +1973,50 @@ function mountEditor(container, opts = {}) {
     // block) so they stay pinned above the scroll. `inputs` is captured by
     // Apply's handler and filled in by the schema loop below.
     const inputs = [];
+    // The config this form was built from, in the shape a PUT takes: the
+    // PRESENT keys with their current values, which is exactly what the
+    // untouched form would read back. It is what Undo restores to, and
+    // what the first apply after this render is paired against.
+    {
+      const seed = {};
+      for (const f of info.schema) {
+        const here = f.present !== undefined
+            ? !!f.present
+            : (f.current !== undefined && f.current !== null);
+        if (here && f.current !== undefined) { seed[f.key] = f.current; }
+      }
+      cfgLast = { sid: state.selectedStage, cfg: seed };
+    }
+    // Undo / Redo are the same slot read in two directions, so one
+    // handler serves both and only their enabled state differs. Both are
+    // edits, so both need a stopped pipeline.
+    const undoBtn = el('button', {
+      class: 'btn ghost mini', disabled: true,
+      title: t('pl.undo_hint'),
+      onclick: () => stepConfigUndo(),
+    }, t('common.undo'));
+    const redoBtn = el('button', {
+      class: 'btn ghost mini', disabled: true,
+      title: t('pl.redo_hint'),
+      onclick: () => stepConfigUndo(),
+    }, t('common.redo'));
+    undoBtns = { undo: undoBtn, redo: redoBtn };
+    syncUndoBtns();
     const applyBtn = el('button', {
       class: 'btn primary mini', disabled: !editable,
       onclick: () => applyConfig(inputs),
     }, t('common.apply'));
-    // Remove the stage (topology edit -- stopped pipelines only).
+    // Remove the stage (topology edit -- stopped pipelines only). Label
+    // only: an icon beside the text makes this button taller than the
+    // plain ones next to it, and a row of header buttons that do not
+    // line up reads as a mistake.
     const removeBtn = el('button', {
       class: 'btn danger mini', disabled: !editable,
       title: editable ? t('pl.remove_stage_title')
                       : t('pl.stop_to_edit'),
       onclick: () => onRemoveStage(),
-    }, makeIcon('trash', 'sm'), el('span', {}, t('common.remove')));
-    cfgHead.append(applyBtn, removeBtn);
+    }, t('common.remove'));
+    cfgHead.append(undoBtn, redoBtn, applyBtn, removeBtn);
 
     // Auto-apply on blur (stopped pipelines only): when a field commits (a
     // text/number box loses focus after an edit), re-POST the whole config
@@ -1453,6 +2027,23 @@ function mountEditor(container, opts = {}) {
     const commit = () => {
       if (canEdit()) { applyConfig(inputs, { rerender: false }); }
     };
+    // The graph refresh an auto-apply deferred (see applyConfig). Run
+    // when focus leaves the FORM, not merely the field: tabbing between
+    // two fields passes through here with relatedTarget still inside,
+    // and rebuilding then would be the very teardown that was deferred.
+    //
+    // Bound ONCE per host element -- clear() empties the body but leaves
+    // its own listeners, so binding per render would stack a copy per
+    // rebuild.
+    if (!body.dataset.cfgFocusHook) {
+      body.dataset.cfgFocusHook = '1';
+      body.addEventListener('focusout', (e) => {
+        if (!state.graphStale) { return; }
+        if (e.relatedTarget && body.contains(e.relatedTarget)) { return; }
+        state.graphStale = false;
+        renderGraphPane();
+      });
+    }
 
     wrap.append(el('div', { class: 'stage-id' }, info.id));
 
@@ -1470,12 +2061,74 @@ function mountEditor(container, opts = {}) {
       wrap.append(el('div', { class: 'ro-note' },
         t('pl.config_readonly')));
     }
+    // The fields get their own grid so the stage identity above them
+    // stays in normal flow and needs no column span of its own;
+    // layoutCfgColumns fills in how many columns it is given.
+    const fieldsWrap = el('div', { class: 'cfg-fields' });
     for (const f of info.schema) {
       const { field, read } = configField(f, !editable, info.type, commit);
       inputs.push({ key: f.key, type: f.type, read });
-      wrap.append(field);
+      // Tag the field's own controls with the key. A rebuild replaces
+      // every element, so the only way to put the caret back where it
+      // was is to find the NEW control that means the same thing.
+      for (const c of field.querySelectorAll(
+             'input, select, textarea')) {
+        c.dataset.cfgKey = f.key;
+      }
+      fieldsWrap.append(field);
+    }
+    wrap.append(fieldsWrap);
+    // COMMANDS a running stage answers (docs/STAGE-COMMANDS.md): one
+    // button for each that needs no buffers and no required argument --
+    // train-lora's save and preview, say. A stopped pipeline has no stage
+    // to send them to, so they show only while it runs.
+    if (!editable && sp && Array.isArray(sp.commands)) {
+      const usable = sp.commands.filter((c) =>
+        !(c.in && c.in.length) && !(c.out && c.out.length) &&
+        !(c.args || []).some((a) => a.required));
+      if (usable.length) {
+        const result = el('div', { class: 'stage-desc' });
+        const row = el('div', { class: 'cmd-row' });
+        const show = (c, r) => {
+          if (r && r.state === 'replied') {
+            const parts = Object.entries(r.result || {}).map(([k, v]) =>
+              `${k}: ${typeof v === 'number' && !Number.isInteger(v)
+                ? v.toPrecision(4) : v}`);
+            result.textContent = t('pl.cmd_replied',
+              { name: c.name, result: parts.join(' · ') });
+          } else {
+            result.textContent = t('pl.cmd_failed',
+              { name: c.name, msg: (r && r.error) || (r && r.state) || '' });
+          }
+        };
+        for (const c of usable) {
+          const btn = el('button', {
+            class: 'btn ghost mini',
+            title: tOr(`cmd.${info.type}.${c.name}.doc`, c.doc || ''),
+            onclick: async () => {
+              btn.disabled = true;
+              result.textContent = t('pl.cmd_sent', { name: c.name });
+              try {
+                show(c, await api.stageCommand(state.selectedId,
+                                               state.selectedStage,
+                                               c.name, {}));
+              } catch (e) {
+                show(c, { state: 'failed', error: e.message });
+              } finally {
+                btn.disabled = false;
+              }
+            },
+          }, tOr(`cmd.${info.type}.${c.name}`, c.name));
+          row.append(btn);
+        }
+        wrap.append(el('div', { class: 'stage-type' }, t('pl.commands')),
+                    row, result);
+      }
     }
     body.append(wrap);
+    // Now that it is in the document and has a width to measure.
+    layoutCfgColumns(body);
+    restore();
   }
 
   // Build one config field. `read()` returns:
@@ -1506,10 +2159,9 @@ function mountEditor(container, opts = {}) {
   // editor doesn't strand the user with empty inputs against an
   // un-upgraded server.
   // Compatibility-aware model browser for a model-registry field.
-  // Lists installed models filtered by (a) the field's model_type allow-
-  // list (suggest_db_type) and (b) parent-model compatibility: a supplement
-  // (vision tower / LoRA) is shown only when the parent model chosen in a
-  // sibling field of this form matches its parent_model_type (+ size).
+  // Lists installed models filtered by the field's model_type allow-list
+  // (suggest_db_type), its required I/O modalities, and parent
+  // compatibility against what the form's other fields already name.
   // Picking a model sets the field via onPick(key).
   async function openModelBrowser(field, input, onPick) {
     let data;
@@ -1521,47 +2173,18 @@ function mountEditor(container, opts = {}) {
     }
     const all = (data && data.models) ? data.models : [];
 
-    // (a) Stage compatibility: the field's model_type allow-list (untyped
-    // fields show plain models only -- hide datasets + bare supplements)
-    // AND its required I/O modalities (need_inputs / need_outputs): a
-    // model's inputs must cover every required input, its outputs every
-    // required output. E.g. text-chat's LM field requires text->text.
-    const allowed = (field.suggest_db_type || '')
-      .split(',').map((s) => s.trim()).filter(Boolean);
-    const needIn = (field.need_inputs || '')
-      .split(',').map((s) => s.trim()).filter(Boolean);
-    const needOut = (field.need_outputs || '')
-      .split(',').map((s) => s.trim()).filter(Boolean);
-    const ioOk = (m) =>
-      needIn.every((x) => (m.inputs || []).includes(x))
-      && needOut.every((x) => (m.outputs || []).includes(x));
-    const stageOk = (m) => (allowed.length
-      ? allowed.includes(m.model_type)
-      : (m.category || 'model') === 'model') && ioOk(m);
-
-    // (b) Parent compatibility: the installed models currently selected in
-    // OTHER fields of this config form (value matches an installed model
-    // key / hf_path) are candidate parents.
+    // WHAT THIS FIELD MAY OFFER: the field's own rules (its
+    // suggest_db_type allow-list and its required I/O modalities) plus
+    // parent compatibility, against the installed models the form's
+    // OTHER fields already name. Shared with the phone sheet -- see
+    // model-filter.js, where a copy of this rule drifted.
     const chosen = new Set();
     document.querySelectorAll('[id^="f_"]').forEach((elm) => {
       if (elm === input) { return; }
       const v = (elm.value || '').trim();
       if (v) { chosen.add(v); }
     });
-    const parents = all.filter(
-      (m) => chosen.has(m.key) || chosen.has(m.hf_path));
-    const parentOk = (m) => {
-      if (!m.parent_model_type) { return true; }   // not a supplement
-      if (!parents.length) { return true; }         // no parent chosen yet
-      return parents.some((p) => p.model_type === m.parent_model_type
-        && (!m.parent_param_class
-            // Case-insensitive: a registry record written before the catalog
-            // switched "e4b" -> "E4B" still matches the tower's "E4B".
-            || m.parent_param_class.toLowerCase()
-                 === (p.param_class || '').toLowerCase()));
-    };
-
-    const compatible = all.filter((m) => stageOk(m) && parentOk(m));
+    const compatible = compatibleModels(all, field, chosen);
 
     let closeModal = () => {};
     const groups = [
@@ -1726,6 +2349,13 @@ function mountEditor(container, opts = {}) {
         ? !!f.present
         : (f.current !== undefined && f.current !== null);
     let input, read, unsetBtn = null, datalist = null, browseBtn = null;
+    let modelBtn = null;
+    // Set by the branch that actually renders a JSON textarea, never
+    // re-derived from f.type further down. The auto-apply wiring at the
+    // bottom has to agree with what was rendered, and a second type list
+    // kept in step by hand is the stale fall-through this tree keeps
+    // finding: the final `else` also catches a type neither list knows.
+    let isJson = false;
     // Two-state fields (numbers, JSON) have no "present but empty" reading --
     // an empty number is not a number, an empty box is not valid JSON -- so
     // blank IS unset and `read()` already omits the key. They still need the
@@ -1734,6 +2364,14 @@ function mountEditor(container, opts = {}) {
     // distinguishes unset from set. Assigned per branch; called after any
     // programmatic change to the box.
     let syncUnset = () => {};
+    // Drops the "did not parse" mark on a JSON box. Assigned by the
+    // auto-apply wiring at the bottom and called from anywhere that sets
+    // `input.value` PROGRAMMATICALLY: that fires no `input` event, so the
+    // listener which normally clears the mark never runs and a box the
+    // user has just emptied would keep wearing the warning for a value
+    // it no longer holds. Declared here, assigned later -- every caller
+    // is a click handler, so it runs long after the assignment.
+    let clearJsonMark = () => {};
     const emptyMeansUnset = () => {
       syncUnset = () => {
         const unset = input.value.trim() === '';
@@ -1831,6 +2469,29 @@ function mountEditor(container, opts = {}) {
         } });
       emptyMeansUnset();
       syncUnset();
+    } else if (f.type === 'string' && Array.isArray(f.choices)
+               && f.choices.length) {
+      // A CLOSED SET (the schema's `choices`): every value this key
+      // accepts, so offer them instead of a text box the reader has to
+      // guess at. The blank option IS the unset state -- the same one the
+      // Clear button toggles -- so textTriState below drives this exactly
+      // as it drives a text field.
+      input = el('select', { id, disabled });
+      const cur = present ? String(f.current ?? '') : '';
+      input.append(el('option', { value: '' }, t('pl.unset')));
+      for (const c of f.choices) {
+        input.append(el('option', { value: String(c) }, String(c)));
+      }
+      // A value the set does not contain: an older pipeline file, or a
+      // spelling the stage still accepts but no longer advertises
+      // (unload_when_idle's legacy always / never). Keep it, and say so.
+      // A form asked to DISPLAY a config must not quietly rewrite it.
+      if (cur && !f.choices.some((c) => String(c) === cur)) {
+        input.append(el('option', { value: cur },
+                       cur + ' ' + t('pl.choice_unlisted')));
+      }
+      input.value = cur;
+      read = textTriState();
     } else if (f.type === 'string') {
       input = el('input', { type: 'text', id, disabled,
         placeholder,
@@ -1918,6 +2579,7 @@ function mountEditor(container, opts = {}) {
       read = textTriState();     // same unset-vs-empty split as `string`
     } else {
       // array / object / any -> JSON textarea.
+      isJson = true;
       input = el('textarea', { id, disabled, placeholder },
         present ? JSON.stringify(f.current ?? null, null, 2) : '');
       // An empty JSON box is not a value either (it does not parse), so blank
@@ -1930,9 +2592,10 @@ function mountEditor(container, opts = {}) {
       unsetBtn = el('button', { class: 'btn ghost mini', type: 'button',
         disabled, onclick: () => {
           if (input.value.trim() === '') { input.focus(); return; }
-          input.value = ''; syncUnset(); input.focus();
-          // Safe to commit even though the JSON box has no blur-commit: an
-          // empty box always reads cleanly as "unset", never a parse error.
+          input.value = ''; syncUnset(); clearJsonMark(); input.focus();
+          // An empty box always reads cleanly as "unset", never a parse
+          // error -- so Clear commits whatever the box held before it,
+          // valid or not.
           if (onCommit) { onCommit(); }
         } });
       emptyMeansUnset();
@@ -1947,7 +2610,14 @@ function mountEditor(container, opts = {}) {
       const openBrowser = () => {
         let seedDir = '';
         if (f.type === 'string') {
-          seedDir = splitPath(input.value.trim()).dir;
+          const v = input.value.trim();
+          // A field with a model picker too may hold a registry KEY
+          // ("org/name"), which is no directory in the sandbox -- seeding
+          // from it opens the dialog on an error toast. Seed only from
+          // what is plainly a path.
+          const pathish = f.suggest_db !== MODEL_REGISTRY_DB
+              || v.startsWith('/') || /\.safetensors$/i.test(v);
+          seedDir = pathish ? splitPath(v).dir : '';
         } else {
           try {
             const v = JSON.parse(input.value.trim() || '[]');
@@ -1994,9 +2664,15 @@ function mountEditor(container, opts = {}) {
     // model browser instead of a datalist: it lists only installed models
     // matching the field's model_type(s) AND the parent model chosen in a
     // sibling field. Free text is still allowed in the input.
+    //
+    // Its OWN button, beside the file browser rather than in place of it.
+    // A field may carry both hints -- a LoRA is as often a downloaded
+    // .safetensors in the sandbox as a catalogued model -- and the stage
+    // resolves either (resolve_adapter_file), so offering one of them
+    // would be hiding a working input.
     if (f.suggest_db === MODEL_REGISTRY_DB && f.type === 'string'
         && !disabled) {
-      browseBtn = el('button', { class: 'btn ghost mini browse',
+      modelBtn = el('button', { class: 'btn ghost mini browse',
         type: 'button', title: t('pl.mb_browse'),
         onclick: () => openModelBrowser(f, input, (val) => {
           input.value = val;
@@ -2007,27 +2683,88 @@ function mountEditor(container, opts = {}) {
         }) },
         makeIcon('database', 'sm'));
     }
+    const docTxt = tOr('cfg.' + type + '.' + f.key, f.doc);
+    // The field NAME carries its documentation as a tooltip while the
+    // lines are hidden, so turning them off costs the reader the space
+    // and nothing else. The text is kept on the element because the
+    // toggle flips under forms that are already rendered -- applyDocs
+    // reads it back rather than rebuilding them.
+    const keySpan = el('span', { class: 'key' }, f.key);
+    if (docTxt) {
+      keySpan.dataset.doc = docTxt;
+      if (!showDocs) { keySpan.title = docTxt; }
+    }
+    // A CHECKBOX is one small control and a small button, which is a
+    // whole row of panel for almost no ink -- so a bool field puts its
+    // name, its box and its unset button on ONE line (see .field-bool),
+    // name left and controls right. The type hint goes with it: "bool"
+    // beside a checkbox says nothing the checkbox has not already said.
+    const isBool = f.type === 'bool';
     const label = el('label', { for: id },
-      el('span', { class: 'key' }, f.key),
+      keySpan,
       f.required ? el('span', { class: 'req' }, '*') : null,
-      el('span', { class: 'ty' }, f.type));
+      isBool ? null : el('span', { class: 'ty' }, f.type));
     const inputRow = el('div', { class: 'field-input-row' }, input);
     if (datalist) { inputRow.append(datalist); }
+    if (modelBtn) { inputRow.append(modelBtn); }
     if (browseBtn) { inputRow.append(browseBtn); }
     if (unsetBtn) { inputRow.append(unsetBtn); }
-    const field = el('div', { class: 'field' }, label, inputRow);
-    const docTxt = tOr('cfg.' + type + '.' + f.key, f.doc);
+    const field = el('div', { class: 'field' + (isBool ? ' field-bool' : '') },
+                     label, inputRow);
     if (docTxt) { field.append(el('div', { class: 'doc' }, docTxt)); }
     // Auto-apply when a text/number box loses focus after an edit. `change`
     // fires on blur-after-edit (and Enter), so tabbing through untouched
     // fields costs nothing; onCommit self-gates on the pipeline being
     // stopped. `text` is a plain-string textarea that never throws on read,
-    // so it commits on blur like `string`; only the JSON textareas
-    // (array/object/any) are excluded -- a half-typed blob would just throw
-    // on every blur.
+    // so it commits on blur like `string`.
     if (onCommit && (f.type === 'string' || f.type === 'text'
         || f.type === 'int' || f.type === 'uint' || f.type === 'real')) {
       input.addEventListener('change', () => onCommit());
+    } else if (onCommit && isJson) {
+      // JSON TEXTAREAS COMMIT ON BLUR TOO, once the box parses.
+      //
+      // They were excluded because a half-typed blob throws on read, and
+      // the exclusion was worse than the throw it avoided. applyConfig
+      // reads EVERY input, so a hand-edit here was not merely
+      // uncommitted -- it rode out on whatever committed next. Blur a
+      // neighbouring string field, or pick a path with Browse, and the
+      // edit went with it; touch nothing else and switch stage, and it
+      // was discarded without a word. That is the unpredictable part:
+      // not that the edit waited, but that WHEN it landed was decided by
+      // an unrelated field. The same reading is why a half-typed box is
+      // not harmless either -- it makes the neighbour's commit fail too,
+      // and the neighbour is where the error surfaces.
+      //
+      // So: parse first, commit only on success, and when it does not
+      // parse SAY SO on the box itself. A toast on every blur is what
+      // the old comment was right to avoid; a silent no-op is what sent
+      // the user looking for the bug in the stage.
+      //
+      // THE PHONE SHEET HAS THIS RULE TOO, in phone/phone-config.js --
+      // it renders its own controls, so the rule is copied rather than
+      // shared, and a value that applies on one shell and not the other
+      // is the drift this directory has already seen once. Change both,
+      // and phone-config.test.mjs pins that copy.
+      const markBad = (bad) => {
+        input.classList.toggle('field-invalid', bad);
+        if (bad) { input.title = t('pl.json_invalid'); }
+        else { input.removeAttribute('title'); }
+      };
+      // Typing is the fix in progress -- drop the mark rather than leave
+      // it nagging through every keystroke of a correction. Browse also
+      // fires `input` before it commits, so a pick clears a stale mark.
+      clearJsonMark = () => markBad(false);
+      input.addEventListener('input', () => markBad(false));
+      input.addEventListener('change', () => {
+        try {
+          read();
+        } catch (e) {
+          markBad(true);
+          return;
+        }
+        markBad(false);
+        onCommit();
+      });
     }
     return { field, read };
   }
@@ -2055,13 +2792,66 @@ function mountEditor(container, opts = {}) {
       toast(t('pl.bad_config', { msg: e.message }), 'error');
       return;
     }
+    const sid = state.selectedStage;
     try {
       state.detail = await api.setStageConfig(
-        state.selectedId, state.selectedStage, cfg);
+        state.selectedId, sid, cfg);
+      // The pair, recorded only once the server has taken the new config:
+      // an apply that failed changed nothing and must not become the step
+      // Undo walks back to.
+      if (cfgLast && cfgLast.sid === sid) {
+        cfgUndo = { sid, before: cfgLast.cfg, after: cfg, undone: false };
+      }
+      cfgLast = { sid, cfg };
+      syncUndoBtns();
       toast(t('pl.config_applied'), 'ok');
-      renderGraphPane();
-      if (rerender) { await renderConfig(); }
+      // `rerender:false` is a promise not to tear down the form the
+      // user is still in, and rebuilding the GRAPH broke that promise
+      // in the one-column layout -- where the form lives inside
+      // graphBody, so clearing it takes the form with it. The graph is
+      // marked stale instead and redrawn when focus leaves the form.
+      if (rerender) {
+        state.graphStale = false;
+        renderGraphPane();
+        await renderConfig();
+      } else {
+        state.graphStale = true;
+      }
     } catch (e) { toast(t('pl.apply_failed', { msg: e.message }), 'error'); }
+  }
+
+  // Which half of the pair is reachable from here. Read from the slot
+  // rather than tracked beside it, so the buttons cannot disagree with
+  // what pressing them would actually do.
+  function syncUndoBtns() {
+    if (!undoBtns) { return; }
+    const pair = !!cfgUndo && cfgUndo.sid === state.selectedStage
+                 && canEdit();
+    undoBtns.undo.disabled = !(pair && !cfgUndo.undone);
+    undoBtns.redo.disabled = !(pair && cfgUndo.undone);
+  }
+
+  // Walk the single undo pair, in whichever direction it is pointing.
+  // Undo and Redo are the same move: PUT the other half of the pair and
+  // flip the arrow, so a user who undid by accident can put it straight
+  // back. The slot survives the re-render below -- it is keyed by stage,
+  // and renderConfig only reseeds `cfgLast`.
+  async function stepConfigUndo() {
+    if (!cfgUndo || cfgUndo.sid !== state.selectedStage) { return; }
+    if (!canEdit()) { toast(t('pl.stop_to_edit'), 'error'); return; }
+    const back = !cfgUndo.undone;
+    const target = back ? cfgUndo.before : cfgUndo.after;
+    try {
+      state.detail = await api.setStageConfig(
+        state.selectedId, cfgUndo.sid, target);
+      cfgUndo.undone = back;
+      cfgLast = { sid: cfgUndo.sid, cfg: target };
+      toast(t(back ? 'pl.config_undone' : 'pl.config_redone'), 'ok');
+      renderGraphPane();
+      await renderConfig();
+    } catch (e) {
+      toast(t('pl.undo_failed', { msg: e.message }), 'error');
+    }
   }
 
   // --- toolbar actions ----------------------------------------------
@@ -2147,7 +2937,14 @@ function mountEditor(container, opts = {}) {
           const d = await api.loadPipeline(p);
           state.selectedId = d.id; await refreshList();
         } catch (e) {
-          toast(t('pl.load_failed', { msg: e.message }), 'error');
+          // A spec the loader refused says exactly what it objected to
+          // and where. That belongs in front of whoever picked the
+          // file, not in a toast that expires before it can be read.
+          openErrorModal({
+            title: t('pl.load_failed_title'),
+            message: e.message,
+            okLabel: t('common.close'),
+          });
         }
       },
     });

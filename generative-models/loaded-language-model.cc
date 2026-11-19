@@ -1,20 +1,31 @@
 #include "generative-models/loaded-language-model.h"
 
 #include "generative-models/chat-template.h"
+#include "generative-models/context-io.h"
+#include "generative-models/lm-memory-limit.h"
 #include "generative-models/qwen3/metal-audio-encoder.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-model-exec.h"
+#include "generative-models/deepseek-v41/metal-deepseek-v41-vision.h"
 #include "generative-models/gemma4/metal-gemma-model-exec.h"
 #include "generative-models/llama3/metal-llama-model-exec.h"
+#include "generative-models/lfm3/metal-lfm3-model-exec.h"
+#include "generative-models/lfm3/metal-lfm3-vision.h"
 #include "generative-models/qwen3/metal-qwen-model-exec.h"
 #include "generative-models/gemma4/metal-gemma4-audio.h"
 #include "generative-models/gemma4/gemma4-unified-embedder.h"
 #include "generative-models/gemma4/metal-gemma4-vision.h"
+#include "generative-models/generative-model-manager.h"
+#include "generative-models/lm-run-memory.h"
+#include "generative-models/mistral3/metal-pixtral-vision.h"
 #include "generative-models/qwen3/metal-qwen-vision.h"
 #include "generative-models/model-exec.h"
 #include "generative-models/model-exec-registry.h"
+#include "generative-models/prefill-progress.h"
 #include "generative-models/sampler.h"
 #include "generative-models/token-muxer.h"
 #include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
+#include "common/flex-bag.h"
 #include "common/perf-scope.h"
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
@@ -28,7 +39,9 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <unordered_map>
 #include <utility>
@@ -69,6 +82,18 @@ struct LoadedLanguageModel::Impl {
   // f16 SharedBuffer + the audio Result host f32, both spliced via the
   // owns_kv metal multimodal path. MLX-free.
   unique_ptr<MetalGemma4VisionEncoder> metal_gemma4_vision;
+  unique_ptr<MetalPixtralVisionEncoder> metal_pixtral_vision;
+  unique_ptr<MetalDeepseekV41Vision> metal_dsv41_vision;
+  unique_ptr<MetalLfm3VisionEncoder> metal_lfm3_vision;
+  // The int8 prefill's flag (set_i8_prefill / request_i8_prefill): what
+  // was asked, and the launch the requests were in.
+  std::mutex    i8_mu;
+  bool          i8_on = false;
+  bool          i8_tagged = false;
+  std::uint64_t i8_epoch = 0;
+  // Image rows take 1-D RoPE positions: the grids a caller passes to
+  // prefill_multimodal_metal are for mROPE families only (Mistral3).
+  bool image_rope_1d = false;
   unique_ptr<MetalGemma4AudioEncoder>  metal_gemma4_audio;
   // Gemma-4-12B "unified" (gemma4_unified): encoder-less shallow multimodal
   // embedder (vision + audio in one object), weights from the mmproj GGUF.
@@ -80,6 +105,8 @@ struct LoadedLanguageModel::Impl {
   MlxRuntime*                       runtime = nullptr;
   const SessionContextIntf*         session = nullptr;
   bool                              valid   = false;
+  // The checkpoint's directory, as loaded: what a saved context names.
+  std::string                       model_dir;
   // Selected via VPIPE_LLM_BACKEND=metal: route prefill/next_token
   // through the metal-compute exec's token-id path instead of the
   // MLX muxer + forward_chunk path.
@@ -143,6 +170,43 @@ auto dispatch_(MlxRuntime* rt, F&& f) -> std::invoke_result_t<F&>
 
 namespace {
 
+
+// What a model sizing itself beside the plan runs in: the figure the
+// stage's plan booked for it (model_memory::lm_claims, under
+// lm_run_label), else this pool's own -- a load outside a planned graph.
+std::size_t
+lm_run_booked_(const SessionContextIntf* session, const std::string& dir,
+               const LmRunShape& shape)
+{
+  auto* mgr = session != nullptr && session->services() != nullptr
+                  ? session->services()->generative_model_manager()
+                  : nullptr;
+  const std::size_t booked =
+      mgr != nullptr ? mgr->declared_scratch(lm_run_label(dir)) : 0;
+  return booked > 0 ? booked : lm_run_bytes(session, dir, shape);
+}
+
+// An expert cache's load line: what bounded it -- the host's limit or
+// the box -- and the cache the host asked for, when it asked. `bytes` is
+// what the cache will hold: never under its floor, which an ask below it
+// is raised to.
+std::string
+cache_line_(std::size_t limit, std::size_t asked, std::size_t bytes)
+{
+  const std::string box = limit > 0 ? fmt("its {} MB limit", limit >> 20)()
+                                    : std::string("this box");
+  if (asked == 0) {
+    return fmt("the routed experts do not fit {} beside the rest -- a {} "
+               "MB expert cache", box, bytes >> 20)();
+  }
+  if (bytes > asked) {
+    return fmt("a {} MB expert cache for the routed experts: {} MB asked "
+               "for, under the least it runs with", bytes >> 20,
+               asked >> 20)();
+  }
+  return fmt("a {} MB expert cache for the routed experts: {} MB asked "
+             "for, within {}", bytes >> 20, asked >> 20, box)();
+}
 
 // Map the parsed HF config to the metal Llama exec's Config (text
 // path; llama3 rope-scaling fields default to a no-op when absent).
@@ -302,11 +366,28 @@ LoadedLanguageModel::LoadedLanguageModel(
     MlxRuntime*                runtime,
     const SessionContextIntf*  session,
     const std::string&         model_dir)
+  : LoadedLanguageModel(std::move(weights), std::move(tokenizer),
+                        compute_dtype_in, page_tokens, max_pages, runtime,
+                        session, model_dir, std::string())
+{
+}
+
+LoadedLanguageModel::LoadedLanguageModel(
+    LoadedWeights              weights,
+    unique_ptr<Tokenizer>      tokenizer,
+    ComputeDtype               compute_dtype_in,
+    int                        page_tokens,
+    uint32_t                   max_pages,
+    MlxRuntime*                runtime,
+    const SessionContextIntf*  session,
+    const std::string&         model_dir,
+    const std::string&         mtp_dir)
   : _impl(make_unique<Impl>())
 {
   _impl->weights   = std::move(weights);
   _impl->tokenizer = std::move(tokenizer);
   _impl->runtime   = runtime;
+  _impl->model_dir = model_dir;
   _impl->session   = session;
 
   if (!_impl->tokenizer) {
@@ -340,8 +421,7 @@ LoadedLanguageModel::LoadedLanguageModel(
   // raw prefill still works, only the lm->chat_template() accessor
   // returns nullptr in that case.
   _impl->chat_tpl =
-      make_chat_template(_impl->weights.config.architecture,
-                         *_impl->tokenizer);
+      make_chat_template(_impl->weights.config, *_impl->tokenizer);
   phase_log("chat_tpl");
   if (!_impl->chat_tpl && session) {
     session->warn(fmt(
@@ -378,21 +458,24 @@ LoadedLanguageModel::LoadedLanguageModel(
         session ? session->services()->metal_compute() : nullptr;
     const char* be_env = std::getenv("VPIPE_LLM_BACKEND");
     const std::string& arch_be = _impl->weights.config.architecture;
-    const bool metal_llama = arch_be == "LlamaForCausalLM";
-    const bool metal_qwen = arch_be == "Qwen3_5ForConditionalGeneration"
-        || arch_be == "Qwen3_5MoeForConditionalGeneration"
-        || arch_be == "Qwen3ASRForConditionalGeneration"
-        // MOSS-TTS-Local-v1.5: TTS model with a dense Qwen3 TEXT backbone
-        // (under "transformer.", tied text head). Loaded as a Qwen text LM
-        // so it emits [vocab] text logits for perplexity / text eval.
-        || arch_be == "MossTTSLocalModel"
-        // MOSS-TTS-Realtime: Qwen3-1.7B backbone under "language_model." with a
-        // tied text head (embed_tokens). Loaded as a Qwen text LM so it emits
-        // [vocab] logits. It has NO real text head (predicts audio), so
-        // absolute perplexity is meaningless -- use the A/B divergence mode.
-        || arch_be == "MossTTSRealtime";
-    const bool metal_gemma = arch_be == "Gemma4ForConditionalGeneration"
-        || arch_be == "Gemma4UnifiedForConditionalGeneration";
+    // The built-in families, by the one list the run-memory figure keys on
+    // too (lm-run-memory.h).
+    const LmFamily family = lm_family(arch_be);
+    const bool metal_llama = family == LmFamily::kLlama;
+    // Qwen3.5 / 3.6 (dense, hybrid, MoE), Qwen3.8-Flash-Next (qwen4_exp:
+    // hyper-connections, the n-gram PLE, the QSA indexer), Qwen3-ASR's
+    // dense decoder, the MOSS-TTS Local-v1.5 / Realtime text backbones
+    // (dense Qwen3, tied text heads: text logits for evaluation) and
+    // Mistral3 / Ministral-3 (a plain dense decoder with YaRN; the Pixtral
+    // tower feeds it below).
+    const bool metal_qwen = family == LmFamily::kQwen;
+    const bool metal_gemma = family == LmFamily::kGemma;
+    // DeepSeek-V4.1-Flash: hyper-connections, compressed sparse attention,
+    // engram, FP4 experts through the expert cache.
+    const bool metal_dsv41 = family == LmFamily::kDeepseekV41;
+    // LFM3 / LFM3-VL: gated short convolutions, sliding and global
+    // attention (generative-models/lfm3/).
+    const bool metal_lfm3 = family == LmFamily::kLfm3;
     // A plugin may register a new arch -> ModelExec factory. Consulted
     // BEFORE the built-in cascade below so a plugin family is selectable
     // by its config.json `architecture` string.
@@ -408,7 +491,8 @@ LoadedLanguageModel::LoadedLanguageModel(
         be_env == nullptr || std::string(be_env) == "metal";
     const bool use_metal = backend_wants_metal && mc_be != nullptr &&
         mc_be->valid() && !model_dir.empty() &&
-        (metal_llama || metal_qwen || metal_gemma || metal_plugin);
+        (metal_llama || metal_qwen || metal_gemma || metal_dsv41 ||
+         metal_lfm3 || metal_plugin);
     if (use_metal) {
       // Bookkeeping-only ctx_mgr (the metal exec owns its own KV).
       ContextManager::Spec s;
@@ -425,6 +509,55 @@ LoadedLanguageModel::LoadedLanguageModel(
             compute_dtype_in == ComputeDtype::BF16};
         _impl->exec = ModelExecRegistry::get().create(arch_be, a);
         _impl->metal_bf16 = (compute_dtype_in == ComputeDtype::BF16);
+      } else if (metal_lfm3) {
+        // F16 throughout: the residual stays under ~30 on real prompts.
+        _impl->metal_bf16 = false;
+        _impl->exec = make_unique<MetalLfm3ModelExec>(
+            model_dir, mc_be, page_tokens, max_pages, session);
+      } else if (metal_dsv41) {
+        MetalDeepseekV41Model::Options o;
+        o.use_bf16 = true;   // the release runs bf16; f16 overflows
+        // Its DSpark draft head (the checkpoint's mtp.*) loads when the
+        // MTP drafter named is the model's own directory: ~8 GB, so only
+        // where speculative decode is wanted (text-chat's `mtp`).
+        {
+          std::error_code ec;
+          o.dspark = !mtp_dir.empty() &&
+                     std::filesystem::equivalent(mtp_dir, model_dir, ec);
+        }
+        // what it runs in beside the weights (run_bytes)
+        LmRunShape rs;
+        rs.kv_tokens = (std::int64_t)page_tokens * max_pages;
+        rs.page_tokens = page_tokens;
+        rs.max_pages = max_pages;
+        rs.draft_head = o.dspark;
+        const std::size_t run = lm_run_booked_(session, model_dir, rs);
+        // within the most the host lets it hold, and the cache it asks
+        // for (lm-memory-limit.h)
+        const std::size_t limit = LmMemoryLimit::current();
+        const std::size_t asked = LmMemoryLimit::expert_cache();
+        o.expert_cache_bytes = MetalDeepseekV41ModelExec::
+            lm_expert_cache_bytes(session, model_dir, run, mc_be, o.dspark,
+                                  limit, asked);
+        if (o.expert_cache_bytes > 0 && session != nullptr) {
+          // the cache never holds fewer than two layers' experts: a
+          // layer's resident and a layer's transient (MetalDeepseekV41
+          // Model's slots)
+          std::size_t ex = 0;
+          const std::size_t floor =
+              MetalDeepseekV41ModelExec::expert_bytes(model_dir, &ex,
+                                                      nullptr)
+                  ? 2 * (ex / (std::size_t)std::max(
+                                  1, _impl->weights.config.n_layers))
+                  : 0;
+          session->info(fmt(
+              "LoadedLanguageModel('{}'): {}", model_dir,
+              cache_line_(limit, asked,
+                          std::max(o.expert_cache_bytes, floor))));
+        }
+        _impl->metal_bf16 = true;
+        _impl->exec = make_unique<MetalDeepseekV41ModelExec>(
+            model_dir, mc_be, o, session);
       } else if (metal_gemma) {
         MetalGemmaModel::Config mcfg =
             MetalGemmaModel::config_from(_impl->weights.config);
@@ -473,6 +606,46 @@ LoadedLanguageModel::LoadedLanguageModel(
         mcfg.page_tokens = page_tokens;
         mcfg.max_pages   = (int)max_pages;
         mcfg.use_bf16    = (compute_dtype_in == ComputeDtype::BF16);
+        mcfg.mtp_dir     = mtp_dir;
+        // A Mixture-of-Experts model too big for the box keeps its ROUTED
+        // EXPERTS in a cache (the rest resident and wired, a missed expert
+        // read from disk, the most-selected kept): the engine's call, on
+        // the same rule the stages size by. Set aside for the K/V and
+        // activations a conversation grows: 2 GB, or a hyper-connection
+        // model's own figure at this pool's context (Qwen3.8-Flash-Next:
+        // ~3.6 GB at 64k tokens).
+        if (mcfg.is_moe()) {
+          LmRunShape rs;
+          rs.kv_tokens = (std::int64_t)page_tokens * max_pages;
+          rs.page_tokens = page_tokens;
+          rs.max_pages = max_pages;
+          rs.one_pass = !mtp_dir.empty();
+          const std::size_t run = lm_run_booked_(session, model_dir, rs);
+          const std::size_t limit = LmMemoryLimit::current();
+          const std::size_t asked = LmMemoryLimit::expert_cache();
+          // An n-gram table asked for in memory, where it fits beside
+          // every expert (load_spec::kNgramResident).
+          if (LmMemoryLimit::ngram_resident() && mcfg.hc()) {
+            mcfg.ple_resident = MetalQwenModel::lm_ngram_resident(
+                session, model_dir, mcfg, run, limit, asked);
+            if (session != nullptr) {
+              session->info(fmt(
+                  "LoadedLanguageModel('{}'): the n-gram table {}",
+                  model_dir,
+                  mcfg.ple_resident
+                      ? "is held in memory (filled after the load)"
+                      : "stays on disk: it and every expert do not fit "
+                        "the box beside the rest (or the host's limit)"));
+            }
+          }
+          mcfg.expert_cache_bytes = MetalQwenModel::lm_expert_cache_bytes(
+              session, model_dir, mcfg, run, limit, asked);
+          if (mcfg.expert_cache_bytes > 0 && session != nullptr) {
+            session->info(fmt("LoadedLanguageModel('{}'): {}", model_dir,
+                              cache_line_(limit, asked,
+                                          mcfg.expert_cache_bytes)));
+          }
+        }
         _impl->metal_bf16 = mcfg.use_bf16;
         _impl->exec = make_unique<MetalQwenModelExec>(
             model_dir, mc_be, mcfg, session);
@@ -509,7 +682,9 @@ LoadedLanguageModel::LoadedLanguageModel(
       }
       // Metal vision tower (Qwen3-VL): host-f32 image embeddings for the
       // metal multimodal splice. No MLX in the forward.
-      if (_impl->weights.config.vision.present && metal_qwen) {
+      const bool pixtral =
+          arch_be == "Mistral3ForConditionalGeneration";
+      if (_impl->weights.config.vision.present && metal_qwen && !pixtral) {
         // The tower's weights live in the LM's own checkpoint, so it
         // goes through the manager's set for that directory -- the same
         // one the exec above is holding. Without this the ViT opened a
@@ -523,6 +698,79 @@ LoadedLanguageModel::LoadedLanguageModel(
         if (_impl->metal_vision) {
           _impl->metal_vision->set_session(session);
           phase_log("metal_vision_encoder (load + bind, no MLX)");
+        }
+      }
+      // DeepSeek-V4.1's ViT + aligner: an image's whole span of rows
+      // (start, cells and row breaks, end), spliced with the token ids
+      // kept (prefill_multimodal_ids: the engram hashes them).
+      if (metal_dsv41) {
+        auto* dx = dynamic_cast<MetalDeepseekV41ModelExec*>(
+            _impl->exec.get());
+        if (dx != nullptr && dx->model() != nullptr &&
+            dx->model()->config().vis_layers > 0) {
+          std::string verr;
+          _impl->metal_dsv41_vision = MetalDeepseekV41Vision::load(
+              open_weight_set(model_dir, session), mc_be,
+              dx->model()->config(), true, &verr);
+          if (!_impl->metal_dsv41_vision && session) {
+            session->warn(fmt("LoadedLanguageModel: the DeepSeek-V4.1 vision "
+                              "tower did not load ({}); image input is "
+                              "unavailable", verr));
+          }
+        }
+      }
+      // LFM3-VL's tower + projector: one row an <|image|> placeholder,
+      // 1-D positions like text.
+      if (metal_lfm3 && _impl->weights.config.vision.present) {
+        _impl->image_rope_1d = true;
+        MetalLfm3VisionEncoder::Config vc;
+        std::string verr;
+        if (MetalLfm3VisionEncoder::Config::from_dir(model_dir, &vc,
+                                                     &verr)) {
+          _impl->metal_lfm3_vision = MetalLfm3VisionEncoder::load(
+              open_weight_set(model_dir, session), mc_be, vc, &verr);
+        }
+        if (_impl->metal_lfm3_vision) {
+          _impl->metal_lfm3_vision->set_session(session);
+          phase_log("metal_lfm3_vision_encoder (load + bind, no MLX)");
+        } else if (session) {
+          session->warn(fmt("LoadedLanguageModel: the LFM3-VL vision tower "
+                            "did not load ({}); image input is unavailable",
+                            verr));
+        }
+      }
+      // Metal Pixtral tower + Mistral3 projector (Ministral-3). Its rows
+      // carry each image's [IMG_BREAK] / [IMG_END] too, as the LM's own
+      // embeddings of those tokens -- so one placeholder per row splices
+      // exactly what the reference's token stream embeds. Images take
+      // 1-D RoPE positions like text.
+      if (_impl->weights.config.vision.present && pixtral) {
+        _impl->image_rope_1d = true;
+        auto enc = MetalPixtralVisionEncoder::load(
+            open_weight_set(model_dir, session), mc_be,
+            MetalPixtralVisionEncoder::config_from(_impl->weights.config));
+        const Tokenizer* tok = _impl->tokenizer.get();
+        const std::int32_t ids[2] = {
+            tok ? tok->special_token_id("[IMG_BREAK]") : -1,
+            tok ? tok->special_token_id("[IMG_END]") : -1};
+        const std::size_t H = (std::size_t)_impl->weights.config.hidden;
+        if (enc && ids[0] >= 0 && ids[1] >= 0) {
+          const std::vector<float> rows = _impl->exec->embed_text_rows(
+              std::span<const std::int32_t>(ids, 2));
+          if (rows.size() >= 2 * H) {
+            enc->set_layout_rows(
+                std::vector<float>(rows.begin(), rows.begin() + (long)H),
+                std::vector<float>(rows.begin() + (long)H,
+                                   rows.begin() + (long)(2 * H)));
+            enc->set_session(session);
+            _impl->metal_pixtral_vision = std::move(enc);
+            phase_log("metal_pixtral_vision_encoder (load + bind, no MLX)");
+          }
+        }
+        if (!_impl->metal_pixtral_vision && session) {
+          session->warn(fmt(
+              "LoadedLanguageModel: the Pixtral vision tower did not load "
+              "for '{}'; image input is unavailable", model_dir));
         }
       }
       // Gemma-4-12B "unified" (gemma4_unified): the encoder-LESS shallow
@@ -789,6 +1037,30 @@ LoadedLanguageModel::kv_bytes() const
   return _impl->ctx_mgr ? _impl->ctx_mgr->resident_bytes() : 0;
 }
 
+std::size_t
+LoadedLanguageModel::run_state_bytes() const
+{
+  if (!_impl || !_impl->exec) { return 0; }
+  if (auto* dx =
+          dynamic_cast<MetalDeepseekV41ModelExec*>(_impl->exec.get())) {
+    if (const MetalDeepseekV41Model* m = dx->model()) {
+      const std::size_t held = m->run_held(), kv = m->kv_bytes();
+      return held > kv ? held - kv : 0;
+    }
+  }
+  return 0;
+}
+
+std::size_t
+LoadedLanguageModel::filled_after_load_bytes() const
+{
+  if (!_impl || !_impl->exec) { return 0; }
+  if (auto* qx = dynamic_cast<MetalQwenModelExec*>(_impl->exec.get())) {
+    return qx->filled_after_load_bytes();
+  }
+  return 0;
+}
+
 const ModelConfig&
 LoadedLanguageModel::config() const noexcept
 {
@@ -835,6 +1107,24 @@ MetalGemma4VisionEncoder*
 LoadedLanguageModel::metal_gemma4_vision_encoder() const noexcept
 {
   return _impl ? _impl->metal_gemma4_vision.get() : nullptr;
+}
+
+MetalDeepseekV41Vision*
+LoadedLanguageModel::metal_deepseek_v41_vision() const noexcept
+{
+  return _impl ? _impl->metal_dsv41_vision.get() : nullptr;
+}
+
+MetalLfm3VisionEncoder*
+LoadedLanguageModel::metal_lfm3_vision() const noexcept
+{
+  return _impl ? _impl->metal_lfm3_vision.get() : nullptr;
+}
+
+MetalPixtralVisionEncoder*
+LoadedLanguageModel::metal_pixtral_vision_encoder() const noexcept
+{
+  return _impl ? _impl->metal_pixtral_vision.get() : nullptr;
 }
 
 MetalGemma4AudioEncoder*
@@ -983,6 +1273,185 @@ LoadedLanguageModel::make_context()
   return c;
 }
 
+namespace {
+
+// A saved context's file: this magic, the FINGERPRINT of the model that
+// made it, where the context stands (its length, its next rope position,
+// its last predicted token), the caller's meta, then the exec's stream
+// (ContextIoExt). Strings are a u32 length and their bytes.
+constexpr char kSavedContextMagic[8] = {'V', 'P', 'C', 'T', 'X', 0, 0, '1'};
+constexpr std::uint32_t kMaxFingerprint = 1u << 20;
+constexpr std::uint32_t kMaxMeta = 64u << 20;
+
+// What a saved context was made by: the architecture, the checkpoint's
+// directory, and its weight and config files by name, size and time --
+// weights replaced in place are another model, whose K/V would read back
+// silently wrong.
+std::string
+context_fingerprint_(const std::string& arch, const std::string& dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  std::string fp = arch + "\n" + fs::weakly_canonical(dir, ec).string();
+  std::vector<std::string> files;
+  auto note = [&](const fs::path& p) {
+    std::error_code e;
+    const auto ext = p.extension().string();
+    if (ext != ".safetensors" && ext != ".json" && ext != ".gguf") {
+      return;
+    }
+    const auto size = fs::file_size(p, e);
+    const auto when = fs::last_write_time(p, e).time_since_epoch().count();
+    files.push_back(fmt("{}:{}:{}", p.filename().string(), size,
+                        static_cast<long long>(when))());
+  };
+  if (fs::is_regular_file(dir, ec)) {
+    note(dir);
+  } else {
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+      std::error_code fe;
+      if (e.is_regular_file(fe)) { note(e.path()); }
+    }
+  }
+  std::sort(files.begin(), files.end());
+  for (const auto& f : files) { fp += "\n" + f; }
+  return fp;
+}
+
+ContextIoExt*
+context_io_(ModelExec* exec)
+{
+  return exec != nullptr ? static_cast<ContextIoExt*>(
+                               exec->query_extension(
+                                   context_io::kExtensionId))
+                         : nullptr;
+}
+
+}  // namespace
+
+bool
+LoadedLanguageModel::save_context(const Context& ctx, const std::string& path,
+                                  std::string_view meta, std::string* err)
+{
+  auto fail = [&](std::string why) {
+    if (err != nullptr) { *err = std::move(why); }
+    return false;
+  };
+  if (!valid() || !ctx.valid() || ctx._lm != this) {
+    return fail("no context to save");
+  }
+  ContextIoExt* io = context_io_(_impl->exec.get());
+  if (io == nullptr) {
+    return fail("this model's backend cannot save a context");
+  }
+  const std::string part = path + ".part";
+  std::FILE* f = std::fopen(part.c_str(), "wb");
+  if (f == nullptr) { return fail(fmt("cannot write {}", part)()); }
+  bool ok = true;
+  auto put = [&](const void* p, std::size_t n) {
+    if (ok && n > 0) { ok = std::fwrite(p, 1, n, f) == n; }
+    return ok;
+  };
+  auto put_str = [&](std::string_view sv) {
+    const auto n = static_cast<std::uint32_t>(sv.size());
+    put(&n, sizeof n);
+    put(sv.data(), sv.size());
+  };
+  put(kSavedContextMagic, sizeof kSavedContextMagic);
+  put_str(context_fingerprint_(_impl->weights.config.architecture,
+                               _impl->model_dir));
+  const std::int32_t where[3] = {ctx.seq_len(), ctx._rope_next_position,
+                                 ctx._last_predicted};
+  put(where, sizeof where);
+  put_str(meta);
+  if (ok) {
+    ok = dispatch_(_impl->runtime, [&] {
+      return io->export_context(
+          ctx._id, [&](const void* p, std::size_t n) { return put(p, n); });
+    });
+  }
+  if (std::fclose(f) != 0) { ok = false; }
+  std::error_code ec;
+  if (!ok) {
+    std::filesystem::remove(part, ec);
+    return fail(fmt("could not write the context to {}", path)());
+  }
+  std::filesystem::rename(part, path, ec);
+  if (ec) {
+    std::filesystem::remove(part, ec);
+    return fail(fmt("could not move the context to {}", path)());
+  }
+  return true;
+}
+
+LoadedLanguageModel::Context
+LoadedLanguageModel::load_context(const std::string& path, std::string* meta,
+                                  std::string* err)
+{
+  auto fail = [&](std::string why) {
+    if (err != nullptr) { *err = std::move(why); }
+    return Context{};
+  };
+  if (!valid()) { return fail("no model"); }
+  ContextIoExt* io = context_io_(_impl->exec.get());
+  if (io == nullptr) {
+    return fail("this model's backend cannot read a context back");
+  }
+  std::FILE* f = std::fopen(path.c_str(), "rb");
+  if (f == nullptr) { return fail(fmt("no context at {}", path)()); }
+  struct Closer {
+    std::FILE* f;
+    ~Closer() { std::fclose(f); }
+  } closer{f};
+  bool ok = true;
+  auto get = [&](void* p, std::size_t n) {
+    if (ok && n > 0) { ok = std::fread(p, 1, n, f) == n; }
+    return ok;
+  };
+  auto get_str = [&](std::string& out, std::uint32_t cap) {
+    std::uint32_t n = 0;
+    get(&n, sizeof n);
+    if (!ok || n > cap) {
+      ok = false;
+      return;
+    }
+    out.resize(n);
+    get(out.data(), n);
+  };
+  char magic[sizeof kSavedContextMagic] = {};
+  get(magic, sizeof magic);
+  if (!ok || std::memcmp(magic, kSavedContextMagic, sizeof magic) != 0) {
+    return fail(fmt("{} is not a saved context", path)());
+  }
+  std::string fp;
+  get_str(fp, kMaxFingerprint);
+  if (!ok || fp != context_fingerprint_(_impl->weights.config.architecture,
+                                        _impl->model_dir)) {
+    return fail("the saved context was made by another model");
+  }
+  std::int32_t where[3] = {};
+  get(where, sizeof where);
+  std::string m;
+  get_str(m, kMaxMeta);
+  if (!ok) { return fail(fmt("{} is cut short", path)()); }
+  Context c = make_context();
+  if (!c.valid()) { return fail("no context could be made"); }
+  ok = dispatch_(_impl->runtime, [&] {
+    return io->import_context(
+        c._id, [&](void* p, std::size_t n) { return get(p, n); });
+  });
+  if (!ok) {
+    return fail(fmt("{} does not fit this model's context", path)());
+  }
+  c._rope_next_position = where[1];
+  c._last_predicted     = where[2];
+  if (c.seq_len() != where[0]) {
+    return fail(fmt("{} read back at another length", path)());
+  }
+  if (meta != nullptr) { *meta = std::move(m); }
+  return c;
+}
+
 LoadedLanguageModel::Context
 LoadedLanguageModel::branch(const Context& parent)
 {
@@ -1084,6 +1553,41 @@ LoadedLanguageModel::prefill_multimodal_metal(
     return -1;
   }
 
+  // DeepSeek-V4.1: the engram hashes the token ids, so a splice goes with
+  // them -- each media row at its placeholder (the image token), the rows
+  // the tower's host f32.
+  if (auto* dx =
+          dynamic_cast<MetalDeepseekV41ModelExec*>(_impl->exec.get())) {
+    const int Hh = _impl->weights.config.hidden;
+    const std::int32_t img_id =
+        dx->model() != nullptr ? dx->model()->config().image_token : 0;
+    std::vector<std::int32_t> ids;
+    std::vector<int> positions;
+    std::vector<float> mm_rows;
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+      const auto& r = refs[i];
+      if (r.kind != TokenRef::Kind::ImageTokens) {
+        ids.push_back(r.text_id);
+        continue;
+      }
+      ids.push_back(img_id);
+      positions.push_back((int)i);
+      const std::size_t o = (std::size_t)r.image_token_offset * Hh;
+      if (r.embeddings_host == nullptr ||
+          o + (std::size_t)Hh > r.embeddings_host->size()) {
+        return -1;
+      }
+      mm_rows.insert(mm_rows.end(), r.embeddings_host->begin() + (long)o,
+                     r.embeddings_host->begin() + (long)(o + Hh));
+    }
+    int32_t pred = dispatch_(_impl->runtime, [&]() -> int32_t {
+      return dx->prefill_multimodal_ids(ctx._id, ids, mm_rows,
+                                        (int)positions.size(), positions);
+    });
+    if (pred >= 0) { ctx._last_predicted = pred; }
+    return pred;
+  }
+
   // owns_kv metal Gemma: PLE needs the raw ids + embed_scale lives inside
   // the forward, so the embedding-splice path below (prefill_embeddings)
   // can't serve it. Build (ids, mm rows, positions) from refs and drive
@@ -1141,12 +1645,20 @@ LoadedLanguageModel::prefill_multimodal_metal(
 
   const int H = _impl->weights.config.hidden;
   const int n = (int)refs.size();
+  // A hyper-connection Qwen (Qwen3.8-Flash-Next) hashes the token ids in
+  // its n-gram PLE, so its splice goes WITH them -- each media row its
+  // placeholder's (TokenRef::text_id; the image pad where a caller left
+  // it 0) -- through the host-f32 assembly below.
+  auto* hcx = dynamic_cast<MetalQwenModelExec*>(_impl->exec.get());
+  const bool hc = hcx != nullptr && hcx->hc();
 
   // 3-axis mROPE positions when image grids are supplied (VQA); else
   // plain 1-D RoPE (audio / text).
   std::vector<int32_t> pos_t, pos_h, pos_w;
   int rope_next = -1;
-  const bool have_grids = !image_grids.empty();
+  // mROPE families only: a 1-D RoPE family (Mistral3) positions its
+  // image rows like text whatever grids the caller passes.
+  const bool have_grids = !image_grids.empty() && !_impl->image_rope_1d;
   if (have_grids) {
     if (!build_mrope_position_ids(refs, image_grids, &pos_t, &pos_h, &pos_w,
                                   &rope_next)) {
@@ -1162,7 +1674,7 @@ LoadedLanguageModel::prefill_multimodal_metal(
   // (no host f32 round-trip, no cast). The image tokens dominate, so the
   // f16-only copy is the big win.
   auto* mc_dev = _impl->session ? _impl->session->services()->metal_compute() : nullptr;
-  if (mc_dev != nullptr && !_impl->metal_bf16) {
+  if (mc_dev != nullptr && !_impl->metal_bf16 && !hc) {
     bool all_buf = true;
     for (int i = 0; i < n; ++i) {
       if (refs[i].kind != TokenRef::Kind::Text
@@ -1282,6 +1794,33 @@ LoadedLanguageModel::prefill_multimodal_metal(
   }
 
   int32_t pred = -1;
+  if (hc) {
+    const std::int32_t pad =
+        _impl->tokenizer ? _impl->tokenizer->special_token_id("<|image_pad|>")
+                         : -1;
+    std::vector<int32_t> ids((std::size_t)n);
+    for (int i = 0; i < n; ++i) {
+      const TokenRef& r = refs[(std::size_t)i];
+      ids[(std::size_t)i] =
+          r.kind == TokenRef::Kind::Text || r.text_id != 0 ? r.text_id : pad;
+      if (ids[(std::size_t)i] < 0) { return -1; }
+    }
+    std::vector<int32_t> pos;
+    if (have_grids) {
+      pos.resize(3 * (std::size_t)n);
+      for (int t = 0; t < n; ++t) {
+        pos[t] = pos_t[t];
+        pos[n + t] = pos_h[t];
+        pos[2 * n + t] = pos_w[t];
+      }
+    }
+    pred = hcx->prefill_hc_spliced(ctx._id, emb, ids, pos, n);
+    if (pred >= 0) {
+      ctx._last_predicted = pred;
+      if (have_grids) { ctx._rope_next_position = rope_next; }
+    }
+    return pred;
+  }
   if (have_grids) {
     std::vector<int32_t> pos(3 * (std::size_t)n);
     for (int t = 0; t < n; ++t) {
@@ -1715,7 +2254,35 @@ LoadedLanguageModel::base_suppressed_tokens() const noexcept
 void
 LoadedLanguageModel::set_i8_prefill(bool on)
 {
-  if (_impl && _impl->exec) { _impl->exec->set_i8_gemm(on); }
+  if (!_impl) { return; }
+  std::lock_guard<std::mutex> lk(_impl->i8_mu);
+  _impl->i8_on = on;
+  _impl->i8_tagged = false;   // the next request starts a launch afresh
+  if (_impl->exec) { _impl->exec->set_i8_gemm(on); }
+}
+
+void
+LoadedLanguageModel::request_i8_prefill(bool on, std::uint64_t epoch)
+{
+  if (!_impl) { return; }
+  std::lock_guard<std::mutex> lk(_impl->i8_mu);
+  if (!_impl->i8_tagged || _impl->i8_epoch != epoch) {
+    _impl->i8_tagged = true;
+    _impl->i8_epoch = epoch;
+    _impl->i8_on = on;
+  } else {
+    _impl->i8_on = _impl->i8_on || on;
+  }
+  // The models keep their context when the flag does not move.
+  if (_impl->exec) { _impl->exec->set_i8_gemm(_impl->i8_on); }
+}
+
+bool
+LoadedLanguageModel::i8_prefill_requested() const
+{
+  if (!_impl) { return false; }
+  std::lock_guard<std::mutex> lk(_impl->i8_mu);
+  return _impl->i8_on;
 }
 
 bool
@@ -1725,6 +2292,18 @@ LoadedLanguageModel::mtp_generate(
     const std::function<bool(int32_t)>&                  is_stop,
     const std::function<bool(span<const int32_t>)>&      on_tokens,
     int* produced, bool* hit_stop)
+{
+  return mtp_generate(ctx, first_token, max_tokens, params, is_stop,
+                      on_tokens, produced, hit_stop, span<const int32_t>{});
+}
+
+bool
+LoadedLanguageModel::mtp_generate(
+    Context& ctx, int32_t first_token, int max_tokens,
+    const SamplerParams&                                 params,
+    const std::function<bool(int32_t)>&                  is_stop,
+    const std::function<bool(span<const int32_t>)>&      on_tokens,
+    int* produced, bool* hit_stop, span<const int32_t> prompt)
 {
   if (produced) { *produced = 0; }
   if (hit_stop) { *hit_stop = false; }
@@ -1738,7 +2317,17 @@ LoadedLanguageModel::mtp_generate(
   // The verify's sampler: greedy => argmax accept; non-greedy => speculative
   // sampling (per-position GPU sample). Same SamplerParams->GpuSamplerParams
   // path the pdecode loop uses (seed 0 -> a random base so turns differ).
-  const GpuSamplerParams sp = gpu_sampler_params_(params);
+  GpuSamplerParams sp = gpu_sampler_params_(params);
+  // The penalty seen-set's start rides in the sampler's bag: the exec
+  // virtual keeps the signature plugins were built against.
+  if (!prompt.empty()) {
+    FlexData ids = FlexData::make_array();
+    {
+      FlexData::ArrayView av = ids.as_array();
+      for (const int32_t t : prompt) { av.push_back((int64_t)t); }
+    }
+    bag::set(sp.extra, gpu_sampler::kPrime, std::move(ids));
+  }
   PerfAuxScope _perf(_impl->session, kPerfLaneLLM, kGvidLlmDecode,
                      kPerfLlmDecodeBegin, 1);
   int  prod   = 0;
@@ -1773,6 +2362,117 @@ LoadedLanguageModel::mtp_generate(
   return true;
 }
 
+
+namespace {
+
+SpecDecodeExt*
+spec_ext_(ModelExec* exec)
+{
+  return exec != nullptr ? static_cast<SpecDecodeExt*>(
+                               exec->query_extension(spec_decode::kExtensionId))
+                         : nullptr;
+}
+
+}  // namespace
+
+bool
+LoadedLanguageModel::set_prefill_progress(std::function<void(int, int)> fn)
+{
+  if (!valid() || !_impl->exec) { return false; }
+  auto* px = static_cast<PrefillProgressExt*>(
+      _impl->exec->query_extension(prefill_progress::kExtensionId));
+  if (px == nullptr) { return false; }
+  px->set_prefill_progress(std::move(fn));
+  return true;
+}
+
+bool
+LoadedLanguageModel::spec_decode_available() const
+{
+  if (!valid() || !_impl->exec) { return false; }
+  const SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  return sx != nullptr && !sx->drafter().empty();
+}
+
+std::string
+LoadedLanguageModel::spec_drafter() const
+{
+  if (!valid() || !_impl->exec) { return {}; }
+  const SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  return sx != nullptr ? std::string(sx->drafter()) : std::string();
+}
+
+bool
+LoadedLanguageModel::attach_draft_model(const std::string& dir, int bits,
+                                        std::string* err)
+{
+  if (!valid() || !_impl->exec) {
+    if (err) { *err = "no model"; }
+    return false;
+  }
+  SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  if (sx == nullptr) {
+    if (err) { *err = "this backend has no speculative decode"; }
+    return false;
+  }
+  return dispatch_(_impl->runtime, [&]() -> bool {
+    return sx->attach_drafter(dir, bits, err);
+  });
+}
+
+bool
+LoadedLanguageModel::spec_generate(
+    Context& ctx, int32_t first_token, int max_tokens,
+    const SamplerParams&                                 params,
+    const std::function<bool(int32_t)>&                  is_stop,
+    const std::function<bool(span<const int32_t>)>&      on_tokens,
+    int* produced, bool* hit_stop, span<const int32_t> prompt, int block,
+    SpecDecodeResult* stats)
+{
+  if (produced) { *produced = 0; }
+  if (hit_stop) { *hit_stop = false; }
+  if (!valid() || !ctx.valid() || !_impl->exec || max_tokens <= 0) {
+    return false;
+  }
+  SpecDecodeExt* sx = spec_ext_(_impl->exec.get());
+  if (sx == nullptr || sx->drafter().empty()) { return false; }
+  PerfAuxScope _perf(_impl->session, kPerfLaneLLM, kGvidLlmDecode,
+                     kPerfLlmDecodeBegin, 1);
+  // Track the last kept token for the context's bookkeeping (the verify
+  // appends each kept token's KV itself).
+  int32_t last_tok = first_token;
+  const std::function<bool(span<const int32_t>)> on_wrapped =
+      [&last_tok, &on_tokens](span<const int32_t> toks) -> bool {
+        if (!toks.empty()) { last_tok = toks.back(); }
+        return on_tokens ? on_tokens(toks) : true;
+      };
+  SpecDecodeRequest rq;
+  rq.ctx = ctx._id;
+  rq.first_token = first_token;
+  rq.max_tokens = max_tokens;
+  // The first decoded token's rotary position, as pdecode_begin takes it.
+  rq.rope_first = ctx._rope_next_position;
+  rq.sampler = gpu_sampler_params_(params);
+  rq.prime = prompt;
+  rq.is_stop = is_stop ? &is_stop : nullptr;
+  rq.on_tokens = &on_wrapped;
+  rq.block = block;
+  SpecDecodeResult r;
+  const bool ok = dispatch_(_impl->runtime, [&]() -> bool {
+    return sx->generate(rq, &r);
+  });
+  _perf.set_value(static_cast<std::uint64_t>(r.produced));
+  if (r.produced > 0) {
+    ctx._last_predicted = last_tok;
+    if (ctx._rope_next_position >= 0) {
+      ctx._rope_next_position += r.produced;
+    }
+  }
+  if (produced) { *produced = r.produced; }
+  if (hit_stop) { *hit_stop = r.hit_stop; }
+  if (stats) { *stats = std::move(r); }
+  return ok;
+}
 
 // The profile API is only meaningful for LlamaModelExec (the
 // per-stage tick instrumentation lives on the concrete class). For

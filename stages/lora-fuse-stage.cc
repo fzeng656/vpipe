@@ -93,10 +93,15 @@ constexpr ConfigKey kAttrs[] = {
    .doc = "base model dir or models-DB key (for Krea-2, the transformer/ DiT)",
    .suggest_db = kModelRegistryDb},
   {.key = "lora", .type = ConfigType::String, .required = true,
-   .doc = "LoRA .safetensors file, or a dir/key with one .safetensors"},
+   .doc = "LoRA .safetensors file, or a dir/key with one .safetensors",
+   // Both pickers, as on the model-config stages' `lora` fields: a
+   // catalogued adapter, or a downloaded file in the sandbox.
+   .suggest_db = kModelRegistryDb,
+   .suggest_db_type = "krea2-lora,flux2-lora,minimax-h3-lora",
+   .is_path = true, .path_filter = "weights"},
   {.key = "output_name", .type = ConfigType::String, .required = true,
-   .doc = "result name -> <cwd>/models/<output_name> (registered), or an "
-          "explicit path"},
+   .doc = "result name -> models/<output_name> beside the database "
+          "(registered), or an explicit path"},
   {.key = "base_pipeline", .type = ConfigType::String,
    .doc = "optional base diffusers pipeline ROOT (dir or key); when set, the "
           "fused DiT is written under <output>/transformer/ and the pipeline's "
@@ -216,7 +221,7 @@ LoraFuseStage::fuse_once(const std::function<bool()>& stop)
       _output_name.rfind("../", 0) == 0;
   const std::string out_dir = explicit_path
       ? _output_name
-      : (fs::current_path() / "models" / _output_name).string();
+      : (default_models_dir(session()) / _output_name).string();
   _out_dir = out_dir;
 
   metal_compute::MetalCompute* mc = session()->services()->metal_compute();

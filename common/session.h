@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,6 +22,11 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+// Exported for the in-tree apps, NOT the plugin contract (vpipe/export.h).
+VPIPE_HOST_API_BEGIN
 
 namespace vpipe {
 
@@ -42,6 +48,12 @@ public:
   //                                        or binary-FlexData config
   Session(std::string_view = "");
 
+  // The same, from a config document already in memory: the document the
+  // text forms parse into (SessionManager::create_session(const FlexData&)).
+  // Null means built-in defaults; anything but an object is refused with
+  // a warning, and defaults are used, as for an unparsable string.
+  explicit Session(const FlexData& config);
+
   // Test / library-user injection. Bypasses config-driven delegate
   // selection. A null pointer falls back to a default StdoutLogDelegate.
   // Worker count and edge-buffer capacity use built-in defaults.
@@ -53,6 +65,12 @@ public:
 
   /* external */
   PipelineHandle load_pipeline(std::string_view) override;
+  // SessionIntf's non-virtual FlexData form, visible on a Session too.
+  using SessionIntf::load_pipeline;
+  // Build a pipeline from a parsed spec document. `storage` is the file it
+  // came from ("" for an inline or in-memory spec).
+  PipelineHandle load_pipeline_spec(const FlexData& spec,
+                                    std::string storage = {});
   PipelineHandle create_pipeline(std::string) override;
   Status launch_pipeline(PipelineHandle) override;
   Status pause_pipeline(PipelineHandle) override;
@@ -62,6 +80,8 @@ public:
   Status store_pipeline(PipelineHandle,
                         std::string_view path) override;
   Status wait_pipelines(int timeout_ms = -1) override;
+  // SessionIntf::wait_pipeline: one pipeline's wait.
+  Status wait_one_pipeline(PipelineHandle, int timeout_ms);
 
   Status debug_level(unsigned) override;
   Status debug_level(std::string_view) override;
@@ -72,6 +92,9 @@ public:
   // memory, raisable while a pipeline runs and not lowerable.
   Status set_wired_pool_mb(std::size_t mb) override;
   std::size_t wired_pool_mb() const override;
+
+  Status set_swap_allowance_mb(std::size_t mb) override;
+  std::size_t swap_allowance_mb() const override;
 
   Status enable_profiling(unsigned max_events_per_stage) override;
   Status disable_profiling() override;
@@ -115,6 +138,10 @@ public:
   // not safe to race against active worker-thread log/UI calls; the
   // caller installs it before launching pipelines.
   void set_ui_delegate(std::unique_ptr<UiDelegateIntf>);
+
+  // The delegate installed now -- what SessionIntf::progress() reads the
+  // live reports from. Never null (see _ui_delegate).
+  const UiDelegateIntf& ui_delegate() const { return *_ui_delegate; }
 
   // Install the diagnostic log delegate (the log_* channels). Defaults
   // to a StdoutLogDelegate; the web-ui app swaps in one that diverts
@@ -219,6 +246,12 @@ public:
   // SessionContextIntf for the contract.
   metal_compute::MetalCompute* metal_compute() const;
 
+  // The session's kernel-tuning answers (KernelTuningCache): every
+  // model in the session reads what another -- or its own earlier load
+  // -- measured. Lazily constructed; nullptr when the config's
+  // `kernel_tuning.cache` is false or VPIPE_TUNING_CACHE=0.
+  KernelTuningCache* kernel_tuning_cache() const;
+
   // This session IS its own service bundle -- the subsystems it lazily
   // constructs are the ones callers ask for. Keeping the accessors on
   // Session as well means the ~450 direct `sess.metal_compute()` call
@@ -241,6 +274,15 @@ public:
   ThreadPool* pool() noexcept { return _pool.get(); }
 
 private:
+  // Both public config constructors delegate here: the parsed document,
+  // or the reason there is none (then built-in defaults, with a warning).
+  struct ParsedConfig {
+    FlexData    config;
+    std::string error;
+  };
+  explicit Session(ParsedConfig);
+  static ParsedConfig parse_config_(std::string_view);
+
   // Resolve a PipelineHandle to its owning Impl, or nullptr if the
   // handle is unknown to this Session.
   PipelineHandleImpl* resolve(PipelineHandle) const;
@@ -258,6 +300,30 @@ private:
   // checked in those methods. With it, a swap can never race against
   // a worker-thread log() call so no extra synchronization is needed.
   std::unique_ptr<LogDelegateIntf> _delegate;
+
+  // Structured reports for the host (common/host-report.h): the latest
+  // kReportsKept, oldest first, each with the id SessionIntf::reports()
+  // gives it.
+  struct HostReport {
+    std::uint64_t                         id = 0;
+    std::string                           kind;
+    FlexData                              data;
+    std::chrono::steady_clock::time_point at;
+  };
+  static constexpr std::size_t kReportsKept = 32;
+  mutable std::mutex                        _reports_mu;
+  std::deque<HostReport>                    _reports;
+  std::uint64_t                             _report_id = 0;
+  friend void host_report(const SessionContextIntf*, std::string, FlexData);
+
+  // The host's log listener (SessionIntf::set_log_listener), shared so a
+  // reporting thread keeps the one it took while it is swapped.
+  mutable std::mutex                        _listener_mu;
+  std::shared_ptr<const LogListener>        _listener;
+  friend class SessionIntf;
+  // The listener, if any, given `msg` at `level`.
+  void tell_listener_(LogLevel level, const std::string& msg) const;
+  std::shared_ptr<const LogListener> listener_() const;
 
   // User-facing I/O delegate (error/warn/info + getline). Defaults to
   // a StdioUiDelegate; swappable via set_ui_delegate(). Declared right
@@ -352,6 +418,12 @@ private:
   mutable std::once_flag                                  _mc_once;
   mutable std::unique_ptr<metal_compute::MetalCompute>    _mc;
 
+  // The kernel tuners' answers, kept for the session. Lazily constructed
+  // on first kernel_tuning_cache() call, and only when the config leaves
+  // it on. Text only: nothing in it points into the device or a model.
+  mutable std::once_flag                                  _tuning_once;
+  mutable std::unique_ptr<KernelTuningCache>              _tuning;
+
   // Owns every PipelineHandleImpl we hand out. Keyed on the impl's
   // own pointer (which is the value carried inside PipelineHandle).
   mutable std::mutex                                              _pipelines_mu;
@@ -360,5 +432,7 @@ private:
 };
 
 }
+
+VPIPE_HOST_API_END
 
 #endif

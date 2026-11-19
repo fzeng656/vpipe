@@ -17,7 +17,6 @@ set(VPIPE_WEBUI_SOURCES
     db-browser.cc
     model-browser.cc
     qr-code.cc
-    system-status.cc
     startup-checks.cc
 )
 # Microphone permission probe (AVCaptureDevice authorization status) is
@@ -62,17 +61,11 @@ target_include_directories(vpipe-web-ui
 # links it PRIVATE so it isn't propagated -- link it here too.
 target_link_libraries(vpipe-web-ui PRIVATE vpipe lmdb)
 
-# system-status.cc reads Apple Silicon GPU stats via IOKit
-# (IOAccelerator's PerformanceStatistics) -- the same data nvtop's
-# AS backend and asitop / mactop consume. CoreFoundation is already
-# brought in transitively via libvpipe; IOKit is local to this app.
+# The status bar's GPU / ANE readings are the library's now
+# (vpipe/system-monitor.h, stages/system-status.cc), which links IOKit
+# itself; the IOReport private framework is resolved there at runtime
+# via dlopen. These stay for the web UI's own IOKit / CF use.
 if(APPLE)
-    # IOKit for GPU stats. The IOReport private framework (used for
-    # ANE energy samples, the same source macmon reads) is resolved at
-    # runtime via dlopen("/System/Library/PrivateFrameworks/IOReport
-    # .framework/IOReport") from the dyld shared cache -- no link-time
-    # framework path exists for it on modern macOS, so we don't pass
-    # `-framework IOReport`.
     target_link_libraries(vpipe-web-ui PRIVATE
         "-framework IOKit"
         "-framework CoreFoundation")
@@ -93,6 +86,15 @@ endif()
 if(APPLE AND NOT OPENSSL_ROOT_DIR AND EXISTS /opt/homebrew/opt/openssl@3)
     set(OPENSSL_ROOT_DIR /opt/homebrew/opt/openssl@3)
 endif()
+# The metal-compute facet of /api/system/status (this PROCESS's GPU
+# allocation, the never-evicted kernel caches, the residency set) needs
+# the same guard the library is built under -- it is PRIVATE there, so
+# without this the block compiles out silently and the endpoint simply
+# reports fewer fields than it looks like it does.
+if(APPLE AND VPIPE_BUILD_APPLE_SILICON)
+    target_compile_definitions(vpipe-web-ui PRIVATE VPIPE_BUILD_APPLE_SILICON=1)
+endif()
+
 find_package(OpenSSL QUIET)
 if(OpenSSL_FOUND)
     target_sources(vpipe-web-ui PRIVATE tls-context.cc)

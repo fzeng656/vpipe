@@ -147,6 +147,10 @@ public:
     // the prefix has to coexist with is whatever else the run holds.
     bool   stream_layers  = false;
     double pin_frac       = 0.0;
+    // Whether the decode-attention tuner MEASURES (the accel key
+    // `autotune`, accel-keys.h): false keeps its default split, timing
+    // nothing and reading no kept answer.
+    bool   autotune       = true;
     int   page_tokens     = 256;    // bookkeeping ctx manager
     int   max_pages       = 0;
     // Per-layer attention kind (true = full_attention). Size == n_layers.
@@ -186,6 +190,19 @@ public:
 
   // Derive the shape-affecting Config from a parsed ModelConfig.
   static Config config_from(const ModelConfig& c);
+  // Its working memory beside its weights, for the LM stages' plan
+  // (lm_run_bytes): a prompt of up to max_seq rows prefilled in ONE forward
+  // (prefill() grows the context's sliding ring to it), that forward's
+  // buffers (forward_chunk_, element by element; `plain_mlp`: a dense or
+  // mixed checkpoint's separate gate; `double_wide`: the KV-shared layers'
+  // 2x MLP; `matrix_cores`: the gate|up output, the dequantized weight and
+  // the head-dim-512 attention's gathered K/V), the scratch ensure_scratch_
+  // keeps (the materialized global scores among it), the full layers' paged
+  // pool at `kv_tokens` as its doubling reaches, and `contexts` contexts'
+  // sliding rings, one of them grown to the prompt.
+  static std::size_t run_bytes(const Config& c, std::int64_t kv_tokens,
+                               int contexts, bool plain_mlp,
+                               bool double_wide, bool matrix_cores);
 
   // Decode one token: append to `cid`'s own KV and return [vocab] f32
   // logits at the new position. rope_pos<0 uses the KV slot position.
@@ -259,11 +276,15 @@ public:
   // key_valid_len > 0 applies a PREFIX KEY-MASK, matching HF's
   // attention_mask over a right-padded prompt.
   metal_compute::SharedBuffer
+  // `skip_final_norm` changes what INDEX n_layers means: the raw
+  // residual rather than the post-norm one. No effect on any other
+  // index, and no effect at all when n_layers is not requested.
   forward_embeddings_taps(ContextId cid,
                           const std::vector<std::int32_t>& ids,
                           const std::vector<int>& hf_indices,
                           int key_valid_len = 0,
-                          std::string* err = nullptr);
+                          std::string* err = nullptr,
+                          bool skip_final_norm = false);
 
   // Own-KV lifecycle (the exec calls these on branch / release).
   bool branch_kv(ContextId parent, ContextId child);
@@ -367,6 +388,9 @@ private:
     // the whole call fails, rather than handing back a buffer with a
     // silently stale slot.
     bool partial = false;
+    // Index n_layers hands back the RAW residual instead of the normed
+    // one. See HiddenTapRequest::skip_final_norm.
+    bool skip_final_norm = false;
   };
   TapState* _taps = nullptr;
   // Copy [n*hidden] from `src` into slot `slot` of the tap buffer.
@@ -509,7 +533,7 @@ private:
 
   metal_compute::ComputeLibrary _lib_qmv, _lib_qmm, _lib_rms, _lib_elt,
       _lib_rope, _lib_sdpa, _lib_dense, _lib_dequant, _lib_dense_mma,
-      _lib_sdpa_mma;
+      _lib_sdpa_mma, _lib_attn_nax;
   // _fn_qmv / _fn_qmm run at the base quant_bits (attn / lm_head); the
   // _mlp / geglu variants run at mlp_bits (gemma4_unified MLP is 8-bit).
   metal_compute::ComputeFunction _fn_qmv, _fn_qmv_add, _fn_qmv_geglu,
@@ -813,6 +837,9 @@ private:
   // _d_scores = f16 [CAP, CAP] per-head score matrix; _d_vT = f16 [Hkv,D,CAP]
   // V transpose. CAP = min(max_seq, 8192). Allocated only when the flag is on.
   metal_compute::SharedBuffer _d_scores, _d_vT;
+  // The NAX global prefill's contiguous K/V [Hkv, kL, D], gathered from the
+  // paged pool per layer; grown to the longest context seen.
+  metal_compute::SharedBuffer _d_nax_k, _d_nax_v;
   // Pipelined PLE production (Design A): split _d_pli into per-chunk buffers so
   // chunks 1..N-1 overlap the layer chain's bubbles (only chunk 0 gates layer
   // 0). _d_x_ple is a private snapshot of _d_x so the chunk GEMVs don't WAR with
@@ -925,6 +952,13 @@ private:
   // GEMM), replacing the inefficient fused sdpa_paged_flash_d512 for the
   // single-chunk (qpos==0) global prefill only. Capped at T_kv<=_scores_cap.
   bool _materialized_global = false;
+  // M5 GLOBAL (head_dim 512) prefill on MLX's NAX head-dim split attention
+  // (attn_steel_nax_dsplit_h_bd512, four 128-wide D slices): the paged pool
+  // gathered into contiguous K/V (_fn_kv_gather), then one dispatch. Ahead
+  // of both the materialized path and pmma2 for any prefill chunk; per
+  // (align_Q, align_K) pipeline. VPIPE_GEMMA_NO_NAX512=1 reverts (A/B).
+  bool _nax512_attn = false;
+  metal_compute::ComputeFunction _fn_nax512[2][2], _fn_kv_gather;
   // All six grouped-MoE-prefill functions validated (see the loader). Off ->
   // the MoE prefill stays on the pair-batched gathers.
   bool _moe_grouped_ok = false;

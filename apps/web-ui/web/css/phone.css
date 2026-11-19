@@ -407,6 +407,13 @@
    default applies. Visually distinct from a field set to the empty
    string, which is a different configuration. */
 .ph-field.unset .ph-input { border-style: dashed; opacity: .75; }
+/* A JSON box that did not parse when it lost focus, so its value was NOT
+   applied. Auto-apply is silent by design -- the value simply goes -- so
+   the one case where it declines has to be visible, and on a phone there
+   is no hover to explain it. The :focus twin keeps the warning up while
+   the box is being corrected, which is exactly when it is being read. */
+.ph-field.bad-json .ph-input,
+.ph-field.bad-json .ph-input:focus { border-color: var(--danger); }
 .ph-textarea { resize: vertical; min-height: 58px; }
 .ph-select { height: 38px; }
 .ph-apply { width: 100%; justify-content: center; margin-top: 12px;
@@ -636,6 +643,14 @@
 #app.phone .userio .io-text { font-size: 12.5px; }
 #app.phone .userio .console { font-size: 12.5px; padding: 8px 10px; }
 #app.phone .io-md-toggle { font-size: 11px; white-space: nowrap; }
+/* The console text-size control. The desktop's 20px buttons are a
+   pointer's target, not a finger's, so it takes the header strip's
+   own thumb size (.ph-act is 34x30). */
+#app.phone .tz { gap: 2px; }
+#app.phone .tz-btn,
+#app.phone .tz-size {
+  height: 30px; min-width: 30px; font-size: 12px;
+}
 /* The prompt label eats the width the input needs; it only ever says
    "waiting" or repeats the pending request, which the placeholder and
    the enabled state already convey. */

@@ -16,10 +16,13 @@
 ![Python](https://img.shields.io/badge/Python-bindings-green)
 ![Status](https://img.shields.io/badge/Status-alpha-orange)
 
+**[🌟 New! Try Valtz for streamlined creative work, powered by VPIPE 🌟](https://github.com/tgo-app-dev/valtz)**
+
 **[Download the macOS app](https://github.com/tgo-app-dev/vpipe/releases/latest)**
 · **[Run the first example](#first-example)**
-· **[Try image editing](docs/KLEIN-KV.md)**
-· **[Try MiniMax H3 video](docs/MINIMAX-H3.md)**
+· **[Try image editing](docs/KLEIN.md)** ([简体中文](docs/KLEIN-zh-cn.md))
+· **[Try MiniMax H3 video](docs/MINIMAX-H3.md)** ([简体中文](docs/MINIMAX-H3-zh-cn.md))
+· **[Try Krea-2 images](docs/KREA-2.md)**
 
 For the easiest install, choose the largest `.dmg` in the latest release.
 
@@ -38,17 +41,28 @@ preview panels, profiler, and reproducible model configuration.*
   generating video **and its soundtrack together**, on as little as 16 GB.
   Now with **Turbo LoRA** support!
   See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**
+  ([简体中文](docs/MINIMAX-H3-zh-cn.md))
 
-  * 5s @ 0.5 MP 24p, 6 steps takes **~11 minutes** on a fanless
+  * 5s @ 0.5 MP 24p, 6 steps takes **~13 minutes** on a fanless
     15-inch **base-model** M5 MacBook Air, 16 GB [^1]
 
 - Runs **LTX-2.5** on an Apple Silicon Mac — a 22B model generating video
   and its soundtrack together, again on as little as 16 GB, through the
   [vpipe-ltx-2.5 plugin](https://github.com/tgo-app-dev/vpipe-ltx-2.5).
 
+- Runs **Krea-2 Turbo** — a 12B CFG-distilled text-to-image model — on the
+  **published bf16 weights**, no quantization pass.
+  See **[docs/KREA-2.md](docs/KREA-2.md)**
+
+  * 1024 x 1024, 8 steps takes **35 seconds** on an M5 Pro MacBook Pro
+    (20 GPU cores, 24 GB), with a run-time LoRA applied [^4]
+  * the same run takes **81 seconds** on a fanless 15-inch M5 MacBook Air
+    (10 GPU cores, 16 GB), no cooling aid — it scales with GPU cores [^4]
+
 - **Image and video generation on base-model Macs** with weight streaming —
-  walk through a reference image edit in
-  **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**
+  walk through a reference image edit, or combine two references, in
+  **[docs/KLEIN.md](docs/KLEIN.md)**
+  ([简体中文](docs/KLEIN-zh-cn.md))
 
 - **Realtime multimodal pipelines** for VQA, ASR, chat, TTS, image editing,
   video generation, and tool use.
@@ -62,20 +76,44 @@ preview panels, profiler, and reproducible model configuration.*
 [^1]: Fanless, and this run was helped by an ice pack under the
       chassis — a stock Air will throttle sooner and take longer.
 
+[^4]: Measured on the published bf16 weights with no quantization pass,
+      `i8_gemm` on (matrix-core GPUs only), end to end from launch to the
+      written file.
+
 [^2]: Build from source artifact size, not counting dynamically linked
       dependencies like FFmpeg, libcurl.
 
 ## Flagship workloads / performance
 
-### MiniMax H3 Turbo LoRA — matched runs
+### MiniMax H3 — matched runs against h3.c
 
 Matched MiniMax H3 runs using the same **960 × 544, 124-frame, 6-DiT-step**
-workload and settings for both runtimes:
+workload for both runtimes: the published bf16 weights read from the
+internal SSD, no LoRA and no quantization pass, the same prompt and seed.
+h3.c runs its exact mode (all 50 blocks, no step reuse). VPIPE turns on the
+acceleration each chip has — the Neural Engine tiers (`ane_ffn` +
+`ane_qkv`) on the M4 Pro, which has no int8 matrix path, and `i8_gemm` on
+the two M5 machines, where the Neural Engine does not pay:
 
 | Hardware | VPIPE | h3.c |
 | --- | ---: | ---: |
-| M4 Pro Mac mini, 64 GB RAM | **21 min 44 sec** | 27 min 40 sec |
-| Base M5 MacBook Air 15", 16 GB RAM | **11 min 25 sec** | 16 min 22 sec |
+| M4 Pro Mac mini, 64 GB RAM | **17 min 43 sec** | 23 min 9 sec |
+| Base M5 MacBook Air 15", 16 GB RAM | **13 min 7 sec** | 16 min 22 sec |
+| M5 Pro MacBook Pro 16", 24 GB RAM | **5 min 29 sec** | 7 min 11 sec |
+
+On the 16 GB and 24 GB M5 machines, h3.c needs `--ssd-streaming`, which
+runs bf16 — its int8 engines need the whole transformer resident. The
+phase-by-phase breakdown is in
+[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md#against-h3c).
+
+**Cooling is part of what these rows measure.** The fanless MacBook Air was
+run on an ice pack: it holds its full 1578 MHz for about two minutes, then
+throttles to around 1300 MHz for the rest — and because the pack is placed
+by hand, that row is one sample rather than a repeatable figure. The
+MacBook Pro 16" holds 1620 MHz, its maximum, at 100% for the whole run, and
+does repeat. See
+[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md#how-long-it-takes) for what that is
+worth in wall clock.
 
 These numbers are workload-specific measurements, not a universal runtime
 speed claim. [^3]
@@ -85,14 +123,18 @@ speed claim. [^3]
 | Workload family | Verified status |
 | --- | --- |
 | Video + audio generation | MiniMax H3 FL2VA/REF2VA, Turbo LoRA, and LTX-2.5 plugin workflows. |
-| Image generation / editing | **FLUX.2-klein-9b-kv:** 4-bit reference image editing with 4-step default pipeline and compare-image UI on Apple Silicon. |
-| Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. |
+| Image generation / editing | **Krea-2 Turbo:** 12B text-to-image on the published bf16 weights, run-time LoRA and a live per-step preview. **FLUX.2-klein-9B / 9b-kv:** 4-bit reference image editing and two-reference composition, 4-step default pipelines and compare-image UI on Apple Silicon; the -kv variant trades a little quality for speed. **FLUX.3 Image Klein:** text-to-image and reference editing on the published bf16 weights in 16 steps, the joint blocks' feed-forward on the ANE (1.6x on an M4 Pro). |
+| Multimodal / LLM / VLM inference | **Qwen chat and VQA:** local chat with image input, sampler control, stateful turns, and documented per-run token logs. **Ministral 3 14B:** text and image chat (Pixtral vision tower) on the MLX 4-bit weights. **LFM3-VL 2B:** Liquid AI's convolution / attention hybrid, text and image chat and live-video questions (realtime-vqa) on the published bf16 weights. **DeepSeek-V4.1-Flash:** text and image chat with the 552B MoE on a 64 GB Mac, its routed experts served from a cache sized to the machine, with its own DSpark speculative decoding on a machine that holds every expert. |
 
 See **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)** for the H3 workload,
-settings, caveats, and Turbo LoRA notes; see
-**[docs/KLEIN-KV.md](docs/KLEIN-KV.md)** and
+settings, caveats, and Turbo LoRA notes; **[docs/KREA-2.md](docs/KREA-2.md)**
+for text-to-image, the tuned 8-step schedule and the live denoising preview;
+**[docs/FLUX3.md](docs/FLUX3.md)** for FLUX.3 Image Klein;
+and **[docs/KLEIN.md](docs/KLEIN.md)** and
 **[docs/QWEN35-CHAT.md](docs/QWEN35-CHAT.md)** for image editing and chat
-workflows.
+workflows, **[docs/MINISTRAL3.md](docs/MINISTRAL3.md)** for Ministral 3
+chat with pictures, **[docs/LFM3-VL.md](docs/LFM3-VL.md)** for LFM3-VL, and
+**[docs/DEEPSEEK-V41.md](docs/DEEPSEEK-V41.md)** for DeepSeek-V4.1-Flash.
 
 [^3]: These are matched MiniMax H3 runs, not a general speed claim.
 
@@ -347,9 +389,15 @@ worth knowing.
 
 **Then:** **[EXAMPLES.md](EXAMPLES.md)** builds the same chat by hand in the
 web UI, and adds speech transcription. For image editing from a reference
-photo, **[docs/KLEIN-KV.md](docs/KLEIN-KV.md)**; for text-to-video *with
-sound*, **[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**. Each ships the
-pipelines it describes.
+photo, **[docs/KLEIN.md](docs/KLEIN.md)**; for text-to-image,
+**[docs/KREA-2.md](docs/KREA-2.md)**; for text-to-video *with sound*,
+**[docs/MINIMAX-H3.md](docs/MINIMAX-H3.md)**; for whole songs from a style
+prompt and lyrics, **[docs/YUE2.md](docs/YUE2.md)**; for speech with
+several voices, inline cues and voice cloning,
+**[docs/DRAMA3.md](docs/DRAMA3.md)**; to split a song into its vocals and
+accompaniment, **[docs/BS-ROFORMER.md](docs/BS-ROFORMER.md)**; to find
+a song's beats as they go by, **[docs/BEAT-TRACK.md](docs/BEAT-TRACK.md)**.
+Each ships the pipelines it describes.
 
 ---
 
@@ -645,6 +693,28 @@ The build produces a unit-test executable:
 Some tests exercise real models and are gated on environment variables that
 point at local model directories; when a variable is unset, the corresponding
 test skips.
+
+### Sanitizers
+
+`VPIPE_SANITIZE` builds the whole tree — library, apps and tests — under a
+sanitizer. Use a **separate build directory**: the flags go in the cache and
+every object needs them consistently.
+
+```sh
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVPIPE_SANITIZE=thread
+cmake --build build-tsan -j
+./build-tsan/vpipe_test
+```
+
+`thread`, `address` and `undefined` are accepted, comma-separated;
+`address,thread` is refused (they instrument memory incompatibly). Debug info
+is added regardless of build type, since a sanitizer report without line
+numbers is most of the way to useless.
+
+Reach for `thread` on anything touching the coroutine/teardown paths. The races
+it finds there are latent — they can be 100% reproducible on one binary and
+invisible after an unrelated relink of the same source — so a crash that "went
+away" is not evidence, and TSan finding nothing is.
 
 ---
 

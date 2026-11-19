@@ -16,17 +16,33 @@
 #include "common/session.h"
 #include "stages/diffusion-conditioner-stage.h"
 #include "generative-models/generative-model-manager.h"
+#include "generative-models/shared/wired-pool.h"
 #include "generative-models/weight-set.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "pipeline/pipeline-runtime.h"
+#include "pipeline/resource-plan.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/runtime-context.h"
+#include "common/thread-pool.h"
 #include "pipeline/typed-stage.h"
 #include "stages/model-memory.h"
+#include "stages/model-memory-host.h"
+#include "generative-models/lm-run-memory.h"
 #include "stages/model-registry.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
 #include "stages/vae-decode-stage.h"
+#include "stages/generate-video-stage.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-video-vae.h"
+#include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
+#include "generative-models/shared/accel-settings.h"
 #include "stages/vae-encode-stage.h"
+#include "stages/audio-vae-decode-stage.h"
+#include "stages/model-select-stage.h"
+#include "stages/video-ref-encoder-stage.h"
+#include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
+#include "pipeline/resource-claim-delivery.h"
+#include "common/memory-owner.h"
+#include "common/vertex.h"
 
 #include <cstdlib>
 #include <functional>
@@ -35,6 +51,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace vpipe;
@@ -72,6 +89,57 @@ TEST(model_memory, weight_bytes_counts_only_safetensors)
                   (dir / "nope" / "nope").string()) == 0);
   EXPECT_TRUE(model_memory::dir_weights_bytes("") == 0);
   fs::remove_all(dir.parent_path(), ec);
+}
+
+// A RE-SHARDED REPO fetched over an older copy (fishaudio/drama-3: eight
+// shards became fifteen of the same tensors) leaves the old shards
+// beside the new. The loader reads what the index names, so the plan
+// weighs those -- all of them where the index names none on disk (an
+// index from another repo: the loader globs), and every shard where a
+// directory holds one count only.
+TEST(model_memory, weight_bytes_skip_shards_the_index_left)
+{
+  namespace fs = std::filesystem;
+  const fs::path dir = fs::temp_directory_path() / "vpipe-model-memory-shards";
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+  fs::create_directories(dir / "vae", ec);
+  auto write = [](const fs::path& p, std::size_t n) {
+    std::ofstream f(p, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  auto index = [](const fs::path& p, const std::vector<std::string>& files) {
+    std::ofstream f(p);
+    f << "{\"metadata\": {}, \"weight_map\": {";
+    for (std::size_t i = 0; i < files.size(); ++i) {
+      f << (i ? ", " : "") << "\"t" << i << "\": \"" << files[i] << "\"";
+    }
+    f << "}}";
+  };
+  write(dir / "model-00001-of-00002.safetensors", 700);   // the old pair
+  write(dir / "model-00002-of-00002.safetensors", 700);
+  write(dir / "model-00001-of-00003.safetensors", 500);   // the new three
+  write(dir / "model-00002-of-00003.safetensors", 500);
+  write(dir / "model-00003-of-00003.safetensors", 400);
+  write(dir / "vae" / "diffusion_pytorch_model.safetensors", 90);
+  // No index: everything, as before.
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 2890);
+  index(dir / "model.safetensors.index.json",
+        {"model-00001-of-00003.safetensors",
+         "model-00002-of-00003.safetensors",
+         "model-00003-of-00003.safetensors",
+         "model-00001-of-00003.safetensors"});
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 1490);
+  // An index naming no shard on disk: the loader globs, so all count.
+  index(dir / "model.safetensors.index.json",
+        {"model-00001-of-00004.safetensors"});
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 2890);
+  // One count only: an index is not even read.
+  fs::remove(dir / "model-00001-of-00002.safetensors", ec);
+  fs::remove(dir / "model-00002-of-00002.safetensors", ec);
+  EXPECT_TRUE(model_memory::dir_weights_bytes(dir.string()) == 1490);
+  fs::remove_all(dir, ec);
 }
 
 TEST(model_memory, bounded_compares_against_physical_ram)
@@ -346,6 +414,51 @@ TEST(model_memory, a_declared_model_counts_before_it_loads)
   fs::remove_all(root, ec);
 }
 
+// A revision below the DECLARED FLOOR is raised to it. Revisions come
+// from a model that has just loaded, and a block-streaming one builds its
+// slot pair on the first forward -- so what it reports then is below the
+// least it will run on, and taken as said it under-counts.
+TEST(model_memory, a_revision_is_held_at_the_declared_floor)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-floor-revise";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / "dit", ec);
+  {
+    std::ofstream f(root / "dit" / "w.safetensors", std::ios::binary);
+    std::string blob(8192, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  const std::string dit = (root / "dit").string();
+
+  // Streamable: 8192 on disk, 4096 at its floor (trunk + slot pair).
+  mgr->declare_weights(dit, 8192, std::string(), std::string(), 4096);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 8192u);
+
+  // Straight after load: the trunk alone. Raised to the floor -- in the
+  // floor ledger too, which takes the smaller of this and the floor and
+  // so read 1024 before.
+  mgr->revise_declaration(dit, 1024);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 4096u);
+  EXPECT_TRUE(mgr->phase_footprint_floor(std::string()) == 4096u);
+
+  // Above the floor -- blocks promoted into free RAM: taken as said.
+  mgr->revise_declaration(dit, 6144);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 6144u);
+
+  // 0 is a withdrawal, not a report, and still withdraws.
+  mgr->revise_declaration(dit, 0);
+  EXPECT_TRUE(mgr->resident_weight_bytes() == 0u);
+
+  mgr->clear_declarations();
+  fs::remove_all(root, ec);
+}
+
 // A claim on a directory that CONTAINS another claim is counted ONCE.
 //
 // dir_weights_bytes() is recursive but the manager keys declarations by
@@ -585,6 +698,186 @@ TEST(model_memory, the_runtime_declares_before_init_and_clears_after)
   EXPECT_TRUE(stage->ran_process);
   EXPECT_TRUE(stage->saw_in_process == 4096u);
   fs::remove_all(root, ec);
+}
+
+// WHOSE a buffer is (common/memory-owner.h): counted under the owner and
+// use in force on its thread as it is made -- nested scopes their own,
+// the outer's back after -- carried with the buffer through a move, and
+// counted out where it was counted in when it goes. Made where nothing
+// owns its thread, it is no one's.
+TEST(model_memory, each_buffer_is_counted_as_its_owners)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  auto bytes = [](const std::string& dir, MemoryUse use) {
+    std::uint64_t n = 0;
+    for (const OwnedMemory& m : owned_memory()) {
+      if (m.dir == dir && m.use == use) { n += m.bytes; }
+    }
+    return n;
+  };
+  const std::string dir = "/ut/owned-model";
+  const std::string other = "/ut/other-model";
+  constexpr std::size_t kMb = std::size_t{1} << 20;
+  metal_compute::SharedBuffer kept;
+  {
+    MemoryOwnerScope own(dir, "ut-stage");
+    metal_compute::SharedBuffer a = mc->make_shared_buffer(kMb);
+    {
+      MemoryUseScope use(MemoryUse::kBlocks);
+      metal_compute::SharedBuffer b = mc->make_shared_buffer(2 * kMb);
+      EXPECT_TRUE(bytes(dir, MemoryUse::kBlocks) == 2 * kMb);
+    }
+    // Gone, counted out.
+    EXPECT_TRUE(bytes(dir, MemoryUse::kBlocks) == 0);
+    {
+      MemoryUseScope use(MemoryUse::kExperts);
+      kept = mc->make_shared_buffer(3 * kMb);
+      {
+        // Another owner inside: its own scratch, then the outer's back.
+        MemoryOwnerScope inner(other, "language-model");
+        metal_compute::SharedBuffer c = mc->make_shared_buffer(kMb);
+        EXPECT_TRUE(bytes(other, MemoryUse::kScratch) == kMb);
+        EXPECT_TRUE(memory_use_now() == MemoryUse::kScratch);
+      }
+      EXPECT_TRUE(memory_owner_now() == memory_owner(dir, "ut-stage"));
+      EXPECT_TRUE(memory_use_now() == MemoryUse::kExperts);
+    }
+    EXPECT_TRUE(bytes(dir, MemoryUse::kScratch) == kMb);
+  }
+  EXPECT_TRUE(memory_owner_now() == kNoMemoryOwner);
+  EXPECT_TRUE(bytes(dir, MemoryUse::kScratch) == 0);
+  EXPECT_TRUE(bytes(other, MemoryUse::kScratch) == 0);
+  // Moved, still its owner's -- and the session says so.
+  metal_compute::SharedBuffer moved = std::move(kept);
+  EXPECT_TRUE(bytes(dir, MemoryUse::kExperts) == 3 * kMb);
+  const vpipe::SessionIntf& host = sess;
+  const std::string json = host.memory_report().to_json();
+  EXPECT_TRUE(json.find("\"owned\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"/ut/owned-model\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"experts\"") != std::string::npos);
+  EXPECT_TRUE(json.find("\"unowned_bytes\"") != std::string::npos);
+  moved = metal_compute::SharedBuffer{};
+  EXPECT_TRUE(bytes(dir, MemoryUse::kExperts) == 0);
+  // Owned by no one.
+  std::uint64_t before = 0, during = 0;
+  (void)owned_memory(&before);
+  {
+    metal_compute::SharedBuffer z = mc->make_shared_buffer(kMb);
+    (void)owned_memory(&during);
+  }
+  EXPECT_TRUE(during - before == kMb);
+}
+
+namespace {
+
+// Parks the awaiting coroutine on the session's pool, as an edge's wake
+// does (OportBuffer schedules its waiter there): what follows runs in a
+// resume slice of its own, the pool's scope taken from THAT handle.
+struct ParkOnPool {
+  ThreadPool* pool;
+  bool*       parked;
+
+  bool await_ready() const noexcept { return false; }
+
+  void
+  await_suspend(std::coroutine_handle<> h) const noexcept
+  {
+    // Locals first: the pool may resume the handle at once.
+    ThreadPool* p = pool;
+    *parked = true;
+    p->schedule(h);
+  }
+
+  void await_resume() const noexcept {}
+};
+
+// A stage that holds a checkpoint and allocates as it runs -- in its own
+// process() and in a Job it awaits, after that Job has waited.
+class OwningStage : public TypedStage<OwningStage> {
+public:
+  static constexpr const char* kTypeName = "ut-owning-stage";
+  using TypedStage::TypedStage;
+
+  std::string                   dir;
+  metal_compute::MetalCompute*  mc = nullptr;
+  metal_compute::SharedBuffer   made, made_inside;
+  std::uint32_t                 tag = kNoPerfTag;
+  bool                          parked = false;
+
+  StageMemory declare_memory() const override
+  {
+    StageMemory m;
+    m.hold(dir + "/lora", 1024);
+    m.hold(dir, 8192);
+    return m;
+  }
+
+  Job inside()
+  {
+    co_await ParkOnPool{session()->thread_pool(), &parked};
+    made_inside = mc->make_shared_buffer(std::size_t{2} << 20);
+    co_return;
+  }
+
+  Job process(RuntimeContext& ctx) override
+  {
+    if (made.empty()) {
+      tag = VertexGraphAccess::gvid(this);
+      made = mc->make_shared_buffer(std::size_t{1} << 20);
+      co_await inside();
+    }
+    ctx.signal_done();
+    co_return;
+  }
+};
+
+}  // namespace
+
+// A stage's memory is its model's: the pool puts on each of its resumes
+// the owner the runtime registered for it -- its largest declared
+// checkpoint and its type -- so what it allocates running, and what a
+// Job it awaits allocates once the pool resumes that Job (its own
+// handle, tagged by Job::Awaiter), is that checkpoint's; cleared as the
+// launch ends.
+TEST(model_memory, a_stage_allocates_as_its_models)
+{
+  Session sess;
+  metal_compute::MetalCompute* mc = sess.metal_compute();
+  if (mc == nullptr) { return; }
+  Pipeline pl("owning-test", &sess);
+  auto st = std::make_unique<OwningStage>(
+      &sess, "own", std::vector<InEdge>{}, FlexData::make_object());
+  st->dir = "/ut/owning-model";
+  st->mc = mc;
+  st->allocate_oports(0);
+  auto* stage = static_cast<OwningStage*>(pl.insert_stage(std::move(st)));
+  {
+    PipelineRuntime rt(&pl, &sess);
+    ASSERT_TRUE(rt.launch());
+    rt.wait_idle();
+    rt.stop();
+  }
+  ASSERT_TRUE(!stage->made.empty() && !stage->made_inside.empty());
+  EXPECT_TRUE(stage->parked);
+  std::uint64_t scratch = 0, lora = 0;
+  std::string kind;
+  for (const OwnedMemory& m : owned_memory()) {
+    if (m.dir == "/ut/owning-model" && m.use == MemoryUse::kScratch) {
+      scratch += m.bytes;
+      kind = m.kind;
+    }
+    if (m.dir == "/ut/owning-model/lora") { lora += m.bytes; }
+  }
+  EXPECT_TRUE(scratch == (std::size_t{3} << 20));
+  EXPECT_TRUE(kind == "ut-owning-stage");
+  EXPECT_TRUE(lora == 0);
+  // The launch over, its tag is no one's.
+  EXPECT_TRUE(tag_memory_owner(stage->session(), stage->tag) ==
+              kNoMemoryOwner);
+  stage->made = metal_compute::SharedBuffer{};
+  stage->made_inside = metal_compute::SharedBuffer{};
 }
 
 namespace {
@@ -840,6 +1133,103 @@ struct CapturingUi : public UiDelegateIntf {
 // a VAE that only matters after -- scaled down. On MiniMax-H3 the same
 // shape is 94 GB summed against 78 GB peaked, which is the difference
 // between streaming a 33B DiT and holding it.
+// plan_streaming()'s `phase` is the CALLER'S phase, and getting it wrong
+// drops the caller's own bytes out of its own verdict.
+//
+// weight_footprint() narrows its total to the phase but deduplicates
+// with a phase-BLIND test, so a dir claimed in another phase contributes
+// 0 to the total AND is skipped from the sum. A component that asks
+// about a phase it does not run in therefore sizes itself against a box
+// its own checkpoint is absent from.
+//
+// MEASURED on the M5 16 GB with Qwen-Image-2.1: the text encoder runs in
+// `condition` and is claimed there, but asked with the denoise default
+// and read 1288 MB for a 16722 MB checkpoint -- so it preloaded and put
+// 9 GB into swap. Sibling families escaped it only because their DiT
+// floors happen to clear the threshold, which is luck, not design.
+//
+// The geometry below is that bug scaled down: a BIG encoder in
+// `condition` and a SMALL DiT floor in `denoise`.
+// pin_frac is sized WHATEVER the stream verdict is, because the prefix
+// and the verdict are independent questions and only prefill-only text
+// encoders read the prefix.
+//
+// Those encoders stream unconditionally (see StreamPlan::stream), so
+// gating pin_frac on `stream` had exactly the wrong shape: on a ROOMY
+// box the verdict is "preload", the prefix stayed 0, and an encoder
+// that streams anyway then streamed with NOTHING pinned -- the worst of
+// both paths, on the machine with the most room to spare.
+TEST(model_memory, pin_frac_is_sized_even_when_the_verdict_is_preload)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-pin-frac";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const std::string enc = make_ckpt(root / "enc", 4u << 20);
+
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { fs::remove_all(root, ec); return; }
+  mgr->clear_declarations();
+
+  // A 128 GB box against a 4 MB checkpoint: as roomy as it gets, so the
+  // verdict is unambiguously PRELOAD and pin_frac must still be sized.
+  ::setenv("VPIPE_RAM_LIMIT_MB", "131072", 1);
+  const auto roomy = model_memory::plan_streaming(
+      &sess, enc, std::string(), model_memory::kStreamHeadroom);
+  EXPECT_FALSE(roomy.stream);            // the DiT answer: preload
+  EXPECT_TRUE(roomy.pin_frac > 0.0);     // the encoder answer: pin it
+  std::printf("[model_memory] roomy: stream=%d pin_frac=%.2f\n",
+              (int)roomy.stream, roomy.pin_frac);
+
+  // And the ceiling stream-sizing.h budgets against still holds.
+  EXPECT_TRUE(roomy.pin_frac <= 0.60);
+
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
+  mgr->clear_declarations();
+  fs::remove_all(root, ec);
+}
+
+TEST(model_memory, plan_streaming_counts_the_caller_in_its_own_phase)
+{
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-plan-phase";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const std::string enc = make_ckpt(root / "enc", 16000);
+  const std::string dit = make_ckpt(root / "dit", 1200);
+
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { fs::remove_all(root, ec); return; }
+  mgr->clear_declarations();
+  mgr->declare_weights(enc, 16000, std::string(model_memory::kPhaseCondition));
+  mgr->declare_weights(dit, 1200, std::string(model_memory::kPhaseDenoise));
+
+  // THE ENCODER, asking about the phase it is actually resident in: its
+  // own 16000 bytes are in the verdict.
+  const auto cond = model_memory::plan_streaming(
+      &sess, enc, std::string(), 0, 0, model_memory::kPhaseCondition);
+  EXPECT_TRUE(cond.footprint == 16000u);
+
+  // The same call with the DENOISE default -- what it used to do -- sees
+  // a box holding only the DiT floor and none of itself. This is the
+  // defect, asserted so the two cannot silently converge again.
+  const auto den = model_memory::plan_streaming(
+      &sess, enc, std::string(), 0);
+  EXPECT_TRUE(den.footprint == 1200u);
+  EXPECT_TRUE(cond.footprint > den.footprint);
+
+  // And the DEFAULT still does the job it exists for: a DiT asking in
+  // `denoise` while naming a peer's encoder must NOT be charged for an
+  // encoder that stops existing before the first step. This is H3's
+  // case, where the verdict once turned on 1 GB.
+  const auto dit_plan = model_memory::plan_streaming(&sess, dit, enc, 0);
+  EXPECT_TRUE(dit_plan.footprint == 1200u);
+
+  fs::remove_all(root, ec);
+}
+
 TEST(model_memory, phases_peak_rather_than_sum)
 {
   namespace fs = std::filesystem;
@@ -877,6 +1267,184 @@ TEST(model_memory, phases_peak_rather_than_sum)
 
   mgr->clear_declarations();
   fs::remove_all(root, ec);
+}
+
+// A CoreML hold is bytes nothing else in the process can see -- not a
+// weight set, not a SharedBuffer, not even a Metal allocation -- so the
+// only thing that can keep it honest is that it is CLAIMED. These check
+// the two halves that make the claim worth making: that a grant is
+// bounded by what the rest of the plan left, and that the granted bytes
+// then show up in the peak like everything else.
+// A stage books a plugin family's CoreML claim under its own label, which
+// only works if the claim reads back exactly -- including a label that
+// itself contains the separator.
+TEST(model_memory, a_coreml_claim_parses_back_under_any_label)
+{
+  const auto cs = model_memory::coreml_claims("fam|ane-ffn", 650u << 20, 3,
+                                              model_memory::kPhaseDenoise);
+  ASSERT_TRUE(cs.size() == 1u);
+  std::string label;
+  std::size_t ub = 0;
+  int un = 0;
+  EXPECT_TRUE(model_memory::parse_coreml_claim(cs[0], &label, &ub, &un));
+  EXPECT_TRUE(label == "fam|ane-ffn");
+  EXPECT_TRUE(ub == (650u << 20));
+  EXPECT_TRUE(un == 3);
+  EXPECT_TRUE(cs[0].phase == std::string(model_memory::kPhaseDenoise));
+
+  // Not CoreML, or not well formed: refused, outputs untouched.
+  ResourceClaim w = cs[0];
+  w.kind = std::string(model_memory::kWeightsKind);
+  EXPECT_FALSE(model_memory::parse_coreml_claim(w, nullptr, &ub, &un));
+  for (const char* key : {"x", "x|1", "x|0|1", "x|12|0", "x|12|y", "|12|1",
+                          "x||1"}) {
+    ResourceClaim b = cs[0];
+    b.key = key;
+    EXPECT_FALSE(model_memory::parse_coreml_claim(b, nullptr, nullptr,
+                                                  nullptr));
+  }
+}
+
+TEST(model_memory, a_coreml_grant_is_bounded_by_what_the_plan_left)
+{
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* p =
+      ResourcePlannerRegistry::get().find(model_memory::kCoreMLKind);
+  ASSERT_TRUE(p != nullptr);
+  if (p == nullptr) { return; }
+
+  // A 32 GB box, so the arithmetic is stated rather than whatever this
+  // machine happens to have.
+  ::setenv("VPIPE_RAM_LIMIT_MB", "32768", 1);
+  mgr->clear_declarations();
+  mgr->clear_scratch();
+  mgr->set_phase_order({std::string(model_memory::kPhaseCondition),
+                        std::string(model_memory::kPhaseDenoise),
+                        std::string(model_memory::kPhaseDecode)});
+
+  // 4 GB already planned. With kStreamHeadroom (8 GB) reserved that
+  // leaves 20 GB, so 10 units of 2 GB fit and the 28 asked for do not.
+  mgr->declare_weights("/nonexistent/dit", 4ull << 30);
+  const std::size_t unit = 2ull << 30;
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 28,
+                                             model_memory::kPhaseDenoise)) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  // It must never REFUSE: an accelerator that does not fit is an
+  // accelerator that stays off, not a graph that will not run.
+  EXPECT_TRUE(p->end_plan(&sess));
+
+  const int got = model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 28);
+  std::printf("[model_memory] coreml grant %d of 28 units\n", got);
+  EXPECT_TRUE(got == 10);
+  // And the grant is VISIBLE: declared into the scratch ledger, so the
+  // peak a peer sizes against includes it. 4 GB of weights + 20 GB
+  // granted, all in the denoise.
+  EXPECT_TRUE(mgr->scratch_bytes(std::string(model_memory::kPhaseDenoise))
+              == (std::size_t)got * unit);
+  EXPECT_TRUE(mgr->phase_peak() == (4ull << 30) + (std::size_t)got * unit);
+
+  // A caller asking for less than it was granted gets what it asked.
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 4) == 4);
+
+  mgr->clear_scratch();
+  mgr->clear_declarations();
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
+}
+
+// THE PER-PHASE RULE. A unit lives only in its claim's phase, so a graph
+// that already peaks higher somewhere else is made no tighter by it. 16 GB,
+// a quarter kept back: RAM alone leaves 12 GB. The denoise holds 11 GB and
+// the decode peaks at 14 GB, so a 1.4 GB module in the denoise (12.4 GB)
+// must be granted -- refusing it would refuse memory the run already has
+// to have -- and must not move the peak.
+TEST(model_memory, a_coreml_grant_is_judged_in_its_own_phase)
+{
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* p =
+      ResourcePlannerRegistry::get().find(model_memory::kCoreMLKind);
+  ASSERT_TRUE(p != nullptr);
+  if (p == nullptr) { return; }
+  ::setenv("VPIPE_RAM_LIMIT_MB", "16384", 1);
+  mgr->clear_declarations();
+  mgr->clear_scratch();
+  mgr->set_phase_order({std::string(model_memory::kPhaseCondition),
+                        std::string(model_memory::kPhaseDenoise),
+                        std::string(model_memory::kPhaseDecode)});
+  mgr->declare_weights("/nonexistent/dit", 11ull << 30,
+                       std::string(model_memory::kPhaseDenoise));
+  mgr->declare_scratch("arena", 14ull << 30,
+                       std::string(model_memory::kPhaseDecode));
+  const std::size_t peak0 = mgr->phase_peak();
+  const std::size_t unit = 1411ull << 20;
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 1,
+                                             model_memory::kPhaseDenoise)) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  EXPECT_TRUE(p->end_plan(&sess));
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 1) == 1);
+  EXPECT_TRUE(mgr->phase_peak() == peak0);
+  EXPECT_TRUE(mgr->scratch_bytes(std::string(model_memory::kPhaseDenoise)) ==
+              unit);
+
+  // ...and the same module where the denoise is ALREADY the peak and RAM
+  // has no room either: 11 GB denoise, no other phase, 12 GB usable -- a
+  // 1.4 GB module would raise the peak past what the box allows.
+  mgr->clear_scratch();
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 1,
+                                             model_memory::kPhaseDenoise)) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  EXPECT_TRUE(p->end_plan(&sess));
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 1) == 0);
+
+  mgr->clear_scratch();
+  mgr->clear_declarations();
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
+}
+
+// The box too small to hold even one unit. The tier has to come back
+// zero rather than a fraction or a refusal -- zero IS the fallback, and
+// the caller reads it as "keep the GPU path".
+TEST(model_memory, a_coreml_grant_can_be_nothing)
+{
+  Session sess;
+  auto*   mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* p =
+      ResourcePlannerRegistry::get().find(model_memory::kCoreMLKind);
+  ASSERT_TRUE(p != nullptr);
+  if (p == nullptr) { return; }
+
+  // No phase order set here, on purpose: outside a launch phase_peak()
+  // has nothing to walk and answers 0, and a budget that believed it
+  // would hand out the whole box.
+  ::setenv("VPIPE_RAM_LIMIT_MB", "16384", 1);
+  mgr->clear_declarations();
+  mgr->clear_scratch();
+  // 11 of 16, with a quarter of the box (4 GB) kept back: 1 GB left.
+  mgr->declare_weights("/nonexistent/dit", 11ull << 30);
+  const std::size_t unit = 2ull << 30;
+  p->begin_plan(&sess);
+  for (auto& c : model_memory::coreml_claims("ane-ffn/t", unit, 28, {})) {
+    p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+  }
+  EXPECT_TRUE(p->end_plan(&sess));
+  EXPECT_TRUE(model_memory::coreml_grant(&sess, "ane-ffn/t", unit, 28) == 0);
+  // Nothing granted, nothing declared -- a zero-byte arena in the
+  // ledger would read as an allocation that exists.
+  EXPECT_TRUE(mgr->scratch_bytes(std::string()) == 0u);
+
+  mgr->clear_scratch();
+  mgr->clear_declarations();
+  ::unsetenv("VPIPE_RAM_LIMIT_MB");
 }
 
 // Two stages disagreeing about one checkpoint's lifetime: the WIDER
@@ -1119,10 +1687,22 @@ TEST(model_memory, a_decode_arena_is_estimated_from_the_vae_config)
   // FLUX.2: ~7 full-res base-channel buffers at 2 B/elt -> h*w*base*14.
   // base is max(block_out[0], block_out[1]) -- block_out[0] alone
   // under-modelled the peak 2x, which is what the 2K overflow fix found.
+  // ...plus the im2col band MetalFlux2Vae allocates on every decode,
+  // capped at 128 MB.
   write_vae("AutoencoderKLFlux2", "[128, 256, 512, 512]");
   const std::size_t flux = model_memory::vae_decode_scratch_bytes(
       root.string(), 1024, 1024);
-  EXPECT_TRUE(flux == (std::size_t)1024 * 1024 * 256 * 14);
+  EXPECT_TRUE(flux == (std::size_t)1024 * 1024 * 256 * 14 + (128u << 20));
+  // FLUX.3's VAE states its decoder's widths as `null` -- diffusers' "as
+  // the encoder's" -- which threw, refusing every FLUX.3 graph at launch.
+  {
+    std::ofstream f(root / "vae" / "config.json");
+    f << "{\"_class_name\": \"AutoencoderKLFlux2\", "
+         "\"block_out_channels\": [128, 256, 512, 512], "
+         "\"decoder_block_out_channels\": null}";
+  }
+  EXPECT_TRUE(model_memory::vae_decode_scratch_bytes(root.string(), 1024, 1024)
+              == flux);
 
   // Qwen-Image / Krea-2 spell their width `base_dim` and ship NO
   // block_out_channels -- every quantized Krea-2 and Qwen-Image-Edit
@@ -1157,6 +1737,21 @@ TEST(model_memory, a_decode_arena_is_estimated_from_the_vae_config)
   write_vae("AutoencoderKLSomethingNew", "[128, 256, 512, 512]");
   EXPECT_TRUE(model_memory::vae_decode_scratch_bytes(root.string(), 1024, 1024)
               == (std::size_t)1024 * 1024 * 256 * 27);
+
+  // VOSR's autoencoder is `Qwen-Image-vae-2d/` under the model's root
+  // (where the decoder finds it, resolve_vae_dir), the 2-D class of the
+  // same network: the same peak -- not the nothing a `vae/`-only read
+  // declared.
+  fs::remove_all(root / "vae", ec);
+  fs::create_directories(root / "Qwen-Image-vae-2d", ec);
+  {
+    std::ofstream f(root / "Qwen-Image-vae-2d" / "config.json");
+    f << "{\"_class_name\": \"AutoencoderKLQwenImage2D\", "
+         "\"base_dim\": 96}";
+  }
+  EXPECT_TRUE(model_memory::vae_decode_scratch_bytes(root.string(), 1280, 704)
+              == (std::size_t)1280 * 704 * 96 * 27);
+  fs::remove_all(root / "Qwen-Image-vae-2d", ec);
 
   // No readable config at all is 0, not a guess: a caller that gets 0
   // falls back to its old behaviour rather than to a number nobody
@@ -1580,19 +2175,200 @@ TEST(model_memory, a_pooled_checkpoint_survives_its_last_model)
   if (!ws) { fs::remove_all(root, ec); return; }
   const genai::WeightSet* raw = ws.get();
 
-  // Released to the pool, then dropped by its last holder. Without the
-  // pool's strong reference the set would be gone here.
-  mgr->pool_weights(dir);
+  // Dropped by its last holder, WITHOUT being handed over first: the
+  // manager owns every checkpoint it opened, so there is nothing to hand
+  // over. This is the case the old weak-reference cache re-read from
+  // disk, however comfortably the model fitted in RAM.
   ws.reset();
   auto again = mgr->weight_set(dir);
   EXPECT_TRUE(again != nullptr);
   EXPECT_TRUE(again.get() == raw);        // the SAME set, not a reopen
 
-  // And taking it back removes it from the pool: a set in use is not
-  // spare capacity, and an eviction must not drop pages a model reads.
+  // And a BORROWED set is not spare capacity: an eviction must not drop
+  // pages a model is reading.
   EXPECT_TRUE(mgr->pooled_bytes() == 0u);
 
   fs::remove_all(root, ec);
+}
+
+namespace {
+
+// A checkpoint of one F32 tensor `w`, written at <tmp>/<name>, for the
+// parking tests below. 128 KB ON PURPOSE: under MetalCompute's 64 KB
+// threshold a buffer is a heap sub-allocation, which parks nothing --
+// and the set's `parked` flag is set all the same, so a small tensor
+// passes every flag check while proving nothing. The bytes the registry
+// holds parked are the evidence.
+constexpr std::size_t kParkTestElems = 32768;
+constexpr std::size_t kParkTestBytes = kParkTestElems * sizeof(float);
+
+std::filesystem::path
+write_park_test_checkpoint_(const char* name)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path root = fs::temp_directory_path() / name;
+  fs::remove_all(root, ec);
+  fs::create_directories(root, ec);
+  std::string hdr = "{\"w\":{\"dtype\":\"F32\",\"shape\":[" +
+                    std::to_string(kParkTestElems) +
+                    "],\"data_offsets\":[0," +
+                    std::to_string(kParkTestBytes) + "]}}";
+  while (((8 + hdr.size()) % 16) != 0) { hdr.push_back(' '); }
+  std::ofstream f(root / "model.safetensors", std::ios::binary);
+  const std::uint64_t n = hdr.size();
+  f.write(reinterpret_cast<const char*>(&n), 8);
+  f.write(hdr.data(), (std::streamsize)hdr.size());
+  const std::vector<float> v(kParkTestElems, 1.0f);
+  f.write(reinterpret_cast<const char*>(v.data()),
+          (std::streamsize)kParkTestBytes);
+  return root;
+}
+
+// The weight report's row for the checkpoint whose directory contains
+// `name`; none once the manager no longer holds it.
+std::optional<genai::GenerativeModelManager::WeightUsage>
+usage_of_(const genai::GenerativeModelManager* mgr, const char* name)
+{
+  for (const auto& u : mgr->weight_report()) {
+    if (u.dir.find(name) != std::string::npos) { return u; }
+  }
+  return std::nullopt;
+}
+
+}  // namespace
+
+// What a pipeline's unload does with the checkpoints its graph let go,
+// and what a host that wants the memory back asks for: an idle checkpoint
+// SETTLED by the unload -- parked, not left resident -- and then
+// RELEASED, its bytes given back (release_idle_models). One a model
+// still borrows is left alone by both. (A finished graph's DiT and VAE
+// stayed resident and unparked: nothing settled them once the pipeline
+// was gone.)
+TEST(model_memory, idle_checkpoints_are_settled_and_released)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  auto* mc  = s.metal_compute();
+  if (mgr == nullptr || mc == nullptr || !mc->valid()) { return; }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path idle_root =
+      write_park_test_checkpoint_("vpipe-idle-released");
+  const fs::path busy_root =
+      write_park_test_checkpoint_("vpipe-idle-borrowed");
+  // The graph whose unload settles them. It has no stages, so all its
+  // unload does here is reach the settle.
+  PipelineHandle h = s.create_pipeline("idle-settle");
+  ASSERT_TRUE(h.valid());
+  auto idle = mgr->weight_set(idle_root.string());
+  auto busy = mgr->weight_set(busy_root.string());
+  ASSERT_TRUE(idle != nullptr && busy != nullptr);
+  ASSERT_TRUE(!idle->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                   .empty());
+  ASSERT_TRUE(!busy->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                   .empty());
+  idle.reset();   // its model gone; `busy` is still borrowed
+
+  // Let go and not yet settled: nothing parks a set on its own.
+  const std::size_t parked0 = mgr->weights().stats().parked_bytes;
+  auto u = usage_of_(mgr, "vpipe-idle-released");
+  ASSERT_TRUE(u.has_value());
+  EXPECT_TRUE(!u->parked);
+
+  // Settled by the unload: the idle one parked, its bytes purgeable;
+  // the borrowed one as it was.
+  EXPECT_TRUE(s.unload_pipeline(h).code == 0u);
+  EXPECT_TRUE(mgr->weights().stats().parked_bytes >=
+              parked0 + kParkTestBytes);
+  u = usage_of_(mgr, "vpipe-idle-released");
+  ASSERT_TRUE(u.has_value());
+  EXPECT_TRUE(u->parked);
+  EXPECT_TRUE(u->holders == 0);
+  u = usage_of_(mgr, "vpipe-idle-borrowed");
+  ASSERT_TRUE(u.has_value());
+  EXPECT_TRUE(!u->parked);
+  // Nothing left to settle.
+  EXPECT_TRUE(mgr->settle_unborrowed() == 0u);
+
+  // Released: the idle one dropped, its bytes given back; the borrowed
+  // one kept.
+  SessionIntf& host = s;
+  EXPECT_TRUE(host.release_idle_models() >= kParkTestBytes);
+  EXPECT_TRUE(!usage_of_(mgr, "vpipe-idle-released").has_value());
+  EXPECT_TRUE(!mgr->holds_weights(idle_root.string()));
+  EXPECT_TRUE(usage_of_(mgr, "vpipe-idle-borrowed").has_value());
+  EXPECT_TRUE(mgr->holds_weights(busy_root.string()));
+  // Nothing idle left: a second ask gives nothing back.
+  EXPECT_TRUE(host.release_idle_models() == 0u);
+
+  busy.reset();
+  fs::remove_all(idle_root, ec);
+  fs::remove_all(busy_root, ec);
+}
+
+// THE PARK/BORROW RACE. A settle chooses what to park under the
+// manager's lock and parks after letting go of it, so a weight_set() in
+// between can hand a chosen set to a model that reads its tensors before
+// the park lands -- and the park then made that model's buffers
+// purgeable, under a model that never asks the set again. The hook runs
+// in exactly that window, and takes one of the two chosen sets. The
+// other, which nobody takes, is the control: it IS parked, so the settle
+// did reach its parks and stood down for the taken one alone.
+TEST(model_memory, a_set_handed_out_mid_settle_is_not_parked)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  auto* mc  = s.metal_compute();
+  if (mgr == nullptr || mc == nullptr || !mc->valid()) { return; }
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path taken_root =
+      write_park_test_checkpoint_("vpipe-park-race-taken");
+  const fs::path spare_root =
+      write_park_test_checkpoint_("vpipe-park-race-spare");
+  {
+    // Both read once and let go: idle and unparked, what a settle parks.
+    auto a = mgr->weight_set(taken_root.string());
+    auto b = mgr->weight_set(spare_root.string());
+    ASSERT_TRUE(a != nullptr && b != nullptr);
+    ASSERT_TRUE(!a->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                     .empty());
+    ASSERT_TRUE(!b->tensor("w", mc, genai::WeightSet::Residency::Copied)
+                     .empty());
+  }
+  const std::size_t parked0 = mgr->weights().stats().parked_bytes;
+
+  // A model borrowing the set mid-settle and reading its tensor, as a
+  // concurrent stage's load would.
+  std::shared_ptr<genai::WeightSet> held;
+  metal_compute::SharedBuffer       alias;
+  bool                              ran = false;
+  mgr->set_before_park_for_test([&] {
+    ran  = true;
+    held = mgr->weight_set(taken_root.string());
+    if (held != nullptr) {
+      alias = held->tensor("w", mc, genai::WeightSet::Residency::Copied);
+    }
+  });
+  (void)mgr->settle_unborrowed();
+  ASSERT_TRUE(ran);
+  ASSERT_TRUE(held != nullptr && !alias.empty());
+
+  // The taken one is left alone -- the model's buffers stay resident;
+  // the spare one is parked. One set's bytes, not two.
+  EXPECT_TRUE(!held->parked());
+  const auto spare = usage_of_(mgr, "vpipe-park-race-spare");
+  ASSERT_TRUE(spare.has_value());
+  EXPECT_TRUE(spare->parked);
+  const std::size_t parked = mgr->weights().stats().parked_bytes - parked0;
+  EXPECT_TRUE(parked >= kParkTestBytes);
+  EXPECT_TRUE(parked < 2 * kParkTestBytes);
+
+  alias = {};
+  held.reset();
+  fs::remove_all(taken_root, ec);
+  fs::remove_all(spare_root, ec);
 }
 
 // A set specialised to a run's parameters is DROPPED rather than pooled:
@@ -1624,18 +2400,36 @@ TEST(model_memory, an_unrecyclable_checkpoint_is_not_pooled)
   EXPECT_TRUE(!ws->recyclable());
   EXPECT_TRUE(!ws->unrecyclable_reason().empty());
 
-  mgr->pool_weights(dir);
-  EXPECT_TRUE(mgr->pooled_bytes() == 0u);   // refused, not pooled
+  // The manager keeps what nobody is borrowing -- EXCEPT this. Dropped
+  // outright, so the next launch opens the checkpoint afresh rather than
+  // inheriting a set baked for a run it knows nothing about.
+  ws.reset();
+  mgr->pool_weights(dir);                   // settle it now
+  EXPECT_TRUE(mgr->weight_set_count() == 0u);
+
+  // Re-opening gives a FRESH set, which is what "not recyclable" has to
+  // mean: the specialisation did not come back with it. Checked by the
+  // flag rather than by address, since a new allocation may reuse the
+  // old one's.
+  auto again = mgr->weight_set(dir);
+  ASSERT_TRUE(again != nullptr);
+  if (again != nullptr) {
+    EXPECT_TRUE(again->recyclable());
+    EXPECT_TRUE(again->unrecyclable_reason().empty());
+  }
   fs::remove_all(root, ec);
 }
 
-// POOLING AFTER THE LAST HOLDER LET GO DOES NOTHING, and does not say so.
+// EITHER ORDER WORKS, which it did not used to.
 //
-// pool_weights() finds the set through a WEAK reference, so a caller that
-// drops its model first has nothing left to pool -- the call returns
-// having done neither the pooling nor the "not recyclable" report. This
-// shipped once: generate-video reset its DiT and then pooled, and the
-// silence looked exactly like a checkpoint the pool had refused.
+// pool_weights() found the set through a WEAK reference, so a caller
+// that dropped its model first had nothing left to pool -- the call
+// returned having done neither the pooling nor the "not recyclable"
+// report. That shipped once: generate-video reset its DiT and then
+// pooled, and the silence looked exactly like a checkpoint the pool had
+// refused. The manager owns the set now, so the order is free; what the
+// call still does is ask for the checkpoint to be settled NOW rather
+// than whenever the manager is next doing work.
 TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
 {
   Session s;
@@ -1655,15 +2449,20 @@ TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
   }
   const std::string dir = root.string();
 
-  // WRONG ORDER: drop, then pool. Nothing is pooled.
+  // DROP, THEN POOL: settles immediately, and the set is still there.
   {
     auto ws = mgr->weight_set(dir);
     if (!ws) { fs::remove_all(root, ec); return; }
+    const genai::WeightSet* raw = ws.get();
     ws.reset();
     mgr->pool_weights(dir);
-    EXPECT_TRUE(mgr->pooled_bytes() == 0u);
+    auto again = mgr->weight_set(dir);
+    EXPECT_TRUE(again != nullptr);
+    EXPECT_TRUE(again != nullptr && again.get() == raw);
   }
-  // RIGHT ORDER: pool while it is still held, then drop.
+  // POOL, THEN DROP: the caller is still borrowing at the call, so
+  // nothing settles there; the set is kept regardless and settles on the
+  // next manager call.
   {
     auto ws = mgr->weight_set(dir);
     if (!ws) { fs::remove_all(root, ec); return; }
@@ -1676,3 +2475,1195 @@ TEST(model_memory, pooling_after_the_last_holder_is_a_no_op)
   }
   fs::remove_all(root, ec);
 }
+
+
+// ---- WiredPool: the per-model window onto the pool -----------------------
+//
+// The state machine every streamed DiT now shares (MiniMax-H3, LTX-2.5,
+// FLUX.2, Krea-2, Qwen-Image-Edit, Boogu-Image). What it
+// decides is whether a block may be KEPT at all, so the properties worth
+// pinning are the ones that bound memory rather than the ones that make
+// it fast: the budget is never exceeded, a refusal STOPS admission, and
+// the counter can neither underflow nor drift upward on its own.
+//
+// Wired memory is the one allocation the kernel cannot reclaim, so
+// "uncapped growth" here is not a slow run, it is a panicked box.
+TEST(model_memory, the_wire_budget_bounds_what_a_model_will_keep)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  const std::size_t kAsk = 8ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on()) { mgr->set_wired_pool_pct(0); return; }   // pool unavailable
+  EXPECT_TRUE(w.budget() <= mgr->wired_pool_limit());
+
+  // A block that fits is admissible; one that does not is refused BEFORE
+  // it is kept -- which is the whole point. Growth that outruns the pool
+  // leaves blocks resident but unprotected, and those are exactly the
+  // pages the compressor takes first.
+  const std::size_t budget = w.budget();
+  EXPECT_TRUE(w.wirable(budget));
+  EXPECT_FALSE(w.wirable(budget + 1));
+
+  // Wire real buffers through it, one "block" at a time, and check the
+  // two invariants after every one: this model never claims more than
+  // its budget, and the process never passes the pool's ceiling.
+  std::vector<metal_compute::SharedBuffer> held;
+  for (int i = 0; i < 24; ++i) {
+    const std::size_t nb = 1ull << 20;
+    if (!w.wirable(nb)) { break; }
+    auto b = mc->make_shared_buffer(nb);
+    if (b.empty()) { break; }
+    const std::size_t got = w.wire_one(mc, b, true);
+    w.note_wired(mc, got, nb);
+    held.push_back(std::move(b));
+    EXPECT_TRUE(w.wired_bytes() <= w.budget());
+    EXPECT_TRUE(mgr->wired_pool_used() <= mgr->wired_pool_limit());
+  }
+  EXPECT_TRUE(w.wired_bytes() <= kAsk);
+
+  // Giving blocks back is what an eviction does, and it must land on
+  // zero rather than wrapping: note_unwired takes a byte count, and a
+  // count larger than what is held is the ordinary case when a partly
+  // wired block is dropped whole.
+  for (auto& b : held) { w.note_unwired(w.wire_one(mc, b, false)); }
+  w.note_unwired(1ull << 40);                    // deliberate over-give
+  EXPECT_TRUE(w.wired_bytes() == 0u);
+  held.clear();
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+
+  mgr->set_wired_pool_pct(0);
+}
+
+// A REFUSAL COLLAPSES THE BUDGET, and the retry cannot raise it past the
+// pool. The first half is what stops a run admitting blocks nothing can
+// protect; the second is what stops the retry becoming a way around the
+// ceiling.
+TEST(model_memory, a_refused_wiring_stops_growth_and_the_retry_is_capped)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  mgr->set_wired_pool_bytes(8ull << 20);
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on() || w.budget() == 0) { mgr->set_wired_pool_pct(0); return; }
+
+  const std::size_t want = 4ull << 20, got = 1ull << 20;
+
+  // A SHORTFALL WITH ROOM LEFT IS NOT A REFUSAL. Every block carries
+  // buffers below GenerativeModelManager::kMinWiredBytes, which the pool
+  // never wires, so a fully wired block always reports less than its
+  // resident size. Collapsing on that stopped growth after one block.
+  {
+    genai::WiredPool v;
+    v.open(mc);
+    v.note_wired(mc, got, want);
+    EXPECT_TRUE(v.wired_bytes() == got);
+    EXPECT_TRUE(v.budget() > got);
+    EXPECT_TRUE(v.wirable(1));
+  }
+
+  // A REAL partial grant: the box gave less than the block asked for AND
+  // the pool cannot take the rest -- here because memory wired on the
+  // process's behalf fills it, and the box collapsed the ceiling there.
+  mgr->charge_external_wired(6ull << 20);
+  mgr->note_wired_pool_refused();                 // collapsed at 6 of 8 MB
+  w.note_wired(mc, got, want);
+  EXPECT_TRUE(w.wired_bytes() == got);
+  // Nothing further is admissible: growth stops on the spot rather than
+  // one failed mlock per block for the rest of the schedule.
+  EXPECT_TRUE(w.budget() == got);
+  EXPECT_FALSE(w.wirable(1));
+
+  // The retry of THIS model's refusal is gated on the box having freed a
+  // block's worth SINCE, so asking with a huge block never fires -- a
+  // genuinely full box is never asked, because reopening the ceiling would
+  // let the mlock behind it fail and leave a block resident but unwired.
+  EXPECT_FALSE(w.retry(mc, (std::size_t)1 << 60));
+  EXPECT_TRUE(mgr->wired_pool_limit() < mgr->wired_pool_ask());
+  EXPECT_FALSE(w.wirable(1));
+
+  // And however it goes, the budget never passes the pool's own limit.
+  w.retry(mc, 0);
+  EXPECT_TRUE(w.budget() <= mgr->wired_pool_limit() + w.wired_bytes());
+  EXPECT_TRUE(mgr->wired_pool_limit() <= mgr->wired_pool_ask());
+
+  mgr->release_external_wired(6ull << 20);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+  mgr->set_wired_pool_pct(0);
+}
+
+// THE GATE READS THE POOL AS IT IS NOW. A budget snapshotted at load kept
+// whatever a peer held at that moment out of the model's reach for its
+// whole life -- a model loaded while its predecessor was still being torn
+// down stayed capped by bytes that were already gone.
+TEST(model_memory, the_wire_gate_follows_the_pool_live)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  const std::size_t kAsk = 8ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+  // A peer holds most of the pool when this model loads.
+  mgr->charge_external_wired(6ull << 20);
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on()) {
+    mgr->release_external_wired(6ull << 20);
+    mgr->set_wired_pool_pct(0);
+    return;
+  }
+  EXPECT_FALSE(w.wirable(4ull << 20));
+  // The peer lets go: the room is this model's at once.
+  mgr->release_external_wired(6ull << 20);
+  EXPECT_TRUE(w.wirable(4ull << 20));
+  EXPECT_TRUE(w.budget() == kAsk);
+  // And a peer arriving later takes it back.
+  mgr->charge_external_wired(kAsk);
+  EXPECT_FALSE(w.wirable(1));
+  mgr->release_external_wired(kAsk);
+  mgr->set_wired_pool_pct(0);
+}
+
+// THE SET API, THE REPORT, AND THE OPAQUE HANDLE. wire_set() is the loop
+// every model used to write for itself -- wire in order, skip what is too
+// small to be a pool question, STOP at a real refusal and keep what is
+// wired -- and info() is how a plugin reads the pool without reaching past
+// this class. WiredPool is one pointer, so a moved-from handle must stay
+// callable and an `enabled: false` option must keep it closed.
+TEST(model_memory, a_wire_set_stops_at_the_refusal_and_reports_it)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+  namespace acc = genai::accel;
+  namespace wp = genai::wired_pool;
+
+  const std::size_t kAsk = 4ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+  genai::WiredPool w;
+  FlexData opts = FlexData::make_object();
+  acc::set_text(&opts, wp::kTag, "test-pool");
+  w.open(mc, opts);
+  if (!w.on()) { mgr->set_wired_pool_pct(0); return; }
+
+  // 3 MB fits, the next 3 MB does not, and the tiny one after it is never a
+  // pool question either way.
+  auto a = mc->make_shared_buffer(3ull << 20);
+  auto b = mc->make_shared_buffer(3ull << 20);
+  auto t = mc->make_shared_buffer(64);
+  metal_compute::SharedBuffer* set[] = {&a, nullptr, &b, &t};
+  const std::size_t got = w.wire_set(set, true);
+  // An mlock the box refuses outright (a tight RLIMIT_MEMLOCK) wires
+  // nothing and says nothing about the set logic; only check what did wire.
+  if (got > 0) {
+    EXPECT_TRUE(got == (3ull << 20));
+    EXPECT_TRUE(a.is_wired());
+    EXPECT_FALSE(b.is_wired());
+    const FlexData inf = w.info();
+    EXPECT_TRUE(acc::flag(&inf, wp::kInfoOn));
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoLastRefused, 0) ==
+                (long long)(3ull << 20));
+    EXPECT_TRUE(acc::flag(&inf, wp::kInfoRetryArmed));
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoRefusals, 0) >= 1);
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoPoolAsk, 0) == (long long)kAsk);
+    EXPECT_TRUE(acc::integer(&inf, wp::kInfoPoolUsed, 0) ==
+                (long long)(3ull << 20));
+  }
+  // wire_set does not book: that is note_wired's decision.
+  EXPECT_TRUE(w.wired_bytes() == 0u);
+  // Unwiring the set gives the pool back everything it took.
+  EXPECT_TRUE(w.wire_set(set, false) == got);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+
+  // A moved-from handle stays callable and inert; the moved-to one works.
+  genai::WiredPool v(std::move(w));
+  EXPECT_FALSE(w.on());
+  EXPECT_TRUE(w.wirable(1));
+  EXPECT_FALSE(w.retry(mc, 0));
+  EXPECT_TRUE(w.wire_set(set, true) == 0u);
+  EXPECT_TRUE(v.on());
+
+  // Asked to stay out, it stays out even with the manager's pool on.
+  genai::WiredPool off;
+  FlexData no = FlexData::make_object();
+  acc::set_flag(&no, wp::kEnabled, false);
+  if (std::getenv("VPIPE_WIRE_RESIDENT") == nullptr) {
+    off.open(mc, no);
+    EXPECT_FALSE(off.on());
+    EXPECT_TRUE(off.wirable((std::size_t)1 << 60));
+  }
+  mgr->set_wired_pool_pct(0);
+}
+
+// A CEILING SOMEONE ELSE COLLAPSED IS ASKED ABOUT ONCE PER RUN. The model
+// that met the refusal is the only one with a retry armed, so a model
+// loaded afterwards used to live inside that cap for its whole life -- and
+// so did every model after it, since none of them had refused anything.
+TEST(model_memory, an_inherited_pool_cap_is_reopened_once_per_run)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  const std::size_t kAsk = 8ull << 20;
+  mgr->set_wired_pool_bytes(kAsk);
+  mgr->charge_external_wired(2ull << 20);
+  mgr->note_wired_pool_refused();                 // an earlier refusal
+  genai::WiredPool w;
+  w.open(mc);
+  if (!w.on()) {
+    mgr->release_external_wired(2ull << 20);
+    mgr->set_wired_pool_pct(0);
+    return;
+  }
+  EXPECT_TRUE(mgr->wired_pool_limit() == (2ull << 20));
+  EXPECT_FALSE(w.wirable(1ull << 20));
+
+  // First forward of a run: reopened, whatever the box's free reading.
+  w.new_run();
+  EXPECT_TRUE(w.retry(mc, (std::size_t)1 << 60));
+  EXPECT_TRUE(mgr->wired_pool_limit() == kAsk);
+  EXPECT_TRUE(w.wirable(1ull << 20));
+
+  // Collapsed again within the same run: not asked again until the next.
+  mgr->note_wired_pool_refused();
+  EXPECT_FALSE(w.retry(mc, 0));
+  EXPECT_TRUE(mgr->wired_pool_limit() == (2ull << 20));
+  w.new_run();
+  EXPECT_TRUE(w.retry(mc, 0));
+  EXPECT_TRUE(mgr->wired_pool_limit() == kAsk);
+
+  // Nothing collapsed: nothing to reopen, and no reopen reported.
+  w.new_run();
+  EXPECT_FALSE(w.retry(mc, 0));
+
+  mgr->release_external_wired(2ull << 20);
+  EXPECT_TRUE(mgr->wired_pool_used() == 0u);
+  mgr->set_wired_pool_pct(0);
+}
+
+// WITH THE POOL OFF, NOTHING CHANGES. The gate has to be transparent:
+// wirable() is what sits in front of every admission, so a false here
+// would turn the pool being unavailable into a model that streams
+// everything.
+TEST(model_memory, a_closed_pool_gates_nothing)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  auto* mc = s.services()->metal_compute();
+  if (mc == nullptr || !mc->valid()) { return; }
+
+  mgr->set_wired_pool_pct(0);
+  genai::WiredPool w;
+  w.open(mc);
+  EXPECT_FALSE(w.on());
+  EXPECT_TRUE(w.wirable((std::size_t)1 << 60));   // admission unaffected
+  EXPECT_FALSE(w.retry(mc, 0));
+  EXPECT_TRUE(w.wired_bytes() == 0u);
+}
+
+// A MAPPED WEIGHT CAN BE NEITHER WIRED NOR PARKED, so the residency
+// choice and the pool are one decision, not two. This is the rule every
+// DiT loader now shares; getting it backwards is silent (the load
+// succeeds, the mlock refuses, and the run reads as merely slow).
+TEST(model_memory, mapping_is_off_whenever_streaming_or_wiring)
+{
+  EXPECT_TRUE(genai::weights_may_be_mapped(false, false));
+  EXPECT_FALSE(genai::weights_may_be_mapped(true, false));    // streaming
+  EXPECT_FALSE(genai::weights_may_be_mapped(false, true));    // pool on
+  EXPECT_FALSE(genai::weights_may_be_mapped(true, true));
+}
+
+// A PHASE ON A DECLARATION IS HONOURED, and the planner must not say
+// otherwise.
+//
+// `ResourceClaim::phase` is a declaration-time field -- "Optional
+// LIFETIME", empty meaning the whole run -- and every VAE stage sets it
+// to `decode`, because a VAE is loaded when a latent arrives and dropped
+// after: charging its whole weight to the conditioning and denoise
+// columns is what turns a graph that runs into a graph that reads as too
+// big.
+//
+// The weights planner warned that a declared phase was "ignored" and
+// told callers to move it to decide_resources. That was true of the
+// commit that added the warning and stopped being true three days later,
+// when claim() started forwarding `phase` to declare_weights -- so the
+// warning outlived its subject and fired on every graph with a
+// vae-decode in it, advising a move that was never needed. The two-pass
+// split exists to stop a stage READING accumulating manager state in
+// declare_resources; it was never about describing a lifetime.
+//
+// This goes through the PLANNER rather than declare_weights directly,
+// because the planner is the part that was dropping it, and a test that
+// called the manager would have passed throughout.
+TEST(model_memory, a_declared_phase_survives_the_planner)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-declphase";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  put("diffusion_models/dit.safetensors", 8000);
+  put("vae/vae.safetensors", 2000);
+  const std::string dit = (root / "diffusion_models").string();
+  const std::string vae = (root / "vae").string();
+
+  // Exactly what the runtime does: begin, every stage's claims, end.
+  // The DiT is unphased (held throughout); the VAE names `decode` the
+  // way VaeDecodeStage::declare_resources does.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, std::string(model_memory::kPhaseDecode), "", 0);
+  pl->end_plan(&s);
+
+  // The denoise does not carry the VAE; the decode carries both.
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDenoise)) == 8000u);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDecode)) == 10000u);
+  // And the peak is the widest phase, not the sum of every claim ever
+  // made -- which is the number an ignored phase would have produced.
+  EXPECT_TRUE(mgr->phase_peak(nullptr) == 10000u);
+
+  fs::remove_all(root, ec);
+}
+
+// ONE STORE, TWO COMPONENTS, TWO PHASES. A Draw Things .ckpt can hold
+// both MiniMax-H3 VAEs: vae-decode claims it for `decode`, audio-vae-
+// decode claims it unphased and -- under `destroy` -- refines it to
+// `decode-audio`. The refinement used to REPLACE the decode claim, so the
+// video VAE was absent from the phase that runs it; now it widens to
+// cover both, and only the denoise (and condition) go without it.
+TEST(model_memory, a_refinement_widens_to_another_stage_s_phase)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-twophase";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  fs::create_directories(root / "vaes", ec);
+  {
+    std::ofstream f(root / "vaes" / "both.safetensors", std::ios::binary);
+    std::string blob(3000, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  }
+  const std::string vae = (root / "vaes").string();
+  pl->begin_plan(&s);
+  pl->claim(&s, vae, std::string(model_memory::kPhaseDecode), "", 0);
+  pl->claim(&s, vae, "", "", 0);
+  pl->decide(&s, vae, std::string(model_memory::kPhaseDecodeAudio));
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDecode)) == 3000u);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDecodeAudio)) == 3000u);
+  EXPECT_TRUE(mgr->phase_footprint(
+                  std::string(model_memory::kPhaseDenoise)) == 0u);
+  fs::remove_all(root, ec);
+}
+
+// TWO HOLDERS APART: one checkpoint held in the condition by one stage
+// and in the decode by another, and by neither between. MiniMax-H3's video
+// VAE: video-ref-encoder encodes references through it and drops it
+// (decide: condition), vae-decode loads it at its first latent (claim:
+// decode). Counted over the HULL, condition..decode, the 5 GB VAE sat in
+// a denoise neither holds it in, and on a 16 GB M4 that left the DiT's
+// ANE module (1.9 GB) no room: granted 0 of 1 where it had run.
+// A MODEL KEPT BETWEEN ITS USES SITS BESIDE EVERY PHASE.
+// MiniMax-H3's video decoder kept resident after the decode
+// (kept_beside_every_phase, vae-decode's idle rule) is beside the next
+// clip's denoise too -- where its claim, decode-phased in a model-select
+// graph, told the plan it is absent. With the DiT phased to the denoise
+// (`destroy`), the decode phase alone reads roomy: its peers are the
+// decoder itself, and a box short by the DiT, its scratch and the decoder
+// together kept it. The figure is the worst phase's less the decode's
+// working set: the denoise's here, under `destroy` and under `auto` alike.
+TEST(model_memory, a_kept_model_sits_beside_every_phase)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-kept";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  put("transformer/dit.safetensors", 8000);
+  put("video_vae/source/model.safetensors", 3000);
+  const std::string dit = (root / "transformer").string();
+  const std::string vae = (root / "video_vae" / "source").string();
+  const std::string den(model_memory::kPhaseDenoise);
+  const std::string dec(model_memory::kPhaseDecode);
+  constexpr std::size_t kNeed = 500, kHead = 100;
+
+  // `destroy`: the DiT phased to the denoise, its scratch there.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, den, "", 0);
+  pl->claim(&s, vae, dec, "", 0);
+  pl->end_plan(&s);
+  mgr->declare_scratch("dit", 2000, den);
+  const std::size_t decode_only =
+      model_memory::weight_footprint(&s, {vae}, dec);
+  const std::size_t kept =
+      model_memory::kept_beside_every_phase(&s, vae, dec, kNeed, 0, kHead);
+  std::printf("  destroy: the decode phase alone %zu, every phase %zu "
+              "(the denoise: 8000 + 2000 + 3000 - %zu)\n", decode_only,
+              kept, kNeed);
+  EXPECT_TRUE(decode_only == 3000u);
+  EXPECT_TRUE(kept == 8000u + 2000u + 3000u - kNeed);
+  // ...and what is held through every phase is added to every phase.
+  EXPECT_TRUE(model_memory::kept_beside_every_phase(&s, vae, dec, kNeed, 700,
+                                                    kHead) ==
+              kept + 700u);
+
+  // `auto`: the DiT unphased -- in the decode phase too.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, dec, "", 0);
+  pl->end_plan(&s);
+  mgr->declare_scratch("dit", 2000, den);
+  EXPECT_TRUE(model_memory::kept_beside_every_phase(&s, vae, dec, kNeed, 0,
+                                                    kHead) ==
+              8000u + 2000u + 3000u - kNeed);
+  // The decode's own figure (weights, the decoder with them) wins once
+  // its working set makes the decode the larger phase.
+  EXPECT_TRUE(model_memory::kept_beside_every_phase(&s, vae, dec, 5000, 0,
+                                                    kHead) == 11000u);
+  fs::remove_all(root, ec);
+}
+
+TEST(model_memory, two_holders_apart_leave_the_phase_between_free)
+{
+  Session s;
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-apart";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  put("transformer/dit.safetensors", 8000);
+  put("video_vae/source/model.safetensors", 3000);
+  const std::string dit = (root / "transformer").string();
+  const std::string vae = (root / "video_vae" / "source").string();
+  const std::string den(model_memory::kPhaseDenoise);
+  const std::string cond(model_memory::kPhaseCondition);
+  const std::string dec(model_memory::kPhaseDecode);
+  const std::string deca(model_memory::kPhaseDecodeAudio);
+
+  // Released after the condition: the gap is free.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, dec, "", 0);        // vae-decode
+  pl->claim(&s, vae, "", "", 0);         // video-ref-encoder, pass one
+  pl->decide(&s, vae, cond);             // ...and it lets go
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(cond) == 11000u);
+  EXPECT_TRUE(mgr->phase_footprint(den) == 8000u);
+  EXPECT_TRUE(mgr->phase_footprint(deca) == 8000u);
+  EXPECT_TRUE(mgr->phase_footprint(dec) == 11000u);
+  std::vector<std::pair<std::string, std::size_t>> by;
+  EXPECT_TRUE(mgr->phase_peak(&by) == 11000u);
+  bool saw = false;
+  for (const auto& [p, b] : by) {
+    if (p == den) {
+      saw = true;
+      EXPECT_TRUE(b == 8000u);
+    }
+  }
+  EXPECT_TRUE(saw);
+
+  // Kept by the encoder (no refinement): held the whole run, as before.
+  pl->begin_plan(&s);
+  pl->claim(&s, dit, "", "", 0);
+  pl->claim(&s, vae, dec, "", 0);
+  pl->claim(&s, vae, "", "", 0);
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(den) == 11000u);
+  EXPECT_TRUE(mgr->phase_peak(nullptr) == 11000u);
+
+  // One claim's interval still reads as one interval -- and a relaunch
+  // does not inherit the last one's END: the second launch claims the
+  // condition alone, and the decode must not carry it.
+  pl->begin_plan(&s);
+  pl->claim(&s, vae, cond, dec, 0);
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(den) == 3000u);
+  pl->begin_plan(&s);
+  pl->claim(&s, vae, cond, "", 0);
+  pl->end_plan(&s);
+  EXPECT_TRUE(mgr->phase_footprint(cond) == 3000u);
+  EXPECT_TRUE(mgr->phase_footprint(dec) == 0u);
+  fs::remove_all(root, ec);
+}
+
+namespace {
+
+// RAII for VPIPE_RAM_LIMIT_MB, which every memory decision reads to
+// decide what it BELIEVES the box has.
+class RamLimit {
+public:
+  explicit RamLimit(const char* mb) { ::setenv("VPIPE_RAM_LIMIT_MB", mb, 1); }
+  ~RamLimit()                       { ::unsetenv("VPIPE_RAM_LIMIT_MB"); }
+};
+
+}   // namespace
+
+// A PEAK OVER BELIEVED RAM REPORTS; IT DOES NOT REFUSE -- and the advice
+// it gives names the free fix first.
+//
+// The message used to end "It does not fit at any setting", which is a
+// verdict, and the graph it was aimed at ran to completion. These models
+// hold their weights in mlock-WIRED buffers and the pool has a ceiling:
+// past it WiredPool::wirable() gates ADMISSION rather than merely
+// wiring, so a block nothing can protect is not kept at all and the
+// resident set falls back toward its streaming floor. That costs a
+// re-read per forward -- speed -- not correctness, and nothing fails to
+// allocate: a refused buffer is still allocated, just unwired.
+//
+// So the contract this pins is (a) end_plan does NOT refuse, and (b) the
+// remedy an operator reads first is `unload_when_idle`, ahead of the two
+// that trade output for room. Asserting the ORDER rather than the
+// wording, so the prose can be edited without breaking the test but the
+// priority cannot be silently inverted.
+TEST(model_memory, over_believed_ram_reports_and_advises_unload_first)
+{
+  // The UI delegate, not the log delegate: Session::warn routes there.
+  auto  ui_owner = std::make_unique<CapturingUi>();
+  auto* ui       = ui_owner.get();
+  Session s;
+  s.set_ui_delegate(std::move(ui_owner));
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-overram";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  auto put = [&](const fs::path& rel, std::size_t n) {
+    fs::create_directories((root / rel).parent_path(), ec);
+    std::ofstream f(root / rel, std::ios::binary);
+    std::string blob(n, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+  };
+  // Comfortably over the 1 MB box below, so `need` clears it after the
+  // >> 20 the message prints in.
+  put("diffusion_models/dit.safetensors", 6u << 20);
+  put("vae/vae.safetensors", 3u << 20);
+
+  RamLimit tiny("1");
+  pl->begin_plan(&s);
+  pl->claim(&s, (root / "diffusion_models").string(), "", "", 0);
+  pl->claim(&s, (root / "vae").string(),
+            std::string(model_memory::kPhaseDecode), "", 0);
+  // REPORTED, NOT REFUSED. wired_pool_enforce is off by default, and a
+  // graph over believed RAM is exactly the case that still runs.
+  EXPECT_TRUE(pl->end_plan(&s));
+
+  std::string msg;
+  for (const std::string& l : ui->lines) {
+    if (l.find("estimated peak") != std::string::npos) { msg = l; break; }
+  }
+  EXPECT_TRUE(!msg.empty());
+  if (msg.empty()) { fs::remove_all(root, ec); return; }
+  // The old verdict is gone.
+  EXPECT_TRUE(msg.find("does not fit at any setting") == std::string::npos);
+  // Streaming is already inside the number, so recommending it would be
+  // advice that cannot be taken.
+  const std::size_t unload = msg.find("unload_when_idle");
+  const std::size_t geom   = msg.find("geometry");
+  const std::size_t quant  = msg.find("quantized");
+  EXPECT_TRUE(unload != std::string::npos);
+  EXPECT_TRUE(geom != std::string::npos);
+  EXPECT_TRUE(quant != std::string::npos);
+  // The free fix is offered BEFORE the two that cost output quality.
+  EXPECT_TRUE(unload < geom && unload < quant);
+  // And it names the policy that actually shortens a lifetime.
+  EXPECT_TRUE(msg.find("destroy") != std::string::npos);
+  EXPECT_TRUE(msg.find("park") != std::string::npos);
+
+  fs::remove_all(root, ec);
+}
+
+// EVERY PHASE IN THE RUNNING ORDER IS DECIDABLE.
+//
+// The planner's decide() hand-listed condition/denoise/decode and so
+// rejected `decode-audio`, which has been a first-class phase since the
+// two decodes were split apart ("an audio VAE and a video VAE are loaded
+// and dropped independently, and summing them sizes a moment that does
+// not happen"). A stage deciding it correctly was told its phase was
+// unknown and had its claim counted resident for the WHOLE RUN -- an
+// over-count that lands in every other phase's column, which is how a
+// graph starts reading as too big for its box.
+//
+// Driven from kPhasesInOrder rather than from a list written here, so
+// the test cannot desync the way the code did: adding a phase adds a
+// case automatically.
+TEST(model_memory, every_phase_in_the_order_can_be_decided)
+{
+  auto  ui_owner = std::make_unique<CapturingUi>();
+  auto* ui       = ui_owner.get();
+  Session s;
+  s.set_ui_delegate(std::move(ui_owner));
+  auto* mgr = s.generative_model_manager();
+  if (mgr == nullptr) { return; }
+  ResourcePlanner* pl =
+      ResourcePlannerRegistry::get().find(model_memory::kWeightsKind);
+  ASSERT_TRUE(pl != nullptr);
+  if (pl == nullptr) { return; }
+
+  namespace fs = std::filesystem;
+  const fs::path root = fs::temp_directory_path() / "vpipe-mm-allphases";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const int n = model_memory::phase_count();
+  EXPECT_TRUE(n > 0);
+  std::vector<std::string> dirs;
+  for (int i = 0; i < n; ++i) {
+    const fs::path d = root / ("c" + std::to_string(i));
+    fs::create_directories(d, ec);
+    std::ofstream f(d / "w.safetensors", std::ios::binary);
+    std::string blob(1000, 'x');
+    f.write(blob.data(), (std::streamsize)blob.size());
+    dirs.push_back(d.string());
+  }
+
+  pl->begin_plan(&s);
+  for (const std::string& d : dirs) { pl->claim(&s, d, "", "", 0); }
+  // One component per phase, each deciding the phase it really runs in.
+  for (int i = 0; i < n; ++i) {
+    pl->decide(&s, dirs[(std::size_t)i],
+               std::string(model_memory::phase_name(i)));
+  }
+  pl->end_plan(&s);
+
+  // Not one of them may be called unknown.
+  const bool any_unknown = ui->contains("decides unknown phase");
+  if (any_unknown) {
+    for (const std::string& l : ui->lines) {
+      std::printf("[all-phases] %s\n", l.c_str());
+    }
+  }
+  EXPECT_FALSE(any_unknown);
+  // And each really landed in its own phase: every phase carries its own
+  // 1000 bytes and nothing else, so the peak is one component, not four.
+  for (int i = 0; i < n; ++i) {
+    EXPECT_TRUE(mgr->phase_footprint(
+                    std::string(model_memory::phase_name(i))) == 1000u);
+  }
+  EXPECT_TRUE(mgr->phase_peak(nullptr) == 1000u);
+
+  fs::remove_all(root, ec);
+}
+
+// THE ANE MODULES ARE CLAIMED BY THE STAGES THAT BUILD THEM, AND ONLY THERE.
+//
+// A CoreML claim is the only ledger that can see a module's bytes, so a
+// stage that builds one without claiming it hides memory from every peer,
+// and a stage that claims one it never builds books memory nobody holds --
+// both of which the plan then sizes irreversible decisions against. The
+// vae-decode claim is gated on the VAE family for exactly the second
+// reason: the H3 VAE's config reader accepts other families' config.json.
+//
+// Loads nothing. Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH (an H3 root or pack),
+// optionally VPIPE_KREA2_TEST_MODEL_PATH (a model whose VAE is not H3's).
+// generate-video BOOKS MiniMax-H3's ACTIVATIONS in the denoise phase --
+// ~200 KB a row, which only the runtime preflight had known -- in both
+// ledgers, sized at the graph's geometry; and on matrix cores with an
+// int8 tier a dense checkpoint's floor carries the layout each streamed
+// slot keeps beside its bf16 (h3_int8_slot_bytes_).
+//
+// Env: VPIPE_MINIMAX_H3_TEST_MODEL_PATH. Loads no weights.
+TEST(model_memory, generate_video_books_h3_s_activations)
+{
+  const char* h3 = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (h3 == nullptr || *h3 == '\0') { return; }
+  Session sess;
+  auto* mc = sess.metal_compute();
+  const bool mx = mc != nullptr && mc->supports_matrix_cores();
+  struct Plan {
+    std::size_t scratch = 0, reported = 0, floor = 0;
+  };
+  auto plan = [&](bool geometry, const char* tier) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(h3));
+    if (geometry) {
+      cfg.as_object().insert("width", FlexData::make_int(960));
+      cfg.as_object().insert("height", FlexData::make_int(544));
+      cfg.as_object().insert("frames", FlexData::make_int(61));
+      cfg.as_object().insert("fps", FlexData::make_real(24.0));
+    }
+    if (tier != nullptr) {
+      cfg.as_object().insert("i8_gemm", FlexData::make_bool(true));
+      cfg.as_object().insert("i8_gemm_tier", FlexData::make_string(tier));
+    }
+    GenerateVideoStage st(&sess, "gen", std::vector<InEdge>{},
+                          std::move(cfg));
+    Plan p;
+    for (const ResourceClaim& c : st.declare_resources()) {
+      if (c.kind == model_memory::kScratchKind &&
+          c.phase == model_memory::kPhaseDenoise &&
+          c.key.find("-h3-dit|") != std::string::npos) {
+        p.scratch = std::strtoull(
+            c.key.substr(c.key.rfind('|') + 1).c_str(), nullptr, 10);
+      }
+      if (c.kind == model_memory::kWeightsKind && c.floor_bytes > 0) {
+        p.floor = std::max(p.floor, c.floor_bytes);
+      }
+    }
+    p.reported = st.declare_memory().scratch;
+    return p;
+  };
+  const Plan none = plan(false, nullptr);
+  const Plan base = plan(true, nullptr);
+  const Plan acc = plan(true, "accurate");
+  const Plan tok = plan(true, "token");
+  std::printf("[model_memory] generate-video H3 denoise scratch: %zu MB "
+              "(default geometry %zu MB), reported %zu MB; i8 accurate %zu MB, "
+              "token %zu MB; DiT floor %zu MB, token %zu MB%s\n",
+              base.scratch >> 20, none.scratch >> 20, base.reported >> 20,
+              acc.scratch >> 20, tok.scratch >> 20, acc.floor >> 20,
+              tok.floor >> 20, mx ? "" : " (no matrix cores)");
+  // 960x544 x 61 frames is ~10k rows: over a gigabyte at ~200 KB a row.
+  EXPECT_TRUE(base.scratch > (1ull << 30) && base.reported == base.scratch);
+  // Without one in the graph, the checkpoint's default geometry is
+  // planned (planned_geometry_), so a real bound still lands.
+  EXPECT_TRUE(none.scratch > (1ull << 30));
+  if (mx) {
+    EXPECT_TRUE(acc.scratch > base.scratch);
+    // The slot layout is sized from block 0's shapes, so a root whose
+    // DiT weights live elsewhere (a config-only transformer/ beside a
+    // Draw Things file) has nothing to size it from.
+    if (acc.floor > (1ull << 30)) { EXPECT_TRUE(tok.floor > acc.floor); }
+  } else {
+    EXPECT_TRUE(acc.scratch == base.scratch && tok.floor == acc.floor);
+  }
+}
+
+// MiniMax-H3's DiT asks its two memory questions of the manager and names
+// no peer's directory (GenerateVideoStage::h3_stream_plan,
+// ::h3_box_bounded). The geometry is a split's rank on a 64 GB box: its
+// share of the DiT declared at 13 GB, the root's text encoder on disk at
+// 50 GB. In a graph handed its conditioning nothing declares the
+// encoder, and naming it tipped both questions on its own. Through the
+// manager it counts where a stage declares it, in that stage's phase.
+TEST(model_memory, h3_counts_an_encoder_only_where_a_stage_holds_it)
+{
+  namespace fs = std::filesystem;
+  constexpr std::size_t kGB = 1ull << 30;
+  const fs::path root = fs::temp_directory_path() / "vpipe-h3-peers";
+  std::error_code ec;
+  fs::remove_all(root, ec);
+  const std::string enc = (root / "text_encoder").string();
+  const std::string dit = (root / "transformer").string();
+  // Laid out as a root's encoder is, where its resolver finds it. The
+  // shard is SPARSE: dir_weights_bytes reads its size, and none of the
+  // 50 GB is written.
+  fs::create_directories(enc, ec);
+  const fs::path shard = fs::path(enc) / "model.safetensors";
+  { std::ofstream f(shard, std::ios::binary); }
+  std::ofstream(fs::path(enc) / "config.json") << "{}";
+  fs::resize_file(shard, 50 * kGB, ec);
+  if (ec) {
+    fs::remove_all(root, ec);
+    ASSERT_TRUE(false);
+    return;
+  }
+  ASSERT_TRUE(model_memory::dir_weights_bytes(enc) == 50 * kGB);
+
+  RamLimit ram("65536");
+  Session sess;
+  auto* mgr = sess.generative_model_manager();
+  if (mgr == nullptr) { fs::remove_all(root, ec); return; }
+  mgr->clear_declarations();
+  mgr->declare_weights(dit, 13 * kGB);
+
+  // NO STAGE HOLDS THE ENCODER. The DiT's share alone fits: its blocks
+  // are kept, and it stays between clips.
+  const auto alone = GenerateVideoStage::h3_stream_plan(&sess, dit, 0);
+  EXPECT_TRUE(alone.footprint == 13 * kGB);
+  EXPECT_FALSE(alone.stream);
+  EXPECT_FALSE(GenerateVideoStage::h3_box_bounded(&sess));
+  // ...where naming the encoder, as both questions once did, tips each
+  // of them: the geometry tells the two apart.
+  EXPECT_TRUE(model_memory::plan_streaming(&sess, dit, enc,
+                                           model_memory::kStreamHeadroom)
+                  .stream);
+  EXPECT_TRUE(model_memory::bounded(&sess, {enc}, model_memory::kHeadroom));
+
+  // A STAGE HOLDS IT ALL RUN: both questions see it.
+  mgr->declare_weights(enc, 50 * kGB);
+  const auto held = GenerateVideoStage::h3_stream_plan(&sess, dit, 0);
+  EXPECT_TRUE(held.footprint == 63 * kGB);
+  EXPECT_TRUE(held.stream);
+  EXPECT_TRUE(GenerateVideoStage::h3_box_bounded(&sess));
+
+  // A STAGE HOLDS IT ONLY TO CONDITION: gone before the denoise the
+  // streaming question is asked in, still in the launch's peak.
+  mgr->clear_declarations();
+  mgr->declare_weights(dit, 13 * kGB);
+  mgr->declare_weights(enc, 50 * kGB,
+                       std::string(model_memory::kPhaseCondition));
+  const auto cond = GenerateVideoStage::h3_stream_plan(&sess, dit, 0);
+  EXPECT_TRUE(cond.footprint == 13 * kGB);
+  EXPECT_FALSE(cond.stream);
+  EXPECT_TRUE(GenerateVideoStage::h3_box_bounded(&sess));
+  std::printf("[model_memory] H3 at 64 GB, DiT 13 GB: encoder unheld %zu GB "
+              "stream %d; held %zu GB stream %d; conditioning only %zu GB "
+              "stream %d\n", alone.footprint / kGB, (int)alone.stream,
+              held.footprint / kGB, (int)held.stream,
+              cond.footprint / kGB, (int)cond.stream);
+
+  mgr->note_phase_released(enc);
+  mgr->clear_declarations();
+  fs::remove_all(root, ec);
+}
+
+TEST(model_memory, ane_modules_are_claimed_by_the_stages_that_build_them)
+{
+  const char* h3 = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+  if (h3 == nullptr || *h3 == '\0') { return; }
+  Session sess;
+
+  struct Claim {
+    std::size_t bytes = 0;
+    int         units = 0;
+    std::string phase;
+  };
+  auto coreml = [](const std::vector<ResourceClaim>& cs) {
+    Claim out;
+    for (const ResourceClaim& c : cs) {
+      if (c.kind != model_memory::kCoreMLKind) { continue; }
+      const std::size_t b2 = c.key.rfind('|');
+      const std::size_t b1 = c.key.rfind('|', b2 - 1);
+      out.bytes = (std::size_t)std::stoull(c.key.substr(b1 + 1, b2 - b1 - 1));
+      out.units += std::stoi(c.key.substr(b2 + 1));
+      out.phase = c.phase;
+    }
+    return out;
+  };
+  auto cfg_of = [](const char* root, bool ane) {
+    FlexData cfg = FlexData::make_object();
+    cfg.as_object().insert("hf_dir", FlexData::make_string(root));
+    if (ane) { cfg.as_object().insert("ane_ffn", FlexData::make_bool(true)); }
+    return cfg;
+  };
+
+  // vae-decode over H3: one unit, sized from the VAE's own tile, in the
+  // decode -- and nothing without the key.
+  {
+    VaeDecodeStage off(&sess, "dec", std::vector<InEdge>{},
+                       cfg_of(h3, false));
+    EXPECT_TRUE(coreml(off.declare_resources()).units == 0);
+    VaeDecodeStage on(&sess, "dec", std::vector<InEdge>{}, cfg_of(h3, true));
+    const Claim c = coreml(on.declare_resources());
+    genai::MetalMiniMaxH3VideoVae::Config vc;
+    std::string err;
+    const bool have = genai::MetalMiniMaxH3VideoVae::config_from_json(
+        genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(h3), vc, &err);
+    std::printf("[model_memory] vae-decode ANE claim: %d unit(s) x %zu MB "
+                "in '%s'\n", c.units, c.bytes >> 20, c.phase.c_str());
+    EXPECT_TRUE(have);
+    EXPECT_TRUE(c.units == 1);
+    EXPECT_TRUE(c.phase == model_memory::kPhaseDecode);
+    EXPECT_TRUE(have && c.bytes ==
+                genai::MetalMiniMaxH3VideoVae::ane_runtime_bytes(vc));
+  }
+  // generate-video over H3: one unit in the denoise.
+  {
+    GenerateVideoStage off(&sess, "gen", std::vector<InEdge>{},
+                           cfg_of(h3, false));
+    EXPECT_TRUE(coreml(off.declare_resources()).units == 0);
+    GenerateVideoStage on(&sess, "gen", std::vector<InEdge>{},
+                          cfg_of(h3, true));
+    const Claim c = coreml(on.declare_resources());
+    std::printf("[model_memory] generate-video ANE claim: %d unit(s) x %zu "
+                "MB in '%s'\n", c.units, c.bytes >> 20, c.phase.c_str());
+    EXPECT_TRUE(c.units == 1);
+    EXPECT_TRUE(c.phase == model_memory::kPhaseDenoise);
+    const genai::MetalMiniMaxH3Transformer::Config tc;
+    const std::size_t slots =
+        3ull * (std::size_t)tc.hidden * (std::size_t)tc.ffn * 2ull;
+    EXPECT_TRUE(c.bytes > slots);
+  }
+  // vae-decode over a VAE that is not H3's claims nothing, key or not.
+  if (const char* k = std::getenv("VPIPE_KREA2_TEST_MODEL_PATH")) {
+    if (*k != '\0') {
+      VaeDecodeStage on(&sess, "dec", std::vector<InEdge>{}, cfg_of(k, true));
+      EXPECT_TRUE(coreml(on.declare_resources()).units == 0);
+    }
+  }
+}
+
+// THE GRAPH OF A REPORT, planned as the runtime plans it: MiniMax-H3
+// Ref2VA at 896x832 with ane_ffn + ane_qkv on a 16 GB box
+// (VPIPE_RAM_LIMIT_MB). Since the denoise booked the DiT's activations
+// (3.5-3.8 GB there) the video VAE -- counted through the denoise though
+// video-ref-encoder drops it after the condition and vae-decode loads it
+// at its first latent -- left the ANE module no room: "granted 0 of 1",
+// where the release before had run it on a 16 GB M4 Mac mini. With the
+// encoder letting go, the denoise must carry neither it nor the VAE (the
+// difference against the encoder KEPT is exactly the two), the decode
+// must still carry the VAE, and the module is granted. Env:
+// VPIPE_MINIMAX_H3_TEST_MODEL_PATH (a repo holding Ref2VA/, or the
+// partition itself) and / or VPIPE_MINIMAX_H3_REPACK_PATH (Comfy-Org's
+// single-file repack -- the report's layout: there the plan before this
+// granted 0, denoise 12460 MB against 7493); configs and sizes only,
+// nothing loads.
+TEST(model_memory, h3_ref2va_leaves_the_denoise_room_for_its_ane_module)
+{
+  namespace fs = std::filesystem;
+  auto plan_on_16gb = [&](const std::string& root) {
+    Session sess;
+    auto* mgr = sess.generative_model_manager();
+    if (mgr == nullptr) { return; }
+    ::setenv("VPIPE_RAM_LIMIT_MB", "16384", 1);
+
+    using KV = std::vector<std::pair<std::string, FlexData>>;
+    auto cfg = [&](const KV& kv) {
+      FlexData c = FlexData::make_object();
+      c.as_object().insert("hf_dir", FlexData::make_string(root));
+      for (const auto& [k, v] : kv) { c.as_object().insert(k, v); }
+      return c;
+    };
+    // What PipelineRuntime does: every planner bracketed, every claim
+    // delivered, then every decision. Returns {denoise, decode}.
+    auto plan = [&](const std::vector<Stage*>& stages) {
+      const auto planners = ResourcePlannerRegistry::get().all();
+      for (ResourcePlanner* p : planners) { p->begin_plan(&sess); }
+      for (Stage* st : stages) {
+        for (const ResourceClaim& c : st->declare_resources()) {
+          ResourcePlanner* p = ResourcePlannerRegistry::get().find(c.kind);
+          if (c.key.empty() || p == nullptr) { continue; }
+          DeliveringResourceClaim delivering(c);
+          p->claim(&sess, c.key, c.phase, c.last_phase, c.floor_bytes);
+        }
+      }
+      for (Stage* st : stages) {
+        for (const ResourceClaim& c : st->decide_resources()) {
+          ResourcePlanner* p = ResourcePlannerRegistry::get().find(c.kind);
+          if (c.key.empty() || p == nullptr) { continue; }
+          p->decide(&sess, c.key, c.phase);
+        }
+      }
+      for (ResourcePlanner* p : planners) { p->end_plan(&sess); }
+      std::vector<std::pair<std::string, std::size_t>> by;
+      mgr->phase_peak(&by);
+      std::size_t den = 0, dec = 0;
+      for (const auto& [ph, b] : by) {
+        if (ph == model_memory::kPhaseDenoise) { den = b; }
+        if (ph == model_memory::kPhaseDecode) { dec = b; }
+      }
+      return std::pair<std::size_t, std::size_t>{den, dec};
+    };
+    struct Run {
+      std::size_t den = 0, dec = 0, unit = 0;
+      int granted = -1;
+    };
+    auto run = [&](const char* unload) {
+      ModelSelectStage sel(&sess, "sel", std::vector<InEdge>{}, cfg({}));
+      VideoRefEncoderStage enc(
+          &sess, "enc", std::vector<InEdge>{},
+          cfg({{"frames", FlexData::make_int(121)},
+               {"unload_when_idle", FlexData::make_string(unload)}}));
+      GenerateVideoStage gen(
+          &sess, "gen", std::vector<InEdge>{},
+          cfg({{"width", FlexData::make_int(896)},
+               {"height", FlexData::make_int(832)},
+               {"frames", FlexData::make_int(121)},
+               {"fps", FlexData::make_real(24.0)},
+               {"ane_ffn", FlexData::make_bool(true)},
+               {"ane_qkv", FlexData::make_bool(true)}}));
+      // A model-select on the model iport, as every shipped graph has: the
+      // VAE then loads at the first latent.
+      VaeDecodeStage dec(&sess, "dec",
+                         std::vector<InEdge>{{nullptr, 0}, {&sel, 0}}, cfg({}));
+      AudioVaeDecodeStage adec(&sess, "adec", std::vector<InEdge>{}, cfg({}));
+      Run r;
+      std::tie(r.den, r.dec) = plan({&sel, &enc, &gen, &dec, &adec});
+      for (const ResourceClaim& c : gen.declare_resources()) {
+        int units = 0;
+        if (model_memory::parse_coreml_claim(c, nullptr, &r.unit, &units)) {
+          break;
+        }
+      }
+      if (r.unit > 0) {
+        r.granted = model_memory::coreml_grant(&sess, "ane-ffn/gen", r.unit, 1);
+      }
+      return r;
+    };
+    const Run rel = run("auto");
+    const Run keep = run("keep");
+    ::unsetenv("VPIPE_RAM_LIMIT_MB");
+
+    const std::string enc_dir =
+        genai::MiniMaxH3TextEncoder::resolve_encoder_dir(root);
+    const std::size_t enc_floor =
+        genai::MiniMaxH3TextEncoder::streaming_floor_bytes(enc_dir);
+    // The VAE at what its holders hold: video-ref-encoder its encoder
+    // half, vae-decode its decoder half -- each half loads at its first
+    // use -- and the manager keeps one figure a checkpoint, the larger.
+    using Half = genai::MetalMiniMaxH3VideoVae::Half;
+    const std::string vdir =
+        genai::MetalMiniMaxH3VideoVae::resolve_vae_dir(root);
+    const std::size_t vae = std::max(
+        genai::MetalMiniMaxH3VideoVae::held_bytes(vdir, Half::kEncoder),
+        genai::MetalMiniMaxH3VideoVae::held_bytes(vdir, Half::kDecoder));
+    std::printf("[model_memory] H3 Ref2VA at 16 GB: denoise %zu MB (encoder "
+                "kept %zu MB), decode %zu MB; VAE %zu MB, encoder floor %zu "
+                "MB; ANE module %zu MB granted %d (encoder kept: %d)\n",
+                rel.den >> 20, keep.den >> 20, rel.dec >> 20, vae >> 20,
+                enc_floor >> 20, rel.unit >> 20, rel.granted, keep.granted);
+    EXPECT_TRUE(vae > 0 && enc_floor > 0 && rel.unit > 0);
+    // The grant is booked into the denoise too (end_plan's `coreml:`
+    // scratch), so it is taken back out before the weights are compared.
+    EXPECT_TRUE(rel.granted == 1 && keep.granted == 0);
+    EXPECT_TRUE(keep.den + rel.unit == rel.den + enc_floor + vae);
+    // The decode holds the VAE either way; kept, the encoder as well.
+    EXPECT_TRUE(rel.dec >= vae && keep.dec == rel.dec + enc_floor);
+  };
+  if (const char* h3 = std::getenv("VPIPE_MINIMAX_H3_TEST_MODEL_PATH");
+      h3 != nullptr && *h3 != '\0') {
+    std::string root = h3;
+    if (fs::exists(fs::path(h3) / "Ref2VA" / "video_vae")) {
+      root = (fs::path(h3) / "Ref2VA").string();
+    }
+    if (fs::exists(fs::path(root) / "video_vae")) {
+      plan_on_16gb(root);
+    }
+  }
+  if (const char* r = std::getenv("VPIPE_MINIMAX_H3_REPACK_PATH");
+      r != nullptr && *r != '\0') {
+    plan_on_16gb(r);
+  }
+}
+
+// A LANGUAGE-MODEL stage's claims, one rule for text-chat, visual-qa and
+// realtime-vqa (model_memory::lm_claims): a Mixture-of-Experts model held
+// at its streamable floor (Qwen3.8-Flash-Next: the rest of the model and a
+// layer of experts, its n-gram table no part of it), a dense one whole,
+// and a Qwen vision tower's scratch at the largest picture it admits --
+// ~5 GB at the 16.7 MP a Qwen3-VL repo states -- or at a live frame's
+// budget, or not at all. Env: VPIPE_QWEN4_EXP_TEST_MODEL_PATH and / or
+// VPIPE_QWEN35_TEST_MODEL_PATH (their configs only; nothing loads).
+TEST(model_memory, a_language_model_claims_its_floor_and_its_tower)
+{
+  const char* dirs[] = {std::getenv("VPIPE_QWEN4_EXP_TEST_MODEL_PATH"),
+                        std::getenv("VPIPE_QWEN35_TEST_MODEL_PATH")};
+  Session sess;
+  // the scratch claims whose label starts `prefix`
+  auto scratch = [](const std::vector<ResourceClaim>& cs,
+                    const std::string& prefix = "vision:") {
+    std::size_t b = 0;
+    for (const auto& c : cs) {
+      if (c.kind != model_memory::kScratchKind ||
+          c.key.rfind(prefix, 0) != 0) {
+        continue;
+      }
+      const std::size_t bar = c.key.rfind('|');
+      if (bar != std::string::npos) {
+        b += (std::size_t)std::stoull(c.key.substr(bar + 1));
+      }
+    }
+    return b;
+  };
+  genai::LmRunShape run;
+  run.page_tokens = 512;
+  run.max_pages = 64;
+  run.kv_tokens = 512 * 64;
+  for (int i = 0; i < 2; ++i) {
+    if (dirs[i] == nullptr) { continue; }
+    const std::string d = dirs[i];
+    const auto all = model_memory::lm_claims(&sess, d, "t", run);
+    const auto frame =
+        model_memory::lm_claims(&sess, d, "t", run, 28LL * 28 * 1280);
+    const auto none = model_memory::lm_claims(&sess, d, "t", run, -1);
+    // what it runs in: one claim, per checkpoint, at the family's figure
+    const std::size_t want = genai::lm_run_bytes(&sess, d, run);
+    std::printf("[lm-claims] %s: runs in %zu MB at a 32K-token pool\n",
+                d.c_str(), want >> 20);
+    EXPECT_TRUE(want > ((std::size_t)64 << 20));
+    EXPECT_TRUE(scratch(all, "lm:") == want &&
+                scratch(none, "lm:") == want);
+    ASSERT_TRUE(!all.empty() && all[0].kind == model_memory::kWeightsKind);
+    if (all.empty()) { continue; }
+    const std::size_t disk = model_memory::dir_weights_bytes(d);
+    std::printf("[lm-claims] %s: weights %zu MB, floor %zu MB; vision "
+                "scratch %zu MB (largest picture), %zu MB (~1 MP frame)\n",
+                d.c_str(), disk >> 20, all[0].floor_bytes >> 20,
+                scratch(all) >> 20, scratch(frame) >> 20);
+    EXPECT_TRUE(scratch(none) == 0);
+    EXPECT_TRUE(scratch(frame) > 0 && scratch(frame) < scratch(all));
+    if (i == 0) {
+      // Flash-Next: streamable, under a tenth of its 128 GB; a 16.7 MP
+      // picture's tower (27 x 1152) ~5 GB.
+      EXPECT_TRUE(all[0].floor_bytes > 0 && all[0].floor_bytes < disk / 10);
+      EXPECT_TRUE(scratch(all) > ((std::size_t)4 << 30) &&
+                  scratch(all) < ((std::size_t)6 << 30));
+    } else {
+      EXPECT_TRUE(all[0].floor_bytes == 0);   // dense: held whole
+    }
+  }
+}
+

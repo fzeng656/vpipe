@@ -1,6 +1,7 @@
 #ifndef VPIPE_STAGES_KREA2_MODEL_CONFIG_STAGE_H
 #define VPIPE_STAGES_KREA2_MODEL_CONFIG_STAGE_H
 
+#include "stages/latent-preview.h"
 #include "stages/model-config-source.h"
 
 #include <string>
@@ -12,8 +13,8 @@ namespace vpipe {
 //
 // Krea-2's grounded edit encodes the instruction WITH the source
 // image, and the ComfyUI-Krea2Edit node caps that image's long edge
-// at 768 before the Qwen3-VL tower sees it -- looser than the
-// Mage-Flow families' 384 and tighter than the tower's own ~1M-pixel
+// at 768 before the Qwen3-VL tower sees it -- looser than the 384
+// some families train at and tighter than the tower's own ~1M-pixel
 // limit. The number is the identity-edit LoRA's training
 // distribution, so it is the family's, not the stage's.
 //
@@ -37,6 +38,11 @@ public:
   const StageSpec& spec() const noexcept override;
 
   FlexData resolved_config() const;
+
+private:
+  // The live-preview keys (preview_vae / _every / _max_edge). No
+  // `preview_frames`: a picture is one frame.
+  LatentPreviewSpec _preview;
 };
 
 }  // namespace vpipe

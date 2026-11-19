@@ -1,5 +1,7 @@
 # MiniMax H3 on Apple Silicon
 
+English | [简体中文](MINIMAX-H3-zh-cn.md)
+
 **MiniMax H3 (FL2VA)** is a 33-billion-parameter video model that generates a
 clip **and its soundtrack together**, from a single prompt. vpipe runs it
 on-device through its **metal-compute** backend — its own Metal kernels, no
@@ -13,6 +15,100 @@ it afterwards. Ask for rain and you get rain you can hear.
 It is also **guidance-distilled**, which is what makes it practical here:
 there is no second unconditional forward pass per step, and useful output
 arrives in **8–16 steps** instead of 30+.
+
+## Contents
+
+- [What you need](#what-you-need)
+  - [Disk space](#disk-space)
+- [The pipelines](#the-pipelines)
+- [Step 1 — prepare the model](#step-1--prepare-the-model)
+  - [First, choose a work directory](#first-choose-a-work-directory)
+  - [Then run the pipeline](#then-run-the-pipeline)
+- [Step 2 — text to video and audio](#step-2--text-to-video-and-audio)
+  - [The settings worth knowing](#the-settings-worth-knowing)
+    - [Counting steps](#counting-steps)
+    - [Your own grid, and how a step is taken](#your-own-grid-and-how-a-step-is-taken)
+  - [How long it takes](#how-long-it-takes)
+    - [Against h3.c](#against-h3c)
+  - [Watching it form — live previews](#watching-it-form--live-previews)
+  - [More than text in](#more-than-text-in)
+  - [Conditioning on references (Ref2VA)](#conditioning-on-references-ref2va)
+    - [Two ways to hand it a reference](#two-ways-to-hand-it-a-reference)
+    - [No references this time — prompt only](#no-references-this-time--prompt-only)
+    - [The example](#the-example)
+    - [What it costs](#what-it-costs)
+    - [How a reference is read](#how-a-reference-is-read)
+    - [References that are not files](#references-that-are-not-files)
+    - [Preparing the Ref2VA checkpoint](#preparing-the-ref2va-checkpoint)
+    - [Ref2VA-like — references on the FL2VA weights](#ref2va-like--references-on-the-fl2va-weights)
+  - [Longer clips — one story in four parts](#longer-clips--one-story-in-four-parts)
+    - [Running the chain](#running-the-chain)
+    - [How a part takes its guide](#how-a-part-takes-its-guide)
+    - [Writing the prompts](#writing-the-prompts)
+    - [Joining the parts](#joining-the-parts)
+    - [Making it your own](#making-it-your-own)
+    - [Carrying a part's own latents](#carrying-a-parts-own-latents)
+  - [The released weights, either partition](#the-released-weights-either-partition)
+  - [Fewer steps — the Turbo LoRA](#fewer-steps--the-turbo-lora)
+    - [Get it](#get-it)
+    - [Run it](#run-it)
+    - [Runtime (recommended)](#runtime-recommended)
+    - [Several at once](#several-at-once)
+    - [Merging, and why it loses most of this adapter](#merging-and-why-it-loses-most-of-this-adapter)
+    - [Which Turbo adapters work](#which-turbo-adapters-work)
+    - [Community LoRAs — Civitai, musubi-tuner, ai-toolkit](#community-loras--civitai-musubi-tuner-ai-toolkit)
+  - [FP8 checkpoints — lightx2v's turbo DiT](#fp8-checkpoints--lightx2vs-turbo-dit)
+  - [int8 checkpoints — community DiTs saved by ComfyUI](#int8-checkpoints--community-dits-saved-by-comfyui)
+  - [Eight steps — HyperFlow](#eight-steps--hyperflow)
+    - [Fetch it, then name it](#fetch-it-then-name-it)
+    - [What makes it different](#what-makes-it-different)
+    - [What it costs](#what-it-costs-1)
+  - [Six steps, any reference — Pika H3 Flex](#six-steps-any-reference--pika-h3-flex)
+    - [Get the two adapters](#get-the-two-adapters)
+    - [What the manifest decides](#what-the-manifest-decides)
+    - [The rest of the release's recipe](#the-rest-of-the-releases-recipe)
+    - [Where vpipe differs from the release](#where-vpipe-differs-from-the-release)
+    - [What six steps cost](#what-six-steps-cost)
+    - [Checked without the release](#checked-without-the-release)
+  - [Three steps, streamed — TaoMate-H3](#three-steps-streamed--taomate-h3)
+  - [A draft at 2K — Open-H3-Regenerate-2K](#a-draft-at-2k--open-h3-regenerate-2k)
+    - [Get it, then run it](#get-it-then-run-it)
+    - [What it costs](#what-it-costs-2)
+    - [Against the release](#against-the-release)
+  - [The draft in context — Open-H3-Regenerate-2K-IC](#the-draft-in-context--open-h3-regenerate-2k-ic)
+    - [Fetch the IC release, then run it](#fetch-the-ic-release-then-run-it)
+    - [What the in-context refine costs](#what-the-in-context-refine-costs)
+    - [Checked against the IC release](#checked-against-the-ic-release)
+  - [Pictures — MiniMax-H3-Image](#pictures--minimax-h3-image)
+    - [Fetch MiniMax-H3-Image, then run it](#fetch-minimax-h3-image-then-run-it)
+    - [Sizes, and what is read off the checkpoint](#sizes-and-what-is-read-off-the-checkpoint)
+    - [What MiniMax-H3-Image costs](#what-minimax-h3-image-costs)
+    - [Checked against diffusers' MiniMax-H3-Image](#checked-against-diffusers-minimax-h3-image)
+  - [Pictures — P-H3-Image](#pictures--p-h3-image)
+    - [Get it, then run it](#get-it-then-run-it-1)
+    - [What is read off the checkpoint](#what-is-read-off-the-checkpoint)
+    - [What it costs](#what-it-costs-3)
+    - [Checked against the reference](#checked-against-the-reference)
+  - [Pictures through H3's VAE — the Image VAE](#pictures-through-h3s-vae--the-image-vae)
+  - [Faster attention — the VDN linear branch](#faster-attention--the-vdn-linear-branch)
+    - [Get it and run it](#get-it-and-run-it)
+    - [What it saves](#what-it-saves)
+  - [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk)
+  - [Its P·V in int8 too — `sage_pv8`](#its-pv-in-int8-too--sage_pv8)
+  - [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing)
+    - [What it saves](#what-it-saves-1)
+    - [Against the VDN branch](#against-the-vdn-branch)
+    - [The knobs](#the-knobs)
+  - [Fewer forwards — MotionCache](#fewer-forwards--motioncache)
+    - [What it saves](#what-it-saves-2)
+    - [Its knobs](#its-knobs)
+  - [The Neural Engine — for M4-family Macs](#the-neural-engine--for-m4-family-macs)
+    - [What it saves on an M4](#what-it-saves-on-an-m4)
+    - [How it behaves](#how-it-behaves)
+- [Memory](#memory)
+- [Troubleshooting](#troubleshooting)
+- [Under the hood](#under-the-hood)
+- [References and licences](#references-and-licences)
 
 ## What you need
 
@@ -33,10 +129,21 @@ once, up front. Both copies exist while that runs:
 | Source repack (`Comfy-Org/MiniMax-H3`, bf16) | **~115 GB** |
 | Peak while preparing (source + output) | **~180 GB** |
 | 8-bit model, source deleted | **~65 GB** |
-| Adding the Ref2VA partition (its transformer only) | **+66 GB** source, **+33 GB** 8-bit or **+24 GB** 4-bit |
+| Adding the Ref2VA partition | **+66 GB** source, **+60 GB** 8-bit (~**+44 GB** at 4-bit) |
 
 Once preparation finishes you can delete the source repack and keep the
 ~65 GB. The 115 GB is a one-time cost, not a standing one.
+
+The Ref2VA row is the whole partition, not just its transformer, and that is
+worth reading twice. The *download* really does add only the 66 GB
+transformer — the prompt encoder and both VAEs are already on disk and are
+skipped. But the pipeline that prepares it **quantizes the encoder too**, into
+an output of its own, so what you end up holding is a second complete model:
+~33 GB of transformer plus ~27 GB of encoder at 8-bit. Only the components
+quantization leaves alone are hard-linked, and a re-quantized encoder is new
+bytes. The 4-bit figure is that same sum scaled by the transformer's own
+8-bit-to-4-bit ratio rather than a measurement; treat it as a budget, not a
+promise.
 
 **Why 8-bit and not 4.** Quality, at the price of disk and very little else.
 Both widths stream, so neither has to fit in RAM, and the transformer spends
@@ -45,6 +152,22 @@ are — so moving to 8-bit costs about 20 GB and does not meaningfully change
 how long a clip takes. The 4-bit path still works and is the one to take if
 the disk matters more: set `bits` to 4 in both `model-quantize` stages and
 name the output to match.
+
+**You do not have to quantize at all.** The downloaded bf16 repack is a
+complete, runnable model: point `model-select` straight at
+`Comfy-Org/MiniMax-H3-FL2VA` and skip [step 1](#step-1--prepare-the-model)'s
+quantize stages entirely. Nothing has to be told what width it is — the
+loader reads the per-tensor bit width out of the checkpoint, and a checkpoint
+that carries none is simply the dense bf16 path.
+
+What it costs is memory, and the cost is paid per step rather than once. The
+transformer is ~66 GB at bf16 against ~33 GB at 8-bit, so streaming it
+re-reads about twice the bytes on every forward pass, and the resident set —
+which grows into whatever RAM is spare, see [Memory](#memory) — holds
+proportionally fewer blocks between steps. On a memory-bounded box that is
+the whole difference: the same clip, more time in the storage path. Quantize
+when you are going to generate more than once; run the repack as it comes when
+you want to see the model work before spending the hours and the 115 GB.
 
 > **Keep the download and the output on one filesystem.** Components that
 > quantization does not touch (the VAEs) are **hard-linked** into the output
@@ -63,13 +186,91 @@ name the output to match.
   you want it; the two share a download.
 - **[`minimax-h3-text-to-video.vpipeline`](pipelines/minimax-h3-text-to-video.vpipeline)**
   — prompt in, `.mp4` with sound out.
+- **[`minimax-h3-text-to-video-preview.vpipeline`](pipelines/minimax-h3-text-to-video-preview.vpipeline)**
+  — the same, with a **live preview** of the clip forming, step by step (see
+  [Watching it form](#watching-it-form--live-previews)).
 - **[`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)**
   — the same, anchored to an image at both ends (see
   [More than text in](#more-than-text-in)).
+- **[`minimax-h3-last-frame-to-video.vpipeline`](pipelines/minimax-h3-last-frame-to-video.vpipeline)**
+  — the same, but the clip *ends* on the image instead (see
+  [More than text in](#more-than-text-in)).
 - **[`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)**
-  — the **Ref2VA** partition instead: a list of reference images, clips and
-  soundtracks in, `.mp4` out (see
+  — the **Ref2VA** partition instead: reference images, clips and soundtracks
+  in, `.mp4` out, each one prepared to a size you choose (see
   [Conditioning on references](#conditioning-on-references-ref2va)).
+- **[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)**
+  — reference images on the **FL2VA** weights, with the VDN branch and the
+  Turbo LoRA, so no second 66 GB transformer is needed (see
+  [Ref2VA-like](#ref2va-like--references-on-the-fl2va-weights)).
+- **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
+  … **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
+  — a **40-second** clip in four runs: FL2VA text-to-video, then three Ref2VA
+  continuations, each carrying on from the last 3.75 s of the part before it
+  (see [Longer clips](#longer-clips--one-story-in-four-parts)). Runs both
+  partitions of the **released** weights at 20 steps, with no Turbo adapter,
+  and writes each part **lossless** — FFV1 video at 4:4:4, ALAC sound — so
+  every continuation reads back exactly what the part before it made.
+- **[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline)**
+  — joins those four parts into one 40-second file through the concat
+  demuxer, with no model and no hand-written ffmpeg. The one lossy encode in
+  the chain.
+- **[`prepare-pika-h3-flex.vpipeline`](pipelines/prepare-pika-h3-flex.vpipeline)**
+  / **[`pika-h3-flex-text-to-video.vpipeline`](pipelines/pika-h3-flex-text-to-video.vpipeline)**,
+  **[`…-first-frame-to-video`](pipelines/pika-h3-flex-first-frame-to-video.vpipeline)**,
+  **[`…-reference-to-video`](pipelines/pika-h3-flex-reference-to-video.vpipeline)**
+  — fetch Pika Labs' **six-step** adapters for both partitions and run text,
+  an opening frame, or references through them, each on the schedule its
+  adapter's manifest names (see
+  [Six steps, any reference](#six-steps-any-reference--pika-h3-flex)).
+- **[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)**
+  / **[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline)**
+  — fetch TaoLiveAIGC's **3-step** adapter and run its **streaming** method:
+  the soundtrack from the base model, the video in chunks that remember the
+  ones before them, in whole 5-second requests (see
+  [Three steps, streamed](#three-steps-streamed--taomate-h3)).
+- **[`prepare-open-h3-regenerate-2k.vpipeline`](pipelines/prepare-open-h3-regenerate-2k.vpipeline)**
+  / **[`minimax-h3-regenerate-2k.vpipeline`](pipelines/minimax-h3-regenerate-2k.vpipeline)**
+  — fetch NVIDIA's **Open-H3-Regenerate-2K** and regenerate a 768P draft at
+  **2560 × 1440** in three steps: the draft encoded, its latent enlarged
+  without decoding, re-noised and refined by the FL2VA weights under the
+  release's merged LoRA (see
+  [A draft at 2K](#a-draft-at-2k--open-h3-regenerate-2k)).
+  **[`minimax-h3-regenerate-2k-fast-m4.vpipeline`](pipelines/minimax-h3-regenerate-2k-fast-m4.vpipeline)**
+  / **[`-fast-m5`](pipelines/minimax-h3-regenerate-2k-fast-m5.vpipeline)**
+  are the same graph on the box's lossy tiers — the Neural Engine on an M4,
+  int8 on an M5's matrix cores — and the release's **fast decoder**, which
+  [`prepare-open-h3-regenerate-2k-fast-vae.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-fast-vae.vpipeline)
+  fetches.
+- **[`prepare-minimax-h3-image.vpipeline`](pipelines/prepare-minimax-h3-image.vpipeline)**
+  / **[`minimax-h3-image-text-to-image.vpipeline`](pipelines/minimax-h3-image-text-to-image.vpipeline)**,
+  **[`minimax-h3-image-edit.vpipeline`](pipelines/minimax-h3-image-edit.vpipeline)**
+  — **pictures** from MiniMax's own image model, **MiniMax-H3-Image**:
+  text-to-image and editing with up to 16 pictures, about 16 megapixels at
+  any aspect, in six steps (see
+  [Pictures](#pictures--minimax-h3-image)).
+  **[`minimax-h3-image-text-to-image-fast-m5.vpipeline`](pipelines/minimax-h3-image-text-to-image-fast-m5.vpipeline)**
+  is the same picture with the DiT's projections in int8 on an M5's
+  matrix cores.
+- **[`prepare-p-h3-image.vpipeline`](pipelines/prepare-p-h3-image.vpipeline)**
+  / **[`p-h3-image-text-to-image.vpipeline`](pipelines/p-h3-image-text-to-image.vpipeline)**,
+  **[`p-h3-image-edit.vpipeline`](pipelines/p-h3-image-edit.vpipeline)**
+  — **pictures**, not clips: PrunaAI's **P-H3-Image** on your FL2VA weights
+  under PrunaAI's adapter, text-to-image at 8 megapixels and editing a
+  picture with up to seven more as references, in eight steps (see
+  [Pictures](#pictures--p-h3-image)).
+- **[`prepare-minimax-h3-image-vae.vpipeline`](pipelines/prepare-minimax-h3-image-vae.vpipeline)**
+  / **[`minimax-h3-image-round-trip.vpipeline`](pipelines/minimax-h3-image-round-trip.vpipeline)**
+  — fetch Mamad8's **single-frame** H3 VAE and send a picture through H3's
+  latent space and back: what a reference picture or a keyframe keeps once
+  the model has encoded it (see
+  [Pictures through H3's VAE](#pictures-through-h3s-vae--the-image-vae)).
+- **[`prepare-minimax-h3-vdn.vpipeline`](pipelines/prepare-minimax-h3-vdn.vpipeline)**
+  / **[`minimax-h3-vdn.vpipeline`](pipelines/minimax-h3-vdn.vpipeline)**
+  — fetch the **VDN** hybrid-attention branch and run text-to-video with it.
+  **FL2VA partition only** — text or first/last keyframes, not references —
+  and worth more the longer the clip **and the larger the frame** (see
+  [Faster attention](#faster-attention--the-vdn-linear-branch)).
 
 Follow a link and use **Raw ▸ Save as** to download it, or take them straight
 from `docs/pipelines/` in your clone. Either can be run from the terminal with
@@ -135,6 +336,17 @@ Four stages, in order:
    different transformer files and different tokenizers. A fetch that does
    not say which is refused, with both listed, rather than quietly taking
    the first.
+
+   **`model_key` is what the next stage names.** The two partitions share
+   a directory on disk, so what keeps them apart is the key each is
+   registered under in the models DB — not the repo path, which is the
+   same string for both. `model_key: Comfy-Org/MiniMax-H3-FL2VA` pins it,
+   and step 2's `src_model` has to be that key. Passing the repo path
+   (`Comfy-Org/MiniMax-H3`) there instead is the mistake to avoid: the
+   fetch succeeds, and the quantize then fails to find a model of that
+   name. Left unset, the key falls back to the catalogue entry's name,
+   which happens to be the same string here — so pinning it costs
+   nothing and makes the pipeline say what it depends on.
 2. **`model-quantize`** (`target: dit`) — the 33B transformer to 8-bit,
    group size 64. **Leave `quant_modulation: true` alone.** H3's per-block
    AdaLN modulation is not a small side projection the way other DiTs' is —
@@ -169,23 +381,25 @@ registry holding your model lives. Then open the URL it prints, load
 `minimax-h3-text-to-video.vpipeline`, edit the `text-prompt` stage, and press
 Start. The shipped prompt asks for both halves at once:
 
-> *An Asian musician playing classical music on a grand piano.*
+> *Cinematic video of a young Asian female pianist passionately playing a
+> grand piano.*
 
-The soundtrack is in that sentence: naming what is being *played* is what
-gives the model the music. There is no separate audio prompt — the sound
-comes from the same text — so describe the **sound** as well as the picture.
-Either name it outright (*"sound of the rain, with the occasional individual
-drop"*) or, as here, name the thing making it. A prompt that says only what a
-scene looks like gets you whatever the model thinks that scene sounds like.
+The soundtrack is in that sentence: naming the instrument is what gives the
+model the music. There is no separate audio prompt — the sound comes from the
+same text — so describe the **sound** as well as the picture. Either name it
+outright (*"sound of the rain, with the occasional individual drop"*) or, as
+here, name the thing making it. A prompt that says only what a scene looks
+like gets you whatever the model thinks that scene sounds like.
 
-The graph is eight stages:
+The graph is nine stages:
 
 ```
 text-prompt ──> diffusion-conditioner ──> generate-video ─┬─0─> vae-decode ──> rgb-to-video ─┐
                                                           │                                  ├─> save-video
                                                           └─1─> audio-vae-decode ────────────┘
 
-model-select ──> diffusion-conditioner, generate-video, vae-decode, audio-vae-decode
+model-select            ──> diffusion-conditioner, generate-video, vae-decode, audio-vae-decode
+minimax-h3-model-config ──> generate-video (port 9)
 ```
 
 `model-select` names the model once and every model-holding stage latches it,
@@ -214,8 +428,14 @@ From the `generate-video` stage:
 | `width` / `height` | 960 × 544 | **Rounded up** to the nearest multiple of **32** — the video VAE's 16× spatial stride times the DiT's 2× patch. A multiple of 16 is not enough: 1360 is one, and its latent is an odd 85 that the packer cannot patch. The stage logs the change. |
 | `frames` | 120 | **Rounded up** to the nearest count the VAE can chunk — 5, 22, 39, 56, 73, 90, 107, **124**, … So 120 becomes 124. The stage logs the change. |
 | `fps` | 24 | 124 frames ≈ 5.2 s; 56 ≈ 2.3 s. |
-| `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
+| `steps` | 8 | **8 is draft quality** — enough to see what a prompt does — and **16 gives good quality**. One step is one forward of the model, counted the way ComfyUI and diffusers count them — see [Counting steps](#counting-steps). Fewer than 8 is the [Turbo LoRA](#fewer-steps--the-turbo-lora)'s territory, not this model's. `guidance_scale` and a negative prompt are **inert** here — a distilled model has no unconditional pass to guide against, so vpipe skips it rather than paying 2× on a 33B model for nothing. |
 | `seed` | 6 | Same seed + same settings ⇒ same clip. |
+| `i8_gemm` | `true` | An opt-in **lossy** accelerated mode, on in every shipped pipeline here. Only matrix-core GPUs (M5 and newer) can use it, so it does nothing on an M4 — and on an M5 turning it off is slower. It changes the picture slightly, so turn it off when you are judging output rather than speed. |
+| `sage_attn` | `false` | An opt-in **lossy** accelerated mode, independent of both `i8_gemm` and `sol_attn` and settable with either — it runs the attention's QK^T product in int8 with a per-block scale, where `sol_attn` decides which blocks are attended at all. 1.20× on the attention at video geometry, at the same cosine the f16 kernel scores. Matrix cores only. See [Cheaper attention — SageAttention's int8 QK](#cheaper-attention--sageattentions-int8-qk). |
+| `sage_pv8` | `false` | With `sage_attn`: the attention's P·V product in int8 too, held in int32 across key blocks — 2.46 s against `sage_attn`'s 2.90 on one attention of a 1344 × 768 × 362-frame clip. `sage_pv8_from_step` (default `-1`: the first quarter of the steps without) and `sage_pv8_all_rows` (default `false`: the prompt's and soundtrack's rows keep `sage_attn` alone) beside it. See [Its P·V in int8 too](#its-pv-in-int8-too--sage_pv8). |
+| `ane_ffn` / `ane_qkv` | `false` | Opt-in **lossy** modes that run part of every block on the **Apple Neural Engine** beside the GPU. Worth it on an **M4-family** Mac, normally not on an M5. See [The Neural Engine](#the-neural-engine--for-m4-family-macs). |
+| `sol_attn` | `false` | Another opt-in **lossy** accelerated mode, and an independent one — it changes how the attention between the GEMMs is computed where `i8_gemm` changes the GEMMs. 1.27× on the wall clock at 124 frames of 832 × 480, with no extra weights; see [Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing) for the knobs beside it. |
+| `motion_cache` | `false` | An opt-in **lossy** mode of a different kind: it skips whole denoising steps whose answer the last one already predicts, so it composes with every setting above. It pays on long schedules — 1.32× on the denoise at `steps: 20` — and has little to skip on an 8-step draft or a Turbo run. See [Fewer forwards — MotionCache](#fewer-forwards--motioncache). |
 | `unload_when_idle` | `always` | Drop the weights between runs. On 16 GB this is what lets the next stage have the machine. |
 
 And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
@@ -227,6 +447,7 @@ And from the **`minimax-h3-model-config`** stage, wired to `generate-video`'s
 | `condition_timestep` | 1.0 | The level the pinned keyframe rows sit at. `1.0` is **clean** in this model's `t = 1 − sigma` convention. |
 | `condition_audio_timestep` | 1.0 | The same, for a Ref2VA reference **soundtrack**. |
 | `audio_seconds` | 0 | Audio length follows from `frames` and `fps`; set this only to override that. |
+| `sigmas` | — | The video's sigmas **as run**, in place of the grid `steps` and the shifts make — and so of the step count. A ComfyUI `SIGMAS` list pastes as it is. See [Your own grid, and how a step is taken](#your-own-grid-and-how-a-step-is-taken). |
 
 These are H3's own knobs, so they live in an H3 stage rather than in
 `generate-video`, which keeps only what every video model answers to
@@ -240,27 +461,276 @@ distilled model has no unconditional pass to guide against. Wan's guidance
 and expert boundary live in `wan2-model-config` for the same reason — each
 family carries its own.
 
+#### Counting steps
+
+**`steps` is the number of times the model runs**, which is how ComfyUI's
+`steps` and diffusers' `num_inference_steps` count: `steps: 8` is eight
+forwards over the nine sigmas of `linspace(1, 0, 9)`, shifted, the last of
+them the clean end point.
+
+MiniMax's own reference scheduler counts the other way. Its
+`num_inference_steps` is the number of points on that grid, end point
+included, so the same number there runs **one forward fewer**. vpipe
+follows ComfyUI and diffusers rather than the reference for two reasons:
+
+- **A step count travels.** It gets copied out of ComfyUI workflows,
+  model cards and other people's settings, and every one of those means
+  forwards. Read the reference's way, each one lands a step short: 20
+  steps copied from a ComfyUI graph would run 19.
+- **The Turbo adapters are named for it.** A "4-step" or "8-step"
+  distillation is fit to that many forwards on that many intervals of the
+  grid. One forward fewer is a different grid, and nothing reports it.
+
+What the reference-style count would have given is still one number away:
+`steps: N` here is `num_inference_steps: N + 1` there, and the schedules
+are then identical.
+
+#### Your own grid, and how a step is taken
+
+By default a clip runs `steps` forwards over `linspace(1, 0, steps + 1)`,
+pushed through each modality's shift, and every step is an Euler step.
+That is the schedule MiniMax's reference and the Turbo adapters' own
+workflows use. Two settings change it, and they are independent:
+
+- **The grid** — `sigmas` on `minimax-h3-model-config`: the video's sigmas
+  as run, terminal `0` included, strictly falling from at most 1:
+
+  ```json
+  "sigmas": "1, 0.9844, 0.9627, 0.9304, 0.878, 0.7579, 0.5527, 0.2369, 0"
+  ```
+
+  One forward runs per sigma but the last, so this list is eight steps,
+  whatever `generate-video`'s `steps` says (the stage warns when the two
+  disagree). A ComfyUI `SIGMAS` list pastes as it is — brackets are
+  fine — because ComfyUI's sigmas are the video's too. The **audio's**
+  sigmas follow the way ComfyUI's H3 model derives them: each video sigma
+  is taken back to the shared unshifted grid through `video_shift`, then
+  out through `audio_shift`. So the two shifts still matter with a list of
+  your own: they decide where the audio sits. The list for the example
+  above, at shifts 12 / 3, puts the audio at 1, 0.940, 0.866, 0.770,
+  0.643, 0.439, 0.236, 0.072, 0.
+
+- **The update** — a `diffusion-sampler-select` stage wired to
+  `generate-video`'s `sampler` iport (port 3). H3 has its own scheduler and
+  maps the selector's `method` onto it. Each method below runs one forward
+  a step:
+
+  | `method` | what each step does |
+  |---|---|
+  | `euler` | the default: `x += (σ' − σ) · v`, deterministic |
+  | `dmd` | re-noising: the clean estimate `x0 = x + σ · v`, then put at the next sigma with **fresh** noise, `(1 − σ') · x0 + σ' · n` — the update a DMD-style few-step student is sampled with, and diffusers' `stochastic_sampling` |
+  | `res_multistep` | ComfyUI's: second order in log-sigma, off the previous step's `x0` |
+
+  `heun`, `dpmpp_2m` and `dpmpp_sde` are not offered for H3. `heun` and
+  `dpmpp_sde` take **two** forwards a step, which on a 33B model is twice
+  the cost of a step. A spec naming one is warned about and the default
+  runs. `eta` and `s_noise` are `dpmpp_sde`'s and are not read. The
+  re-noise draws from the clip's own seed, or from the selector's `seed`
+  when one is set.
+
+Where an adapter brings its own schedule, the two settings take
+precedence:
+
+- A [HyperFlow](#eight-steps--hyperflow) flow map's grid, or a
+  [Pika H3 Flex](#six-steps-any-reference--pika-h3-flex) sampling
+  contract's, is replaced by `sigmas` (the stage warns). A contract's
+  re-noising goes with it unless the sampler port names `dmd`.
+- A sampler port naming `euler` over a Pika contract keeps the contract's
+  grid and steps it by Euler.
+- A flow map's step **is** its jump to the next sigma, so under one only
+  `euler` runs, and anything else is warned about and dropped.
+- On a [refine](#a-draft-at-2k--open-h3-regenerate-2k), `sigmas` **are**
+  its sigmas. The first one is then the level the clip is re-noised to.
+- TaoMate-H3's streaming method takes neither setting: it runs its own
+  grid and steps.
+
+**A few-step adapter was fitted to a grid.** The Turbo LoRAs were
+distilled on the shifted `linspace` grid at their own shifts (see
+[Fewer steps](#fewer-steps--the-turbo-lora)), HyperFlow and Pika H3 Flex
+on grids of their own, so a grid of yours puts them off their training:
+it may look better on one shot and worse on the next. One thing a list changes that `steps` and the shifts
+cannot reach separately is the **last** step, which takes the clip from
+the last sigma straight to clean. The 8-step grid at shift 12 starts it at
+0.632; at shift 6, 0.462; at shift 12, 16 steps start it at 0.444.
+
 ### How long it takes
 
-Measured on the smallest machine that runs this at all — a **fanless
-MacBook Air 15-inch (M5)**, 10-core CPU / 10-core GPU, 16 GB — on the 8-bit
-model at 960 × 544 (0.5 MP) and 24 fps, 6 steps with the
-[Turbo LoRA](#fewer-steps--the-turbo-lora) applied at run time:
+Measured on the 8-bit model at 960 × 544 (0.5 MP) and 24 fps, 5 steps with
+the [Turbo LoRA](#fewer-steps--the-turbo-lora) applied at run time (the
+shipped Turbo graph runs 6, one forward more), on the
+smallest machine that runs this at all — a **fanless MacBook Air 15-inch
+(M5)**, 10-core CPU / 10-core GPU, 16 GB — and on a **MacBook Pro 16-inch
+(M5 Pro)**, 24 GB:
 
-| frames | clip | |
-|---|---|---|
-| 90 | 3.75 s | **9 min 26 s** |
-| 124 | 5.2 s | **11 min 25 s** |
+| frames | clip | M5 Air, 16 GB | M5 Pro, 24 GB |
+|---|---|---|---|
+| 90 | 3.75 s | **9 min 26 s** | **3 min 20 s** |
+| 124 | 5.2 s | **11 min 25 s** | **5 min 0 s** |
 
 `steps` is the setting that moves this most, and the Turbo adapter is what
 buys the low count: without it, plan on 8 steps for a draft and 16 for a
-final clip, at roughly proportional cost.
+final clip, at roughly proportional cost. What moves the cost of each *step*
+is one of the two attention settings: [the VDN linear
+branch](#faster-attention--the-vdn-linear-branch), which takes the
+124-frame Pro run to **4 min 38 s** and saves more the longer the clip, or
+[Sol-Attn routing](#faster-attention--sol-attn-routing), which needs no
+extra weights and takes a 124-frame run at 832 × 480 from 3 min 30 s to
+**2 min 44 s**.
 
-> **Both figures were measured with the chassis sitting on an ice pack.**
-> That is not a tuning tip so much as a warning about what the numbers are:
-> this model holds the GPU flat out for the whole run, and a fanless Mac
-> clocks down long before it ends. On a warm desk expect slower — how much
-> slower has not been measured here, so no figure for it is quoted.
+**The two columns are not equally solid, and it is worth saying which is
+which.** The M5 Pro column is repeatable: fans, one pinned clock, the same
+figure run to run. The M5 Air column is not. An ice pack is placed by hand,
+and where it sits changes both how long the boost window lasts and how far
+the clock falls afterwards, so those figures carry a run-to-run spread that
+has not been quantified here.
+
+So the gap reads **2.8× at 90 frames and 2.3× at 124**, but the difference
+between those two is not structure — it is mostly the Air moving. The same
+goes for scaling: 90 → 124 frames is 1.38× the length and costs the Air
+1.21× its time against the Pro's 1.50×, and only the Pro's number is a
+measurement rather than one sample of a noisy quantity. Take the Air column
+as the order of magnitude a well-cooled fanless M5 reaches, and the Pro
+column as a figure you can reproduce.
+
+> **The M5 Air column was measured with the chassis sitting on an ice pack**,
+> and even then it is a throttled machine for most of the run. It starts at
+> the full **1578 MHz** and holds it for roughly the **first two minutes**,
+> then throttles and settles into a fluctuation around **1300 MHz** — 82% of
+> the part — because an ice pack is a heatsink that warms up, not stable
+> cooling.
+>
+> So the penalty is a function of how LONG the job is, not a flat tax: a
+> two-minute job never leaves the boost window, while these runs spend
+> **79–82% of their wall clock** past it. Read the Air column as a machine
+> that was fast at the start and is not by the end.
+>
+> It is also **noisy**, in a way the other column is not: the ice pack is
+> placed by hand and where it sits moves both the length of the boost window
+> and the clock it settles to, so repeating an Air run does not repeat its
+> number. On a warm desk it drops further still — the 124-frame run takes
+> about 15 minutes there.
+>
+> **The M5 Pro column is that machine as it ships**, on its own fans with
+> nothing under it, and its fans are enough that the workload pins the GPU at
+> **1620 MHz — the maximum — at 100% for the whole run.** That is **1.25×**
+> the Air's sustained clock before any difference in core count, so clock
+> alone accounts for part of the 2.3–2.8× gap and not for most of it.
+
+<a id="against-h3c"></a>
+#### Against h3.c
+
+The same clip, run against [h3.c](https://github.com/antirez/h3.c) with
+nothing that either runtime can do and the other cannot: the published
+**bf16** weights (the MiniMaxAI snapshot, which is the layout h3.c reads)
+from the internal SSD, **no LoRA and no quantization pass**, 960 × 544,
+124 frames, **6 DiT steps**, the same prompt and seed. h3.c runs its exact
+mode — all 50 blocks, no step reuse — so VPIPE runs without
+[MotionCache](#fewer-forwards--motioncache) too. Each VPIPE run turns on
+what its chip has: `ane_ffn` + `ane_qkv` on the M4 Pro, which has no int8
+matrix path, and `i8_gemm` on the M5 machines, where the
+[Neural Engine does not pay](#the-neural-engine--for-m4-family-macs).
+Wall clock, from launch to the written file:
+
+| | M4 Pro Mac mini, 64 GB | | M5 Pro MacBook Pro 16", 24 GB | |
+|---|---|---|---|---|
+| | **VPIPE** | h3.c | **VPIPE** | h3.c |
+| text encoder + DiT setup | 30 s | 28 s | 20 s | 12 s |
+| denoise, 6 steps | **14 min 27 s** | 19 min 59 s | **4 min 25 s** | 5 min 0 s |
+| VAE decode, video + audio | 2 min 46 s | 2 min 41 s | **43 s** | 1 min 59 s |
+| **total** | **17 min 43 s** | 23 min 9 s | **5 min 29 s** | 7 min 11 s |
+| peak memory | 46.0 GB | 45.2 GB | 18.2 GB | 11.6 GB |
+
+**On the M4 Pro the gain is the denoise, 1.38×, and it is the Neural
+Engine's.** The two tiers take about half of each block's feed-forward and
+q|k|v rows off the GPU. `ane_ffn` alone measured 16 min 3 s on the same
+denoise (19 min 23 s in total); adding `ane_qkv` is the rest. Setup and the
+VAE decode are a wash.
+
+**On the M5 Pro most of it is the decode.** The denoise is 1.13× faster; the
+video VAE decode is 2.8× faster, on the matrix-core convolution. h3.c's
+footprint is the smaller one here because on 24 GB it needs
+`--ssd-streaming`, which reads every block every step — and which runs
+**bf16**: its int8 engines need the whole transformer resident, so on this
+machine they are off. VPIPE streams too, and keeps the blocks it has room
+for (14 of 50 on this run).
+
+**On the fanless M5 MacBook Air 15", 16 GB**, on an ice pack, the same run
+takes **13 min 7 s** against h3.c's 16 min 22 s — **1.25×** end to end, with
+`i8_gemm` as on the M5 Pro and h3.c again on `--ssd-streaming`. Only the
+whole-run times were taken there, and it is the row whose number depends
+on how it is cooled (see the ice-pack note above).
+
+Across the three, VPIPE's times line up as **17 min 43 s** (M4 Pro),
+**13 min 7 s** (M5 Air) and **5 min 29 s** (M5 Pro): the fanless Air finishes
+**1.35×** faster than the fan-cooled M4 Pro on a quarter of its memory, and
+the M5 Pro is **2.4×** the Air — **3.2×** the M4 Pro.
+
+h3.c's M4 figure repeats: run first or second, its denoise landed within
+0.6%.
+
+### Watching it form — live previews
+
+A denoise of this model runs for minutes, and without a preview there is
+nothing to look at until the very end. `generate-video` can show the clip
+as it forms: after a step, it takes the model's current best guess at the
+finished clip and decodes it with a **tiny autoencoder** (a TAE) instead
+of the real video VAE. The result goes out on `generate-video`'s port 2,
+and a `preview` stage wired there plays it in the web UI, looping each
+clip until the next step replaces it.
+
+**[`minimax-h3-text-to-video-preview.vpipeline`](pipelines/minimax-h3-text-to-video-preview.vpipeline)**
+is the text-to-video graph with this added. It needs one small file, and
+[`prepare-minimax-h3-preview.vpipeline`](pipelines/prepare-minimax-h3-preview.vpipeline)
+fetches it (23 MB) and registers it as `madebyollin/taeh3`:
+
+```sh
+cd ~/vpipe-work                                    # the SAME work directory
+vpipe --launch ~/src/vpipe/docs/pipelines/prepare-minimax-h3-preview.vpipeline
+```
+
+That is madebyollin's **`taeh3`**, trained for this model's latent space.
+It is published on GitHub rather than Hugging Face; the catalogue knows
+where. It decodes the same frame count the real VAE does and keeps the
+motion. **Kijai's `MiniMax-H3-TAE`** also works (`Kijai/MiniMax-H3-TAE`,
+10 MB, also in the catalogue). It is a still-image decoder, though, so it
+makes one frame per latent frame and plays them slower to fill the same
+time. On the same clip it also scored lower against the real VAE: 23.3 dB,
+against `taeh3`'s 25.3 dB.
+
+The knobs are on `minimax-h3-model-config`, next to H3's other settings:
+
+| key | default | notes |
+|---|---|---|
+| `preview_vae` | *(empty)* | The TAE: a registered model (`madebyollin/taeh3`), a directory holding one `.safetensors`, or a path to one. Empty turns previews off. |
+| `preview_every` | 1 | Render after every *N*th step; the last step always renders. |
+| `preview_max_edge` | 512 | Longest edge of the preview picture. The TAE always decodes at full size; the picture is then scaled down. Shrinking the latent first instead measured blurry, with colour shifts. |
+| `preview_frames` | 0 | Preview only the first *N* frames; 0 is the whole clip. This is the knob that makes a preview cheaper. |
+
+What it costs, measured on an M4 Pro:
+
+- A full 90-frame 960 × 576 clip takes **0.94 s** to decode on an idle GPU.
+- A 39-frame 512 × 288 preview took about **0.5 s** while the DiT ran
+  (the model resident, 8 s per step). That, and the 3% below, were
+  measured when the full clip took 2.1 s, before the decoder's ReLUs,
+  residual adds, upsamples and concats were folded into its convs, so
+  read both as upper bounds.
+- The decode runs off the generation thread. If a render is still running
+  when the next one is due, the waiting clip is replaced rather than
+  queued, so previews never make the generation wait.
+- The decode does share the GPU. A preview on **every** step added about
+  **3%** to the denoise: 85 s without previews against 87 and 88 s with
+  them, over 7 steps with the runs alternated. Raise `preview_every` to
+  spend less.
+- The last step's preview matched the real VAE decode at **30–32 dB**.
+
+Leave port 2 unwired, or `preview_vae` empty, and nothing is loaded or
+decoded. Two things to know:
+
+- **One consumer only.** The port drops a clip nobody reads rather than
+  holding the generation up, and that policy takes a single consumer.
+- **The `preview` stage runs until you stop the pipeline.** It is a live
+  view, so a graph that includes one does not finish by itself from the
+  command line. Use it in the web UI.
 
 ### More than text in
 
@@ -269,6 +739,18 @@ The checkpoint is named **FL2VA** — *first-and-last to video and audio*. Feed
 anchored to it as the opening frame; add a second `vae-encode` on port 6 and
 the model interpolates between two stills. Both anchors must be encoded at
 the same resolution the clip is generated at.
+
+Port 6 also works **on its own**: wire the `vae-encode` there and leave
+port 5 empty, and the clip is generated *up to* that picture — it ends on
+it instead of starting from it (last frame to video). Write the prompt for a
+shot that arrives at the picture rather than one that leaves it, and show it
+to the conditioner on `ref_image` (port 3), where it is `<Picture 1>`. The
+log's anchor line says which end each anchor pins (`1 keyframe anchor (last
+frame)`).
+[`minimax-h3-last-frame-to-video.vpipeline`](pipelines/minimax-h3-last-frame-to-video.vpipeline)
+is that graph: one `reference.jpg`, centre-cropped to 960x544 and encoded
+once, and a prompt that glides in and settles on it. It runs the way the
+graph below does.
 
 [`minimax-h3-first-last-to-video.vpipeline`](pipelines/minimax-h3-first-last-to-video.vpipeline)
 is that graph, worked through. Drop a `reference.jpg` beside it and run it the
@@ -318,6 +800,17 @@ If you would rather not, delete the `lora` and `lora_scale` keys from
 `minimax-h3-model-config` and put `steps` back up to 8; everything else in
 the graph is the same.
 
+**Show the keyframes to the conditioner too.** Both references hand Qwen3-VL
+each keyframe ahead of the prompt — `<Picture 1>: ` and a vision block for the
+first frame, `<Picture 2>: ` for the last — so a prompt can say "the woman in
+image 1" and mean something. Wire the same resized picture into
+`diffusion-conditioner`'s `ref_image` port (port 3) and the last frame into
+`ref_image2` (port 4). The conditioner then loads its vision tower, the
+presentation gains the pictures' tokens (390 at 832 × 480, 1008 at
+1344 × 768), and `generate-video` tags those rows as video, as the model
+expects. Leave the ports unwired and the conditioning is the prompt alone,
+as this example has it.
+
 `frames` is **124**, not the 120 the text-to-video examples use, because H3
 chunks video 17 frames at a time keeping 5 latents — any count is rounded up
 to the next `17n + 5`. Naming one that already fits means the number in the
@@ -332,15 +825,48 @@ at once is the difference between a clip and a refusal.
 
 MiniMax-H3 ships a **second checkpoint**, `ref2va`, that conditions on a
 *list* of reference media instead of on keyframes: up to **9 images**, **3
-video clips** and **3 soundtracks**, twelve in total, and audio can never be
-the only kind. Images carry subject and style, clips carry motion and camera,
-soundtracks carry a voice or a piece of music.
+video clips** and **3 soundtracks**, twelve in total, in any mix — a
+soundtrack alone included ([below](#a-soundtrack-alone)). Images carry subject
+and style, clips carry motion and camera, soundtracks carry a voice or a piece
+of music.
 
 The two partitions are the same architecture and ship byte-identical
 transformer configs, so **nothing in the weights tells them apart** — vpipe
 reads it off the packaging. A Ref2VA checkpoint wired as if it were FL2VA is
 refused rather than run: it would load, denoise at full 33B cost, and generate
-video conditioned on nothing.
+video conditioned on nothing. Asking it for *no references on purpose* is a
+different request, and one it takes — see
+[prompt only](#no-references-this-time--prompt-only).
+
+The *other* direction is a real mode rather than a mistake: FL2VA weights will
+take reference images through this same sequence, which is what
+[Ref2VA-like](#ref2va-like--references-on-the-fl2va-weights) below is. Read
+this section first — the wiring, the limits and how a reference is read are
+the same — and that one for what changes.
+
+> **A reference is not a keyframe, and Ref2VA cannot pin one.** The two
+> partitions pack different sequences — FL2VA's is
+> `[text | keyframe conditions | target audio | target video]` and Ref2VA's is
+> `[text | reference blocks | target audio | target video]` — so there is no
+> slot that binds a reference to output frame 0. A reference image conditions
+> the **whole clip**: it carries subject, outfit and style everywhere, and
+> nowhere in particular.
+>
+> Asking for one in the prompt (*"use `<Picture 2>` as the opening frame"*)
+> therefore does nothing. It is not disobedience; there is no machinery for
+> that instruction to act on, and the give-away is a run where the wardrobe
+> and the face transfer while the first frame does not. Anchoring an opening
+> frame — continuing from the last frame of a previous clip, say — is
+> [FL2VA's job](#more-than-text-in), on `generate-video` port 5, and the two
+> are mutually exclusive: taking the anchor costs you the reference list.
+> `generate-video` **warns** if you wire a keyframe on a Ref2VA graph rather
+> than dropping it quietly.
+>
+> Continuing a **clip** is a different request, and one Ref2VA does take. A
+> reference video described as the source of a `[video continuation]` is
+> carried on from its end: its motion, its subjects and its sound. That is
+> behaviour the model learned, not a pinned frame; see
+> [Longer clips](#longer-clips--one-story-in-four-parts).
 
 Wire a **`video-ref-encoder`** stage:
 
@@ -348,25 +874,164 @@ Wire a **`video-ref-encoder`** stage:
 | --- | --- |
 | port 0 in | the prompt |
 | port 1 in | optional `model-select` |
+| ports 2–7 in | optional `ref1`..`ref6` — a reference as a tensor |
 | port 0 out | conditioning → `generate-video` port 0 |
 | port 1 out | reference video rows → `generate-video` port **7** |
 | port 2 out | reference audio rows → `generate-video` port **8** |
 
-The references are the stage's **`references` config**, not a port: they are
-files to open, so the composer's file browser fills them in — **select
-several at once** and they land in the list in the order you picked them.
+#### Two ways to hand it a reference
+
+**A list of files**, in the stage's `references` config. They are paths to
+open, so the composer's file browser fills them in — **select several at
+once** and they land in the list in the order you picked them:
 
 ```json
 "references": ["subject.png", "motion.mp4", "voice.wav"]
 ```
 
+**Or a tensor**, on one of the six `ref` iports. That is for the references a
+path cannot name — a still your graph just generated, a cropped frame, a clip
+that was never written to disk — and for choosing each reference's geometry
+yourself. The contract is in
+[References that are not files](#references-that-are-not-files) below.
+
+The two mix freely: port references are numbered *after* the list, and the
+limits (9 images, 3 clips, 3 soundtracks, 12 total) apply to the union. Reach
+for the list when the references are files you have and are happy for the
+model's own rule to size; reach for the ports when a stage produces the
+reference, or when you want to set its size.
+
+#### No references this time — prompt only
+
+An **empty list** is a request of its own: generate from the prompt alone,
+through the Ref2VA checkpoint that is already loaded.
+
+```json
+"references": []
+```
+
+That is what lets one graph serve requests with and without references —
+dropping the last reference no longer means swapping to the FL2VA checkpoint
+(and holding both, on a box that uses Ref2VA elsewhere), and adding one later
+is a change to the list rather than to the graph. A wired `ref` port that
+beats an **empty tensor** says the same thing, since that is its declared way
+of saying *nothing this time*.
+
+What runs is text-to-video's own sequence, `[text | target audio | target
+video]`, read by the Ref2VA weights: the conditioning is the prompt alone,
+byte for byte what `diffusion-conditioner` produces for it, and no reference
+rows are packed. The log says so on each side:
+
+```
+VideoRefEncoderStage('refenc'): prompt only (an explicitly empty reference
+  list) -> 34 conditioning rows, no reference rows
+GenerateVideoStage('gen'): prompt-only Ref2VA -- the request's reference list
+  is explicitly empty, so the Ref2VA weights denoise from the prompt alone
+  over the text-to-video layout
+```
+
+**Leaving the key out is not the same request.** With no `references` key and
+no `ref` port wired, the encoder has been handed nothing at all — which is
+what an unwired graph looks like — and it skips the request with a warning
+rather than spend a 33B denoise on it. `generate-video` holds the same line:
+on the Ref2VA checkpoint, a conditioning that carries no reference list (one
+from a `diffusion-conditioner`, say) is refused, and only an explicitly empty
+one runs.
+
+On the **FL2VA** checkpoint an empty list is simply text-to-video, and a
+keyframe wired on port 5 is honoured as usual. On Ref2VA it is not: the
+prompt-only request is still Ref2VA's sequence, which has no keyframe slot.
+
+This is the Ref2VA weights doing text-to-video, which the sequence permits
+but the Ref2VA recipe does not describe. The FL2VA checkpoint is the trained
+route for it; this one is for the graph that already holds Ref2VA.
+
+#### A soundtrack alone
+
+One soundtrack, or up to three, with **no picture and no clip** is a request
+of its own: a voice to speak in, or a piece of music to move to.
+
+```json
+"references": ["voice.wav"]
+```
+
+Each soundtrack is labelled ahead of the prompt as usual — the presentation
+is `<Audio 1>: ` and then your text, so the prompt can say *"talks in the
+voice of `<Audio 1>`"* — and its rows reach the DiT on the shared clock ahead
+of the generated ones: `[text | reference audio | target audio | target
+video]`. Nothing goes through the vision tower or the video VAE. ComfyUI's
+MiniMax-H3 reference node packs the same request the same way. The log says
+what was packed:
+
+```
+VideoRefEncoderStage('video-ref-encoder'): 1 reference(s) -> 46 conditioning
+  rows, 0 reference video rows, 244 reference audio rows
+```
+
+As with any reference, the soundtrack is cut to the generated duration unless
+`whole_references` keeps it whole. Encoding one takes about **25 MB of GPU
+memory per second** of it while it runs (91 MB for a 3 s cut, 1.5 GB for a
+minute kept whole), and the memory plan books it before the conditioning
+starts. MEASURED on the M4 Pro (the w8 Ref2VA pack streamed from an external
+SSD, 640x352x73, 8 steps, shift 12): a 7.7 s spoken English clip as the only
+reference ran in 6 min 02 s. The clip was clean, its subject talking to camera
+as the prompt asked. Qwen3-ASR heard its soundtrack as English speech opening
+on the reference's own first word ("Sometimes …"); the words after it are not
+the reference's.
+
+#### The example
+
 [`minimax-h3-reference-to-video.vpipeline`](pipelines/minimax-h3-reference-to-video.vpipeline)
-is that graph, and it runs on assets you already have:
+runs on assets you already have:
 
 | reference | carries | where it comes from |
 |---|---|---|
 | `minimax-h3-reference-subject.jpg` | the subject | [ships in this repo](images/minimax-h3-reference-subject.jpg) — made with vpipe's own FLUX.2 text-to-image graph, so it comes with no licence question attached |
-| `minimax-h3-text-to-video.mp4` | the camera move **and** the soundtrack | whatever [step 2](#step-2--text-to-video-and-audio) wrote. A clip that carries its own audio is two references in one — it is labelled `<Audio 1>` and `<Video 1>` and its soundtrack is encoded separately |
+| `minimax-h3-text-to-video.mp4` | the camera move **and** the soundtrack | whatever [step 2](#step-2--text-to-video-and-audio) wrote. A clip with audio stays ONE reference carrying both, labelled `<Video 1>` and `<Audio 1>`, however you feed it |
+
+It takes the **ports** route, preparing each reference through ordinary stages:
+
+```
+load-image → image-resample(1024×1024)                              → ref1
+load-video ┬→ video-to-rgb → image-resample(1344×768) → temporal-stack → ref2
+           └→ audio-to-pcm(32000, stereo) → temporal-stack             → ref3
+```
+
+Seventeen stages where the list would need three lines, and it buys one thing:
+the two `image-resample` sizes are yours. The ports default to
+`short_edge: 0`, so the encoder takes what it is handed instead of re-resolving
+it — change those numbers and the reference geometry changes with them. Swap
+the whole chain for a `references` list if you would rather have the three
+lines; the stage takes either.
+
+Four details in that shape are load-bearing. **One `load-video` feeds both
+streams**, so the clip and its soundtrack still leave one container together —
+the sync argument the `references` list was built on, kept rather than traded.
+**`attach_audio: [3]`** on the encoder makes **ref3**'s audio — the PCM on
+iport 4, the third reference — the soundtrack of the reference before it, so
+it stays one `<Video 1>` + `<Audio 1>` pair instead of becoming a third,
+independent reference. The number is a **reference** number in `1..6`, not an
+iport index: ref1 is iport 2. **`channels: 2`** carries true stereo, which the
+`references` path also does and a mono chain would silently give up.
+And **`max_mb: 384`** on the clip stacker is sized on purpose: the 124-frame
+clip step 2 writes is 366 MiB at 1344 × 768, over the 256 MiB default, which
+would otherwise cap the group at 86 frames and warn. Note how little headroom
+384 leaves — a longer reference clip needs a larger ceiling, or a `duration_s`
+on the `load-video`.
+
+MEASURED: this produces a request identical to the `references` list at every
+count that exists — 2 references, 3,115 conditioning rows, 13,120 reference
+video rows, 130 audio rows, a 22,615-row packed sequence. It is not the same
+*video*, at the same seed: the resize now happens in `image-resample` rather
+than inside the encoder, and two implementations landing on the same dimensions
+do not land on the same bytes. If you want bit-equivalence with the file list
+instead of the size control, leave the resamples at the source size and put
+`short_edge: 768` in the clip stacker's `sideband`.
+
+One inefficiency worth knowing: the encoder truncates a clip to `frames`, so
+this chain resizes all 124 frames of the reference and uses 39. The
+`references` list truncates first and resizes only what it keeps. Bound the
+source rather than raise `max_mb` if that matters.
 
 ```sh
 cd ~/vpipe-work                                    # the work directory again
@@ -379,6 +1044,8 @@ The `.mp4` is already beside them if you ran step 2 from this directory; any
 clip with a soundtrack will do. Point `model-select` at your Ref2VA directory
 if you named it something else, and note the two `frames` settings — the
 encoder's and `generate-video`'s — which already agree at 39 and have to.
+
+#### What it costs
 
 **Ref2VA costs more than its output suggests**, and the example is sized
 around that rather than around the clip it makes. A reference is packed into
@@ -404,46 +1071,305 @@ Dropping to 39 moves both halves and fits — 22,615 rows, of which 13,120 are
 the clip. Making only `width`/`height` smaller would cut the 28% and leave the
 58% exactly where it is.
 
-As shipped — 960 × 544, 39 frames, 8 steps, one still and one clip — that is
-**24 min 15 s** on the fanless 16 GB M5. Around a third of it happens before
+The **other** lever is the reference canvas itself. That 1344 × 768 is an
+*upscale* of a 960 × 544 file — 1.98× the pixels, interpolated from the same
+information — and declining it is worth measuring. MEASURED back to back on an
+idle 16 GB M5 at the same seed, on the two-reference request the example
+builds:
+
+| | `768` (default) | `0` (the clip's own) |
+|---|---|---|
+| reference clip canvas | 1344 × 768 | 960 × 544 |
+| VAE tiles per chunk | 28 | 15 |
+| reference rows | 13,120 | 7,144 |
+| **conditioning rows** | **3,115** | **2,119** |
+| packed sequence | 22,615 | 15,643 |
+| wall clock | 23 m 07 s | 14 m 17 s |
+
+**It moves three things, and the third one surprises people.** The VAE encode
+and the reference rows are the obvious pair. The third is the *conditioner*:
+the vision tower is handed the same normalized pixels and smart-resizes from
+them, so this canvas also decides how many vision tokens a clip contributes —
+996 fewer here, all of them the clip's (the still is encoded at its own short
+edge and does not move). Lowering it is a fidelity decision on **both**
+channels, not a free 1.6×.
+
+And on the shipped example it is visibly not free. At `768` the generated cat
+wears the reference still's navy jacket and sits in the concert hall the
+prompt asks for; at `0`, at the same seed, it wears no jacket and the setting
+collapses toward the reference *clip's* dark room. Different sequence shapes
+give different samples, so one seed is not proof of a systematic loss — but it
+is proof that `0` is a different generation and not a cheaper spelling of the
+same one.
+
+So `768` stays the default: it is the released checkpoint's rule, and a
+reference the model was trained to see upscaled is what it gives. `0` is worth
+*trying* where references are already smaller than 768 and the budget is
+tight — and worth **comparing side by side** before you keep it. The area cap
+still binds a clip larger than the canvas either way.
+
+**Which key you turn depends on the route.** `reference_video_short_edge` is
+the per-kind default, and it is only consulted for a reference whose size the
+encoder has to resolve — i.e. one from the `references` LIST. A reference on a
+port arrives with `short_edge: 0` already set (that is the port default, and
+it is the point of the ports), so the per-kind default is never reached. On
+**this** example, which is the ports route throughout, the `0` column above is
+what you get by resampling the clip to 960 × 544 in `size-clip`; setting
+`reference_video_short_edge` on the encoder would change nothing. The same
+goes for `reference_image_short_edge` and the still.
+
+At the shipped 960 × 544 and 39 frames, one still and one clip, but 7 steps
+where the graph asks for 8, that is
+**23 min 54 s** on the fanless 16 GB M5 (the `references` list, same geometry,
+measured 23 min 07 s: the ports chain resizes every decoded frame and the list
+resizes only the ones it keeps). Around a third of it happens before
 the first denoise step: the 32B conditioner is loaded and streamed, and both
 references are read twice, once by the vision tower at its own canvas and once
 by the video VAE at MiniMax-H3's. Raising `frames` from here raises the
 reference rows with it, so the next size up is a bigger jump than it looks.
 
-A single path may be written bare, without the brackets. **The order is the
-request**: it numbers the references in the prompt the model reads
-(`<Picture 1>`, `<Audio 2>`, `<Video 1>`) and places them on a shared clock,
-so reordering the list is a different generation. That is also why they are
-one list rather than a port per reference — a request's shape is only known
-when it arrives, and twelve `load-image` chains cannot express "three clips
-and nine stills" without the graph being rewritten per request.
+#### How a reference is read
 
-**You do not say what each file is.** vpipe opens it and reads that from the
-file: a container with one frame is an *image* reference, an `.mp4` carrying
+A single path may be written bare, without the brackets. **The order is the
+request**: it numbers the references in the prompt the model reads and places
+them on a shared clock, so reordering the list is a different generation — and
+port references continue that numbering after the last file.
+
+**The number in a tag counts within its KIND, not across the list.** Each of
+`<Picture i>`, `<Video k>` and `<Audio j>` has a counter of its own, so the
+third reference overall can perfectly well be `<Audio 1>` — it is the first
+*soundtrack*, whatever sits ahead of it. Two stills and a soundtrack, in that
+order, present as:
+
+```
+<Picture 1>: … <Picture 2>: … <Audio 1>: … <your prompt text>
+```
+
+and a still followed by a clip that carries sound is `<Picture 1>`,
+`<Audio 1>`, `<Video 1>` — the clip is reference two and still the first video
+and the first audio. Getting this backwards writes a prompt that points at a
+reference which is not there, and nothing reports it: an unmatched tag is
+ordinary text to the model.
+
+A reference's own block is emitted in list order and the prompt text comes
+after all of them, so where you mention a tag inside the prompt is free — the
+tags refer back to blocks the model has already read.
+
+That ordering is why the list exists at all rather than a port per reference.
+A request's shape is only known when it arrives, and twelve `load-image`
+chains cannot express "three clips and nine stills" without the graph being
+rewritten per request. The six ports are the other half of the same argument,
+not a reversal of it: a *path* cannot name a still that does not exist yet.
+Six, and not more, because the numbering has to be static — a port that could
+fall silent would renumber every reference behind it.
+
+**A file does not say what it is.** vpipe opens it and reads that from the
+bytes: a container with one frame is an *image* reference, an `.mp4` carrying
 no video stream is an *audio* one, and an animated `.webp` is a clip. An
 extension is a claim and the bytes are the fact — and a file picker hands
 over whatever the user chose. Getting it wrong is not loud: a still read as
 video conditions the model on a frozen clip, and a clip read as a still
-quietly keeps only its first frame.
+quietly keeps only its first frame. A tensor has no such ambiguity, which is
+one reason the ports type by rank: `[1, 3, H, W]` is a one-frame clip and
+`[3, H, W]` is a still, and nothing has to be inferred.
 
-A video reference conditions on **its own soundtrack** when it has one. That
-is why the stage opens the file itself rather than taking frames from
-`load-video`: a clip and its audio have to come out of one container to stay
-in sync, and the file's **frame rate** has to survive the trip. MiniMax-H3
-resamples every reference onto its own 24 fps, so a rate lost on the way in
-is a generation conditioned at the wrong speed with nothing to complain
-about.
+A video reference conditions on **its own soundtrack** when it has one, and a
+clip and its audio have to leave one container together to stay in sync. The
+`references` list gets that by opening the file itself; the ports route gets
+it from one `load-video` feeding both its streams. Either way the file's
+**frame rate** has to survive the trip: MiniMax-H3 resamples every reference
+onto its own 24 fps, so a rate lost on the way in is a generation conditioned
+at the wrong speed with nothing to complain about. That is why a clip on a
+port must state `fps` and is refused without one.
 
 Set the stage's `frames` to the **same value** as `generate-video`'s: it is
 the duration references are truncated to as well as the size of the sequence
 the transformer packs. They are checked against each other, not trusted.
 
+**Keeping a reference whole.** `whole_references` names references by their
+number in the request -- the `references` list first, then the ports, a
+soundtrack attached to a clip counting with it -- that are NOT truncated:
+`whole_references: [2]` keeps a song's every sample (its frames too, for a
+clip) where the generated duration would cut it. The released recipe
+truncates every reference, so this is off it -- a song drawn on as a whole,
+say. A kept clip is that many more rows on every step, and it moves the
+generated rows on along the shared clock past anything a truncated one could.
+
+Kept whole, a clip in the `references` list is decoded at its own size, which
+nothing downstream bounds: about 6 MB a 1080p frame, plus the resized copy the
+encoder makes. So the stage sizes the decode from the file's header first and
+refuses it, before reading a frame, when it would not fit in the memory the
+machine has free (and never more than half of what it has). The decoder still
+stops at 4096 frames; a clip longer than that keeps its first 4096, and its
+soundtrack is cut to match so the two stay in step. A clip that fits in memory
+can still be too long to use: its vision tokens may pass the encoder's
+`max_prompt_tokens`, or its rows the denoise's scratch preflight, and either
+refuses the request. Naming a picture does nothing (it has no duration).
+
 References never bind the generated geometry. An image is encoded at a short
-edge of its own (2048), with no area cap and upscaling included; a clip goes
-onto the same canvas rule as the target, resolved from *its* aspect ratio.
-Two references of different shapes land on different canvases, which is
-expected.
+edge of its own (`reference_image_short_edge`, 2048), with no area cap and
+upscaling included; a clip goes onto the same canvas rule as the target
+(`reference_video_short_edge` 768, under `reference_video_max_pixels`
+1032192), resolved from *its* aspect ratio. Two references of different shapes
+land on different canvases, which is expected.
+
+Those defaults are the released checkpoint's, and all of them are worth knowing
+about because none is visible in the output. `reference_image_short_edge` in
+particular: at 2048 a single still is 121 VAE tiles, and nine are allowed; at
+1024 it is 25. Lower it on any graph that feeds stills through the
+`references` list.
+
+Both keys are per-kind defaults, so they apply to the `references` list only —
+a reference arriving on a port already carries its own `short_edge` and never
+reaches them. The example holds its still to 1024 with an `image-resample`
+stage instead, which is the ports route's equivalent and the reason it also
+carries a redundant `reference_image_short_edge: 1024`.
+
+You do not have to accept any of it silently. **Every reference the encoder
+had to reshape is warned about**, naming what was kept:
+
+```
+reference 1 fitted -- rescaled 1920x1080 -> 1344x736 (48% of the pixels),
+  resampled 30 -> 24 fps (18 frame(s) dropped),
+  truncated 72 -> 39 frames (54% of the clip)
+```
+
+Three reductions, counted apart on purpose, because they have different
+remedies: the rate resample drops whole frames whether or not the clip is also
+too long, `frames` is what fixes the truncation, and the canvas keys are what
+fix the rescale. A reference that needed nothing is logged at debug as *taken
+as given* — which is the outcome to aim for when you have sized it yourself.
+
+#### References that are not files
+
+Six **tensor iports** (`ref1`..`ref6`) sit after `prompt` and `model`, for the
+references a file list cannot name: a still your graph just generated, a
+cropped frame, a clip that was never written to disk. They supplement the
+`references` list rather than replacing it, and are numbered after it.
+
+| what you send | rank | sideband |
+|---|---|---|
+| audio | `[N]` or `[channels, N]` f32 | `sr` (or `sample_rate`) — **required** |
+| a picture | `[3, H, W]` u8 | — |
+| a clip | `[frames, 3, H, W]` u8 | `fps` — **required** |
+
+Rank is what types it, which also settles the one case a container cannot
+state: a one-frame clip is `[1, 3, H, W]` and a still is `[3, H, W]`, and those
+are different requests. The rates are **required and never defaulted** — a
+soundtrack read at the wrong rate conditions on the wrong sound, and a clip at
+the wrong speed generates video with nothing to complain about.
+
+**Send audio at the audio VAE's rate: 32000 Hz.** A file reference is
+decoded straight onto it, but a *beat* arrives at whatever its producer
+chose, so set the producing `audio-to-pcm`'s `output_sample_rate` to
+`32000`. Another rate is not silently wrong — the encoder resamples it
+onto 32000 and warns — but that is a second pass of the filter over a
+waveform its producer already resampled once, and the fix is one config
+key. It matters because nothing downstream looks at the rate again: an
+*unconformed* 44.1 kHz soundtrack would be encoded as if it were 32 kHz,
+i.e. 1.38× too fast, pitched up a fourth, and 1.38× too long against the
+clip it shares a rotary clock with — with every shape still valid.
+
+Optional sideband keys: `short_edge` sets *this one reference's* canvas,
+`attach` folds a soundtrack onto the reference before it (below), `latent`
+says the beat is already encoded ([Carrying a part's own
+latents](#carrying-a-parts-own-latents)), and `present: false` gives the
+reference to the DiT alone ([below](#a-reference-for-the-dit-alone)).
+
+When the rate is not yours to set — the PCM arrives from a stage you did not
+configure, or one feed has to serve both this port and a 44.1 kHz mux — put an
+**`audio-temporal-resample`** in front of it with `output_sample_rate: 32000`.
+That stage also owns the *speed* and *pitch* of a soundtrack, if the reference
+wants stretching before the model hears it.
+
+##### Audio that belongs to a clip
+
+A clip demuxed into frames and PCM arrives on **two** ports and should stay
+**one** reference. `attach_audio` on the encoder names the ports whose audio is
+a soundtrack rather than a reference of its own:
+
+```json
+"attach_audio": [3]
+```
+
+It is **positional**: the audio folds onto whichever reference immediately
+precedes it. With one clip that is unambiguous; with two, order the ports so
+each soundtrack follows its own clip. There is no way to name a target.
+
+It is a list and not a single switch because a request may legitimately carry
+both an attached soundtrack and a standalone piece of music, and those are
+different references.
+
+**It can attach to a reference from the `references` list.** Files are read
+before any port, so the reference it folds onto may be one of them — which
+makes `references: ["motion.mp4"]` plus a generated soundtrack on a port a
+perfectly good request, and the neatest way to score a clip you already have.
+
+An audio beat's own `attach` sideband overrides the config for that beat, so a
+producer that knows better than the graph can say so — `true` to attach where
+the config did not ask, `false` to decline where it did.
+
+Attaching to a **still** is allowed and warned about. It is a real request —
+a one-frame `.mp4` with an audio track comes through the `references` list the
+same way — but it is far more often a port wired in the wrong order, so the run
+says so rather than refusing something the other route permits.
+
+##### A reference for the DiT alone
+
+`present: false` in a beat's sideband keeps that reference out of the
+prompt. It gets no `<Picture i>` / `<Video k>` / `<Audio j>` block and no
+vision tower run, while its rows are packed and placed on the clock exactly as
+a presented reference's are: the DiT reads it, the conditioner never does. It
+is what ComfyUI's RefMod pack does with a stored reference in **Apply H3
+RefMod**, which appends the latents to the conditioning's references without
+telling the text encoder; its **H3 RefMod Text Encode** is the presented route.
+
+**Count only the presented references when you write tags.** The tags after an
+unpresented reference are numbered without it, so with two stills of which
+the first is for the DiT alone, the second is `<Picture 1>` and there is no
+`<Picture 2>`. A request whose references are all unpresented presents the
+prompt alone.
+
+It is also how a **carried latent with no pixels** comes in. A beat with
+`{latent: true, present: false}` is a reference of its own, with no VAE encode
+and no tower. A presented latent has to `attach` to the picture or clip before
+it, whose pixels feed the tower, because there is nothing else for the tower
+to read. A one-frame latent is a one-frame **clip** unless the beat also says
+`image: true`, which makes it a **still**: one slot on the clock, as the
+picture it was encoded from takes. `image: true` on a latent of more than one
+frame is refused.
+
+To *present* a stored still instead, decode it first: `vae-decode` reads a
+one-frame H3 latent on the stock video VAE, so the picture can go on a port of
+its own with the latent attached after it. The stock decoder cannot read the
+token alone. It decodes five copies of it as one chunk and keeps frame 3, the
+rule ComfyUI's `MiniMaxH3VideoVAE` follows: a photo round-tripped that way read
+33.0 dB, against 17.2 dB for the token alone. The fast decoder
+(`fast_decoder`) does not decode stills.
+
+`present` on a beat that attaches is not read: the reference it folds onto
+keeps its own.
+
+A **wired port must beat every request**; send an empty tensor to say "nothing
+this time". A port that could fall silent would renumber every reference after
+it, and the numbering is the request.
+
+The port default is `short_edge: 0` — **encode it at the size it arrived**.
+That is the point of the ports: if you have resampled to 768 with an
+`image-resample` stage, or cropped to a framing you chose, re-resolving it
+against a per-kind default would scale it straight back up and undo the work
+(and cost you a second Lanczos pass). At `0` the encoder may only **reduce**,
+never enlarge — it brings a picture under the area cap, floors both axes to
+the multiple of 32 the DiT patch and VAE stride demand, and otherwise leaves it
+alone. Three things it still cannot skip: that grid (a 1080-tall frame becomes
+1056), the 1:4 … 4:1 aspect bound, which is a refusal rather than a fit, and
+for clips the 24 fps resample plus the `17n + 5` snap.
+
+Because a short edge of `0` removes the only bound an image reference had, set
+**`reference_image_max_pixels`** on a graph that feeds raw pictures. It is
+uncapped by default, matching the checkpoint, and an uncapped 4K still is
+~220 VAE tiles and 8,160 DiT rows — half the packed sequence of a typical
+request, before its vision tokens.
 
 This stage holds the prompt encoder, its vision tower and both VAEs while it
 runs, so on a memory-bounded box leave `unload_when_idle` at `auto` — the
@@ -481,6 +1407,490 @@ transformers and cannot say which one you meant. Left to guess it picks
 FL2VA, and a Ref2VA request would load, run at full 33B cost, and generate
 video conditioned on nothing.
 
+#### Ref2VA-like — references on the FL2VA weights
+
+You do not always need the second checkpoint. The **FL2VA** weights will take
+reference images too, through Ref2VA's own sequence rather than through
+keyframes, and OpenVDN [published that
+mode](https://github.com/OpenVDN/vdn-minimax-h3#supporting-ref2va-like-task)
+with a rendered example on 2026-09-17. vpipe runs it: wire a
+`video-ref-encoder` exactly as above and point `model-select` at an FL2VA
+checkpoint instead of a Ref2VA one.
+
+[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)
+is that graph, with the [VDN linear branch](#faster-attention--the-vdn-linear-branch)
+and the [Turbo LoRA](#fewer-steps--the-turbo-lora) on it — which is the
+combination upstream renders, and one this mode is what makes possible at
+all: **the VDN branch is only published for FL2VA**, so before it the linear
+attention and references could not be had together.
+
+**What it actually is.** Nothing about the weights changes. The references are
+packed as Ref2VA packs them — `[text | one block per reference | target audio
+| target video]`, one rotary slot each, every one held just short of clean at
+its noise-augmentation level — and read by the FL2VA transformer, not by
+MiniMax-H3's separate `transformer_ref`. The two partitions ship
+byte-identical transformer configs, so the sequence builds either way; what
+differs is only which weights read it.
+
+> **Zero-shot, and say so when you report a result.** This is an ability the
+> FL2VA checkpoint turns out to have, not a task it was trained for. Ref2VA
+> **is** that task, on weights trained for it, and remains the better answer
+> when subject fidelity is the point. `generate-video` names the mode in its
+> log every run that uses it, because the way this fails is a clip that
+> quietly ignores its references and looks entirely ordinary.
+
+**Three differences from a Ref2VA graph**, and only the first needs anything
+from you:
+
+- **Images only.** Upstream's mode is reference *images*. A reference clip or
+  soundtrack packs and runs — the layout is the same one — but nothing
+  published covers it, so vpipe warns. Clips and soundtracks are a trained
+  input on the Ref2VA partition.
+- **A 768 short edge, not 2048.** That is upstream's recipe and vpipe takes it
+  automatically: left unset, `reference_image_short_edge` is **768 on FL2VA**
+  and 2048 on Ref2VA. It is a quarter of the tokens per reference, and those
+  rows sit in the sequence the DiT re-reads at **every step** — so the
+  difference is not a fidelity knob you can leave anywhere safe. Setting the
+  key is always taken as said, on either partition.
+- **Still no keyframe.** References and a keyframe anchor remain mutually
+  exclusive, and that was never about the partition: there is no slot for an
+  anchor in the reference layout whichever weights read it.
+  `generate-video` says so rather than dropping the anchor quietly.
+
+### Longer clips — one story in four parts
+
+A single generation gets expensive fast as it grows: every frame adds rows
+to the packed sequence, and attention pays for rows squared. Four ordinary
+10-second runs are the cheaper way to a **40-second** clip. Each run after
+the first hands the **tail of the one before** to Ref2VA as a clip to
+continue from, so the story is carried forward by the picture and the sound
+rather than by the prompt alone:
+
+- **[`minimax-h3-extend-part1.vpipeline`](pipelines/minimax-h3-extend-part1.vpipeline)**
+  — text to video and audio on the **FL2VA** checkpoint, 243 frames
+  (10.125 s) at 960 × 576. It writes `minimax-h3-extend-part1.mp4`.
+- **[`…-part2`](pipelines/minimax-h3-extend-part2.vpipeline)** /
+  **[`…-part3`](pipelines/minimax-h3-extend-part3.vpipeline)** /
+  **[`…-part4`](pipelines/minimax-h3-extend-part4.vpipeline)**
+  — **Ref2VA**, each conditioned on the last 3.75 s (90 frames) of the part
+  before it, picture and sound. 243 frames each.
+- **[`…-concat`](pipelines/minimax-h3-extend-concat.vpipeline)** — joins the
+  four into one file, in vpipe rather than by hand. See
+  [Joining the parts](#joining-the-parts).
+
+Every continuation is the same graph with a different prompt and a different
+file to read, so a fifth is a copy of the fourth.
+
+**The shipped graphs run the released weights at 20 steps, with no
+adapter.** Every part names the publisher's own checkpoint (see
+[The released weights, either partition](#the-released-weights-either-partition)):
+
+| | checkpoint | steps | shifts |
+|---|---|---|---|
+| part 1 | `MiniMaxAI/MiniMax-H3-FL2VA` | 20 | 12 / 3 |
+| parts 2–4 | `MiniMaxAI/MiniMax-H3-Ref2VA` | 20 | 12 / 3 |
+
+That is a choice for quality over time, and a chain is where it pays. A
+Turbo adapter buys its step count with some of what the base model knows
+about composition — a part can come back with the subject badly placed, a
+hand wrong, or a beat the prompt asked for simply missing — and in a chain
+every later part continues from whatever the one before it got wrong.
+The graphs also leave `sol_attn` off; `i8_gemm` stays on in every part.
+
+**To run the chain faster**, put back what the shipped graphs leave out:
+the prepared 8-bit repacks (`local/MiniMax-H3-FL2VA-8bit` and
+`local/MiniMax-H3-Ref2VA-8bit` on `model-select`), `sol_attn: true` on each
+`generate-video`, and one Turbo adapter per partition on
+`minimax-h3-model-config` — each partition takes ITS OWN, since an adapter
+is distilled for one task and the catalogue's parent link refuses the other
+partition's (see [Which Turbo adapters work](#which-turbo-adapters-work)):
+
+| | `lora` | `steps` | `video_shift` |
+|---|---|---|---|
+| part 1 | `larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema` | 8 | 12 |
+| parts 2–4 | `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p` | 8 | **6.0** |
+
+The Ref2VA adapter is the only one here that needs `video_shift: 6.0`.
+
+When a part comes back with a composition you do not want, try a
+**different `seed`** before rewriting the prompt: it is the cheaper change
+and often enough. Nothing else in the graph changes, and the parts after it
+still read only its tail.
+
+The shipped story is *the clockmaker's songbird*:
+
+| part | what happens | ends on |
+|---|---|---|
+| 1 | In a candlelit workshop walled with clocks, an old clockmaker winds a brass songbird, murmurs *"Just one more turn,"* and raises it on her finger. | her holding still, the bird motionless |
+| 2 | The bird wakes, sings, and flies a circle as every clock chimes; she laughs *"You remembered the song!"* It settles on the frosted windowsill. | the bird still on the sill, watching the snow |
+| 3 | She unlatches the window and lifts the sash; snow blows in, the bird hops onto the open frame and looks back. *"Go on, then. It's your sky."* | the bird poised on the frame, wings half-raised |
+| 4 | It springs into the night, climbs past the eaves, and circles once as she watches from the lit window. *"Goodnight, little one."* | — |
+
+#### Running the chain
+
+You need **both** partitions of the released weights: fetch
+`MiniMaxAI/MiniMax-H3` twice, with `model_variant: fl2va` and `ref2va` (see
+[The released weights, either partition](#the-released-weights-either-partition)).
+To run on the repacks prepared in step 1 and
+[Preparing the Ref2VA checkpoint](#preparing-the-ref2va-checkpoint) instead,
+change each part's `model-select` as described above. Run the parts in
+order, from the same work directory — each part opens the previous part's
+`.mp4` by its relative name:
+
+```sh
+cd ~/vpipe-work                                    # the work directory again
+cp ~/src/vpipe/docs/pipelines/minimax-h3-extend-part*.vpipeline .
+for n in 1 2 3 4; do
+  ~/src/vpipe/build/apps/vpipe/vpipe \
+    --launch minimax-h3-extend-part$n.vpipeline || break
+done
+```
+
+Run them **one at a time**, never together: each holds a 33B transformer
+(see [Memory](#memory)). The `|| break` matters — a part whose input is
+missing produces nothing, and the next part would then condition on a stale
+file rather than fail.
+
+The four part files are **FFV1**, which QuickTime and most browsers do not
+play; they are for the chain to read, not for watching. Watch the joined
+clip, or open a part in `ffplay` or VLC.
+
+#### How a part takes its guide
+
+```
+load-video ─> video-to-rgb(u8) ─> temporal-slice(start −90)
+                                ─> temporal-stack ─────────────> ref1
+load-audio(start_s 6.375, duration_s 3.75) ─> audio-to-pcm(32000, stereo)
+                                           ─> temporal-stack ────────────> ref2
+```
+
+**The guide reaches the model exactly as it was decoded.** The slice feeds
+the stack directly — no resample and no levels adjustment in between. What
+the previous part produced is what the next part continues from.
+
+**The prompt decides where a continuation picks up.** It is meant to carry
+on from the guide's final frame, and with the shipped prompts every part
+does: the parts join without a jump.
+
+Write your own continuation prompts the way these are written — name the
+subjects that carry over and say they are preserved, open the summary with
+`[video continuation + audio reference]`, and give the shot an explicit
+timeline of what happens and when. If a join does jump, **rewrite the
+prompt** rather than correcting the picture: a resample or a brightness
+lift fitted to one join will not transfer to the next.
+
+**The parts are written lossless, because the next part reads them.** Each
+part's `rgb-to-video` emits `yuv444p` at `full` range, tagged `bt709`, and
+its `save-video` encodes that with `video_codec: ffv1` and
+`audio_codec: alac`. So the guide a continuation reads is the decoded picture
+itself — no chroma halved to 4:2:0, no lossy quantization, all 256 code
+values rather than 219 — and nothing compounds down the chain however many
+parts it has. The only lossy encode is the join at the end. A part is about
+80–93 MB for its 10 s at 960 × 576, and the `video_bitrate` its sink carries
+is inert under FFV1.
+
+**Colour range is carried, not assumed.** `save-video` tags the stream it
+writes and `video-to-rgb` reads that tag back, so a clip that is decoded,
+conditioned on and re-encoded keeps its contrast. That matters here
+because a continuation re-reads its own
+output once per part, and an untagged file read by the wrong convention
+loses 219/255 of its contrast on every hop.
+
+**The frame cut is `temporal-slice`, not a seek.** `load-video`'s `start_s`
+lands on the keyframe at or before the time asked for, which in a 10-second
+file may be the first frame. A negative `start` holds exactly the last 90
+decoded frames until the stream ends, so the cut is exact to the frame and
+costs one decode of a short file. Audio packets decode independently, so
+`load-audio` can take its window by time. That window is
+`243/24 − 90/24 = 6.375 s` onward, the same 3.75 s the frames cover.
+
+**`attach_audio: [2]`** folds that soundtrack onto the clip before it, so the
+model reads one `<Video 1>` with its `<Audio 1>` rather than two unrelated
+references (see [Audio that belongs to a clip](#audio-that-belongs-to-a-clip)).
+
+**Why 90 frames.** The encoder snaps a reference clip down to a whole
+`17n + 5` frames **from the start**, so a guide of any other length loses its
+LAST frames — the very moment the continuation is supposed to pick up from.
+Two seconds at 24 fps is 48, which it cuts to 39. 90 is `17 × 5 + 5`, so
+nothing is dropped, and at 3.75 s it carries more of the motion across the
+seam than the shortest clean guide, 56 frames (2.33 s). It encodes to 27
+latent frames of 540 cells: **14,580** reference video rows. MiniMax
+documents **2 s** as the shortest reference clip.
+
+**`reference_video_short_edge: 0`** keeps the guide on its own 960 × 576
+canvas, the output's own size, instead of upscaling it to 1344 × 768. That
+keeps the reference at 14,580 rows rather than roughly twice that. It is the
+trade described under [What it costs](#what-it-costs), and it has not been
+compared side by side on this story.
+
+**`max_prompt_tokens`** on `video-ref-encoder` is raised from its default of
+16,384 — to **65,536** on part 2 and **131,072** on parts 3 and 4. It is the
+ceiling on the conditioner's sequence: the prompt plus the vision tower's
+reading of the guide, which the encoder refuses outright rather than
+truncates when it runs longer. Its KV is paged and costs ~200 KB per token
+actually encoded, so a high ceiling is not memory held up front. Raise it
+when the encoder reports a presentation longer than its token pool.
+
+**`unload_when_idle: destroy`** on both the reference encoder and
+`generate-video` hands each model's memory back as soon as its phase of the
+part is over.
+
+#### Writing the prompts
+
+The prompts follow MiniMax's own prompt guides, which describe the format
+the model was trained on. This is not decoration: H3's encoder reads the
+prompt verbatim, with no rewriting step in between.
+
+- **Part 1** uses the three fields of the
+  [base guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md):
+  `integrated_multimodal_description`, `overall_soundscape` and
+  `non_diegetic_music`. Shots are marked `[Shot N] At MM:SS.mmm`, the
+  speaker has a stable ID, and her line is written as
+  `<d>[English] Just one more turn.</d>`.
+- **Parts 2 to 4** use the six sections of the
+  [reference guide](https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md).
+  `subject_definitions` names the clockmaker, the bird and the workshop as
+  `<Subject 1..3>` of `<Video 1>`, with `<Audio 1>` as its soundtrack. The
+  `summary` opens with **`[video continuation + audio reference]`**, the task
+  type that says the clip is to be continued, and its sound followed without
+  being copied. `retention_analysis` and a shot-by-shot
+  `detailed_description` follow.
+
+**Every part but the last ends on a held shot, and the next one opens on
+it.** Part 1 closes on a static medium close-up from 6.0 s in which nothing
+moves but the candle flames and the pendulums; part 2 opens on that framing
+and holds it two seconds before the bird wakes; part 2 in turn ends on the
+bird motionless on the sill, and so on down the chain. Every guide ENDS
+inside one of those holds, so every seam falls where the picture is still.
+A 3.75 s guide does not always START inside one: parts 2 and 3 cut to their
+final shot at 7.5 s and 7.0 s, so the guides parts 3 and 4 read open on the
+last moments of the shot before — the cut is part of what the model sees.
+Plan the story that way from the start: the beats worth generating are the
+ones **between** the seams, and a hold at least as long as the guide keeps
+the whole guide on it.
+
+**Plant what the next part will act on.** Part 3 opens the window, so part
+2's prompt gives the frame a small brass catch that can lift the sash, keeps
+the window shut through its own shot, and lands the bird just beside the
+catch. The guide part 3 reads then shows the thing it has to use; a detail
+that first appears in the part that needs it is one the model has to invent
+on the spot.
+
+**Carry the subject definitions over word for word.** Parts 2 to 4 describe
+the woman, the bird and the room in identical words, because the clip shows
+them and the text names them — any drift in the wording is drift the model
+is free to apply to the picture. Some drift arrives anyway; see below.
+
+**Ref2VA continues AFTER the clip; it does not replay it.** Part 2 opens
+on the moment after part 1's **last** frame, not on the first frame of the
+guide window. That is continuation the model learned from the task type,
+not a pinned frame. The
+[caveat above](#conditioning-on-references-ref2va) still stands, which is
+one more reason to meet on a moment that does not move.
+
+#### Joining the parts
+
+**The parts are CONSECUTIVE, so they are joined end to end and nothing is
+trimmed.** A continuation resumes *after* its guide instead of re-rendering
+it, so part 2's first frame follows part 1's **last** frame — not the frame
+3.75 s earlier where the guide was cut from. There is no overlapping
+material, so there is nothing to cut inside.
+
+**In vpipe**, that is
+[`minimax-h3-extend-concat.vpipeline`](pipelines/minimax-h3-extend-concat.vpipeline):
+one `load-video` handed all four files, which it joins in the order given.
+
+```json
+"config": {
+  "input_url": [
+    "minimax-h3-extend-part1.mp4",
+    "minimax-h3-extend-part2.mp4",
+    "minimax-h3-extend-part3.mp4",
+    "minimax-h3-extend-part4.mp4"
+  ],
+  "enable_video": true,
+  "enable_audio": true,
+  "options": {
+    "safe": "0"
+  }
+}
+```
+
+**In the web UI this is a file picker.** Open the pipeline in the editor,
+press Browse on `input_url`, and select the four parts in one dialog — they
+land in the array in the order picked. There is no list file to write and no
+demuxer to name.
+
+> **Do not trim the parts as you join them.** Cutting each one where its
+> guide starts looks natural — it is the moment the next part was
+> conditioned on — but it **skips the rendered frames between that point
+> and the part's end**, 3.75 s of story per seam with the shipped guide, and
+> that skip is a visible jump.
+
+```sh
+vpipe --launch minimax-h3-extend-concat.vpipeline
+```
+
+The graph is the ordinary file chain — `load-video → video-to-rgb →
+rgb-to-video → save-video`, with the soundtrack through `audio-to-pcm` — so
+the join is one re-encode at whatever `video_bitrate` the sink is set to,
+and picture and sound stay locked together across every boundary. It is the
+chain's one lossy step: the sink's defaults, H.264 at 4:2:0 and limited
+range with AAC sound, which is what every player expects of a delivered
+file.
+`start_s` / `duration_s` address the joined timeline, not any one part.
+
+> **When you still want a list file.** An array joins whole clips, which is
+> the case here. To trim each clip *as* it joins — `inpoint` / `outpoint`
+> per entry — write the list yourself and name the demuxer with
+> `format: "concat"`, which then also wants `options: {"safe": "0"}` before
+> it will follow absolute paths. Setting `format` alongside an array is an
+> error rather than one of them quietly winning.
+
+The result is **40.5 s** — all four parts whole, 972 frames.
+
+**What it costs.** Each part's held tail and the next part's held opening
+are both kept, so a seam sits on its static beat for both of them rather
+than for one. That longer dwell is the price of losing nothing, and it is
+usually the right trade: a pause reads as deliberate, a skip reads as a
+glitch. If one seam does stall, trim a *few* frames there — never the whole
+guide, which puts the skip back.
+
+**By hand**, if a seam wants a cross-fade rather than a cut — the graph has
+no stage for one — fade over five frames at each junction. With whole parts
+of 10.125 s, each `offset` is the timeline so far less the fade:
+
+```sh
+ffmpeg -i minimax-h3-extend-part1.mp4 -i minimax-h3-extend-part2.mp4 \
+       -i minimax-h3-extend-part3.mp4 -i minimax-h3-extend-part4.mp4 \
+  -filter_complex "\
+[0:v]setpts=PTS-STARTPTS[v0];[1:v]setpts=PTS-STARTPTS[v1];\
+[2:v]setpts=PTS-STARTPTS[v2];[3:v]setpts=PTS-STARTPTS[v3];\
+[v0][v1]xfade=transition=fade:duration=0.208:offset=9.917[a01];\
+[a01][v2]xfade=transition=fade:duration=0.208:offset=19.834[a02];\
+[a02][v3]xfade=transition=fade:duration=0.208:offset=29.751,format=yuv420p[v];\
+[0:a]asetpts=PTS-STARTPTS[t0];[1:a]asetpts=PTS-STARTPTS[t1];\
+[2:a]asetpts=PTS-STARTPTS[t2];[3:a]asetpts=PTS-STARTPTS[t3];\
+[t0][t1]acrossfade=d=0.208[s01];[s01][t2]acrossfade=d=0.208[s02];\
+[s02][t3]acrossfade=d=0.208[a]" \
+  -map "[v]" -map "[a]" -c:v libx264 -crf 18 -c:a aac -b:a 192k \
+  minimax-h3-extend.mp4
+```
+
+A cross-fade consumes the frames it blends, so this lands at **39.9 s**
+rather than 40.5. It is optional.
+
+#### Making it your own
+
+- **Keep each part's two `frames` equal**, on its `generate-video` and its
+  `video-ref-encoder`; they are checked against each other. The parts do not
+  have to be the same length as each other.
+- **Change a part's length and the next part's audio window moves.**
+  `start_s` is `previous_part_frames / 24 − 90 / 24`. Leave `duration_s` at
+  3.75 as long as the slice stays at 90.
+- **A guide is `17n + 5` frames**: 56 (2.33 s), 73 (3.04 s) or the shipped
+  90 (3.75 s). Change `temporal-slice`'s `start`, and the audio window with
+  it. A longer guide carries more motion and costs about 540 rows per extra
+  latent frame at 960 × 576.
+- **Keep the parts lossless.** Switch a part's sink back to H.264 and every
+  continuation after it conditions on a compressed, 4:2:0 copy of the one
+  before — a loss that compounds once per part.
+- **Expect identity to drift along the chain**, and write against it. Each
+  part sees only the 3.75 s before it, so a detail the guide does not show
+  is carried by the prompt alone. Keep the descriptions identical between
+  parts, keep distinguishing features in frame near the seams, and check the
+  last part against the first rather than against the one before it.
+- **For a fifth part**, copy part 4, point its two `load-guide*` stages at
+  `…-part4.mp4`, give the new part its own `output_url`, and add it to the
+  concat list.
+- **Adding a Turbo adapter changes the step count and the shifts with
+  it.** Each one is distilled at a recipe; the table above is what that
+  pair wants, and
+  [Which Turbo adapters work](#which-turbo-adapters-work) lists the rest
+  with theirs. An adapter for the other partition is refused, not applied.
+
+#### Carrying a part's own latents
+
+The chain above hands each part the previous one as **decoded pixels**, and
+the VAE's encoder is not its decoder's inverse: `encode(decode(z))`
+recovers `z` at correlation 0.875 with a 0.86 gain. A part can keep what
+`generate-video` made and hand THAT on instead:
+
+```
+generate-video ─0─> save-tensor(part-latent.vpt)        (the video latent)
+               ─1─> save-tensor(part-audio-latent.vpt)  (its soundtrack)
+```
+
+Two ways to continue from them:
+
+- **Ref2VA, beside the pixels.** Keep the guide's pixel port (the vision
+  tower reads it, writing `<Video 1>` into the prompt) and add a
+  `load-tensor` window of each latent on the next ports, their `sideband`
+  `{latent: true, attach: true}`: the video rows fold onto the clip (its
+  VAE encode skipped), the soundtrack's take the place of its PCM port
+  (the audio VAE skipped). Time is axis 1 of the video latent
+  `[z, T, H/16, W/16]` and axis 2 of the audio latent `[2, 32, n]`; 90
+  frames are the last 27 latent frames and 150 audio latents.
+  With no pixels, `{latent: true, present: false}` hands the DiT the rows
+  alone and the prompt never names them ([A reference for the DiT
+  alone](#a-reference-for-the-dit-alone)).
+- **FL2VA, through the tail — a GUIDE.** `generate-video`'s ports 12
+  (`guide_latent`) and 13 (`guide_audio_latent`) pin latent frames and
+  their soundtrack where they lie in the clip being made, from pixel
+  frame `frame` of the beat's sideband (0 by default): each latent frame
+  at the rotary time of the target frame it stands over. Hand it the
+  last 7 latent frames (22 pixel frames) of the part before and the
+  audio latents of those frames (36 or 37, at 5/3 a frame), make the new
+  part 22 frames longer, and its first 22
+  frames REDO that tail — conditioned, not generated — before it goes
+  on; drop them when you join. No reference encoder: the prompt is
+  FL2VA's own. With no latents kept, a `vae-encode` of the tail's frames
+  (fitted to the part's size) and an `audio-vae-encode` of its sound
+  make the same two beats — `audio-vae-encode` encodes MiniMax H3's
+  soundtracks itself.
+
+The layout these pack is `[text | anchors | guide video | guide audio |
+target audio | target video]`; a guide's rows are conditioning, held at
+the keyframe level and the reference soundtrack's, and a request with
+references (whose layout has no slot) ignores one, saying so. ComfyUI's
+`MiniMaxH3AddGuide` places its guides the same way.
+
+Measured on an M4 Pro: an int8 FL2VA checkpoint with a 6-step Turbo
+adapter at 640x352, a 39-frame part continued by a 39-frame part (22
+frames redone, 17 new), one prompt and one seed for every arm. Each arm is
+compared against the last 22 frames of the part before:
+
+| part 2 | first 7 latent frames, rel-L2 | redone frames, PSNR | the join | soundtrack, PCM correlation |
+|---|---:|---:|---:|---:|
+| guided by the kept latents | 0.088 | 30.1 dB | 23.2 dB | 0.857 |
+| guided by the tail re-encoded | 0.246 | 30.6 dB | 23.3 dB | 0.658 |
+| no guide | 0.898 | 11.4 dB | 11.0 dB | 0.206 |
+
+"The join" is the PSNR from the earlier part's last frame to the new
+part's first new frame. An ordinary frame step of this clip reads
+20–21 dB, so the cut moves the picture less than a frame of its own
+motion does. The PCM correlation is taken at the best shift within
+±1200 samples.
+
+Either guide redoes the tail, and the parts join without a visible cut.
+In the picture the two routes are equal: what `encode(decode(z))` loses
+(0.97 correlation on this clip) is mostly what the decoder does not show.
+The soundtrack is where keeping the latent pays. The audio VAE's round
+trip is poor — the re-encoded tail correlates under 0.5 with the
+latents it came from — so the re-encoded soundtrack is redone less
+faithfully.
+
+Two things move the soundtrack by a fraction of a latent:
+
+- **The tail's start frame.** A tail starting at pixel frame `s` lies at
+  audio latent `5s/3`, and a window of whole latents is exact only when
+  `s` is a multiple of 3. The 22-frame tail of a 17n+5-frame part starts
+  at frame 17(n − 1), so parts of 73, 124 and 175 frames line up exactly.
+  A 39-frame part is a third of a latent (8 ms) off.
+- **`load-audio` is packet-accurate.** Re-encoding the tail's sound from
+  a file starts at the packet that holds `start_s`. That was 68 ms early
+  here (ALAC, 4096-sample packets). Keeping the audio latent avoids this.
+
 ### The released weights, either partition
 
 Both partitions are also catalogued from **`MiniMaxAI/MiniMax-H3`**, the
@@ -503,6 +1913,20 @@ Which partition a directory holds is read from that partition's own
 `model_index.json`, and the model's registration key is what says which one
 you asked for.
 
+The same repository also carries a diffusers pipeline at its root — one
+pipeline over both partitions: `transformer/` is FL2VA's DiT and
+`transformer_ref/` Ref2VA's, beside one `text_encoder/`, `tokenizer/`,
+`processor/`, `vae/` and `audio_vae/`. Every one of them is the released
+weights under diffusers names (the DiTs, VAEs and encoder tensor for
+tensor), and a graph runs on it as it is: point `model-select` at the
+repository root and each stage finds its component, the DiT chosen by
+partition. When the checkout also holds a released partition, that
+partition's copies are used instead — the same weights, so a graph never
+holds two of them. Which partition a graph runs is the model record's to
+say, as for a checkout of both released partitions: register the root
+with `model-register` and `model_type: minimax-h3-ref2va` (or
+`minimax-h3-fl2va`) and select that record; a bare path is taken as FL2VA.
+
 ### Fewer steps — the Turbo LoRA
 
 Steps are the bulk of what this model costs, and good quality from the raw
@@ -512,24 +1936,52 @@ distils that down: usable video **and** synchronized audio at **4 steps**, and
 better still at 6–8. Past 8 it stops helping and starts to over-sharpen, so
 4–8 is the range. Keep `scale` at **1.0** — the adapter is tuned for it.
 
-It adapts the **FL2VA** partition (text-to-video and image-to-video), not
-Ref2VA. Two checkpoints are catalogued because the choice between them is
-real rather than a version bump:
+Most of these adapt the **FL2VA** partition (text-to-video and
+image-to-video), and lightx2v's line also covers **Ref2VA**. Eight adapters are
+catalogued rather than one — twelve entries, because lightx2v publishes four of
+them twice — since the choices between them are real rather than version
+bumps: a different training resolution, a different sigma grid, a different
+partition, a different decomposition of the same file.
 
-| entry | steps | shifts (v/a) | trained at | when |
-|---|---|---|---|---|
-| `Turbo few-step v4-600 EMA` (larryvrh) | 4–8 | 12 / 3 | — | the default. Better static and small-motion shots, better micro-detail. |
-| `Turbo few-step v1-850 EMA` (larryvrh) | 4 | 12 / 3 | — | only for **4 steps with large, fast motion**, where v4 can trail or smear. At 6–8 steps prefer v4. |
-| `Turbo 4-step v1.0 768p` (lightx2v) | 4 | **6** / 3 | 1344×768 | a second distillation, at 768p. **Set `video_shift: 6.0`** — see below. |
-| `Turbo 8-step v1.0 544p` (lightx2v) | 8 or 4 | 12 / 3 | 544p | the 8-step of that line, on the checkpoint's own shifts. |
+| entry | partition | steps | shifts (v/a) | trained at | when |
+|---|---|---|---|---|---|
+| `Turbo few-step v4-600 EMA` (larryvrh) | FL2VA | 4–8 | 12 / 3 | — | the default. Better static and small-motion shots, better micro-detail. |
+| `Turbo few-step v1-850 EMA` (larryvrh) | FL2VA | 4 | 12 / 3 | — | only for **4 steps with large, fast motion**, where v4 can trail or smear. At 6–8 steps prefer v4. |
+| `Turbo 4-step v1.0 768p` (lightx2v) | FL2VA | 4 | **6** / 3 | 1344×768 | a second distillation, at 768p. **Set `video_shift: 6.0`** — see below. |
+| `Turbo 4-step v1.2 768p` (lightx2v) | FL2VA | 4 | **6** / 3 | 1344×768 | the newest of that line, and the one to try first at 4 steps. Published **split** and fused; take the split. |
+| `Turbo 8-step v1.0 544p` (lightx2v) | FL2VA | 8 or 4 | 12 / 3 | 544p | the 8-step of that line, on the checkpoint's own shifts. |
+| `Turbo 8-step v1.0 768p` (lightx2v) | FL2VA | 8 | **6** / 3 | 1344×768 | upstream's own default — LightX2V Studio serves this one. Also published **split**, which is the copy to prefer; see below. |
+| `Turbo 4-step v0.1` (lightx2v) | **Ref2VA** | 4 | 12 / 3 | 544p | the cheaper of the two for the reference partition, and the one on the checkpoint's own shifts. Also published **split**. |
+| `Turbo 8-step v1.0 768p` (lightx2v) | **Ref2VA** | 8 | **6** / 3 | 1344×768 | the other one, and the only Ref2VA adapter that needs `video_shift: 6.0`. Published **split** and fused; take the split. |
 
-**The shifts are part of the adapter, not a preference.** lightx2v's 4-step
-was distilled on a video shift of **6** where this model's default — and every
-other adapter here — is 12. A distillation is fit to the sigma grid it was
-trained on, so running it on the wrong one is not a style difference; it is a
-different schedule, and nothing will report it. `video_shift` lives on the same
-`minimax-h3-model-config` stage as `lora`, which is exactly why the two travel
-in one beat.
+> **The version numbers are upstream's and are not documented.** lightx2v's
+> model card describes only the 8-step v1.0 it deploys, so what separates
+> v1.0, v1.1 and v1.2 of the 4-step 768p line is not stated anywhere. Of the
+> two newer ones only **v1.2** is catalogued — a version number is for taking
+> the latest — but that means "newest", not "measured better here". Compare it
+> against v1.0 on a seed you know before switching a habit to it.
+>
+> The same goes for what the catalogue *records*. For **v1.2** and for the
+> **Ref2VA 8-step 768p**, every field is read off the filename (partition,
+> steps, resolution, dtype) except the shift, which is inherited from the rest
+> of the 768p line. That inheritance is the assumption worth re-checking if
+> upstream ever documents these: a wrong shift is a wrong sigma grid, and
+> nothing reports it.
+
+**The shifts are part of the adapter, not a preference.** lightx2v's 768p
+checkpoints were distilled on a video shift of **6** where this model's
+default — and every adapter here not trained at 768p — is 12. A distillation is fit to the
+sigma grid it was trained on, so running it on the wrong one is not a style
+difference; it is a different schedule, and nothing will report it.
+`video_shift` lives on the same `minimax-h3-model-config` stage as `lora`,
+which is exactly why the two travel in one beat.
+
+**`-split` is the diffusers copy, and it is the better file.** lightx2v
+publishes each adapter twice — once fused for ComfyUI, once as the original
+split `to_q`/`to_k`/`to_v` export — and vpipe loads both. Prefer the split
+one: see [Which Turbo adapters work](#which-turbo-adapters-work) for why a
+published fusion is silently wrong on one of the two weight releases and a
+split file is right on both.
 
 #### Get it
 
@@ -545,18 +1997,30 @@ it ships, so there is nothing to quantize afterwards.
 
 lightx2v's line is
 [`prepare-minimax-h3-turbo-lora-lightx2v.vpipeline`](pipelines/prepare-minimax-h3-turbo-lora-lightx2v.vpipeline),
-same shape, pinning `lightx2v/Minimax-h3-Turbo-4step-768p` (swap in
-`lightx2v/Minimax-h3-Turbo-8step` for the other). Only the **ComfyUI**
-spellings of that repo are catalogued: it publishes each adapter twice and the
-diffusers copy needs a conversion this build does not do — see *Which Turbo
-adapters work* below.
+same shape, pinning `lightx2v/Minimax-h3-Turbo-4step-768p`. Both of that
+repo's spellings are catalogued — it publishes each adapter twice, fused for
+ComfyUI and split for diffusers, and vpipe loads either. The full set of
+`model_variant` values:
+
+| variant | what |
+|---|---|
+| `lightx2v/Minimax-h3-Turbo-4step-768p` | FL2VA 4-step, shift 6 |
+| `lightx2v/Minimax-h3-Turbo-8step` | FL2VA 8-step, 544p, shift 12 |
+| `lightx2v/Minimax-h3-Turbo-8step-768p` | FL2VA 8-step, shift 6 |
+| `lightx2v/Minimax-h3-Turbo-8step-768p-split` | the same, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-4step-768p-v1.2` | FL2VA 4-step **v1.2**, shift 6, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-4step-768p-v1.2-comfyui` | the same, fused |
+| `lightx2v/Minimax-h3-Turbo-ref2va-4step` | Ref2VA 4-step, 544p, shift 12 |
+| `lightx2v/Minimax-h3-Turbo-ref2va-4step-split` | the same, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p` | Ref2VA 8-step, shift 6, **split** — prefer this |
+| `lightx2v/Minimax-h3-Turbo-ref2va-8step-768p-comfyui` | the same, fused |
 
 `model_variant` is not optional here and its value is the catalogue **name**,
-not a word from the title. Both Turbo checkpoints are published from the one
-repo, so a bare `"turbo"` matches both and the fetch is refused with the
-candidates listed rather than quietly taking the first. Swap in
-`larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema` for the other one; they share a
-directory on disk and register under separate keys.
+not a word from the title. Every Turbo checkpoint of a repo is published from
+that one repo, so a bare `"turbo"` matches several and the fetch is refused
+with the candidates listed rather than quietly taking the first. For larryvrh
+that means swapping in `larryvrh/MiniMax-H3-Turbo-Lora-v1-850-ema` for the
+other one; they share a directory on disk and register under separate keys.
 
 The fetch **registers** the adapter under its catalogue name — an `owner/name`
 key like `larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema` — and that key is what the
@@ -582,7 +2046,7 @@ the adapter replaces the step count, not the checkpoint. Everything else in
 the graph is untouched, which is the point: applying a LoRA is a config edit
 on one stage, not a different pipeline.
 
-**What it costs.** 960 × 544 · 24 fps · **124 frames** (5.17 s) · 6 steps,
+**What it costs.** 960 × 544 · 24 fps · **124 frames** (5.17 s) · 5 steps,
 end to end from `vpipe --launch` to the muxed mp4. The pipeline asks for 120
 and the stage rounds **up to 124** — the video VAE takes 17-frame clips and
 keeps 5 latents from each, so only 17n+5 has a latent form, and it says so in
@@ -592,22 +2056,46 @@ the log.
 |---|---|
 | **M4 Pro** Mac mini, 64 GB, models on an external Thunderbolt SSD | **21 min 44 s** |
 | **M5** MacBook Air 15", 16 GB, fanless, on an ice pack | **11 min 25 s** |
+| **M5 Pro** MacBook Pro 16", 24 GB, its own fans, no cooling aid | **5 min 0 s** |
 
-Both rows are the same pipeline file, so they are directly comparable: the
-fanless M5 finishes **1.9× faster** than the fan-cooled M4 Pro, and does it
-on a quarter of the RAM. On 16 GB the DiT streams its weights, which is what
-keeps that machine from going faster still.
+All three rows are the same pipeline file, so they are directly comparable:
+the fanless M5 finishes **1.9× faster** than the fan-cooled M4 Pro, and does
+it on a quarter of the RAM. On 16 GB the DiT streams its weights, which is
+what keeps that machine from going faster still. The M5 Pro is **2.3× faster
+again** — 4.3× the M4 Pro — with more RAM and, measurably, a chassis that
+holds its clocks.
 
-Each row is that chassis at its best — a fan for one, an ice pack for the
-other. The **same M5 run on a desk takes about 15 minutes**, so on a fanless
-Mac, cooling is worth roughly a tenth of the wall clock and is the first thing
-to check before reading anything else into a timing.
+Each row is that chassis at its best, and for the Air that still is not
+very good for long. It starts at the full **1578 MHz** and holds it about
+**two minutes**, then throttles to a fluctuation around **1300 MHz** — 82%
+of the part — because an ice pack is a heatsink that warms up, not stable
+cooling. An 11-minute run therefore spends **~82% of itself throttled**,
+which is why the number to distrust on a fanless Mac is a short benchmark:
+it can finish before the machine slows down. The **same run on a desk takes
+about 15 minutes**, so cooling is worth roughly a **quarter** of the wall
+clock here, and is the first thing to check before reading anything else
+into a timing.
 
-Note that this pipeline sets `i8_gemm`. It is an opt-in **lossy** accelerated
-mode that only matrix-core GPUs (M5 and newer) can use — so it does nothing on
-the M4 Pro, and an M5 run without it will be slower than 11 min 25 s. It works
-with the adapter, but it changes the picture by about as much as the adapter
-does, so turn one at a time when you are judging output rather than speed.
+It is a **noisy** row for the same reason. The ice pack is placed by hand,
+and where it sits moves both the length of the boost window and the clock
+after it, so the Air figure is one sample rather than a repeatable number.
+Treat it as the order of magnitude, and compare against it accordingly.
+
+The M5 Pro row is the machine as it ships, with nothing under it: its fans
+are enough that this workload **pins the GPU at 1620 MHz, its maximum, at
+100% for the whole run** — so unlike the Air it is repeatable, and it is the
+row to quote when a number has to hold up. The two M5 rows are therefore not
+the same silicon running at the same rate: one is held at its ceiling, the
+other spends most of its run **18% under its own**. That is about **1.25×**
+of the 2.3× between them, leaving roughly **1.8×** to core count and memory
+— worth separating, because only the 1.25× is something better cooling could
+recover.
+
+Like every other pipeline here this one sets `i8_gemm` (see [the settings
+worth knowing](#the-settings-worth-knowing)). It does nothing on the M4 Pro,
+and an M5 run without it will be slower than 11 min 25 s. It works with the
+adapter, but it changes the picture by about as much as the adapter does, so
+turn one at a time when you are judging output rather than speed.
 
 There are two ways to apply it, and for this adapter they are not
 equivalent.
@@ -651,6 +2139,56 @@ which kernels the blocks are built with, so it cannot be swapped under a
 running DiT. A beat that changes the adapter after the DiT is built is
 reported and ignored rather than silently applied to the next clip; one that
 changes only the strength is applied.
+
+#### Several at once
+
+There are **eight slots**: `lora`, then `lora2` … `lora8`, each with its own
+`_scale` and `_qkv_layout`, and every one works exactly as the first does:
+
+```json
+{
+  "id": "h3-config", "type": "minimax-h3-model-config", "iports": [],
+  "config": {
+    "lora":  "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema",
+    "lora_scale": 1.0,
+    "lora2": "my-style-adapter",
+    "lora2_scale": 0.7,
+    "lora3": "my-character-adapter",
+    "lora3_scale": 0.5
+  }
+}
+```
+
+Every adapted projection then computes
+`W x + s1 B1 (A1 x) + s2 B2 (A2 x) + …`, one term per named slot. The pairing
+this exists for is a **few-step distillation** in one slot — a correction to
+the whole model, belonging at the strength it was trained at — beside **style
+or identity adapters** in the others, which are the ones you actually dial.
+Nothing in the model distinguishes the slots though: any may hold any, a slot
+may be left empty, and `lora2` alone (no `lora`) is a perfectly ordinary
+request.
+
+**The strengths are independent, and all stay live.** That is the reason the
+adapters are separate slots rather than one merged set of factors. Merging is
+exact arithmetic — stack the factors on the rank axis, `A = [s1 A1; s2 A2; …]`
+and `B = [B1 | B2 | …]`, and one adapter of rank `r1 + r2 + …` computes the
+same sum for free — but it folds every strength into `A`, which turns the live
+knob back into a rebuild for the adapters most likely to be swept.
+
+What each further adapter costs is **its own pair of skinny GEMMs**, about
+1.5% of a projection at rank 64, and its own rows of a small `[rows, rank]`
+scratch. The base weight is still read once, which is where the time actually
+goes. One caveat if you compare runs: each adapter's delta accumulates onto the
+output in its own bf16 pass, so *the same* adapter split across two slots at
+half strength is not bit-identical to one slot at full — **measured at 5.7e-3
+of the output, flat across strengths**, which is one and a half bf16 ULPs and
+not a scale-dependent error. Eight *different* adapters named in the reverse
+order land **7.2e-3** from the original order (measured through four blocks),
+which is the same rounding and not a different sum.
+
+`lora2` … `lora8` are load-time exactly as `lora` is, and each slot's
+`_qkv_layout` is its own because the fused-`qkv` row order is a property of the
+*file*: two adapters from different publishers need different answers.
 
 #### Merging, and why it loses most of this adapter
 
@@ -703,21 +2241,37 @@ qkv grouping. Neither is visible in the tensors. Budget the disk: it reads
 #### Which Turbo adapters work
 
 Both paths key on the model's own module names, and tolerate a
-`diffusion_model.` container prefix (the ComfyUI convention) on top of them.
+`diffusion_model.` container prefix (the ComfyUI convention) on top of them —
+or kohya's flattened spelling of them, which is what community LoRAs come in
+(see [Community LoRAs](#community-loras--civitai-musubi-tuner-ai-toolkit)).
 Measured against the FL2VA base:
 
 | adapter | modules | works |
 |---|---|---|
 | `larryvrh/MiniMax-H3-Turbo-Lora` | 259 (adds `adaln_proj`, `final_layer`) | yes, both paths |
 | `lightx2v/Minimax-h3-Turbo`, the `_comfyui_` files | 208 | yes, both paths |
-| `lightx2v/Minimax-h3-Turbo`, the diffusers files | 312 | **no** |
+| `lightx2v/Minimax-h3-Turbo`, the diffusers files | 312 | yes, both paths — **and these are the ones to hold** |
 
 The diffusers spelling is not a naming difference but a different
-decomposition: separate `to_q`/`to_k`/`to_v` adapters that would have to be
-stacked block-diagonally into the fused `qkv_proj`, and an `ff.net.0.proj`
-in diffusers' **value-first** order whose halves would need swapping. Both
-transforms produce a well-shaped, wrong model if guessed at, so they are
-refused rather than approximated.
+decomposition: separate `to_q`/`to_k`/`to_v` adapters stacked
+block-diagonally into the fused `qkv_proj`, and an `ff.net.0.proj` in
+diffusers' **value-first** order whose halves are swapped into this model's
+gate-first `mlp.fc1`. vpipe does both transforms at load, verified
+tensor-for-tensor against upstream's own ComfyUI conversion of the same
+adapter: `A` concatenates on the rank axis exactly, `B` is exactly
+block-diagonal, `fc1`'s halves are exactly swapped, `out_proj` and `fc2` are
+byte-identical, and alpha 8 over rank 128 is the same strength as the fused
+24 over 384.
+
+**Prefer the diffusers copy**, which is why both are catalogued. A *published*
+fusion is built for one qkv column grouping — flat, in every case that
+exists — so it is silently wrong on the other publisher's weights. Fusing from
+the split file happens against the DiT actually loaded, so it is right on
+both. It is also the smaller download, 1.38 GB against 1.96, the difference
+being the two thirds of a block-diagonal `B` that is zero — and the smaller
+model, for the same reason: split q/k/v are fused *banded*, each output row
+keeping only its own part's factors, where a published fusion arrives with
+the zeros built in and holds them in RAM too.
 
 lightx2v's `_comfyui_` `qkv_proj` is rank 384 — three rank-128 adapters
 stacked — and that stacking is how you can tell which base it assumes: its
@@ -725,10 +2279,2149 @@ stacked — and that stacking is how you can tell which base it assumes: its
 the Comfy-Org flat grouping, not the per-head release its `base_model` tag
 names.
 
-**On the released MiniMaxAI weights either path would be wrong.** The adapter
-is trained against Comfy-Org's repack, so its `attn.qkv_proj` delta assumes the
+**On the released MiniMaxAI weights a fused adapter would be wrong.** It is
+trained against Comfy-Org's repack, so its `attn.qkv_proj` delta assumes the
 flat grouping. Applied to the per-head release it would add one head's `q`
-delta onto another head's `k`, in all 50 blocks, with nothing to report.
+delta onto another head's `k`, in all 50 blocks, with nothing to report. This
+is exactly the case the split files do not have: their q, k and v arrive
+separately and are fused here, into whichever grouping the loaded DiT has.
+
+#### Community LoRAs — Civitai, musubi-tuner, ai-toolkit
+
+A style, motion or character LoRA trained by the community loads exactly as
+the Turbo adapters do: name the `.safetensors` in `lora` (or any free slot,
+`lora2` … `lora8`) and set its strength with that slot's `_scale`. In the web UI the field has two buttons — the
+model picker for catalogued adapters, and a file browser for a `.safetensors`
+you downloaded into the sandbox. **No conversion is needed.** The reader takes
+each spelling H3's trainers are known to write:
+
+| written by | tensor names | strength |
+|---|---|---|
+| musubi-tuner, kohya sd-scripts | `lora_unet_blocks_0_attn_qkv_proj.lora_down.weight` / `.lora_up.weight` | per-module `.alpha` |
+| ai-toolkit, diffusion-pipe, ComfyUI conversions | `diffusion_model.blocks.0.attn.qkv_proj.lora_A.weight` / `.lora_B.weight` | `.alpha` if present, else at full strength |
+| this DiT's own names | `blocks.0.attn.qkv_proj.lora_A.weight` | the same |
+| diffusers / peft | `transformer_blocks.0.attn.to_q.lora_A.default.weight` | the header's `alpha` |
+
+kohya's names are this model's own module paths with the dots flattened to
+underscores. That cannot be undone from the file's side — `qkv_proj` and
+`qkv.proj` flatten alike — so vpipe goes the other way: it flattens the
+model's names and looks those up, which is exact. `lora-fuse` reads kohya's
+spelling the same way, so for such a file the runtime and merged paths adapt
+the same projections.
+
+The log line says which it found — here a musubi-tuner LoRA at its default
+targets, four projections in each of the 50 blocks:
+
+```
+MetalMiniMaxH3Transformer: runtime LoRA 'my-style.safetensors' -- 200 modules
+  at scale 1, rank <= 32, kohya lora_down/lora_up factors
+```
+
+**Do not rename the keys by hand.** A converted file works only if it keeps
+two things a quick script tends to lose. The first is `.alpha`: kohya
+applies each module at `alpha / rank`, so dropping it changes the strength —
+an adapter saved at alpha 1 over rank 32 then lands **32× too strong**. The
+second is the module each factor pair belongs to: a pair renamed onto the
+wrong projection is set aside while the rest of the adapter runs — reported
+as `SKIPPED (shape mismatch)` when the new name is a projection of another
+shape, and not at all when it names nothing the model has. Hand the loader
+the file as the trainer wrote it.
+
+A file that still binds nothing is refused with the spellings above named in
+the message. That is a naming question, not a broken download — open an
+issue with a few of its tensor names.
+
+The fused `qkv_proj` carries a row order that the names do not show. As with
+the Turbo adapters, vpipe reads a fused `qkv_proj` adapter as Comfy-Org's
+flat grouping and re-orders it for the per-head MiniMaxAI release. If an
+adapter was trained on MiniMaxAI's own weights, set
+`lora_qkv_layout: per_head` (`lora2_qkv_layout` … for the other slots).
+
+### FP8 checkpoints — lightx2v's turbo DiT
+
+[lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
+publishes the FL2VA DiT with its 4-step Turbo **merged in** and stored as
+**FP8** — `minimax_h3_fl2v_turbo_4step_v1.1_768p_fp8.safetensors`, 32 GB
+against the 66 GB of bf16. It is one file with no config, in the
+**diffusers** naming (`transformer_blocks.0.attn.to_q` rather than this
+model's own `blocks.0.attn.qkv_proj`), and each weight carries a per-row
+scale.
+
+Run it as it is, with two settings. Point `generate-video`'s `dit_dir` at
+the file and keep `model-select` on the H3 checkpoint you already have,
+which supplies the prompt encoder and both VAEs:
+
+```json
+"config": {
+  "height": 480,
+  "width": 832,
+  "frames": 56,
+  "steps": 4,
+  "seed": 6,
+  "dit_dir": "/path/to/minimax_h3_fl2v_turbo_4step_v1.1_768p_fp8.safetensors"
+}
+```
+
+Then set the **video shift to 6** in the `minimax-h3-model-config` stage
+wired to `generate-video`'s `model_config` port:
+
+```json
+"config": {
+  "video_shift": 6.0,
+  "audio_shift": 3.0
+}
+```
+
+The Turbo is inside those weights, so leave the Turbo LoRA off and run
+4 steps.
+
+The shift is the schedule the distillation was fit to. Upstream's table
+lists video / audio shifts of 6 / 3 for the 768p Turbo releases (the
+4-step and 8-step v1.0), against 12 / 3 for the base model and the 544p
+Turbos. This file is the 4-step 768p line at v1.1, which the table does
+not list, so the 6 comes from its line. Left at the default 12, the
+merged Turbo samples a different schedule from the one it was distilled
+on. `generate-video` logs the shifts it will run with when it identifies
+the checkpoint (`MiniMax-H3 (video+audio) at …, shifts 6.0/3.0`).
+
+Nothing is converted and nothing lands on disk. The names are translated
+when the file is opened: q, k and v are stacked into the fused projection,
+the two halves of the first feed-forward matrix are exchanged into this
+model's gate-first order, and the rotary table the file omits is computed
+from its base. The weights **stay FP8 in memory**. Each projection is
+widened to bf16 on the GPU just before it is used, so a streamed block is
+half the size it is in bf16 (367 MB against 735). That computes exactly
+what a bf16 copy of the file would, checked bit for bit, streamed and
+with every block resident. So is the translation itself: the publisher's bf16
+diffusers
+checkpoint (`MiniMaxAI/MiniMax-H3-diffusers`) now loads the same way, and
+matches the native release to the bit.
+
+MEASURED on an M4 Pro at 832×480×56, 4 steps, with the file on an external
+SSD: 4 m 54 s end to end, against 4 m 56 s for the bf16 FL2VA weights with
+lightx2v's matching bf16 Turbo LoRA applied at runtime. The two clips show
+the same shot and motion. The FP8 weights, and the Turbo merged into them
+rather than applied at runtime, move the details a little.
+
+**FP8 LoRAs**, plain or scaled, work anywhere a LoRA does. A scaled FP8
+adapter runs exactly what its bf16 decode does. Prefer the scaled form,
+because plain FP8 flushes the small values a LoRA is made of.
+
+Comfy-Org's `…_pruned_fp8_scaled` files read too: they are H3 in
+ComfyUI's *pruned* form, described under [Pruned files](#pruned-files)
+below.
+
+### int8 checkpoints — community DiTs saved by ComfyUI
+
+A community fine-tune of H3 is usually one `.safetensors` that **ComfyUI
+saved**, often requantized to int8 on the way (silveroxides'
+`convert_to_quant --int8 --convrot --comfy_quant`). Such a file is
+ComfyUI's model state:
+
+- every name is this model's own, under `model.diffusion_model.`;
+- there is no config and no metadata;
+- the fused `qkv_proj` is in ComfyUI's **flat** order, `[all q | all k |
+  all v]`, in the main blocks and the token refiner alike. This was
+  checked row against row on a community int8 file, against the
+  released per-head DiT.
+
+Point `generate-video`'s `dit_dir` at the file, as for lightx2v's FP8 one.
+The prefix is dropped when the file is opened, the dimensions are read
+off the tensors, and the qkv is read flat. A file saved this way is
+recognised by its prefix, or, saved with bare names as Comfy-Org's own
+files are, by the pruned form's `adaln_t_table`, which only ComfyUI
+writes. Any other fused, unprefixed file with no config is refused,
+because nothing in it says which order its qkv is in.
+
+**int8.** Each quantized projection is a `comfy_quant` record,
+`{"format": "int8_tensorwise", ...}`, over `I8` codes and their
+`weight_scale` (one value, or one per row). Its value is code × scale.
+With `"convrot": true` the codes quantize the weight **rotated**:
+comfy_kitchen's ConvRot. Each group of `convrot_groupsize` input columns
+(256; 64 where 256 does not divide them, as in the AdaLN projections) is
+multiplied by Hᵀ, where H is the normalized *regular* Hadamard: Kronecker
+powers of `[[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]`. Read as plain
+codes, a rotated row has the right length and the wrong direction
+(cosine about 0.05 with the weight it came from), so the rotation has to
+come off.
+
+The codes stay int8 in memory and are widened per GEMM, as FP8's are. The
+widening un-rotates the **codes** before it scales them: a row's scale is
+common to its groups, and integer codes stay integers through the
+rotation (under 2²⁴ in magnitude), so that part is exact. Each value is
+then code-sum × scale / √group, rounded once to bf16 — the host decode's
+bf16 bit for bit, and within one bf16 rounding of comfy_kitchen's
+`dequantize_int8_convrot_weight` (checked against the matrix built as
+comfy_kitchen builds it). A threadgroup takes 1024 elements, one radix-4
+stage per base-4 digit of the index. Run-time LoRAs apply over the
+widened weight. The Neural Engine tiers (`ane_ffn`, `ane_qkv`) take
+int8 projections as they take any other: the codes are un-rotated and
+scaled on the CPU into the same bf16 values the GPU's widening makes,
+and handed to the ANE in fp16. The int8 GEMM tiers leave them on the
+accurate route, as they do FP8 — with one exception, below. Only models that opt in read int8; for every other
+reader, LoRA files included, it stays refused by name. A host built
+before these kernels runs FP8 checkpoints as before and refuses an int8
+one by name.
+
+**On the `token` tier, the codes run as stored.** A ConvRot-256 file's
+codes are already the token tier's layout — int8, one scale per output
+row over the whole input — only in ConvRot's basis. So on a Mac with
+matrix cores (the M5 family), with `i8_gemm` on at `i8_gemm_tier: token`,
+nothing is widened or converted: the activation is rotated the same way
+before it is quantized per token, and the int8 GEMM runs over the file's
+codes. ConvRot's regular Hadamard is a signed permutation of the
+Sylvester one the tier already rotates by, so the rotation costs no more
+than the tier's own. The load line counts the projections that do
+("… ComfyUI ConvRot projection(s) run their codes as stored").
+MEASURED on a base M5 at H3's widths (two blocks, 5248 rows): a forward
+**1.37×** faster than widening per GEMM. On a small test model its
+output is 1.4% from the same weights run dense, closer than the token
+tier comes on a bf16 checkpoint (1.9%): the file's codes need no second
+quantization. On an M4 the codes are widened per GEMM as before.
+
+MEASURED on an M5 Pro (24 GB) with H3's **Ref2VA** DiT requantized this
+way (34.0 GB against 66.3 GB of bf16). The run was 832×480×39 at seed 7,
+8 steps with the Ref2VA 8-step LoRA and Sol + Sage + int8 GEMMs, the DiT
+streaming in both runs:
+
+- **Speed:** the denoise took the same time with either DiT: about 80 s
+  to reach 90%.
+- **Memory:** the resource plan's figure for the DiT dropped from
+  126.8 GB to 32.5 GB.
+- **Picture:** the clips are the same shot, framing and light, at 34.0 dB
+  mean PSNR (32.4 worst) frame for frame. The details move as two
+  samples' do. This is one seed: it shows the weights are H3's, not that
+  one rounding is closer than another. The same run with the codes
+  un-rotated in f32 after scaling gave 29.8 dB.
+
+The file's partition is its fine-tune's, and nothing in the file says
+which it is. `dit_dir` does not choose it: the graph's model record does,
+as for the released weights (see
+[The released weights, either partition](#the-released-weights-either-partition)).
+For a Ref2VA-based file, select a record registered with
+`model_type: minimax-h3-ref2va`; a bare path is taken as FL2VA.
+
+#### Pruned files
+
+Many community files are saved in ComfyUI's *pruned* form (named
+`…_pruned`), and so are Comfy-Org's own (`…_pruned_bf16`,
+`…_pruned_fp8_scaled`, `…_pruned_int8_convrot`); another example is
+[Winnougan/Cobijada_Minimax-H3_Hybrid_Pruned_ComfyUI](https://huggingface.co/Winnougan/Cobijada_Minimax-H3_Hybrid_Pruned_ComfyUI),
+in BF16, int8 ConvRot and W4A8. The timestep MLP is gone. In its place
+is a table, `adaln_t_table` (1025 × 8), of points along the
+time-embedding curve, and every AdaLN projection reads an 8-wide point
+instead of the 2,688-wide embedding: `[96768, 8]` a block, where the
+released form's is `[96768, 2688]`.
+
+- **The point:** for a timestep t (clamped to 0…1), the lerp of the
+  table's two rows around t × 1024.
+- **The modulation:** the projection applied to that point with no SiLU,
+  summed in f32 and rounded once to bf16, as ComfyUI computes it. The
+  projections are held for the whole run as the file stores them (about
+  77 MB at bf16), so the AdaLN bake does not run: it would hold more than
+  it retires.
+
+Point `dit_dir` at the file as for any other ComfyUI file. Comfy-Org's
+`…_pruned_w6a8` files (6-bit codes) are refused by name.
+
+**W4A8** (`"format": "asym_w4a8_int8"`). Each projection is 4-bit codes,
+two to a byte (the even column in the low nibble), read through a
+16-entry codebook when the file carries one (`weight_codebook`) or as
+code − 8 when it does not. Each group of 16 columns has an E4M3 relative
+scale (`weight_s_rel`), and each row has a scale (`weight_s_channel`).
+The code times its relative scale, rounded half to even and clamped to
+±127, is an int8 code. Those int8 codes are ConvRot-rotated, as an int8
+file's are, and widen the same way: un-rotated exactly in integers, then
+times the row scale over √256, rounded once. The weights stay 4-bit in
+memory: the W4A8 file above is 12.5 GB, its int8 twin 21.0 GB. On the
+`token` tier with matrix cores, the int8 codes are made from the nibbles
+before each GEMM and run as stored (above): MEASURED **1.34×** a forward
+against widening, on the same base M5 geometry. On an M4 Pro, image to
+video at 832×480×124 under a six-step adapter, the W4A8 file ran as fast
+as the int8 one (18.9 minutes end to end each) with a 17.2 GB peak
+against 26.0, and its clip followed the int8 clip beat for beat. A file
+with a weight correction (`weight_correction`) is refused by name. The
+Neural Engine tiers take W4A8 projections as they take int8 ones (above).
+MEASURED on the M4 Pro, four blocks at 9,382 rows with `ane_ffn` +
+`ane_qkv`, both Winnougan files: a forward **1.47–1.54×** faster than
+the GPU alone, the ANE's rows 0.4% from the GPU's (rel-L2), as for the
+released bf16 weights.
+
+**LoRAs.** Every kind applies; what differs is how much of the released
+model it needs.
+
+- **Converted for the pruned form.** Applies as written. Its AdaLN
+  modules are 8 wide, or come as ComfyUI weight diffs
+  (`adaln_proj.linear.diff` / `.diff_b`, the form some pruned Turbo
+  conversions use). A diff is added to the projection at the adapter's
+  strength, as ComfyUI adds it.
+- **Trained on the full model.** Its AdaLN modules are 2,688 wide, and
+  ComfyUI skips them. vpipe carries them onto the curve instead. The
+  pruned form reads the point c(t) where the released form read
+  SiLU(emb(t)), and the two are related by a fixed 2,688 × 8 basis U and
+  a mean m, SiLU(emb(t)) ≈ U c(t) + m. The table is the time
+  embedding's principal subspace: 8 dimensions hold all but about
+  2 × 10⁻⁹ of its energy, and the fit leaves a residual of about
+  2 × 10⁻⁵. So a module's B·A becomes B·(A U) on the projection and
+  B·(A m) on its bias. U and m are fitted once from the released timestep
+  MLP, so this needs the **released checkpoint under the model root**:
+  the graph's own partition of `hf_dir`. Without it the modules are
+  skipped, with a warning.
+- **Changing the time embedding itself.** A full-model LoRA's
+  `time_embedder` modules, or a flow-map adapter such as
+  [HyperFlow](#eight-steps--hyperflow), which blends two timestep MLPs.
+  The pruned file has no MLP for them to change, so vpipe runs them on the
+  released checkpoint's and puts the result on the curve. Their
+  embeddings do not stay on it: HyperFlow puts 5–36% of the embedding
+  off the curve, moving block 0's modulation by 6–49%. That remainder is
+  added back through the released checkpoint's AdaLN projections, once
+  per run, for the rows the schedule uses. The pass reads the released
+  AdaLN weights (about 26 GB at bf16, one block at a time) and keeps a
+  small table per row (booked in the resource plan). It needs an
+  unquantized released checkpoint under the model root. Without one, a
+  flow map is refused and a LoRA's `time_embedder` modules are skipped,
+  with a warning. MEASURED on an M4 Pro with HyperFlow (832×480×60, 8
+  steps, the int8 pruned file): 7.6% of the run's embedding off the
+  curve, 147 MB of tables, and the run as long as on the released DiT
+  (820 s end to end each) at a 26.7 GB peak against 46.4.
+
+### Eight steps — HyperFlow
+
+[HyperFlow](https://huggingface.co/videorebirth/hyperflow) (Video Rebirth) is
+a second way to buy the step count down, and a different kind of adapter from
+the Turbo ones above. It is an 8-step **flow-map** self-distillation: every
+step is conditioned on the interval it integrates, `(t, r)` — where it starts
+and where it lands — rather than on the point `t`. It covers all three
+workflows (`t2va`, `fl2va`, `ref2va`) with **one file**.
+
+#### Fetch it, then name it
+
+[`prepare-minimax-h3-hyperflow.vpipeline`](pipelines/prepare-minimax-h3-hyperflow.vpipeline)
+fetches it (2.8 GB) and registers it as `videorebirth/hyperflow`:
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-hyperflow.vpipeline
+```
+
+[`minimax-h3-text-to-video-hyperflow.vpipeline`](pipelines/minimax-h3-text-to-video-hyperflow.vpipeline)
+is the step-2 graph with the adapter named on the config stage:
+
+```json
+"lora": "videorebirth/hyperflow",
+"lora_scale": 1.0
+```
+
+For a **Ref2VA** graph name `videorebirth/hyperflow-ref2va` instead — the same
+file, catalogued a second time so the Browse list offers it under the
+reference partition. Any FL2VA graph (first frame, first-and-last) takes the
+plain key.
+
+That is the whole change. **You do not set a step count.** The adapter's file
+states the sigma grid it was distilled on — nine points, eight forwards — and
+vpipe runs that grid whenever the adapter is live; the log says so, and the
+graph's `steps` is not used while it is:
+
+```
+GenerateVideoStage('generate-video'): HyperFlow 1.0 on lora slot 0 --
+8-step flow-map grid from the adapter (`steps: 8` is not used while it is
+live), two-time embedding at gate 0.25
+```
+
+Keep `video_shift` / `audio_shift` at **12 / 3**, this model's defaults and
+the shifts the adapter was trained at. The grid is shifted with whatever the
+graph says, as upstream does, but a mismatch is warned about: quality is only
+validated at the trained values.
+
+Keep `lora_scale` at **1.0**. At **0** the model is exactly the base model
+again — both halves of the adapter switch off together, so a graph can A/B the
+two from one loaded model — but values in between are a state the adapter was
+never trained in. HyperFlow takes one adapter slot, so style or identity
+adapters can still ride in the other seven. Two flow-map adapters at once are refused.
+Pairing it with a **Turbo** adapter is not refused, and is not useful: both are
+distillations of the same model and they would stack.
+
+#### What makes it different
+
+A Turbo adapter is a LoRA and nothing else: the same blocks, a fixed schedule,
+fewer of them. HyperFlow is a LoRA plus exactly one architectural change, at
+the timestep MLP. Beside the checkpoint's own time embedder it carries an
+**endpoint** embedder — a copy of it with its own adapter — that embeds `r`,
+and the two are blended before every AdaLN reads them:
+
+```
+temb = emb(t) + gate * (emb_r(r) - emb(t))        gate = 0.25
+```
+
+So each step needs two numbers per row where it used to need one. Generated
+video rows step `(t_video, r_video)` and generated audio rows
+`(t_audio, r_audio)`, each on its own shifted grid. Conditioning rows —
+keyframes, reference frames, a reference soundtrack — have nowhere to go, so
+`r == t` there. The per-step AdaLN tables are baked from `(t, r)` pairs, so
+the bake still applies.
+
+The timestep MLP runs on the host in f32, and so does this adapter's part of
+it: the file ships those factors in f32 on purpose, and they never pass
+through bf16. Checked against upstream's own `TwoTimeEmbedder`, the embedding
+agrees to about **1e-6** relative on every `(t, r)` pair an 8-step run uses.
+The adapter moves it by **9%**, so the check has five orders of magnitude of
+margin. The schedule is **bit-identical** to upstream's.
+
+The rest of the file is the familiar diffusers decomposition — split
+`to_q`/`to_k`/`to_v`, value-first `ff.net.0.proj`, the refiner blocks —
+fused here into whichever qkv grouping the loaded DiT has, exactly as for
+lightx2v's split files. It is applied at runtime, as every adapter here is.
+
+#### What it costs
+
+Measured on an M4 Pro (64 GB) with the 8-bit FL2VA checkpoint resident, at
+640 × 352 × 56 frames (3943 rows), one after the other in one sitting:
+
+| | forwards | per forward | denoise |
+|---|---:|---:|---:|
+| base, `steps: 7` | 7 | 27.7 s | 194 s |
+| base, `steps: 15` (good quality) | 15 | 27.7 s | ~415 s |
+| **HyperFlow** | **8** | **30.2 s** | **241 s** |
+
+The adapter makes each forward **9% slower**. What it buys is the step
+count: eight forwards for a clip the base model wants fifteen or more for.
+Held in RAM the adapter is about **2.8 GB**, what it is on disk. Its q/k/v
+parts are three rank-256 adapters on one fused projection, and each output row
+contracts only against its own part. The equivalent single rank-768 update
+would be two thirds zeros — 1.1 GB more, and 1.4–2.2% slower per forward in
+interleaved measurements on the M4 Pro and the M5 Pro.
+
+Two runs of the same seed produce bit-identical video.
+
+**With Sol-Attn.** Upstream publishes a Sol-Attn recipe for the 8-step grid:
+keep the first **2 steps** and the first **2 blocks** dense, at `tau` 1.0. In
+vpipe that is `sol_dense_steps: 2`, `sol_dense_layers: 2` and `sol_tau: 1.0` on
+`generate-video` beside `sol_attn: true`. A dense step is verified to be the
+unrouted model exactly, but the combination's picture quality has not been
+measured here — judge it on a seed you know. See
+[Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing).
+
+### Six steps, any reference — Pika H3 Flex
+
+[Pika H3 Flex](https://huggingface.co/Pika-Labs/Pika-H3-Flex) (Pika Labs) is
+a post-training of both H3 transformers for **six sampling steps**,
+published as two rank-128 adapters: `fl2va/` for the FL2VA weights (text,
+first frame, last frame, both) and `ref2va/` for the Ref2VA weights (up to
+twelve image, video and audio references). It generates at 480p and 768p,
+5 to 15 seconds at 24 fps, with the soundtrack, the way the base model does.
+
+Each adapter comes with a `manifest.json` that pins **how it must be
+sampled**, and that is most of what is different about it. The release says
+outright that a generic six-step Euler run is not equivalent; vpipe reads the
+manifest and runs what it says (see below).
+
+#### Get the two adapters
+
+[`prepare-pika-h3-flex.vpipeline`](pipelines/prepare-pika-h3-flex.vpipeline)
+fetches both adapters with their manifests (2.8 GB each) and registers them
+as `Pika-Labs/Pika-H3-Flex-fl2va` and `Pika-Labs/Pika-H3-Flex-ref2va`:
+
+```sh
+vpipe --launch docs/pipelines/prepare-pika-h3-flex.vpipeline
+```
+
+Not fetched: the copy of MiniMax-H3 the repository bundles (about 210 GB —
+the MiniMaxAI weights from [Step 1](#step-1--prepare-the-model) are the same
+ones) and `comfy/loras/`, bf16 conversions that carry no manifest.
+
+Three graphs use them, each the matching step-2 graph with the adapter named
+on the config stage, at 832 × 480 and 124 frames:
+
+- [`pika-h3-flex-text-to-video.vpipeline`](pipelines/pika-h3-flex-text-to-video.vpipeline)
+  — a prompt (`t2va`).
+- [`pika-h3-flex-first-frame-to-video.vpipeline`](pipelines/pika-h3-flex-first-frame-to-video.vpipeline)
+  — a prompt and an opening frame (`i2va`); drop a `reference.jpg` beside it.
+  Add a last frame as in [More than text in](#more-than-text-in) for `fl2va`.
+- [`pika-h3-flex-reference-to-video.vpipeline`](pipelines/pika-h3-flex-reference-to-video.vpipeline)
+  — the release's own Ref2VA example on the Ref2VA weights (`ref2va`): a
+  character sheet, an environment and a motion clip with its sound, under the
+  release's prompt. Copy `character.jpg`, `environment.jpg` and `motion.mp4`
+  from the repository's `examples/assets/ref2va/` beside it.
+
+```json
+"lora": "Pika-Labs/Pika-H3-Flex-fl2va",
+"lora_scale": 1.0
+```
+
+**You do not set a step count.** While the adapter is live its manifest's
+schedule runs and the graph's `steps` is not used; the log says so:
+
+```
+MetalMiniMaxH3Transformer: '.../fl2va/adapter.safetensors' states a
+sampling contract (pika-flex-fl2va-v1): 6 steps on its own grid, fresh
+noise each step, shifts 12/3, keyframes rounded to bf16
+```
+
+Keep `lora_scale` at **1.0**. At 0 the model is the base again, and so is its
+sampler: Euler on the graph's `steps`. The FL2VA adapter is **refused** on the
+Ref2VA weights and the Ref2VA adapter on the FL2VA weights — each was trained
+on one — and so is a second adapter that names its own sampler (another
+manifest, or HyperFlow). Style adapters can share the other seven slots.
+
+#### What the manifest decides
+
+```json
+"sampling": {"knots": [1000, 750, 500, 250, 100, 40, 0],
+             "video_shift": 12.0, "audio_shift": 3.0,
+             "method": "renoise"}
+```
+
+**The grid.** The knots over 1000 are a raw grid that each modality pushes
+through its own shift, in double precision and then rounded to float — so the
+six steps sit at these noise levels:
+
+| step | 1 | 2 | 3 | 4 | 5 | 6 |
+|---|---:|---:|---:|---:|---:|---:|
+| video (shift 12) | 1.0 | 0.9730 | 0.9231 | 0.8000 | 0.5714 | 0.3333 |
+| audio (shift 3) | 1.0 | 0.9000 | 0.7500 | 0.5000 | 0.2500 | 0.1111 |
+
+**The update.** `renoise` is not an Euler step. Each step takes the model's
+clean estimate `x0 = x + sigma * v` and puts it at the next noise level with
+**fresh noise**, `(1 - sigma') x0 + sigma' n`; the last step returns `x0`. The
+fresh noise follows the clip's `seed` — the video's rows, then the audio's,
+each step — so a seed still reproduces its clip.
+`VPIPE_H3_RENOISE=0` keeps the grid and steps it by Euler, for an A/B.
+
+**The keyframes.** The FL2VA manifest's `bf16_conditioning_v1` rounds each
+keyframe's latent to bf16 before it is noised to the anchors' level (Ref2VA's
+`fp32_conditioning_v1` leaves them alone).
+
+#### The rest of the release's recipe
+
+The manifest does not cover these. They are graph settings, and the shipped
+graphs set them:
+
+- **Canvas.** 832 × 480 at 480p and 1344 × 768 at 768p for 16:9; the release
+  has eleven aspect ratios per tier, from 21:9 to 9:21. `frames` 124 is five
+  seconds; 362 is fifteen (every count rounds up to the next `17n + 5`).
+- **Keyframes.** The release centre-crops a keyframe to the canvas's aspect
+  and resizes the crop onto it, the first frame and the last alike:
+  `image-resample` with `fit: crop` and `algorithm: lanczos`.
+- **Keyframes shown to the conditioner.** Each keyframe is also put on
+  `diffusion-conditioner`'s `ref_image` port (see
+  [More than text in](#more-than-text-in)). The release's prompts refer to
+  "image 1", and this is where image 1 comes from.
+- **References by tier.** A Ref2VA reference is sized by the tier of the clip
+  it conditions. Below 768p, a picture's short edge is 1024 and a clip goes on
+  the 480p canvas rule; from 768p up, 2048 and 1344 × 768.
+
+  | `video-ref-encoder` key | 480p | 768p |
+  |---|---:|---:|
+  | `reference_image_short_edge` | 1024 | 2048 |
+  | `reference_video_short_edge` | 480 | 768 |
+  | `reference_video_max_pixels` | 399360 | 1032192 |
+
+  These keys size the files named in `references`, which is how the shipped
+  graph passes them; a video file brings its own soundtrack. A picture handed
+  to the stage on a reference **port** is encoded at the size it arrives, so
+  size it on the way (`image-resample`, short edge 1024 or 2048). Pika's
+  example pictures are 2816 × 1584: unsized, each would be 4,400 rows of the
+  sequence instead of 1,824.
+
+  The release accepts up to nine pictures, three clips and three soundtracks,
+  each clip or soundtrack 2–15 seconds; vpipe does not enforce those limits.
+
+#### Where vpipe differs from the release
+
+- **The noise is vpipe's own.** The release draws its noise from CUDA's
+  generator, so the same seed is a different sample here, as with every
+  model in this guide.
+- **A keyframe is encoded at the VAE posterior's mean.** The release samples
+  the posterior with a fixed seed and rounds the sample to float16 first.
+- **The base weights are whatever vpipe loads.** The adapters were trained on
+  MiniMax-H3's bf16 transformers; the shipped graphs run them on the 8-bit
+  packs from step 1, as every other example here does.
+
+#### What six steps cost
+
+Measured on an M4 Pro (64 GB) with the bf16 FL2VA weights read from an
+external drive and streamed, an opening frame and Pika's own example prompt
+trimmed to five seconds, at 832 × 480 × 124 frames (15,395 rows):
+
+| | time |
+|---|---:|
+| conditioning, keyframe encode, loads | ~2.7 min |
+| **denoise, 6 forwards** | **14.7 min** (~2.45 min each) |
+| video + audio decode | ~2 min |
+| whole run | 19.5 min |
+
+The adapter does not make a forward cheaper; what it buys is the count. The
+base model wants 20 or more forwards for a clip like this, which at the same
+~2.45 minutes is 50 minutes of denoise. The clip followed the prompt shot for
+shot and kept the keyframe's drawing style throughout, with a soundtrack.
+
+Showing the keyframe to the conditioner as well adds its 390 vision tokens to
+the conditioning (559 rows in all here) and about 40 seconds to the run
+(20.2 minutes): the vision tower runs once, and the denoise carries 15,793
+rows instead of 15,395.
+
+The Ref2VA example is a longer sequence: the shipped
+[`pika-h3-flex-reference-to-video.vpipeline`](pipelines/pika-h3-flex-reference-to-video.vpipeline)
+on the bf16 Ref2VA weights, read the same way, at 832 × 480 × 124 frames.
+Its two pictures (1824 × 1024 each), the five-second motion clip and its
+sound add 18,078 rows of references and 6,393 of conditioning, for 39,729 in
+all:
+
+| | time |
+|---|---:|
+| references encoded (the clip's VAE encode is 4.1 min of it) | 6.0 min |
+| **denoise, 6 forwards** | **61.5 min** (~10.3 min each) |
+| video + audio decode | 2.4 min |
+| whole run | 70.8 min |
+
+The clip put the character from the sheet in the shop from the second picture
+and followed the motion clip's dance pose for pose, the fern swapped for the
+record as the prompt asks, with a soundtrack. The same request with the
+pictures left at their 2816 × 1584 (see
+[The rest of the release's recipe](#the-rest-of-the-releases-recipe)) carried
+50,033 rows and took 89.8 minutes of denoise.
+
+The memory plan is drawn before any reference or keyframe is read, so it
+sizes the denoise from the canvas and 512 rows of conditioning: 15,929 rows
+for this clip against the 39,729 it runs. The first forward knows the real
+sequence, and the plan takes that forward's figure then, so what is sized
+afterwards (the decode, a next prompt) sees it; the log says so when it is
+larger. The same example at 22 frames runs 13,659 rows, whose activations
+take about 1.8 GB where the launch had booked 0.5 GB.
+
+
+#### Checked without the release
+
+There is nothing to run the release against on a Mac (its package needs an
+80 GB NVIDIA GPU), so each piece was checked on its own:
+
+- **The adapter's names.** The FP32 files are in diffusers' decomposition —
+  split `to_q` / `to_k` / `to_v`, value-first `ff.net.0.proj` — which vpipe
+  fuses for the weights it loads. Pika's own ComfyUI conversion of the same
+  adapter was compared tensor by tensor with that fusion (blocks 0 and 49):
+  identical after rounding to bf16, the q|k|v blocks and the swapped
+  feed-forward halves included.
+- **The schedule.** The grid's float bits match the release's arithmetic,
+  shifted in double; shifting in float would land one bit off at the 0.04
+  knot under both shifts.
+- **The update.** One re-noising step matches its restatement bit for bit, and
+  the last step is the clean estimate exactly.
+- **The adapter on the real weights.** Two blocks of the FL2VA transformer:
+  the adapter binds every module of them, moves the output, and at strength 0
+  gives the base output to the bit. The six-step loop runs re-noised and
+  reproduces itself from a seed; another seed or Euler moves it. The plan
+  books what the load holds, to the byte.
+
+### Three steps, streamed — TaoMate-H3
+
+[TaoMate-H3](https://huggingface.co/TaoLiveAIGC/TaoMate-H3) (Alibaba TaoLive
+AIGC) is a **3-step** adapter for the FL2VA weights, and unlike every adapter
+above it is **not a LoRA you run through the ordinary denoise**. It was
+distilled for a *streaming* method, and vpipe runs that method whenever it
+finds the adapter in a LoRA slot:
+
+1. **The soundtrack comes from the base model.** For each 5-second request an
+   audio-only pass of the plain FL2VA model (no adapter, no video rows, nine
+   forwards over a few hundred rows) writes the request's audio — anchored,
+   from the second request on, on the last second of the request before it.
+2. **The video comes from the adapter, in chunks.** Each request is four
+   chunks (two, two, two and one 17-frame groups; the first request also owns
+   the clip's 5-frame prefix), and each chunk runs **three** steps. Between
+   steps the chunk's audio rows are replaced by the soundtrack's matching
+   state, so the picture is made against the sound it will be played with.
+3. **Every chunk remembers the clean ones before it.** After its three steps a
+   chunk runs one more forward at t = 1 that writes its keys and values into a
+   cache; later chunks attend to that cache as well as to their own rows. The
+   cache keeps the first chunk's video for the whole clip and the two most
+   recent chunks, so a long clip keeps its subject without its cost growing.
+
+#### Fetch it, then name it
+
+[`prepare-minimax-h3-taomate.vpipeline`](pipelines/prepare-minimax-h3-taomate.vpipeline)
+fetches it (2.5 GB) as `TaoLiveAIGC/TaoMate-H3`, and
+[`minimax-h3-taomate.vpipeline`](pipelines/minimax-h3-taomate.vpipeline) is
+the step-2 graph with it named on the config stage:
+
+```json
+"lora": "TaoLiveAIGC/TaoMate-H3",
+"lora_scale": 1.0,
+"taomate": "auto"
+```
+
+`taomate: auto` (the default) is what turns the method on: the adapter is
+recognised from its tensors, and the log says so:
+
+```
+GenerateVideoStage('generate-video'): adapter slot 0 is TaoMate-H3's 3-step
+streaming adapter -- clips run its method (taomate: auto)
+```
+
+`off` runs the ordinary denoise with the adapter instead — which is not what
+it was trained for, and kept only for comparison.
+
+#### What you set, and what you do not
+
+- **`frames`** decides the length, in **whole 5-second requests**: the fewest
+  that cover it. 120 is one request (124 native frames, 5.17 s), 240 is two
+  (243 frames, 10.1 s), and every request after the first adds 119.
+- **`width` / `height`**: both a multiple of 32. Upstream validated a short
+  edge of **480, 768 or 1088**; anything else runs, and is warned about.
+- **`seed`**: one seed seeds both the soundtrack and the video, request by
+  request, the way upstream's runner does.
+- **`steps` and the shifts do not apply** — three steps a chunk, on the
+  schedule the adapter was distilled at. Text-to-audio-video only: keyframe
+  and reference inputs are ignored, with a warning.
+
+#### Memory: the cache lives on disk
+
+The cache is keys and values for every one of the 50 blocks, so it grows
+with the canvas, not with the clip — and in memory it is the run's largest
+allocation by far:
+
+| canvas | in memory (bf16) | on disk, 8-bit |
+|---|---|---|
+| 864 × 480 | ~18 GB | ~9.3 GB |
+| 1376 × 768 | ~46 GB | ~24 GB |
+| 1920 × 1088 | ~90 GB | ~46 GB |
+
+A forward reads each block's cached rows exactly once, in block order, which
+is the access a file serves best. So by default the cache is **on disk**:
+each committed chunk is a file of its own (under vpipe's temp root,
+`VPIPE_TMPDIR`, unlinked as it is made), written once by the commit that made
+it and dropped whole when the cache lets the chunk go. A forward reads block
+L's rows into one of two GPU slots while the GPU runs block L − 1, uncached;
+what the run holds beside the model is those two slots — **~0.5 GB** in 8 bits
+at 832 × 480, ~1 GB in bf16. The preflight counts the slots, not the cache.
+
+`taomate_kv` on the model-config stage says where it lives:
+
+- **`auto`** (the default): on disk, in **8 bits** when `i8_gemm` is on —
+  affine groups of 64 along each head, about half the bytes to write and read
+  back — else in bf16;
+- **`bf16`** / **`int8`**: on disk at that width. bf16 on disk gives exactly
+  the numbers of `memory` (the same bytes, moved through files); 8 bits
+  moved a three-block DiT's velocities by 0.3% (relative L2), under the ~0.6%
+  bf16 itself sits from upstream's reference at two blocks;
+- **`memory`**: upstream's way, the whole cache in RAM. No disk traffic — but
+  on a Mac without the room, the compressor takes the cache between forwards
+  and every forward pays to bring it back.
+
+The disk traffic, MEASURED at 832 × 480 in 8 bits: the files peak at 9.3 GB;
+a 5-second request writes 10.8 GB and reads 77 GB back (at 8–12 GB/s on an
+M5 Pro's internal SSD, under the GPU's work).
+
+#### How long it takes
+
+MEASURED on a MacBook Pro M5 Pro, 24 GB, the bf16 FL2VA checkpoint streamed
+(16 of its 50 blocks resident), `i8_gemm` on, 832 × 480, one request:
+
+| | forwards a request | per forward |
+|---|---|---|
+| soundtrack (base model, audio only) | 9 | 3.4 s |
+| video (4 chunks × 3 steps + a commit) | 16 | 7.9 s |
+
+So **about 3½ minutes per 5 seconds** of video there, decode included
+(denoise 161 s, decode 33 s). With the cache in memory the same run took 10
+minutes 42 seconds: 34.5 s a chunk forward, with ~10 GB compressed and 3 GB of
+swap.
+
+On a Mac mini M4 Pro, 64 GB, the 8-bit checkpoint read from an external
+SSD and held resident, at 864 × 480 (the cache in memory): 3.2 s a soundtrack
+forward, 37 s a
+chunk forward — about 10½ minutes per 5 seconds, and a 10-second clip 28
+minutes from launch to file.
+
+#### How it was verified
+
+Upstream's runtime is CUDA-only, but its model code is plain PyTorch once
+FlashAttention-3 is replaced by PyTorch's own attention.
+`tools/dump_taomate_h3_golden.py` runs **upstream's** DiT on the CPU with the
+adapter, through upstream's own layouts, schedules, attention hook and cache.
+vpipe matches it to bf16's floor on every kind of forward: the soundtrack pass
+with and without the previous request's audio, a chunk with an empty cache,
+and a chunk read through a cache that has already been trimmed.
+`tools/dump_taomate_h3_host_golden.py` does the same for the chunk plans, the
+positions on the clip's timeline, the schedules and the noise. Those match
+exactly, apart from one soundtrack sigma that is a float32 ulp off.
+
+What that does **not** cover is a whole clip against its prompt: the forward
+comparison holds two blocks to upstream's, not fifty, and no clip has been
+compared with one upstream's runtime made. It matters, because one has been
+seen to stray. On an M5 Pro at 832 × 480, "a fox trotting through snow at
+dawn, birdsong" came out as a husky in a sunlit pine forest on all three seeds
+tried — the cache in memory or on disk, bf16 or 8-bit — where the base model
+with lightx2v's 4-step LoRA drew the fox at dawn. Whether that is the method
+or this port is not known yet.
+
+#### Not ported (yet)
+
+- **A prompt per 5 seconds.** Upstream takes one prompt per request; here every
+  request reuses the one prompt.
+- **Upstream's int8 acceleration** of the interior qkv / fc1 projections — an
+  NVIDIA-specific speed choice. vpipe runs the adapter on whatever checkpoint
+  you load, bf16 or quantized.
+- **The exact 5.000-second delivery.** Upstream squeezes 124 native frames into
+  120 and time-stretches the sound to match; vpipe writes the native 124 frames
+  and the soundtrack at its own length.
+
+### A draft at 2K — Open-H3-Regenerate-2K
+
+[Open-H3-Regenerate-2K](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K)
+(NVIDIA, [project page](https://nvlabs.github.io/Sana/Open-H3-Regenerate-2K/))
+does not generate a clip: it **regenerates one you already have at a larger
+size**. A 768P H3 draft (1344 × 768, 124 frames) comes back at 2560 × 1440
+from **three** steps of the FL2VA weights, against MiniMax's closed
+H3-Regenerate-2K service. Drafts from other video models work too — encode
+them at 1024 × 576.
+
+What runs, and the stage that runs it:
+
+1. **Encode the draft** — `vae-encode`, H3's video VAE, with
+   `posterior: sample` (`posterior_seed: 42`): the release samples the
+   draft's posterior rather than taking its mean, with noise drawn by torch's
+   CPU generator, which vpipe draws bit for bit.
+2. **Enlarge the latent** — `latent-upscale`, the
+   [H3 latent upscaler](https://github.com/LBH-123-AI/Comfyui_Minimax_h3_latent_Upscaler)
+   (a 3D-conv network the release ships in `latent_upsampler/`): 48 × 84
+   latent cells to 90 × 160, without decoding. A height that is not whole
+   32-pixel cells computes at the next — 1080 at 1088, 2160 at 2176 — and
+   the latent carries a crop box that `vae-decode` cuts the picture back to.
+   Above 1440 rows it runs twice, through 2K, as the release does for 4K.
+3. **Regenerate** — `generate-video` with the latent on its **`init_latent`**
+   iport. The clip is put back to sigma 0.909 and denoised in three Euler
+   steps (0.909 → 0.857 → 0.667 → 0) under **one merged LoRA** — the
+   refiner NVIDIA trained, lightx2v's FL2VA Turbo v1.2 and LMS Sharp v1.0,
+   concatenated along the rank axis (rank 576 on every projection) — with
+   the soundtrack held at an **encoded silence**, as the release conditions
+   it. Keyframe and reference inputs are ignored in this mode.
+4. **Decode** — `vae-decode`, the released H3 video VAE, keeping as many
+   frames as the draft had (all 124 of an H3 draft's) — or, with
+   `fast_decoder` set, the release's fast decoder (see
+   [Faster](#faster--the-boxs-tiers-and-the-fast-decoder)).
+
+The regenerated clip has no soundtrack of its own (it was made against
+silence); the pipeline muxes the draft's.
+
+#### Get it, then run it
+
+[`prepare-open-h3-regenerate-2k.vpipeline`](pipelines/prepare-open-h3-regenerate-2k.vpipeline)
+fetches the two pieces vpipe uses — the merged LoRA (12.5 GB, f32) and the
+upscaler (0.7 GB) — and registers them as
+`Efficient-Large-Model/Open-H3-Regenerate-2K-lora` and
+`…-upscaler`. It does not fetch the rest of the repository: `base_model/`
+is MiniMax-H3's own diffusers components (the FL2VA checkpoint from
+[Step 1](#step-1--prepare-the-model) serves), `vae_fast/` is a faster,
+lossier decoder (6.5 GB, its own prepare step — see
+[Faster](#faster--the-boxs-tiers-and-the-fast-decoder)), and
+`lora/sharp_curve_branches` — LMS
+Sharp's AdaLN "curve" branches, which the release installs beside the LoRA
+— is **all zeros** (every `curve_B`), so it adds nothing and is not loaded.
+(vpipe reads such branches when a file carries trained ones; a file of zero
+ones binds as an exact no-op.)
+
+[`minimax-h3-regenerate-2k.vpipeline`](pipelines/minimax-h3-regenerate-2k.vpipeline)
+then takes `minimax-h3-768p-draft.mp4` and its prompt and writes
+`minimax-h3-regenerate-2k.mp4`. Set the draft on `load-draft` and
+`load-audio`, its prompt on `text-prompt`. The draft is fit the way the
+release fits it: resampled to 24 fps (`draft-24fps`, ffmpeg's `fps`
+filter, as the release's), cover-scaled (bilinear) and centre-cropped to
+the encode size, cut to 124 frames — 17 × 7 + 5, the length H3's video
+VAE encodes whole (37 latent frames), which is what an H3 clip is made of.
+The release cuts its drafts to 121 and pads the encode to 124 with three
+copies of the last frame; taking the draft's own last three costs nothing
+(the same 37 latent frames) and keeps them real. A shorter draft makes a
+shorter clip (the encode pads it with its last frame).
+
+| to get | `draft-fit` | `latent-upscale` | `generate-video` |
+|---|---|---|---|
+| 2K from an H3 768P draft (the release) | 1344 × 768 | 2560 × 1440 | 2560 × 1440 |
+| 2K from another model's draft | 1024 × 576 | 2560 × 1440 | 2560 × 1440 |
+| 1080p | 1344 × 768 | 1920 × 1080 | 1920 × 1088 |
+| 4K | 1344 × 768 | 3840 × 2160 | 3840 × 2176 |
+| 768P, refine only | 1344 × 768 | 1344 × 768 (passes through) | 1344 × 768 |
+
+`generate-video`'s width / height size the memory plan; the clip runs at
+the latent's own geometry. Fewer steps: `steps: 2` runs 0.7 → 0.494 → 0,
+about a third faster and softer on fine texture; `refine_start_sigma` on
+`minimax-h3-model-config` lowers the noise the clip is put back to (more of
+the draft kept), with the steps after it on `refine_shift` (6).
+
+#### What it costs
+
+The refine is a full-size forward of the 33B DiT, three times, at the
+**output's** size — 2560 × 1440 is 3.4× the rows of the 768P draft, and
+attention grows with their square. MEASURED on an M4 Pro (64 GB), the
+FL2VA weights read off an external drive, the release's LoRA and three
+steps:
+
+| clip | rows | upscale | refine (3 steps) | decode | whole run |
+|---|---:|---:|---:|---:|---:|
+| 22 frames, 1024 × 576 → 1920 × 1080 | 14,371 | 5.0 s | 6.7 min | 1.5 min | 12 min |
+| 39 frames, 1344 × 768 → 2560 × 1440 | 43,200 | 14.8 s | 36 min | 5.3 min | 48 min |
+| 124 frames, 768P → 2K (the release's length) | 133,200 | 46 s | ~4 h (est.) | ~16 min (est.) | |
+
+The third row is extrapolated (attention is four fifths of a 2K forward
+there); a Mac with GPU matrix cores runs it several times faster. The
+release quotes 22 s on one B200.
+
+Memory: the upscaler holds 0.7 GB and its pass 1.6 GB at 768P → 2K (37
+latent frames). The refine's activations are the large term, and a long
+clip's refine keeps for every row of its sequence only what attention
+needs there — each row's queries, keys and values — working through the
+rest a band of up to 8,192 rows at a time: about 54 KB a row, 7.7 GB at the
+full 2K clip's 134,000 rows (17 GB if every row's activations were kept;
+the arithmetic is the same either way, to the bit). The video VAE loads
+each half where it is used — the draft's encode holds the 0.4 GB encoder,
+the decode the 4.6 GB decoder — and the decode builds its clip once,
+stitching each tile as it finishes. At 2K × 124 frames the memory plan
+puts the peak at 13.1 GB, within a 16 GB Mac (planned, not
+yet run on one; there the DiT reads its blocks from the drive every
+step, so expect hours), and 24 GB is comfortable. Sol-Attn and Sage
+(its int8 P·V too) work a band at a time as well, with exactly the
+results they give on the whole sequence; only the Neural Engine tiers
+keep every row's activations — on a smaller Mac use the plain graph or
+`-fast-m5`, not `-fast-m4`. The merged LoRA is 6.2 GB
+at 16 bits. Each block's factors are set aside in a file and read with
+the block, and a block the DiT keeps keeps its factors too: a small Mac
+holds 342 MB of them, a large one converges on all 6.2 GB, and the plan
+books both figures. Loading it passes through all 6.2 GB once.
+
+#### Faster — the box's tiers and the fast decoder
+
+Two variants of the graph trade some accuracy for speed, each on what the
+machine has. All of it is **lossy** and opt-in; the plain graph is the
+release's own arithmetic.
+
+| | [`-fast-m4`](pipelines/minimax-h3-regenerate-2k-fast-m4.vpipeline) | [`-fast-m5`](pipelines/minimax-h3-regenerate-2k-fast-m5.vpipeline) |
+|---|---|---|
+| refine (`generate-video`) | `ane_ffn` + `ane_qkv`: the Neural Engine takes a share of every block's feed-forward and qkv rows, the LoRA folded into its staged weights | `i8_gemm`, tier `token`: the block projections in int8, the LoRA on top |
+| `latent-upscale` | — | `i8_gemm`, tier `token` |
+| `vae-decode` | `fast_decoder` + `ane_ffn` | `fast_decoder` + `i8_gemm`, tier `token` |
+
+Run [`prepare-open-h3-regenerate-2k-fast-vae.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-fast-vae.vpipeline)
+first: it fetches the fast decoder (6.5 GB) and registers it as
+`Efficient-Large-Model/Open-H3-Regenerate-2K-fast-vae`.
+
+**The fast decoder** is the one the release ships in `vae_fast/`, from
+NVIDIA's [StreamRender-H3](https://nvlabs.github.io/Sana/Sol-Engine/StreamRender-H3/):
+24 of the released decoder's 36 layers, distilled, run over the whole clip
+at once — attention in windows of 5 latent frames × 16 × 16 tokens, every
+second layer's windows shifted, with five global tokens per block of 5
+latent frames — where the released decoder decodes overlapping 256-pixel
+tiles and 7-frame chunks and cross-fades them — 3.6× faster on an M4 Pro
+(below); the release puts its pictures ~30 dB from the released
+decoder's. It is
+`vae-decode`'s `fast_decoder` key on any H3 graph, and the release's own
+default is the released decoder, as is this guide's plain graph. It holds
+3.2 GB (the released one 4.6 GB) but its working set grows with the clip,
+because it keeps every token of it between layers: 12.2 GB for 124 frames
+at 2K, with the 1.4 GB clip it hands on (2.9 GB at 1080p × 22). The memory
+plan learns that figure at the first clip; before it, it counts the
+released decoder's (5.1 GB at 2K × 124), so give a long 2K clip the room
+yourself.
+
+MEASURED, the fast decoder alone (`minimax_h3_regenerate.fast_vae_bench`):
+
+| box | clip | released | fast | fast + its tier |
+|---|---|---:|---:|---:|
+| M4 Pro | 2560 × 1440 × 39 frames | 318 s | 88 s | 59 s (`ane_ffn`) |
+| M5 (base, 10-core GPU) | 1344 × 768 × 22 frames | | 9.6 s | 5.0 s (`token`); `accurate` 7.2, `fast` 8.2 |
+
+End to end on the M4 Pro, the 22-frame 1080p clip of the table above with
+`-fast-m4`'s settings: the refine 5.2 min (6.7 GPU-only), the whole run 10
+min (12). Decoded both ways from that one refine, the fast decoder's clip
+is 40.2 dB from the released decoder's (luma 38.6), with no seam at its
+window edges.
+
+The upscaler on the base M5, 768P → 2K × 9 frames: 9.3 s, `token` 7.8 s
+(1.2×; `accurate` and `fast` buy nothing). The refine's tiers are
+H3's own (see the tier sections above); with the release's LoRA they stay
+far inside its effect — two real blocks at 4,096 video rows, distance from
+the dense forward against the adapter's own move of 0.34: Neural Engine
+feed-forward 0.004, + qkv 0.005 (M4 Pro); int8 `accurate` 0.007, `fast`
+0.008, `token` 0.008, `token_plain` 0.016 (M5).
+
+#### Against the release
+
+Every piece that is not H3 itself is checked against the release:
+
+- **The upscaler** against a restatement of its node in fp32 (CPU), on the
+  release's own file: rel-L2 0.00055 and 0.00084 at two geometries (one a
+  non-integer ratio), against the release's own bf16's 0.0072 and 0.0100.
+  The release normalizes the whitened latent **again** with H3's statistics
+  before the network (its node expects ComfyUI's raw latents); that is what
+  its results were made with, so it is the default —
+  `normalization: once` is the node's own intent.
+- **The schedule** — the release's sigmas to the digit, its timesteps
+  (1 − sigma in double, rounded once) and its Euler step
+  (`x + float(σ − σ') · v`).
+- **The LoRA** binds all 312 projections through the diffusers
+  decomposition (q / k / v fused per head for the released weights,
+  banded), alpha = rank.
+- **The fast decoder** against a restatement of its architecture in fp32
+  (CPU), on the release's own file, at two geometries that cut windows at
+  every edge (7 and 12 latent frames): rel-L2 0.0037 / 0.0037 (M4 Pro),
+  0.0041 / 0.0040 (M5, matrix-core attention), against the release's own
+  bf16's 0.0044 / 0.0042; the same frame count as the released decoder (5
+  latent frames, 17 frames). Its int8 tiers on the M5: 0.008 (`accurate`)
+  to 0.010 (`token`), 0.024 (`token_plain`); the Neural Engine 0.0038.
+
+What is not the release's: the refine's noise (the release draws it on the
+GPU with CUDA's generator, which no Mac reproduces), and its forward
+(`standard_fwd` there is dense bf16 attention; vpipe's is the H3 forward
+every other graph here runs). The release itself warns that same-seed PSNR
+is not a metric for this model — rounding-level changes move its 3-step
+output a lot — so judge by eye.
+
+### The draft in context — Open-H3-Regenerate-2K-IC
+
+[Open-H3-Regenerate-2K-IC](https://huggingface.co/Efficient-Large-Model/Open-H3-Regenerate-2K-IC)
+([project page](https://nvlabs.github.io/Sana/Open-H3-Regenerate-2K/#ic)) is
+the same job — a 768P draft back at 2K — done **in context**: the draft
+stays in the DiT's sequence, **clean**, as a reference video, and the
+large clip is generated beside it, every step attending to it. The plain
+refine above re-noises the draft and lets the DiT redraw it; this one is
+told what the draft was at every step, so faces, mouths, lip sync,
+lettering and layout stay the draft's while the detail is drawn at 2K.
+
+It runs on the **Ref2VA** weights (`transformer_ref`, the reference-to-video
+partition), under three adapters at strength 1: HyperFlow's 8-step flow
+map, LMS Sharp v1.0, and the IC LoRA NVIDIA trained (rank 384 on every
+projection of the blocks and the token refiner, alpha = rank). CFG 1, so
+one forward a step.
+
+What runs:
+
+1. **Fit and encode the draft**, as the plain refine does — 24 fps,
+   cover-scaled and centre-cropped to 1344 × 768, 124 frames —
+   `vae-encode` with `posterior: sample` at the release's seed (0). ONE
+   encode: the latent goes both to the upscaler and to `video-ref-encoder`.
+2. **The draft as `<Video 1>`** — `video-ref-encoder` takes the draft's
+   pixels on its first reference port (they feed the vision tower: the
+   prompt sees the draft) and the latent on the second, which
+   **`attach_latent: [2]`** folds onto it as its rows — no second VAE
+   encode. Its prompt is the release's task text, then
+   `Scene description:` and the prompt the draft was made from (empty is
+   fine):
+
+   ```
+   Enhance <Video 1> into a high-quality version of the same video.
+   Preserve the scene, objects, camera motion, timing, and composition of
+   every frame. Restore fine details and remove degradation. Do not
+   continue or change the scene.
+
+   Scene description: <the draft's own prompt>
+   ```
+
+   The graph's `text-prompt` holds all of it; change only the last line.
+   The reference rows are noised to 0.999 (`condition_noise_aug`) and held
+   there (`condition_timestep: 0.999` on the model config), as the release
+   holds them.
+3. **Enlarge the latent** — `latent-upscale`, the same upscaler and the
+   same rule as the plain refine.
+4. **Regenerate in context** — `generate-video` with the upscaled latent on
+   `init_latent` AND the reference rows on its reference ports: the
+   reference layout, the draft's rows ahead of the clip's, the clip put
+   back to sigma 0.835 and denoised over the **last three steps of
+   HyperFlow's 8-step grid** (0.835 → 0.697 → 0.469 → 0, at shift 12),
+   each step the flow map's jump to the next. The soundtrack is an encoded
+   silence held clean, as in the plain refine.
+5. **Decode** — the release's default is the **fast decoder v2**
+   (`vae_fast/` of this repository: StreamRender-H3's 24-layer decoder,
+   new weights), `vae-decode`'s `fast_decoder`. Unset it for the released
+   decoder.
+
+`steps` picks the release's sampler: 3 is its default `up3`, 4 its `up4`
+(from 0.923), 8 its `hf8` — all eight steps from pure noise, the draft
+then guiding through the context alone.
+
+#### Fetch the IC release, then run it
+
+[`prepare-open-h3-regenerate-2k-ic.vpipeline`](pipelines/prepare-open-h3-regenerate-2k-ic.vpipeline)
+fetches the five pieces and registers them under
+`Efficient-Large-Model/Open-H3-Regenerate-2K-IC-`: `-lora` (the IC LoRA,
+8.3 GB f32), `-hyperflow` (2.8 GB, Video Rebirth's file byte for byte),
+`-sharp` (LMS Sharp, 1.2 GB), `-upscaler` (0.7 GB, the plain refine's
+file) and `-fast-vae` (6.5 GB). Not fetched: `base_model/` (MiniMax-H3's
+own components — the `MiniMaxAI/MiniMax-H3-Ref2VA` checkpoint serves),
+`infer/` (the release's runner) and `assets/` (an encoded silence, which
+`generate-video` makes itself). LMS Sharp, as its author publishes it, was
+trained on ComfyUI's pruned H3, so its 50 AdaLN modules read the pruned
+form's 8-wide curve point; on the released weights they are curve
+branches, read as such — and all 50 are zero, as in the plain refine's
+release, so they add nothing and need no curve table.
+
+[`minimax-h3-regenerate-2k-ic.vpipeline`](pipelines/minimax-h3-regenerate-2k-ic.vpipeline)
+takes `minimax-h3-768p-draft.mp4` and writes
+`minimax-h3-regenerate-2k-ic.mp4` with the draft's soundtrack. Set the
+draft on `load-draft` and `load-audio`, its prompt on `text-prompt`.
+
+| to get | `draft-fit` | `latent-upscale` | `generate-video` |
+|---|---|---|---|
+| 2K (the release's default) | 1344 × 768 | 2560 × 1440 | 2560 × 1440 |
+| 1080p | 1344 × 768 | 1920 × 1080 | 1920 × 1088 |
+| 4K | 1344 × 768 | 3840 × 2160 | 3840 × 2176 |
+| 768P from a 384P draft | 672 × 384 | 1344 × 768 | 1344 × 768 |
+
+`video-ref-encoder`'s `frames` and `generate-video`'s stay the draft's
+length (124). The 384P row is the release's `--lq 384` (512 and 576 work
+the same way).
+
+#### What the in-context refine costs
+
+The draft's rows ride every forward beside the clip's, so a step costs
+more than the plain refine's at the same size: at 2K × 124 the clip is
+133,200 rows and the draft 37,296 more. MEASURED on an M4 Pro (64 GB), the
+Ref2VA weights (bf16) and the adapters read off an external drive, the
+release's three steps and its fast decoder, the pianist draft:
+
+| clip | rows a forward | prompt + draft | refine (3 steps) | decode | whole run |
+|---|---:|---:|---:|---:|---:|
+| 39 frames, 672 × 384 → 1344 × 768 | 15,844 | 13 s | 8.4 min | 27 s | 10.3 min |
+| 22 frames, 1344 × 768 → 2560 × 1440 | 33,420 | 15 s | 24.3 min | 54 s | 28.2 min |
+
+Peak footprint 48.7 and 49.5 GB, the DiT keeping 45 of its 50 blocks; on a
+smaller Mac it streams them every step. The release's own clip, 124 frames
+at 2K, is ~173,000 rows a forward: several hours on this box. Both
+pictures keep the draft's composition, hands and lettering (its subtitle
+line character for character); scaled back to the draft's size they sit
+29.5 dB (768P) and 34.4 dB (2K) from it over every frame.
+
+The draft is part of the prompt too: the text encoder reads it as a clip,
+two frames a second merged in pairs, about 1,000 tokens a pair at 768P —
+some 1,000 prompt tokens for every second of draft, so a long draft's
+prompt passes a band's 8,192 rows. A long refine works through its rows
+a band of up to 8,192 at a time, the prompt's included — the token
+refiner runs in bands of its own when the prompt is longer than one —
+with exactly the results the whole sequence gives. A DiT split across Macs does the same
+where both ranks are told they may (`prompt_bands` in `tensor_parallel`;
+see [PLUGINS.md, extension point 5b](PLUGINS.md#extension-point-5b--a-transport-for-a-dit-split-across-hosts));
+otherwise a prompt longer than a rank's band runs its blocks whole.
+
+The adapters run beside the base GEMMs: three of them, ranks 256 + 64 +
+384, about a fifth of a block's projection FLOPs (attention not counted);
+folding them into the weights once (the release's own apply rule for
+HyperFlow and Sharp) is not done. They hold 7.6 GB at 16 bits, set aside
+and read with the blocks on a smaller Mac, as the plain refine's are. The Neural Engine and int8 tiers of the plain
+refine's fast graphs work here too (the adapters fold into the ANE's
+staged weights; the int8 tiers take them on top) but are not measured
+with the IC adapters.
+
+#### Checked against the IC release
+
+Read, not run — NVlabs/Sana sol-engine `models/Open-H3-Regenerate-2K/IC`
+(`infer.py`, `ref2va_ic/`):
+
+- **The samplers**: up3 / up4 / hf8 are HyperFlow's float32 points to the
+  bit (`shift · raw / (1 + (shift − 1) · raw)` over float32), the release's
+  `config.json` to its six digits; each step's (t, r) is the release's
+  `1 − float32(σ)` and `1 − σ'`.
+- **The loop**: on two real Ref2VA blocks under HyperFlow, a 2 × 6 × 10
+  reference clip ahead of a 2 × 12 × 20 clip, three steps through
+  `generate-video`'s denoise equal the release's loop restated — generated
+  rows at (1 − σ, 1 − σ'), the reference rows at (0.999, 0.999), the
+  silence at (1, 1), `x + float(σ − σ') · v` — **to the bit**; the
+  reference rows and the soundtrack are never written; and the interval
+  matters (every row at r = t lands 0.13 away).
+- **The adapters** bind as the release installs them: the IC LoRA through
+  the diffusers decomposition (q / k / v fused per head), LMS Sharp from
+  ComfyUI's names (its flat q|k|v re-ordered for the released weights'
+  per-head grouping), HyperFlow's flow map live; all three at strength 0
+  are the base forward exactly; the memory plan books what the load holds.
+- **The draft's posterior sample** is torch's CPU generator at the
+  release's seed, bit for bit.
+
+What is not the release's: the sampling noise (CUDA's generator), the
+reference rows' 0.001 of noise (ours, at the same level), the adapters
+(the release merges HyperFlow and Sharp into the weights in fp32 and runs
+the IC LoRA beside them; vpipe runs all three beside the base GEMMs, the
+same function up to the weights' rounding), and its VAE encode (FP32,
+tiled; vpipe's is the H3 video VAE every graph here runs).
+
+### Pictures — MiniMax-H3-Image
+
+[MiniMaxAI/MiniMax-H3-Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image)
+is MiniMax's own **image** model in the H3 family: text-to-image, and editing
+of up to **16 pictures** in one request. It generates about **16
+megapixels** at any aspect directly (4096 × 4096 at 1:1, 6272 × 2688 at
+21:9) in **six steps**, with no guidance and no negative prompt.
+
+Its DiT is H3's stack with the **audio branch removed** (33.1B parameters,
+bf16), distilled twice over: guidance is in the weights, and each of its six
+steps runs through an **output head of its own**
+(`pdd_fused_heads.safetensors`, beside the transformer). The picture is one
+latent frame in H3's packed sequence — `[prompt | pictures | the picture]`,
+no soundtrack rows at all. Around it:
+
+- the **text encoder is MiniMax-H3's own** Qwen3-VL-32B (hidden state 50),
+  which this repository does **not** carry — its `model_index.json` names
+  MiniMax-H3's `text_encoder/`. A box with MiniMax-H3 already has it;
+- the **VAE** is H3's encoder with a smaller **2D ViT decoder** (24 blocks,
+  rotary over height and width only): one latent frame into one picture,
+  tiled at 256 px as released.
+
+#### Fetch MiniMax-H3-Image, then run it
+
+[`prepare-minimax-h3-image.vpipeline`](pipelines/prepare-minimax-h3-image.vpipeline)
+fetches the repository (~71 GB: the DiT, its heads, the VAE) and MiniMax-H3's
+text encoder alone (~67 GB). If you already have MiniMax-H3 (either
+partition), delete the second stage — its encoder is the same files:
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-image.vpipeline
+```
+
+The conditioning stages find the encoder through the models DB (MiniMax-H3,
+either partition, or the encoder record). Where it is somewhere else, name
+it: `encoder_dir` on diffusion-conditioner / video-ref-encoder takes the
+`text_encoder/` directory, a partition, or a MiniMax-H3 root.
+
+Then:
+
+- [`minimax-h3-image-text-to-image.vpipeline`](pipelines/minimax-h3-image-text-to-image.vpipeline)
+  — the prompt in `text-prompt`, the size in generate-video's `width` /
+  `height` (the shipped graph: 4736 × 3552, 4:3 at 16 MP). The model reads
+  the prompt **as written** (at most 4096 tokens) and was trained on long,
+  complete descriptions of the whole picture; MiniMax's own pipeline
+  rewrites a short request into one first, with MiniMax-H3-Image-PE (no
+  graph here runs it yet).
+- [`minimax-h3-image-text-to-image-fast-m5.vpipeline`](pipelines/minimax-h3-image-text-to-image-fast-m5.vpipeline)
+  — the same request, size and seed on an **M5**: generate-video's
+  `i8_gemm` at tier `token`, so the DiT's block projections run in int8 on
+  the matrix cores (lossy: compare its picture with the plain graph's by
+  eye). The text encoder and the VAE run as in the plain graph; neither has
+  an int8 route. On an M1–M4 there are no matrix cores, the tier stays
+  off and the graph is the plain one.
+- [`minimax-h3-image-edit.vpipeline`](pipelines/minimax-h3-image-edit.vpipeline)
+  — the pictures on video-ref-encoder's reference ports, in order
+  `<Picture 1>`, `<Picture 2>`, … in the prompt; the size of the RESULT on
+  generate-video (the shipped graph: 4096 × 4096). The pictures keep their
+  own sizes; they are never resized to the result's. The example picture is
+  the repository's `examples/reference1.png`.
+
+#### Sizes, and what is read off the checkpoint
+
+- **The size you name is the size you get.** A request under
+  `min_generation_area` (default 4,194,304 = 2048 × 2048) is generated on a
+  canvas of its aspect scaled up to that area and resized back with Lanczos
+  after decoding, as the release does — so a 1024 × 1024 request costs what
+  2048 × 2048 does. `min_generation_area` on minimax-h3-model-config changes
+  it (1024 generates at the size named). Canvas sides are multiples of 32.
+  The working range is about 4–20 MP, best near 16.
+- **The grid** (`pdd_config.json`): six steps, run exactly as listed —
+  `steps`, the model config's `sigmas` and shifts, and the sampler port do
+  not apply — Euler in the velocity form the heads were distilled with.
+- **Edit pictures** keep their size when their short edge is within 1024 to
+  2048 px, else are scaled to the nearer end; the vision tower reads its own
+  copy at a 1024 short edge. Each picture's VAE posterior is sampled, rounded
+  to float16 and noised to t = 0.999, as the release does.
+- **The noise is the release's**: torch's CPU generator at the seed, so a
+  text-to-image seed reproduces the picture another `generator_device: cpu`
+  run makes. For an edit, the pictures' posteriors draw from that generator
+  first: set video-ref-encoder's `seed` to generate-video's (the shipped
+  graph does).
+
+#### What MiniMax-H3-Image costs
+
+MEASURED on the M4 Pro (64 GB), the DiT and MiniMax-H3's encoder bf16 from
+the Thunderbolt 5 dock, every block kept after the first forward (the read
+hides under it), no lossy tier:
+
+| request | generated at | rows a forward | a step | whole graph |
+|---|---|---:|---:|---:|
+| text-to-image 1024 × 1024 | 2048 × 2048 | 4,388 | ~30 s | 3 m 23 s |
+| text-to-image 4736 × 3552 (16 MP) | 4736 × 3552 | 16,754 | ~160 s | 16 m 44 s |
+| edit, a 1024² picture → 4096 × 4096 | 4096 × 4096 | 19,165 | ~195 s | 20 m 23 s |
+Peak footprint 43–44 GB: the DiT is kept whole (37 GB once its AdaLN
+projections are baked for the six steps). The prompt's conditioning takes
+~20–26 s (the 32B encoder streamed), the decode 6 s at 2048² and 24 s at
+16 MP.
+
+The box's tiers are H3's own code paths and take this DiT's settings.
+MEASURED on an M5 Pro (24 GB, a 12 GB wired pool, the blocks streamed), a
+1024 × 1024 request (generated at 2048 × 2048), the six steps' denoise:
+
+| tiers | denoise |
+|---|---:|
+| none (bf16) | 55.8 s |
+| `i8_gemm` `accurate` + `sage_attn` | 44.8 s |
+| `i8_gemm` `fast` | 43.8 s |
+| `i8_gemm` `token` (the `-fast-m5` graph) | 32.9 s |
+| `i8_gemm` `token` + `sage_attn` with int8 P·V | 32.6 s |
+
+So `token` is 1.7× and Sage adds nothing measurable beside it. Leave two
+tiers off on this model: Sol-Attn (`sol_attn`) duplicated objects in the
+picture, and on that M5 Pro the Neural Engine's feed-forward (`ane_ffn`)
+fell back to the GPU after its 11.7 s build.
+
+The edit's picture is encoded in ~21 s (vision tower 1.2 s, VAE 4.9 s, the
+32B encoder over its 1,757-token presentation 14.8 s); its 1,024 rows ride
+every forward beside the 16,384 generated.
+
+The 16 MP row is the release's own example — `revised_prompt.t2i.txt` at
+4736 × 3552, seed 42 — and the picture it makes is the one the model card
+shows from SGLang, object for object (pixel correlation 0.90 against that
+image; 0.07 against MiniMax's API sample of the same prompt). Only the fine
+detail differs, as bf16 on two different GPUs does. The edit row is its
+edit example (`revised_prompt.edit.txt` on `reference1.png`, seed 1234):
+the same edit as SGLang's — headphones gone, the fist bump above the sign
+between the microphones — at correlation 0.93 to it (0.86 to the unedited
+picture).
+
+#### Checked against diffusers' MiniMax-H3-Image
+
+Held to `tools/dump_minimax_h3_image_golden.py` — the DiT, the layout and
+the VAE restated from diffusers' MiniMax-H3-Image (huggingface/diffusers
+#15230) over the release's own weights, fp32 the truth and the release's
+own bf16 the bar:
+
+- the packed layout — every position and tag — **equal** to the
+  reference's builder; the grid as the release steps it **equal**;
+- two real DiT blocks through step 2's head: 0.00496 from fp32 (the
+  release's bf16 0.00476); the checkpoint's own head reads 0.0082 there,
+  step 0's 0.0114 — the heads differ from each other by 1–2%;
+- the 2D decoder 0.0052 on a 2 × 2 tiling, 0.0038 on one tile (the
+  release's bf16 0.0050 / 0.0035);
+- the encoder 0.015 from fp32 (the release runs it in fp32; this one keeps
+  H3's bf16 activations).
+
+### Pictures — P-H3-Image
+
+[PrunaAI/P-H3-Image](https://huggingface.co/PrunaAI/P-H3-Image) is an
+**image** model built on MiniMax-H3: text-to-image, and instruction editing
+of a picture with up to seven more beside it as references. It renders in
+**eight steps** with no guidance and no negative prompt, and works best at
+**8 megapixels** for text-to-image (2912 × 2912 at 1:1) and 4–8 for edits.
+
+It is H3's own DiT — FL2VA's weights with a rank-128 adapter trained on top —
+so it runs on everything above: streaming, the int8 tiers, Sol, Sage. The
+picture is **one latent frame**, denoised in H3's packed sequence beside two
+audio latents that are thrown away. What is new is around the DiT:
+
+- the **text encoder** is a Qwen3-VL-4B (not H3's 32B), conditioning through
+  a small **connector** that maps five of its layers onto the width H3
+  reads;
+- the **VAE** is H3's encoder byte for byte with a decoder retrained to turn
+  one latent frame into one picture — the same idea as Mamad8's
+  single-frame H3 VAE, with its own weights.
+
+#### Get it, then run it
+
+You need FL2VA (step 1's `local/MiniMax-H3-FL2VA-8bit`, or Comfy-Org's bf16
+file) and P-H3-Image's encoder, connector and VAE —
+[`prepare-p-h3-image.vpipeline`](pipelines/prepare-p-h3-image.vpipeline)
+fetches those (~15 GB) and PrunaAI's adapter (~2 GB), and **not** the
+repository's merged DiT, which is another 66 GB of what FL2VA plus the
+adapter already is:
+
+```sh
+vpipe --launch docs/pipelines/prepare-p-h3-image.vpipeline
+```
+
+Then:
+
+- [`p-h3-image-text-to-image.vpipeline`](pipelines/p-h3-image-text-to-image.vpipeline)
+  — the prompt in `text-prompt`, the canvas in generate-video's `width` /
+  `height` (multiples of 32; anything else is rounded to the nearest). The
+  model reads the prompt **as written**, and it was trained on long,
+  detailed ones.
+- [`p-h3-image-edit.vpipeline`](pipelines/p-h3-image-edit.vpipeline) — the
+  picture to edit on video-ref-encoder's first reference port, up to seven
+  more after it (`<Picture 2>` … in the instruction), the instruction in
+  `text-prompt`. The instruction is read as `Edit <Picture 1>. …` (added
+  when it does not start that way). With no `width` / `height` on
+  generate-video the edit renders at its picture's size, scaled into
+  4–8 megapixels; every other picture keeps its size inside 1–8.
+
+If you fetched the whole repository instead (`PrunaAI/P-H3-Image`, the
+merged DiT included), drop generate-video's `dit_dir` and the model config's
+`lora`: the root's own `transformer/` then runs.
+
+#### What is read off the checkpoint
+
+Everything P-H3-Image does differently from H3 comes from its files, not
+from the graph:
+
+- `modular_model_index.json` names the pipeline and carries the **sampling
+  grid** — eight steps run exactly as listed, **unshifted** (the model
+  config's `video_shift` / `audio_shift` are not used for it) — and the
+  edit's sizing rules;
+- `text_connector/` names the encoder's taps — hidden states 13, 19, 25, 31
+  and the last, normed one — and the projection that maps them;
+- `vae/` names the single-frame decoder (`AutoencoderKLPH3Image`), which
+  decodes only one latent frame — a video graph pointed at it is refused,
+  not decoded wrong.
+
+An edit's pictures are encoded the reference's way: the VAE's posterior
+**sampled** under its own seed (42) and rounded to float16, the rows then
+noised to t = 0.999 and held there; the vision tower reads its own copy of
+each at about one megapixel.
+
+#### What it costs
+
+MEASURED on the M4 Pro (64 GB), FL2VA **bf16** from the internal SSD under
+the adapter, i8 off:
+
+| | rows a forward | first forward | the next seven | whole graph |
+|---|---:|---:|---:|---:|
+| text-to-image 1024 × 1024 | 1,061 | 61 s (reads the DiT) | 6.7 s each | 2 m 48 s |
+| text-to-image 2912 × 2912 (8 MP) | 8,318 | 68 s | 67 s each | 10 m 49 s |
+| edit, 1024² picture → 2048 × 2048 | 9,257 | 80 s | 77 s each | 12 m 16 s |
+
+The first forward pays for reading 66 GB of DiT; every block is kept for the
+rest. Peak resident 45–47 GB. An edit carries its picture's rows beside the
+ones it generates (4,096 + 4,096 at 2048², plus 1,061 of presentation), and
+the vision tower and VAE encode of the picture took 33 s of it.
+
+#### Checked against the reference
+
+The connector, the encoder, the edit's presentation and the image decoder are
+held to `tools/dump_p_h3_image_golden.py` (transformers' Qwen3-VL for the
+encoder; the connector, the decoder and its tiling restated from diffusers'
+`p_h3_image`), fp32 the truth and the reference's own bf16 the bar:
+
+- the connector on the reference's own taps: **bit-identical**;
+- text conditioning 0.0050 / 0.0049 from fp32 (the reference's bf16 0.0060 /
+  0.0054); an edit's presentation — ids and tags equal — 0.0095 (0.0093);
+- the image decoder 0.015 on one tile, 0.034 on a 2 × 3 tiling (0.012 /
+  0.031).
+
+One difference from the reference's edit: naming a `width` / `height` on
+generate-video sets the canvas, but video-ref-encoder still holds the
+picture being edited at the 4-megapixel floor (it cannot see the canvas),
+where the reference keeps a small picture at its own size when a canvas is
+named. Leave the canvas unset — the shipped graph does — for the reference's
+behaviour.
+
+Not ported: the **prompt upsampler** (a Qwen3.5-9B that rewrites a short
+request into the long prompt the model renders best from; on by default in
+PrunaAI's pipeline) — write the full prompt yourself. And the noise is
+vpipe's own, so a seed does not reproduce a picture made elsewhere.
+
+### Pictures through H3's VAE — the Image VAE
+
+H3's video VAE encodes a picture into exactly **one latent frame**, which is
+the form a reference picture or a keyframe takes inside the model. Its
+released decoder is built for clips, so it reads that frame as a short clip
+of copies of itself and keeps one.
+[Mamad8/MiniMax-H3-Image-VAE](https://huggingface.co/Mamad8/MiniMax-H3-Image-VAE)
+is the same encoder, byte for byte, with the decoder retrained to read one
+latent frame on its own. The latent space is unchanged, so it decodes a
+one-frame latent from either partition.
+
+**It is for pictures only.** Its author reports that it decodes clips worse
+than the released decoder (ghosting along the patch grid, frames mixing), so
+keep it out of video graphs. The file says what it is in its metadata, and
+vae-decode reads it as a picture decoder because of that.
+
+[`prepare-minimax-h3-image-vae.vpipeline`](pipelines/prepare-minimax-h3-image-vae.vpipeline)
+fetches the one file (5.2 GB) and registers it as
+`Mamad8/MiniMax-H3-Image-VAE`.
+[`minimax-h3-image-round-trip.vpipeline`](pipelines/minimax-h3-image-round-trip.vpipeline)
+then encodes a picture and decodes it again:
+
+```
+load-image → image-resample (crop_to_grid, 16) → vae-encode → vae-decode → save-image
+                                                                         → compare-image
+```
+
+```sh
+cd ~/vpipe-work                                    # the SAME work directory
+vpipe --launch ~/src/vpipe/docs/pipelines/prepare-minimax-h3-image-vae.vpipeline
+vpipe --launch ~/src/vpipe/docs/pipelines/minimax-h3-image-round-trip.vpipeline \
+      --stage-cfg load-image::url=photo.jpg \
+      --stage-cfg save-image::path=photo-h3.png
+```
+
+H3 wants both sides on a multiple of 16, so image-resample cuts the picture
+down to that grid (1150 × 770 comes back 1136 × 768). It also shrinks a
+picture over `max_pixels`, 4 megapixels in the graph. Both VAE stages take
+the model from one `model-select`. Point it at your H3 checkout instead and
+the same graph runs the released decoder, for comparison.
+
+What it costs and keeps, measured on an M4 Pro with the checkpoint on an
+external Thunderbolt drive, loading included:
+
+| | the Image VAE | the released decoder |
+|---|---|---|
+| 1024 × 1024 photo, whole graph | **12 s** | 34 s |
+| PSNR against the picture | **34.9 dB** | 32.3 dB |
+| mean colour shift | under 0.5 levels | 3 levels darker, every channel |
+| 2048 × 2048, whole graph | 53 s | — |
+| peak memory | 5.5–5.6 GB | 5.1 GB |
+
+The decoder works in overlapping 256-pixel tiles, so its time grows with the
+area: 25 tiles at 1024², 121 at 2048². Nothing in it limits the size: the
+picture comes back at the size it went in. Its author trained it on 256- and
+384-pixel crops, reports 30.4 dB over a 512-pixel test set and checked it up
+to about 3 megapixels. The graph's 4-megapixel cap is the graph's choice, and
+raising `max_pixels` works. One camera photo, scaled down to 2 and 8
+megapixels, measured against the released decoder on the same picture:
+
+| | the Image VAE | the released decoder |
+|---|---|---|
+| 1152 × 1728 (2 MP) | 30.9 dB, 24 s | 28.9 dB, 72 s |
+| 2304 × 3456 (8 MP) | 35.8 dB, 97 s | 33.4 dB, 275 s |
+| 4480 × 6720 (30 MP) | 37.5 dB, 6 min, 805 tiles | — |
+| 5296 × 7952 (42 MP) | 37.0 dB, 8.6 min, 1176 tiles | — |
+
+The higher figure at 8 MP is the picture, not the model: the same photo has
+less detail per pixel at the larger size, and both decoders gain the same
+amount. Up to 42 MP no seam between its tiles is visible; measured, the
+error along the tiles' blend edges is 1.1 to 1.3 times the error elsewhere,
+about what the released decoder shows. Memory grows slowly with the
+picture: the 42 MP round trip peaks at 6.1 GB, of which the checkpoint is
+5.2 GB. As its author warns, it softens hair and fine texture.
+
+### Faster attention — the VDN linear branch
+
+The Turbo LoRA above cuts how many steps a clip costs. This cuts what a step
+costs, and it does it by changing what attention *is* — from **dense**
+attention, whose cost grows with the *square* of the sequence, to a **linear**
+one whose cost grows in step with it. The sequence is every video row in the
+clip, and that count rises with **both** the duration and the resolution — so
+**a longer clip and a bigger frame each make this worth more**, and on a short
+small one it is barely worth turning on.
+
+[**VideoDeltaNet on MiniMax H3**](https://openvdn.github.io/#vdn-h3) (VDN-H3)
+is not a new model. It is a second checkpoint that sits beside the one you
+already have and replaces every main block's dense attention with a **hybrid**
+of two halves:
+
+- a **windowed softmax** over the frames near the query — a fixed span of
+  whole chunks, not the whole clip;
+- a **bidirectional delta rule** carrying everything that window cannot see,
+  as a linear-attention recurrence over frames.
+
+The two **partition** the keys. Every frame is read by exactly one half, which
+is why this is a different attention rather than an approximation layered on
+the old one — and why the branch's weights are trained for it. A frame counted
+by both would be counted twice; by neither, silently dropped.
+
+**Why the saving grows with the clip.** Dense attention compares every row
+with every other row, so **doubling the clip quadruples its cost** — and the
+rows here are the whole clip's video, not one frame's. Neither half of the
+hybrid does that. The window is a fixed span of frames however long the clip
+runs, so doubling the clip only doubles how many windows there are; the delta
+rule beside it is a recurrence over frames, which is linear for the same
+reason. Quadratic against linear is a gap that only opens with length, so the
+saving is a few percent on a short clip and the bulk of it is still ahead of
+you at 10 or 20 seconds.
+
+Measured on one block, both halves on the matrix cores, at two sequence
+lengths. Read the **growth** column: that is the quadratic and the linear
+doing what they do.
+
+| | 18,887 rows | 81,617 rows | growth |
+|---|---|---|---|
+| dense attention | 431 ms | 9662 ms | **22.4×** |
+| the hybrid's windowed half | 222 ms | 1105 ms | **5.0×** |
+| what the hybrid saves | 1.9× | **8.7×** | |
+
+**4.3× the rows costs dense attention 22× and the window 5×.** So the gap is
+not a constant to look up — it widens with every row you add.
+
+**Resolution buys this as surely as duration does.** A frame is
+`(width / 32) × (height / 32)` rows — 510 at 960 × 544, **1008** at
+1344 × 768 — so doubling the canvas doubles the sequence exactly as doubling
+the length does, and a quadratic does not care which one did it. Going from
+544p to 768p at the same duration is therefore about **4× the dense attention
+and 2× the hybrid's**, the same trade the table shows for a longer clip. And
+the two compound, because they multiply the same number: a long clip at a
+large size is where dense attention is worst and this is worth most. Read the
+right-hand column above as about 22 s at 544p **or roughly half that at
+768p** — the same rows either way.
+
+**Text and keyframes, not references.** Two different questions sit behind
+that line, and they have different answers.
+
+*The partition.* Both released stages are built on the **FL2VA** partition's
+blocks and there is no Ref2VA branch to attach, so this and the **Ref2VA
+checkpoint** are a choice between, not a pair. What closes that gap is
+upstream's **Ref2VA-like** mode, which feeds reference images through the
+FL2VA weights — so the branch and references *can* be had together, on FL2VA.
+vpipe runs it; see
+[Ref2VA-like](#ref2va-like--references-on-the-fl2va-weights) for what it is
+and what it is not, and
+[`minimax-h3-ref2va-like.vpipeline`](pipelines/minimax-h3-ref2va-like.vpipeline)
+for the branch and references in one graph. The Ref2VA *partition* with this
+branch attached is still the pairing nothing published covers, and
+`generate-video` warns when a graph asks for it.
+
+*The task.* The branch was trained on **text in, video and audio out**. Since
+then OpenVDN has published first-frame, last-frame and first-and-last
+conditioning on the **same checkpoints**, with the weights unchanged. The
+keyframes are packed as conditioning rows ahead of the generated video, held
+just short of clean, and the hybrid treats them the way it treats the prompt
+and the soundtrack: every generated row attends to each keyframe exactly,
+outside the window, and the linear half never sees them.
+
+vpipe gives those rows the same treatment, so the graphs in
+[More than text in](#more-than-text-in) take the branch as they are: one anchor
+for an opening frame, two for first and last, and port 6 alone for a last
+frame. The log notes the keyframe count once per geometry.
+
+Nothing checks the partition for you, though. It is chosen on `model-select`
+and the branch on `minimax-h3-model-config`, two different stages, and a
+branch attached to the Ref2VA partition's blocks still returns an
+ordinary-looking clip. The log warns when that happens but nothing refuses
+it, so check that `model-select` names FL2VA.
+
+#### Get it and run it
+
+Two catalogue entries, one repo. **`stage-dmd`** is the 8-step distillation
+and the one to take; `stage-b` is the 50-step model it was distilled from.
+Each is about **5 GB** on top of the DiT.
+
+```sh
+vpipe --launch docs/pipelines/prepare-minimax-h3-vdn.vpipeline
+```
+
+Then [**`minimax-h3-vdn.vpipeline`**](pipelines/minimax-h3-vdn.vpipeline),
+which is the text-to-video graph with two lines added to
+`minimax-h3-model-config`:
+
+```json
+"linear_branch": "OpenVDN/vdn-minimax-h3-stage-dmd",
+"lora": "larryvrh/MiniMax-H3-Turbo-Lora-v4-600-ema"
+```
+
+It composes with the Turbo LoRA — the branch shares the DiT's own q/k/v
+projections, so one adapter on those feeds both halves of the hybrid — and
+with [`i8_gemm`](#the-settings-worth-knowing), which reaches it twice over:
+the branch's output projection is run by the DiT's own GEMM, and the q/k/v it
+reads are quantised by then. Nothing inside the branch is affected.
+
+**Load-time, like `lora` and for the same reason:** it changes what the blocks
+*are*, not how strongly something is applied. Naming a different branch under
+a DiT that is already built is refused rather than half-taken. And a branch
+that is named but cannot be attached **fails the stage** instead of warning,
+because a graph that silently ran without it would produce a perfectly
+plausible video from weights trained for a different attention — there is no
+output anyone could look at and tell.
+
+#### How far the softmax half reaches — `vdn_range`
+
+The window is **whole chunks**: a query frame's own chunk of 5 latent frames
+and the chunks either side of it, `softmax_attention.radius` of them in the
+checkpoint's config — **1** in both released stages, so a query sees 15 latent
+frames exactly (about 2 s of video) and the linear half carries the rest.
+`generate-video`'s **`vdn_range`** sets that reach for a request in place of
+the checkpoint's — the **softmax/linear split**:
+
+| `vdn_range` | the softmax half sees | the linear half carries |
+|---|---|---|
+| `-1` (default) | the checkpoint's: the query's chunk ± 1 | every frame beyond |
+| `0` | the query's own chunk alone | everything else |
+| `2`, `3`, … | ± 2, ± 3 chunks | less, and nothing once the window covers the clip |
+
+Wider is more of the original attention — exact, and as costly as the dense
+attention it replaces over the frames it covers; narrower hands more to the
+delta rule. The two halves still **partition** the keys at any value: the
+linear branch reads its complement off the same bounds the window is built
+from. But the branch and its softmax gate were **trained at the checkpoint's
+radius**, so another value is a tuning outside what was trained, to be judged
+by eye. It is **per request** — no reload; the window's spans are rebuilt when
+it changes — and ignored without a branch. The stage logs the reach it runs
+when one is asked for. The reach is **at most 1024** chunks either side, which
+covers any clip; a larger value reads as 1024.
+
+**Step by step — `vdn_range_steps`.** As `sol_tau_steps` is to `sol_tau`:
+comma-separated whole numbers from `-1` to 1024, entry *i* for denoising step
+*i*, the last for every step past the list, `-1` the checkpoint's —
+`"2,1,1"` keeps more of the original attention for the first,
+structure-deciding step and hands more to the linear half after. Each forward carries its own reach
+(`Step::vdn_radius`; nothing latched, a forward without one runs the
+request's), so the window is rebuilt only where the reach changes from one
+step to the next. The memory preflight books the **narrowest** step's window —
+the least the softmax half covers is the most the linear half's buffers come
+to — and a step whose window covers the clip runs no linear half. The loop
+logs the schedule it runs.
+
+**What it costs in memory: the weights, and at 544p nothing else.** The branch
+is the ~5 GB of extra weights above, streamed block by block on the same terms
+as the DiT's own. Its *working* memory is larger than that sounds — over a
+gigabyte for a 5-second clip and more than two at 13 — but it is not a second
+allocation. It is carved out of the attention scratch the DiT is already
+holding, which sits idle for exactly the stretch the branch runs in, so at
+960 × 544 and above the branch's scratch is free. The two do not scale
+together, though: that scratch grows with the clip's **rows** and the branch's
+with its **frames**, so a clip of many small frames — under roughly 250 rows
+each, which is below 672 × 384 — crosses over and the branch starts costing
+the difference. `generate-video` sizes the box for whichever it is before the
+run starts.
+
+#### What it saves
+
+The same 124-frame clip as [How long it takes](#how-long-it-takes), on the
+**M5 Pro, 24 GB**, 5 steps with the Turbo LoRA:
+
+| | 124 frames, 5.2 s |
+|---|---|
+| dense attention | **5 min 0 s** |
+| VDN hybrid | **4 min 38 s** |
+
+**8% of the wall clock at this length, and that is the small end of it.** A
+5-second clip is under 40 latent frames, where the window still covers a large
+fraction of the sequence; the hybrid's advantage is in the part of the clip
+the window *doesn't* reach, which is why the figure above is a floor. Nor is
+attention the whole step — the feed-forward and the projections cost what they
+cost either way — so even the 1.9× on that one stage arrives at the wall clock
+diluted twice over. At four times the clip the same measurement is 8.7×, and
+that is where this setting is worth reaching for.
+
+> **This is a quality trade as well as a speed one, and it has not been
+> measured here.** The hybrid is a different attention, and while the branch's
+> weights are trained for it, nothing in this repository compares a VDN clip
+> against a dense one for fidelity. Upstream reports quality comparable to the
+> dense baseline; treat that as their claim, not a reproduction. Generate both
+> at a seed you like before committing a long job to it.
+
+### Cheaper attention — SageAttention's int8 QK
+
+The other setting that changes attention, and the one that composes with
+everything else here. [**SageAttention**](https://arxiv.org/abs/2410.02367)
+runs the **QK^T product in int8** — not by dropping keys, but by computing
+every one of them more cheaply. One flag:
+
+```json
+"sage_attn": true
+```
+
+**What it does.** A flash attention's matrix work is two products per key
+block: `QK^T` and `P·V`. Sage quantizes the first pair of operands to int8
+with **one scale per block** — per query block for Q, per key block for K,
+which is exactly the granularity the kernel already tiles at, so
+dequantizing a score tile is a single scalar multiply. `P·V` is left in the
+tensor dtype: `P` is a probability, already well-conditioned, and
+quantizing it would buy the same again for a much worse error.
+
+**The key smoothing is what makes it work, and it is exact.** K is
+quantized as `K − mean(K)` over tokens. A key channel's outlier is not
+variation between tokens but a large bias shared by all of them, and
+subtracting it spends the int8 range on the signal instead of the bias.
+Nothing is added back afterwards: a per-channel shift moves every score in
+a row by the same `⟨q, mean⟩`, and softmax does not see a per-row shift. Q
+is *not* smoothed, and that asymmetry is not an oversight — only the key
+side carries the shared bias, and a shift of Q would move each score by
+`⟨q_shift, k_j⟩`, which varies along the row.
+
+**Measured**, on an M5 at 8 heads × 20036 rows × head_dim 128:
+
+| | one attention |
+|---|---|
+| f16 kernel | **156.6 ms** |
+| int8 QK, prologue included | **130.6 ms** |
+
+**1.20×**, of which the quantization prologue is 2.2 ms — 1.7% of the call.
+The ceiling is 1.33×: int8 is 2.00× on the fragment pipe and QK is half a
+flash kernel's matrix work, so this is most of what was there to take.
+Accuracy is cosine **0.99992** against a double-precision reference, where
+the f16 kernel is *also* 0.99992.
+
+**Matrix cores only.** The int8 fragment MMA is an M5 instruction and there
+is no ALU fallback, so an M4 says so once in the log and runs dense rather
+than refusing — a graph that runs today keeps running everywhere it ran
+before.
+
+**It composes.** `sage_attn`, `sol_attn` and `i8_gemm` are three
+independent choices and none of them reads the others: `i8_gemm` decides
+how a block's GEMMs are computed, `sol_attn` which key blocks are attended
+at all, and `sage_attn` how the attended ones are multiplied.
+`sage_dense_layers` leaves a leading run of blocks in f16; it defaults to
+**0**, unlike
+`sol_dense_layers`' 1, because Sage computes every key and every query and
+there is no published profile that needs a dense prefix.
+
+The same setting is on `generate-image`, where FLUX.2, Krea-2 and
+Qwen-Image-Edit take it.
+
+### Its P·V in int8 too — `sage_pv8`
+
+With `sage_attn` on, the flash kernel's **second** product, `P·V`, can run
+in int8 as well:
+
+```json
+"sage_attn": true, "sage_pv8": true
+```
+
+The product is **held in int32** across key blocks — the kernel keeps no
+f32 output tile until the end. `P` goes in as uint8 against the row's
+running maximum (0..255); `V`, minus its mean over tokens, gets one scale
+per channel over the whole sequence and is offset by 128 to uint8 as well.
+When a row's maximum grows, the held sum is rescaled by the online
+softmax's own factor, and a row whose sum nears int32's range has `P`'s
+grid stepped down. `Q` goes per token. Dequantizing each key block's
+product into an f32 output instead cost more than the int8 product saved.
+
+**Measured** on an M5 Ultra, 56 heads × 109k rows × head_dim 128 (a 1344 ×
+768 clip of 362 frames), bf16, one attention:
+
+| | one attention |
+|---|---|
+| f16 kernel | **4.04 s** |
+| `sage_attn` | **2.90 s** |
+| `sage_attn` + `sage_pv8` | **2.46 s** |
+
+The whole denoise of that clip at 16 steps went from 2110 s to 1927 s.
+
+**Two more keys.** `sage_pv8_from_step` is the first sampling step it runs
+at — the steps before keep `sage_attn` alone; `-1`, the default, runs the
+first quarter of the steps without, the steps that settle a clip's
+layout. `sage_pv8_all_rows` (default `false`) puts the prompt's and the
+soundtrack's rows on it too; off, those — under 1% of a clip's rows — keep
+`sage_attn` alone in a dispatch of their own.
+
+`generate-image` has `sage_pv8` too, where FLUX.2, FLUX.3, Krea-2,
+MOSS-Image, Qwen-Image and Z-Image take it on every step and row.
+
+### Faster attention — Sol-Attn routing
+
+The other way to make a step cheaper, and it needs nothing you do not
+already have. [**Sol-Attn**](https://nvlabs.github.io/Sana/Sol-Attn/) is a
+training-free sparse attention from NVIDIA's Sana project. Unlike the VDN
+branch above it is **not a checkpoint** — there is nothing to download and
+nothing to attach, and nothing about it is partition-specific, where the
+branch is trained for FL2VA's blocks. One flag on `generate-video`:
+
+```json
+"sol_attn": true
+```
+
+**What it does.** Attention is dominated by key blocks that contribute
+almost nothing, and *which* ones those are depends on the clip, the head
+and the layer — so it cannot be decided in advance. Sol decides it while
+the softmax runs, from a proxy it computes anyway. Per block of 64 keys it
+keeps two summaries — the keys' centroid and the values' mean — and per
+query block a threshold. One product against the centroids scores every key
+block at 1/64 of the dense cost. A block above the threshold is attended
+**exactly**; one below is **folded into the same running softmax** as if all
+64 of its keys carried the centroid's score. So nothing is dropped, no
+routing map is ever built, and there is no second pass.
+
+**The threshold is a distribution, not a block count.** `sol_tau` is
+measured in **standard deviations** of that proxy's own spread across
+blocks, which is what lets a single number serve every head, layer,
+resolution and clip length — where "keep the best 20 blocks" could not.
+Higher keeps fewer.
+
+**Two things stay exact whatever `sol_tau` says**, and neither is a tuning
+knob. A band of blocks either side of the query's own frame: the near
+diagonal is exactly where a centroid is a poor stand-in, because
+neighbouring keys are the ones a query is there to tell apart. And the
+prompt and soundtrack rows — H3 packs those into one sequence with the
+video, and a prompt summarised by its centroid is a prompt half-read.
+
+#### What it saves
+
+124 frames at **832 × 480**, 24 fps, 5 steps with the
+[Turbo LoRA](#fewer-steps--the-turbo-lora) and `i8_gemm`, on a **MacBook
+Pro 16-inch (M5 Pro), 24 GB**:
+
+| | 124 frames, 5.2 s |
+|---|---|
+| dense attention | **3 min 30 s** |
+| Sol-Attn, `sol_tau` 1.0 | **2 min 44 s** |
+
+**1.27× on the wall clock, and 1.40× on the denoise itself** — the model
+load, the prompt encode and the VAE decode are the same work either way.
+The run kept **23%** of key blocks exact. That fraction is a property of
+the DATA rather than of `sol_tau` alone, so it is measured rather than
+predicted: the log reports it once per forward, and it is the number to
+watch when tuning.
+
+**It costs no memory.** Everything Sol needs lives for the length of one
+attention call, so vpipe lends it buffers the model is not using over that
+stretch instead of allocating any — **861 MB** at the size above that the
+setting never asks the box for.
+
+#### Against the VDN branch
+
+Both replace the same attention and **only one can be on**; naming both
+turns Sol off for the branch's blocks and says so in the log. They are not
+the same trade:
+
+| | VDN linear branch | Sol-Attn |
+|---|---|---|
+| extra weights | ~5 GB, a second checkpoint | **none** |
+| partitions | FL2VA only — its weights are trained for those blocks | **not partition-specific** |
+| what changes | attention itself — a window plus a linear recurrence | which blocks are attended exactly |
+| how it scales | the window is **linear** in clip length, so its advantage widens without limit | a roughly constant fraction of blocks — near a quarter in the runs measured here |
+
+So the branch is the one to reach for on a long clip at a large size, and
+Sol is the one that costs nothing to try. No head-to-head at a single
+geometry is offered here — the figures in each section are at the size each
+was measured at.
+
+#### The knobs
+
+| key | shipped | notes |
+|---|---|---|
+| `sol_attn` | `false` | Off. It is an approximation, and which clips it is safe on is a judgement about the model rather than about the kernel. |
+| `sol_tau` | `1.0` | In standard deviations. Higher keeps fewer blocks: speed rises and quality falls, monotonically in both. |
+| `sol_key_block` | `64` | **32 or 64 only.** 32 does more exact work, is slower and is more faithful — a centroid over 32 keys stands in for them better, while halving the block doubles both the routing and the summary sequence. Larger blocks were measured and lose on both counts, so they are declined with a warning and a fall back to 64. |
+| `sol_dense_layers` | `1` | Leading blocks left dense. The first block is where the residual stream is least redundant, and it is one of 50. |
+| `sol_dense_steps` | `0` | Leading denoising steps left dense — the time-axis twin of `sol_dense_layers`. The first steps decide a clip's coarse structure. HyperFlow's published recipe uses 2 of its 8. |
+| `sol_tau_steps` | empty | `sol_tau` step by step, comma-separated (`"1.0,1.5,1.75"`): entry *i* for step *i*, the last for every step after. A step's error at one tau falls as the noise does — measured on the 2K refine, about 0.6× at the second step and 0.5× at the third — so the later steps can keep fewer blocks. |
+| `sol_local_radius` | `1` | Blocks either side of the query's own kept exact whatever the routing says. |
+| `sol_threshold` | `diag` | How the routing measures the spread `sol_tau` counts in: `diag` from the key centroids' per-channel variance, `exact` from their full covariance — the published method's two forms. One tau keeps a different share of blocks under each, so a tau tuned on one does not carry to the other. |
+
+It composes with the [Turbo LoRA](#fewer-steps--the-turbo-lora) and with
+`i8_gemm`, and the second is worth being precise about, since both are
+lossy: measured in this stack, their errors are **independent** — the pair
+lands at the quadrature sum of the two apart, not at the linear one, and
+switching Sol on does not amplify what `i8_gemm` costs.
+
+> **This is a quality trade as well as a speed one.** What Sol drops is
+> chosen per clip, so its effect is not the same on every prompt, and
+> nothing in this repository compares a routed clip against a dense one for
+> fidelity at full length. Upstream reports quality preserved; treat that as
+> their claim, not a reproduction. Generate both at a seed you like before
+> committing a long job to it, and raise `sol_tau` only against output you
+> have looked at.
+
+### Fewer forwards — MotionCache
+
+Every setting above makes a step cheaper. [**MotionCache**](https://github.com/MAC-AutoML/MotionCache)
+skips some steps outright. Like Sol it is training-free — nothing to
+download, nothing partition-specific — and it is one flag on
+`generate-video`:
+
+```json
+"motion_cache": true
+```
+
+**What it does.** Past the first few steps, consecutive denoising steps ask
+the model nearly the same question and get nearly the same answer. So
+before each forward, MotionCache predicts how far the model's output has
+moved since the last forward that actually ran — a gain measured between
+the last two real forwards, times how far the latent has moved since. If
+that is small, the step reuses the last forward's residual, carried to the
+new latent, instead of running the 33B stack; the step itself still
+happens, so the schedule is unchanged.
+
+**The prediction is weighted by motion.** Every latent position counts in
+proportion to how much the clip is moving there, read from the model's own
+clean estimate frame to frame. A drift over a still background is cheap; the
+same drift on a moving hand is not. The predictions **add up** across
+consecutive skips, and at most two steps are skipped in a row, so a reused
+answer is never far from a real one.
+
+This is the step-level form that the [MiniMax H3 MotionCache node for
+ComfyUI](https://github.com/starsFriday/ComfyUI-MiniMax-H3-MotionCache)
+takes, with the same defaults, and vpipe's decisions are tested against that
+node's own code step for step. The method's token-level variant, which
+recomputes only the moving tokens, is not implemented.
+
+#### What it saves
+
+The shipped prompt, 39 frames at 512 × 288, `steps: 20`, no Turbo LoRA,
+seed 6, on a **MacBook Pro M4 Pro, 64 GB**:
+
+| | forwards | denoise | whole run | video vs off | audio vs off |
+|---|---|---|---|---|---|
+| off | 20 | 249 s | 6 min 3 s | — | — |
+| `motion_cache: true` (threshold 0.15) | **15** | **189 s** | **4 min 58 s** | 30.8 dB mean PSNR, 27.5 worst frame | 14.2 dB SNR |
+
+A skipped step costs a few milliseconds of host work against 12.7 s for a
+forward, so the denoise saving is simply the share of forwards skipped.
+
+**Where it skips.** Not early: the predicted change starts near 0.4 a step
+and only falls under the threshold around the middle of the schedule. On
+the run above the first reuse was step 10, and from there it alternated —
+reuse, forward, reuse — until the last two steps, which ran. That is also
+why **a short schedule has little to give**: warm-up takes the first four
+steps, and on a schedule of eight each remaining step moves the latent far
+enough to keep the prediction high. Reach for it at 16 steps and up.
+
+**The threshold moves in jumps.** Raising it to 0.2 changed nothing on this
+clip: the scores nearest the line were 0.204 and 0.218, both still over it,
+so the same five steps were skipped. What a threshold buys depends on where
+a clip's scores happen to fall, and the per-step trace
+(`VPIPE_H3_DENOISE_PROFILE=1`) prints each one.
+
+**What the difference looks like.** The two clips are the same shot —
+same framing, same performance — with small shifts in pose and hand
+position where the reused steps nudged the trajectory. The soundtrack moves
+more than the picture (14 dB SNR): the sound is the same, the waveform is
+not, so listen before trusting a long job to it.
+
+#### Its knobs
+
+| key | shipped | notes |
+|---|---|---|
+| `motion_cache` | `false` | Off. It is an approximation; faces, hands, fast motion and lip sync are where it shows first. |
+| `motion_cache_threshold` | `0.15` | How much predicted change the reused steps may add up to. **Higher skips more.** The ComfyUI node's example workflow uses 0.2. |
+| `motion_cache_strength` | `1.0` | How much motion weighs. 0 treats every position alike. |
+| `motion_cache_warmup` | `4` | Leading steps always run. The first two run regardless — the prediction needs two real forwards to measure from. |
+| `motion_cache_max_skips` | `2` | Most steps reused in a row. |
+| `motion_cache_start` / `motion_cache_end` | `0.15` / `0.95` | The window it is consulted in, as fractions of the schedule from noise (0) to clean (1). Steps outside it always run. |
+| `motion_cache_subsample` | `8` | The stride of the samples the decision is made from. A reused step still reuses every value. |
+
+It composes with everything above — Sol, Sage, `i8_gemm`, the Neural
+Engine and the LoRAs all make a forward cheaper, and this runs fewer of
+them. The log says what it did once per clip:
+
+```
+h3-denoise: motion_cache reused 5 of 20 steps -- 15 forwards ran, 1.33x fewer
+```
+
+### The Neural Engine — for M4-family Macs
+
+Every Apple Silicon Mac has a second accelerator beside the GPU, the
+**Apple Neural Engine** (ANE), and a generation normally leaves it idle.
+vpipe can hand it part of every block: the rows of the **feed-forward**,
+and optionally of the **q|k|v projection**, are split between the two
+engines and computed **at the same time**. Rows in those layers are
+independent of each other, so the split is exact; there is no seam.
+
+```json
+"ane_ffn": true,
+"ane_qkv": true
+```
+
+**Use it on an M4-family Mac** (M4, M4 Pro, M4 Max). There the GPU's matrix
+products already run close to what its memory bandwidth allows, so the ANE
+is the only spare compute on the chip, and taking a share of the rows off
+the GPU shortens every block.
+
+**On an M5, it typically does not help — leave it off.** The M5 GPU's matrix
+cores run these layers several times faster than an M4 GPU's do, while the
+ANE is roughly as quick as before, so there is much less for it to take back.
+Both engines also read the same memory, so the GPU's own rate falls while the
+ANE is predicting. What is left is a few percent, and it depends on the
+geometry: MEASURED on the 24 GB M5 Pro at 960 × 544, 243 frames, Sol and
+Sage on, 3 steps, the tier armed and took the denoise **203 s → 189 s
+(1.07×)**.
+
+The case where it could pay on an M5 is the one where the feed-forward and
+projections dominate a block — a **long clip at high resolution** — but that
+is also where the modules compete with the forward pass for memory, and on
+a 24 GB box they lose. At 1344 × 768, 328 frames the plan granted the module
+and the stage then declined it:
+
+```
+the 98887-row forward fits only without the ANE modules' ~2711 MB
+  -- running the GPU alone for this clip
+```
+
+That run matched its GPU-only control to within a second, which is the
+fallback behaving. So on an M5 treat the tier as something to **measure on
+your own clip**, not as a setting to leave on.
+
+**It does not save memory, whatever the process size suggests.** In the M5
+pair above peak RSS fell from 16.0 GB to 12.1 GB, and none of that is a
+saving: the modules' weights are **wired outside the process** (~1134 MB and
+~374 MB, logged), and the DiT answered by keeping **9 of its 50 blocks**
+resident instead of 21. The tier competes for memory with the block
+residency that makes streaming cheap, so on a tight box it can cost more in
+re-read weights than it wins in the feed-forward. The activation scratch is
+unchanged either way — it is sized by the sequence, not by which engine
+computes a row.
+
+#### What it saves on an M4
+
+MEASURED on a **MacBook Pro (M4 Pro), 64 GB**, 8-bit, 960 × 544, 124
+frames, 3 steps, dense attention:
+
+| | denoise | wall clock |
+|---|---|---|
+| GPU alone | 10 min 2 s | 14 min 17 s |
+| `ane_ffn` + `ane_qkv` | **7 min 23 s** | **11 min 46 s** |
+
+**1.36× on the denoise.** The wall clock gains less (1.21×) because it also
+carries the one-time module builds and a VAE decode that the ANE does not
+touch. Per block, the two tiers were measured apart at a larger geometry
+(1344 × 768, 328 frames, Sol routing every block): the feed-forward alone
+took a block from 23.6 s to 19.3 s, and adding q|k|v took it to 17.2 s.
+
+The clip is not bit-identical to the GPU-only one — at the same seed the
+frames land ~35 dB PSNR apart, which is what an fp16 path costs.
+
+#### How it behaves
+
+- **It balances itself.** `ane_rows` 0 (the default) sizes the ANE's share
+  from the two engines' measured speeds. The tier also times a GPU-only block
+  now and then, and **goes back to the GPU alone** when the split measures
+  slower. A wrong guess costs a few percent, not the clip.
+- **It is lossy, like `i8_gemm`.** The ANE computes in fp16, and the rows it
+  takes differ slightly from the GPU's. MEASURED on two blocks of real
+  geometry: relative L2 **0.0035** on the video output and **0.00045** on the
+  audio. An activation that overflows fp16 is detected, and the chunk is
+  recomputed at a smaller scale rather than passed on.
+- **8-bit, 4-bit, FP8 and ComfyUI int8 / W4A8 checkpoints work**, and so
+  do runtime LoRAs: each block's weights are dequantized, with any adapter
+  merged in, into buffers the ANE reads, one block at a time. That work is
+  done on the CPU **while the GPU computes**: a block's feed-forward weights
+  under its own attention, its q|k|v weights a block early, under the
+  previous block's attention. A block streamed from disk is read only at its
+  turn, so its q|k|v weights are prepared while the GPU computes its own
+  share of those rows.
+- **It costs memory, planned before the run.** Each tier holds one shared
+  module however many blocks use it, and the resource plan books both
+  together: **1922 MB** at 124 frames of 960 × 544, **2711 MB** at 328 frames
+  of 1344 × 768. If the forward does not fit alongside them, the run says so
+  and uses the **GPU alone** rather than refusing.
+- **The first run pays a one-time build.** macOS compiles each module the
+  first time: about **10 s** for the feed-forward and **5 s** for q|k|v on an
+  M4 Pro, all before the first denoise step. After that it is cached and
+  takes ~50 ms. The cache is kept **per program** (`vpipe` and `vpipe-web-ui`
+  each build once) and **per macOS version**, so an OS update pays it once
+  more. Resolution and clip length never trigger a rebuild.
+
+#### Faster and lossier: `ane_int8`
+
+`ane_int8` runs both modules in **int8** (W8A8) instead of fp16. It is how
+int8 reaches a Mac with no GPU matrix cores, the M4 series, where `i8_gemm`
+does not run. It comes in the two flavours `i8_gemm_tier` names on the GPU,
+chosen by `ane_int8_tier`:
+
+- **`token`** (the default): each weight row is rotated (a Walsh-Hadamard
+  transform over every 256 values) and quantized to int8 as it is prepared,
+  and each projection's input is rotated and quantized per token inside the
+  module. The rotation keeps outlier channels from setting a whole row's
+  step.
+- **`token_plain`**: the same without the rotation, the arithmetic of the
+  GPU's `token_plain`.
+
+MEASURED on a **MacBook Pro (M4 Pro)**, two real blocks at 9382 rows, one
+sitting:
+
+| | ANE split vs GPU alone | video relative L2 |
+|---|---|---|
+| `ane_ffn` | 1.26× | 0.0034 |
+| `ane_ffn` + `ane_int8` | 1.36× | 0.0045 |
+| `ane_ffn` + `ane_int8`, `token_plain` | 1.36× | 0.0079 |
+| `ane_ffn` + `ane_qkv` | 1.41× | 0.0035 |
+| `ane_ffn` + `ane_qkv` + `ane_int8` | **1.65×** | 0.0048 |
+| `ane_ffn` + `ane_qkv` + `ane_int8`, `token_plain` | 1.67× | 0.0081 |
+
+On a block's output, measured against the GPU's own int8 arithmetic on the
+same weights and inputs, each flavour is exactly as far from the exact
+result as the GPU tier it is named after (within 1%): `token` 0.6–2.1e-2,
+`token_plain` 1.9–6.1e-2, against 2.2–2.5e-3 for fp16. So `token_plain`
+buys almost no speed for ~1.7× the error in the video; it is there to run
+the same arithmetic as a GPU on `token_plain`. Judge either by eye, as you
+would the int8 GEMM tiers.
+
+- It needs **macOS 26** or later. Where the module cannot run int8, the tier
+  builds the fp16 one and says so.
+- The first build is a little longer (about **15 s** for the feed-forward
+  and **7 s** for q|k|v on an M4 Pro), then cached like the fp16 one.
+- An overflow inside the module is caught as in fp16 and the chunk is
+  recomputed at a smaller scale; in int8 that costs no precision.
+
+| key | default | notes |
+|---|---|---|
+| `ane_ffn` | `false` | The feed-forward on the ANE. |
+| `ane_qkv` | `false` | The q\|k\|v projection too, as a second module. **Requires `ane_ffn`**; the two are planned and granted together, so the plan may decline the pair where it would have granted the feed-forward alone. |
+| `ane_int8` | `false` | Both modules in rotated int8 (lossy, faster). **Requires `ane_ffn`** and macOS 26. See [Faster and lossier](#faster-and-lossier-ane_int8). |
+| `ane_int8_tier` | `token` | Which int8: `token` (rotated) or `token_plain` (unrotated, lossier, the same speed). Needs `ane_int8`. |
+| `ane_rows` | `0` | The ANE's share of the rows, from 0 to 1. `0` balances automatically; a fixed share is for benchmarking. |
+| `ane_layers` | `0` | Cap on how many blocks use it; `0` is all of them. Not a memory setting: every block shares one module. |
+
+The same switch exists on **`vae-decode`**, for H3's video decoder, whose
+feed-forward is most of the decode. `ane_ffn` there is independent of
+`generate-video`'s, and it follows the same M4-yes, M5-no rule.
 
 ## Memory
 
@@ -754,8 +4447,9 @@ leaving RAM.
 **This is where more memory pays.** The resident set is bounded by free RAM
 and nothing else, so a 32 or 64 GB machine holds proportionally more of the
 model between steps and re-reads proportionally less. On a large enough
-machine it stops streaming altogether and simply preloads. Nothing needs
-configuring for this — it is measured at load and adapts as the run proceeds.
+machine the first step keeps every block it reads, and from the second on
+nothing is read at all. Nothing needs configuring for this — it is measured
+as the run proceeds and adapts to it.
 
 **One heavy job at a time.** Metal buffers are wired and cannot be paged out,
 so a second large model running alongside this one does not slow the machine
@@ -773,7 +4467,24 @@ instead.
 `save-video` has `enable_audio: true` and that `audio-vae-decode` is wired to
 `generate-video` **port 1** (port 0 is video).
 
+**The generated soundtrack doesn't carry the reference music.** The prompt
+has to ask for it — the sound comes from the same text as the picture, so
+name what is being played (see [step 2](#step-2--text-to-video-and-audio)).
+Then check the encoder's line: `N reference(s) -> ... M reference audio
+rows`, where `M` should be `2 × 40 × seconds` — 400 for a 5 s reference.
+Far more than that means the soundtrack reached it at the wrong rate; the
+encoder warns about it and resamples, and the fix is to set the producing
+`audio-to-pcm`'s `output_sample_rate` to **32000**.
+
 **`frames` isn't what you asked for.** Expected — see the table above.
+
+**`ane_ffn` was set but nothing ran on the ANE.** Two lines say why. Either
+the modules did not fit beside the forward pass (*"the N-row forward fits
+only without the ANE modules"*), in which case the clip runs on the GPU
+alone — lower `frames` or the frame size, or turn the tier off; or the tier
+armed and its controller measured the split as slower and went back to the
+GPU, which on an M5 is the expected outcome. See
+[The Neural Engine](#the-neural-engine--for-m4-family-macs).
 
 ## Under the hood
 
@@ -784,4 +4495,94 @@ instead.
 - The video VAE is 24-channel at 1/16 resolution; audio decodes through a
   separate VAE to **32 kHz stereo**.
 - On **M5**, the GEMMs and attention run on the GPU's matrix cores
-  (`matmul2d` / NAX flash attention).
+  (`matmul2d` / NAX flash attention) — including both accelerated attention
+  settings, whose exact halves are that same flash kernel walking only the
+  key blocks they keep.
+
+## References and licences
+
+**MiniMax-H3** is published by MiniMax AI under the **MiniMax H3 Community
+Licence Agreement**, which is the licence the checkpoint carries and the one
+you accept on its Hugging Face page before downloading:
+
+- Weights (FL2VA + Ref2VA): <https://huggingface.co/MiniMaxAI/MiniMax-H3>
+- Repack used as a second opinion on the qkv grouping:
+  <https://huggingface.co/Comfy-Org/MiniMax-H3>
+
+**Pika H3 Flex** — the six-step adapters of
+[Six steps, any reference](#six-steps-any-reference--pika-h3-flex) — is by
+Pika Labs (Mellis, Inc.). The adapters are Model Derivatives of MiniMax H3,
+distributed under the same **MiniMax H3 Community Licence Agreement**, with
+the required notice in the repository's `NOTICE`, which the prepare graph
+fetches beside them.
+
+- Weights: <https://huggingface.co/Pika-Labs/Pika-H3-Flex>
+- Technical deep dive: <https://pika.art/blog/pika-h3-flex-research>
+
+```bibtex
+@misc{pika2026flex,
+  title  = {Pika H3 Flex Technical Deep Dive},
+  author = {{Pika Research}},
+  year   = {2026},
+  howpublished = {\url{https://pika.art/blog/pika-h3-flex-research}}
+}
+```
+
+**VideoDeltaNet on MiniMax H3 (VDN-H3)** — the hybrid attention of
+[Faster attention](#faster-attention--the-vdn-linear-branch) — is by Haocheng
+Xi, Yiming Xie, Hexu Zhao, Yiwen Zhang, Michael Liu, Thomas Creavin, Kurt
+Keutzer, Xiuyu Li, Zhaoyang Lv, Chenfeng Xu and Haiwen Feng, of UC Berkeley,
+Impossible Inc. and UT Austin. Its Hugging Face repository declares the same
+**MiniMax H3 Community Licence Agreement** as the base model it attaches to,
+with the licence text in the repo's own `LICENSE`.
+
+- Project page: <https://openvdn.github.io/#vdn-h3>
+- Code: <https://github.com/OpenVDN/vdn-minimax-h3>
+- Weights: <https://huggingface.co/OpenVDN/vdn-minimax-h3>
+
+```bibtex
+@misc{xi2026videodeltanet,
+  title  = {VideoDeltaNet on MiniMax H3},
+  author = {Haocheng Xi and Yiming Xie and Hexu Zhao and Yiwen Zhang and
+            Michael Liu and Thomas Creavin and Kurt Keutzer and Xiuyu Li and
+            Zhaoyang Lv and Chenfeng Xu and Haiwen Feng},
+  year   = {2026},
+  url    = {https://openvdn.github.io/}
+}
+```
+
+**Sol-Attn** — the routed attention of
+[Faster attention — Sol-Attn routing](#faster-attention--sol-attn-routing)
+— is by Haopeng Li, Yitong Li, Junsong Chen, Tian Ye, Haozhe Liu, Jincheng
+Yu, Duomin Wang, Ruihua Zhang, Zeke Xie, Enze Xie and Song Han, of NVIDIA.
+It ships as part of NVIDIA's **Sana** repository, under that repository's
+**Apache-2.0** licence. It carries no weights of its own, so nothing is
+downloaded for it and nothing is redistributed here — the implementation in
+this tree is written from the published method and sources.
+
+- Project page: <https://nvlabs.github.io/Sana/Sol-Attn/>
+- Paper: <https://arxiv.org/abs/2607.24027>
+- Code: <https://github.com/NVlabs/Sana>
+
+```bibtex
+@misc{li2026solattn,
+  title  = {Sol-Attn: Accelerating Video Generation Inference via
+            On-the-Fly Attention Sparsification},
+  author = {Haopeng Li and Yitong Li and Junsong Chen and Tian Ye and
+            Haozhe Liu and Jincheng Yu and Duomin Wang and Ruihua Zhang and
+            Zeke Xie and Enze Xie and Song Han},
+  year   = {2026},
+  eprint = {2607.24027},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  url    = {https://arxiv.org/abs/2607.24027}
+}
+```
+
+**Turbo LoRAs** are community distillations, each under its own repository's
+terms: [larryvrh/MiniMax-H3-Turbo-Lora](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)
+and [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo).
+
+None of these are redistributed here — every pipeline in this document
+downloads from the publisher, and the licence you accept is theirs. Check each
+before using its output commercially.

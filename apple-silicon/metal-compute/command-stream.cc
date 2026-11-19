@@ -6,7 +6,10 @@
 #include <Metal/Metal.hpp>
 
 #include <cstdlib>
+#include <atomic>
 #include <utility>
+
+#include <mach/mach_time.h>
 
 namespace vpipe::metal_compute {
 
@@ -108,13 +111,143 @@ CommandStream::begin_compute(DispatchType dispatch_type)
   return e;
 }
 
+namespace {
+// See CommandStream::fire_and_forget_stats.
+std::atomic<unsigned long long> g_ff_completed{0};
+std::atomic<unsigned long long> g_ff_errored{0};
+// See CommandStream::gpu_time_stats.
+std::atomic<unsigned long long> g_gpu_ns{0};
+std::atomic<unsigned long long> g_gpu_buffers{0};
+int
+gpu_time_mode_()
+{
+  static const int mode = [] {
+    const char* e = std::getenv("VPIPE_MC_GPU_TIME");
+    return e != nullptr ? std::atoi(e) : 0;
+  }();
+  return mode;
+}
+bool gpu_time_on_() { return gpu_time_mode_() != 0; }
+std::mutex g_spans_mu;
+std::vector<CommandStream::GpuSpan> g_spans;
+// The newest spans kept when nobody takes them (40 bytes each).
+constexpr std::size_t kMaxGpuSpans = 65536;
+void
+note_gpu_time_(MTL::CommandBuffer* cb, double committed)
+{
+  if (cb == nullptr) { return; }
+  const double s = cb->GPUStartTime(), e = cb->GPUEndTime();
+  if (e > s && s > 0.0) {
+    g_gpu_ns.fetch_add((unsigned long long)((e - s) * 1e9),
+                       std::memory_order_relaxed);
+    if (gpu_time_mode_() >= 2) {
+      std::lock_guard<std::mutex> lk(g_spans_mu);
+      if (g_spans.size() >= kMaxGpuSpans) {   // the newest half kept
+        g_spans.erase(g_spans.begin(),
+                      g_spans.begin() + (std::ptrdiff_t)(kMaxGpuSpans / 2));
+      }
+      g_spans.push_back({committed, cb->kernelStartTime(),
+                         cb->kernelEndTime(), s, e});
+    }
+  }
+  g_gpu_buffers.fetch_add(1, std::memory_order_relaxed);
+}
+}  // namespace
+
+double
+CommandStream::host_seconds()
+{
+  static const double tick = [] {
+    mach_timebase_info_data_t tb;
+    mach_timebase_info(&tb);
+    return (double)tb.numer / (double)tb.denom * 1e-9;
+  }();
+  return (double)mach_absolute_time() * tick;
+}
+
+std::vector<CommandStream::GpuSpan>
+CommandStream::take_gpu_spans()
+{
+  std::lock_guard<std::mutex> lk(g_spans_mu);
+  return std::exchange(g_spans, {});
+}
+
+void
+CommandStream::gpu_time_stats(double* busy_ms, unsigned long long* buffers)
+{
+  if (busy_ms != nullptr) {
+    *busy_ms = (double)g_gpu_ns.load(std::memory_order_relaxed) / 1e6;
+  }
+  if (buffers != nullptr) {
+    *buffers = g_gpu_buffers.load(std::memory_order_relaxed);
+  }
+}
+
+void
+CommandStream::fire_and_forget_stats(unsigned long long* completed,
+                                     unsigned long long* errored)
+{
+  if (completed != nullptr) {
+    *completed = g_ff_completed.load(std::memory_order_relaxed);
+  }
+  if (errored != nullptr) {
+    *errored = g_ff_errored.load(std::memory_order_relaxed);
+  }
+}
+
+void
+CommandStream::note_encode_failure_(const char* why)
+{
+  if (!_fail) { _fail = std::make_shared<Failure>(); }
+  bool expected = false;
+  if (!_fail->failed.compare_exchange_strong(expected, true)) { return; }
+  std::lock_guard<std::mutex> lk(_fail->mu);
+  _fail->reason = why;
+}
+
 void
 CommandStream::split_encoder_(ComputeEncoder& enc)
 {
   const DispatchType dt = enc._dt;
   enc.end();                       // endEncoding + release enc._enc
   if (_cb != nullptr) {
-    _cb->commit();                 // fire-and-forget; final commit() waits
+    // NOBODY WAITS ON THIS BUFFER, so nothing else is in a position to
+    // notice it fail. Latch the failure from a completion handler and
+    // let the Fence the caller does wait on report it -- otherwise an
+    // intermediate out-of-memory skips its dispatches and the stream
+    // still reports success, which is a silently wrong result rather
+    // than a failed one.
+    if (!_fail) { _fail = std::make_shared<Failure>(); }
+    auto f = _fail;
+    const double committed = gpu_time_on_() ? host_seconds() : 0.0;
+    MTL::HandlerFunction note = [f, committed](MTL::CommandBuffer* cb) {
+      // Counted FIRST and unconditionally: this is what proves the
+      // handler runs at all, which is what makes a zero error count mean
+      // "nothing failed" rather than "nothing was watching".
+      g_ff_completed.fetch_add(1, std::memory_order_relaxed);
+      if (gpu_time_on_()) { note_gpu_time_(cb, committed); }
+      if (cb == nullptr ||
+          cb->status() != MTL::CommandBufferStatusError) {
+        return;
+      }
+      g_ff_errored.fetch_add(1, std::memory_order_relaxed);
+      // FIRST failure wins: it is the one that explains the rest, and a
+      // later buffer failing because an earlier one did would otherwise
+      // overwrite the cause with a symptom.
+      bool expected = false;
+      if (!f->failed.compare_exchange_strong(expected, true)) { return; }
+      std::string why = "GPU command buffer error";
+      if (NS::Error* e = cb->error()) {
+        if (NS::String* d = e->localizedDescription()) {
+          const char* c = d->utf8String();
+          if (c != nullptr) { why = c; }
+        }
+      }
+      std::lock_guard<std::mutex> lk(f->mu);
+      f->reason = "an earlier command buffer in this stream failed: " + why;
+    };
+    _cb->addCompletedHandler(note);
+    _cb->commit();                 // fire-and-forget; the latch reports
     _cb->release();
     _cb = nullptr;
   }
@@ -175,12 +308,21 @@ CommandStream::commit()
   if (_cb == nullptr) {
     return Fence{};
   }
+  if (gpu_time_on_()) {
+    const double committed = host_seconds();
+    _cb->addCompletedHandler(
+        MTL::HandlerFunction([committed](MTL::CommandBuffer* cb) {
+          note_gpu_time_(cb, committed);
+        }));
+  }
   _cb->commit();
   // Transfer the refcount to the Fence and clear our slot so the
-  // next ensure_cb_() opens a fresh buffer.
+  // next ensure_cb_() opens a fresh buffer. The latch goes with it: this
+  // Fence is what the caller waits on, so it is where a failure in any
+  // buffer this stream already let go has to surface.
   MTL::CommandBuffer* cb = _cb;
   _cb = nullptr;
-  return Fence{cb};
+  return Fence{cb, _fail};
 }
 
 // ---- CommandStream::Fence ---------------------------------------
@@ -190,8 +332,14 @@ CommandStream::Fence::Fence(MTL::CommandBuffer* cb) noexcept
 {
 }
 
+CommandStream::Fence::Fence(MTL::CommandBuffer* cb,
+                            std::shared_ptr<Failure> f) noexcept
+  : _earlier(std::move(f)), _cb(cb)
+{
+}
+
 CommandStream::Fence::Fence(Fence&& o) noexcept
-  : _cb(std::exchange(o._cb, nullptr))
+  : _earlier(std::move(o._earlier)), _cb(std::exchange(o._cb, nullptr))
 {
 }
 
@@ -204,6 +352,7 @@ CommandStream::Fence::operator=(Fence&& o) noexcept
   if (_cb != nullptr) {
     _cb->release();
   }
+  _earlier = std::move(o._earlier);
   _cb = std::exchange(o._cb, nullptr);
   return *this;
 }
@@ -297,13 +446,23 @@ CommandStream::Fence::wait_ok(std::string* reason)
     return true;                 // nothing ran, nothing failed
   }
   _cb->waitUntilCompleted();
-  if (_cb->status() != MTL::CommandBufferStatusError) {
-    return true;
+  // This buffer's own status FIRST: when both failed, the one the caller
+  // was waiting on is the more specific answer.
+  if (_cb->status() == MTL::CommandBufferStatusError) {
+    if (reason != nullptr) { *reason = error_message(); }
+    return false;
   }
-  if (reason != nullptr) {
-    *reason = error_message();
+  // Then any buffer this stream committed and let go before it. Ordering
+  // is safe: a stream's buffers complete in submission order, so by the
+  // time this one has completed every earlier one has run its handler.
+  if (_earlier && _earlier->failed.load()) {
+    if (reason != nullptr) {
+      std::lock_guard<std::mutex> lk(_earlier->mu);
+      *reason = _earlier->reason;
+    }
+    return false;
   }
-  return false;
+  return true;
 }
 
 CommandStream::Fence::GpuTimes

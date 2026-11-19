@@ -40,16 +40,23 @@ public:
   using TypedStage::TypedStage;
 
   unsigned target = 0;
-  unsigned next   = 0;
+  // ATOMIC because the tests below sample it MID-RUN from the main
+  // thread while this coroutine is still producing on a worker. A
+  // plain unsigned there is a data race that ThreadSanitizer flags in
+  // the library's own suite -- noise that hides real findings. Only
+  // this coroutine writes it, so relaxed is enough: the tests want a
+  // sample, not a synchronised count.
+  std::atomic<unsigned> next{0};
 
   vpipe::Job
   process(vpipe::RuntimeContext& ctx) override
   {
-    if (next >= target) {
+    const unsigned v = next.load(std::memory_order_relaxed);
+    if (v >= target) {
       ctx.signal_done();
       co_return;
     }
-    unsigned v = next++;
+    next.store(v + 1, std::memory_order_relaxed);
     co_await ctx.write(0,
         vpipe::make_payload<vpipe::test::UintPayload>(v));
   }
@@ -134,6 +141,69 @@ build_pipeline(vpipe::Session& sess, unsigned target,
 
 }
 
+namespace {
+
+// A sink that FAILS mid-run: it reads `before` beats, then throws -- as a
+// writer refused by its encoder does.
+class FailingSink : public vpipe::TypedStage<FailingSink> {
+public:
+  static constexpr const char* kTypeName = "ut-failing-sink";
+  using TypedStage::TypedStage;
+
+  unsigned              before = 0;
+  std::atomic<unsigned> read{0};
+
+  vpipe::Job
+  process(vpipe::RuntimeContext& ctx) override
+  {
+    if (read.load(std::memory_order_relaxed) >= before) {
+      throw std::runtime_error("the sink refused a beat");
+    }
+    auto t = co_await ctx.read(0);
+    if (!t) {
+      ctx.signal_done();
+      co_return;
+    }
+    read.fetch_add(1, std::memory_order_relaxed);
+  }
+};
+VPIPE_REGISTER_STAGE(FailingSink)
+
+}  // namespace
+
+// A stage that fails mid-run LEAVES its inputs (RuntimeContext::
+// leave_inputs): its producer, held to a ring of one, is not left
+// suspended on what it no longer reads -- the source runs out, and the
+// pipeline ends. It used to wait for good: the failed stage's cursor
+// stayed where it stopped, so the ring stayed full.
+TEST(pipeline_runtime, a_stage_that_fails_lets_its_producers_go) {
+  vpipe::Session sess;
+  auto pl = std::make_unique<vpipe::Pipeline>("p", &sess);
+  auto src_u = std::make_unique<CountingSource>(
+    &sess, "src", std::vector<vpipe::InEdge>{});
+  src_u->allocate_oports(1);
+  src_u->target = 200;
+  auto* src = static_cast<CountingSource*>(
+    pl->insert_stage(std::move(src_u)));
+  auto sink_u = std::make_unique<FailingSink>(
+    &sess, "sink", std::vector<vpipe::InEdge>{{src, 0}});
+  sink_u->before = 3;
+  auto* sink = static_cast<FailingSink*>(
+    pl->insert_stage(std::move(sink_u)));
+  src->set_oport_policy(
+    0, vpipe::OportPolicy{1, vpipe::OverrunPolicy::Backpressure});
+
+  vpipe::PipelineRuntime rt(pl.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  const bool idle = rt.wait_idle(5000);
+  EXPECT_TRUE(idle);
+  // The sink took its three, then failed; the source made all it was
+  // asked for -- the rest dropped, nobody reading them.
+  EXPECT_TRUE(sink->read.load() == 3u);
+  EXPECT_TRUE(src->next.load() == 200u);
+  rt.stop();
+}
+
 TEST(pipeline_runtime, passthrough_basic) {
   vpipe::Session sess;
   auto w = build_pipeline(sess, 100);
@@ -175,7 +245,7 @@ TEST(pipeline_runtime, backpressure_small_buffer) {
   // while the sink is a handful of items in; held to depth 1 it can
   // only be a couple of Beats ahead of what the sink has taken.
   std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  unsigned produced = w.src->next;
+  unsigned produced = w.src->next.load(std::memory_order_relaxed);
   size_t   consumed = 0;
   {
     std::lock_guard<std::mutex> lk(w.sink->mu);
@@ -209,27 +279,35 @@ TEST(pipeline_runtime, backpressure_small_buffer) {
 // this wrong are both silent -- stop() is reachable from the destructor
 // after an explicit stop (two lines for one run) and on a runtime that
 // never launched (a line for a run that never happened).
+// Captures only the "ran for" lines, so a test can count them.
+namespace {
+struct RanLines final : public vpipe::UiDelegateIntf {
+  std::mutex               mu;
+  std::vector<std::string> ran;
+  void error(const vpipe::VpipeFormat&) override {}
+  void warn(const vpipe::VpipeFormat&) override {}
+  void info(const vpipe::VpipeFormat& f) override {
+    const std::string s = f();
+    if (s.find("ran for") == std::string::npos) { return; }
+    std::lock_guard<std::mutex> lk(mu);
+    ran.push_back(s);
+  }
+  vpipe::UiInputStatus getline(const vpipe::VpipeFormat&, std::string&,
+                               const std::function<bool()>&) override {
+    return vpipe::UiInputStatus::Eof;
+  }
+  std::unique_ptr<vpipe::UiTextStream> open_text_stream() override {
+    return std::make_unique<vpipe::NullUiTextStream>();
+  }
+  std::size_t count() {
+    std::lock_guard<std::mutex> lk(mu);
+    return ran.size();
+  }
+};
+}  // namespace
+
 TEST(pipeline_runtime, stop_reports_how_long_it_ran) {
   vpipe::Session sess;
-  struct RanLines final : public vpipe::UiDelegateIntf {
-    std::mutex               mu;
-    std::vector<std::string> ran;
-    void error(const vpipe::VpipeFormat&) override {}
-    void warn(const vpipe::VpipeFormat&) override {}
-    void info(const vpipe::VpipeFormat& f) override {
-      const std::string s = f();
-      if (s.find("ran for") == std::string::npos) { return; }
-      std::lock_guard<std::mutex> lk(mu);
-      ran.push_back(s);
-    }
-    vpipe::UiInputStatus getline(const vpipe::VpipeFormat&, std::string&,
-                                 const std::function<bool()>&) override {
-      return vpipe::UiInputStatus::Eof;
-    }
-    std::unique_ptr<vpipe::UiTextStream> open_text_stream() override {
-      return std::make_unique<vpipe::NullUiTextStream>();
-    }
-  };
   auto owned = std::make_unique<RanLines>();
   RanLines* ui = owned.get();
   sess.set_ui_delegate(std::move(owned));
@@ -299,7 +377,8 @@ TEST(pipeline_runtime, stop_mid_stream) {
   rt.stop();
   EXPECT_TRUE(!rt.running());
   // Source should be far from finished.
-  EXPECT_TRUE(w.src->next < 1000000u);
+  EXPECT_TRUE(w.src->next.load(std::memory_order_relaxed)
+              < 1000000u);
 }
 
 TEST(pipeline_runtime, self_completed_when_all_stages_done) {
@@ -823,4 +902,48 @@ TEST(pipeline_runtime, satisfied_service_requirement_launches) {
   vpipe::PipelineRuntime rt(pl.get(), &sess);
   EXPECT_TRUE(rt.launch());
   rt.stop();
+}
+
+
+// A SELF-COMPLETED RUN HAS NOT REPORTED YET, and that is the whole
+// reason a host has to reap.
+//
+// When every stage signals done the drivers drain on their own, but
+// nothing calls stop() -- so `running()` is still set, the runtime still
+// holds its stages, and the "ran for" line is OWED and unprinted. The
+// web UI reached reap_completed_() only from three GET handlers, which
+// the browser polls only while the Pipeline Manager or Composer view is
+// mounted. Watch the User I/O page for the summary and no poll ever
+// came: the run ended, the console said nothing, and the pipeline read
+// as Running until you navigated back. It looked random because the
+// variable was which view happened to be open.
+//
+// The duration is the second casualty: it is measured launch -> stop(),
+// so a late reap does not merely delay the line, it INFLATES it.
+// MEASURED against the fix, same two-stage graph: 510 ms reaped by a
+// server-side tick against 14.0 s reaped by the first poll after a
+// 14-second wait.
+TEST(pipeline_runtime, a_self_completed_run_owes_its_summary_until_stop) {
+  vpipe::Session sess;
+  auto owned = std::make_unique<RanLines>();
+  RanLines* ui = owned.get();
+  sess.set_ui_delegate(std::move(owned));
+
+  auto w = build_pipeline(sess, 100);
+  vpipe::PipelineRuntime rt(w.pipeline.get(), &sess);
+  ASSERT_TRUE(rt.launch());
+  rt.wait_idle();
+
+  // Drained on its own, with nobody having asked it to stop.
+  EXPECT_TRUE(rt.self_completed());
+  EXPECT_TRUE(rt.running());
+  // ... and NOTHING has been reported. A host that never calls stop()
+  // leaves this line unprinted for the life of the process, which is
+  // the defect a polling-driven reap produced.
+  EXPECT_TRUE(ui->count() == 0);
+
+  rt.stop();
+  EXPECT_TRUE(ui->count() == 1);
+  std::printf("[pipeline_runtime] self-completed: owed 0 lines before "
+              "stop, 1 after\n");
 }

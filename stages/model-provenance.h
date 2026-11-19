@@ -28,6 +28,7 @@
 
 #include "common/flex-data.h"
 #include "vpipe/vpipe.h"
+#include "common/beat-keys.h"
 
 #include <string>
 #include <utility>
@@ -35,7 +36,7 @@
 namespace vpipe::provenance {
 
 // The sideband key every stage in the chain agrees on.
-inline constexpr const char* kSidebandKey = "model_name";
+inline constexpr std::string_view kSidebandKey = sideband::kModelName;
 
 // The model as the USER named it ("local/MiniMax-H3-FL2VA-8bit"), or ""
 // when the producer sent none.
@@ -69,6 +70,22 @@ carry_model_name(const FlexData& src, FlexData& dst)
   set_model_name(dst, model_name(src));
 }
 
+// The model as a file may name it. A local ABSOLUTE path -- a host that
+// resolved the model itself passes one -- is cut to its last two
+// components, <org>/<repo> in the models layout: a file someone shares
+// must not carry their home directory. Any other name is kept as given.
+inline std::string
+public_model_name(const std::string& model)
+{
+  if (model.empty() || model.front() != '/') { return model; }
+  std::string_view s = model;
+  while (s.size() > 1 && s.back() == '/') { s.remove_suffix(1); }
+  const std::size_t last = s.rfind('/');
+  if (last == 0) { return std::string(s.substr(1)); }
+  const std::size_t prev = s.rfind('/', last - 1);
+  return std::string(s.substr(prev + 1));
+}
+
 // What a sink records, in the one wording both of them use:
 //
 //   "Vpipe 0.1 d950473 with local/MiniMax-H3-FL2VA-8bit"
@@ -85,7 +102,7 @@ software_string(const std::string& model)
   s += vpipe_build_hash();
   if (!model.empty()) {
     s += " with ";
-    s += model;
+    s += public_model_name(model);
   }
   return s;
 }

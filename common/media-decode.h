@@ -100,10 +100,17 @@ struct DecodedVideo {
   std::vector<std::uint8_t> rgb;
 
   // The soundtrack, when the container has one. Planar, like
-  // DecodedAudio, and 0 channels when there is none.
+  // DecodedAudio, and 0 channels when there is none. Decoded WHOLE,
+  // whatever stopped the frames.
   int                audio_channels    = 0;
   int                audio_sample_rate = 0;
   std::vector<float> pcm;
+
+  // The frames stopped at a cap -- `max_seconds`, or the backstop
+  // (kMaxDecodedVideoFrames) on a whole-file decode -- rather than at
+  // the end of the stream, so the soundtrack may run past the last
+  // frame. (Also set when the stream happens to end exactly at the cap.)
+  bool cut_short = false;
 };
 
 std::optional<DecodedImage>
@@ -127,6 +134,10 @@ decode_audio_file(const FFmpegLibraries* libs,
                   int                    target_sample_rate,
                   std::string*           error    = nullptr,
                   int                    channels = 1);
+
+// The most frames a video decode reads, whatever `max_seconds` says: the
+// backstop for a whole-file decode (planar RGB is 6 MB a 1080p frame).
+inline constexpr int kMaxDecodedVideoFrames = 4096;
 
 // Decode a video file's frames, its frame rate and its soundtrack.
 //
@@ -153,6 +164,32 @@ decode_audio_bytes(const FFmpegLibraries*         libs,
                    int                            target_sample_rate,
                    std::string*                   error    = nullptr,
                    int                            channels = 1);
+
+// Resample PLANAR f32 PCM that is ALREADY DECODED onto another rate and
+// channel count, through the same swresample every decoder above uses.
+//
+// The decoders take a target rate because they are the one pass that
+// can: a file is demuxed, decoded and resampled together, and a second
+// resampler after them filters the waveform twice. This is for the
+// waveform that did NOT come through them -- one that arrived on a port
+// already at some producer's rate, where the choice is not "one pass or
+// two" but "the model's rate or the wrong one".
+//
+// `pcm` is planar [channels, samples]; `out` receives planar
+// [out_channels, *out_samples]. Both counts are 1 or 2. A no-op
+// conversion (same rate, same channels) still runs, so a caller need
+// not special-case it -- but it is cheap to skip and worth skipping.
+bool
+resample_pcm(const FFmpegLibraries* libs,
+             const float*           pcm,
+             int                    channels,
+             int                    samples,
+             int                    in_sample_rate,
+             int                    out_sample_rate,
+             int                    out_channels,
+             std::vector<float>*    out,
+             int*                   out_samples,
+             std::string*           error = nullptr);
 
 }
 

@@ -9,9 +9,14 @@
 #include "pipeline/runtime-context.h"
 #include "pipeline/typed-stage.h"
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 
@@ -150,6 +155,27 @@ public:
     _done = false;
   }
 
+  // The beat is a pure function of THIS STAGE'S CONFIG, so a consumer
+  // can have it before any driver starts.
+  //
+  // Unconditional, and that is not an oversight about the trigger: a
+  // trigger controls WHEN and HOW MANY TIMES resolved_config() is
+  // emitted, never WHAT -- it is a const method over members only the
+  // constructor writes. So the first beat and every later one are the
+  // same value, which is exactly the promise apply_constant is given.
+  //
+  // What this buys: a consumer that latches something load-time from
+  // this beat -- MiniMax-H3's `linear_branch`, a second 4.28 GB
+  // checkpoint -- can declare it. declare_resources() runs before any
+  // driver, so a checkpoint first seen at run time is one every peer
+  // sized the box without. See Stage::constant_output.
+  std::optional<FlexData>
+  constant_output(unsigned oport) const override
+  {
+    if (oport != 0) { return std::nullopt; }
+    return static_cast<const Derived*>(this)->resolved_config();
+  }
+
   Job
   process(RuntimeContext& ctx) override
   {
@@ -191,5 +217,7 @@ protected:
 };
 
 }  // namespace vpipe
+
+VPIPE_API_END
 
 #endif

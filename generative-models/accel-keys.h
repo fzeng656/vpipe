@@ -1,0 +1,231 @@
+#ifndef VPIPE_GENERATIVE_MODELS_ACCEL_KEYS_H
+#define VPIPE_GENERATIVE_MODELS_ACCEL_KEYS_H
+
+// The ACCELERATION BAG's keys: what a generating stage puts in the
+// `accel` FlexData it hands every model family. The contract and the
+// readers are in generative-models/shared/accel-settings.h (toolkit);
+// the NAMES are here, in the stable SDK, because they are what the host
+// promises every plugin in its support window -- added, never renamed,
+// never repurposed, and absent meaning the shipped default.
+
+#include <string_view>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
+namespace vpipe {
+namespace genai {
+namespace accel {
+
+// ---- the keys -------------------------------------------------------
+//
+// Spelled exactly as the graph spells them, because they ARE the graph's
+// keys: `generate-video` documents them in its own config schema and
+// copies the settled values here. One vocabulary, not two.
+
+// int8 GEMMs in the block. Bool; default false.
+inline constexpr std::string_view kI8Gemm = "i8_gemm";
+// ...and which TIER of them. String: "accurate" (groups of 64 on both
+// operands, Hadamard-rotated where a bf16 weight is quantized per call
+// -- the default, and what an absent key means) or "fast" (rotated int8
+// at a coarse group: fewer folds per contraction, more error than the
+// rotated accurate tier). Read only with kI8Gemm on; a family without
+// the fast tier runs accurate.
+inline constexpr std::string_view kI8GemmTier = "i8_gemm_tier";
+inline constexpr std::string_view kI8TierAccurate = "accurate";
+inline constexpr std::string_view kI8TierFast = "fast";
+// "token": int8 per output channel x per token over all of K -- the
+// fastest -- with both operands Walsh-Hadamard rotated in blocks of 256
+// first, which keeps an outlier channel from setting its token's scale.
+// "token_plain": the same unrotated, the layout Draw Things' i8x
+// checkpoints store (whose codes it then reads as stored; "token"
+// requantizes them rotated).
+inline constexpr std::string_view kI8TierToken = "token";
+inline constexpr std::string_view kI8TierTokenPlain = "token_plain";
+
+// SageAttention -- the QK^T product in int8. Bool; default false.
+inline constexpr std::string_view kSageAttn = "sage_attn";
+// Leading blocks left in the tensor dtype. Int; default 0.
+inline constexpr std::string_view kSageDenseLayers = "sage_dense_layers";
+// ...and its P*V in int8 too -- the product held in int32 across key
+// blocks, P on uint8 against V + 128 (attn_steel_nax's constants 308 and
+// 310). Bool; default false. Read only with kSageAttn on.
+inline constexpr std::string_view kSagePv8 = "sage_pv8";
+// The first sampling step it runs at; the steps before keep the int8 QK
+// alone. Int; absent, the family's own (MiniMax-H3: the first quarter of
+// its steps run without, the steps that settle a clip's layout).
+inline constexpr std::string_view kSagePv8FromStep = "sage_pv8_from_step";
+// ...on EVERY query row. Bool; default false: a family whose sequence
+// leads with prompt and soundtrack rows (MiniMax-H3's) keeps those on the
+// int8 QK alone -- under 1% of the rows -- and runs the video's in int8.
+inline constexpr std::string_view kSagePv8AllRows = "sage_pv8_all_rows";
+
+// Sol-Attn -- which key blocks are attended exactly. Bool; default
+// false.
+inline constexpr std::string_view kSolAttn = "sol_attn";
+// The threshold, in standard deviations of the routing proxy's spread.
+// Real; default 1.0.
+inline constexpr std::string_view kSolTau = "sol_tau";
+// The routing block, in keys. Int; 32 or 64, default 64 -- already
+// corrected by the stage, so a value here is one the host accepted.
+inline constexpr std::string_view kSolKeyBlock = "sol_key_block";
+// Leading blocks left dense. Int; default 1.
+inline constexpr std::string_view kSolDenseLayers = "sol_dense_layers";
+// Key blocks either side of the query's own, kept exact. Int; default 1.
+inline constexpr std::string_view kSolLocalRadius = "sol_local_radius";
+// How the routing threshold estimates the spread of a query block's
+// proxy scores: "diag" (default) from the key centroids' per-channel
+// variance, "exact" from their full covariance -- the published
+// Sol-Attn's two forms. Text; a host whose kernels predate "exact"
+// refuses it by name.
+inline constexpr std::string_view kSolThreshold = "sol_threshold";
+inline constexpr std::string_view kSolThreshDiag = "diag";
+inline constexpr std::string_view kSolThreshExact = "exact";
+
+// ---- MotionCache ----------------------------------------------------
+//
+// Step-level caching (shared/motion-cache.h): a denoiser forward whose
+// output a cached residual predicts well enough is skipped. Unlike every
+// tier above it saves whole FORWARDS rather than making one cheaper, so it
+// composes with all of them. Implemented by the family's SAMPLING LOOP,
+// not by its transformer.
+//
+// Bool; default false.
+inline constexpr std::string_view kMotionCache = "motion_cache";
+// Accumulated predicted relative change under which a step reuses.
+// Real; default 0.15. Higher skips more.
+inline constexpr std::string_view kMotionCacheThreshold =
+    "motion_cache_threshold";
+// Weight of frame-to-frame motion in every change measure. Real;
+// default 1.0; 0 weighs every position equally.
+inline constexpr std::string_view kMotionCacheStrength =
+    "motion_cache_strength";
+// Leading forwards always computed. Int; default 4.
+inline constexpr std::string_view kMotionCacheWarmup = "motion_cache_warmup";
+// Most reused forwards in a row. Int; default 2, at least 1.
+inline constexpr std::string_view kMotionCacheMaxSkips =
+    "motion_cache_max_skips";
+// The window it is consulted in, as fractions of the sampling range (0
+// noise, 1 clean). Real; defaults 0.15 and 0.95, start < end.
+inline constexpr std::string_view kMotionCacheStart = "motion_cache_start";
+inline constexpr std::string_view kMotionCacheEnd = "motion_cache_end";
+// Latent stride of the change estimator. Int; default 8, at least 1.
+inline constexpr std::string_view kMotionCacheSubsample =
+    "motion_cache_subsample";
+
+// ---- the ANE tier ---------------------------------------------------
+//
+// The block's feed-forward on the Apple Neural Engine. This is the one
+// tier whose prize is not a better kernel but a SECOND ENGINE: on an M4
+// the GPU has no int8 path worth having (integer MAD runs 2.0 TOP/s
+// against 7.94 TFLOP/s f16) and its f16 GEMM is already at 84-92% of
+// roofline, so the ANE is the only unused compute on the die. Measured
+// there: ~14 TOPS on a tiled DiT-shaped FFN against the GPU's achieved
+// 6.6-7.3, and the gap is wider on a base M4, which carries the same
+// 16-core ANE against roughly half the GPU.
+//
+// TWO COSTS A FAMILY MUST WEIGH BEFORE SETTING THIS. The ANE runs fp16
+// ONLY -- int8 weights buy footprint under its ~8-10 MB weight buffer,
+// not arithmetic -- so a QUANTIZED block is dequantized to fp16 for it.
+// And the module holds memory no other ledger sees: the families that
+// implement this (shared/ane-ffn.h) run ONE runtime-weight module whose
+// weights are staged per block, so the cost is one block's fp16 weights
+// twice over plus the ANE's rows -- fixed, and claimed from the plan.
+//
+// Bool; default false.
+inline constexpr std::string_view kAneFfn = "ane_ffn";
+
+// The share of an FFN's ROWS given to the ANE, with the GPU taking the
+// rest concurrently. Rows are independent in a feed-forward, so the
+// split is exact -- no partial sums, no seam. Real in [0,1]; default
+// 0.0, meaning "let the family choose", which it should do from the two
+// engines' measured rates (~12.6 TOPS ANE against ~7 TFLOP/s GPU puts
+// the balance near 0.64).
+//
+// A share set (> 0) is PINNED: rounded down to whole chunks of the
+// module's rows, never probed or rebalanced -- the split a run takes is
+// the next run's, which is what a reproducible generation needs (the
+// ANE's rows run fp16, so a split that moves moves the output).
+//
+// 1.0 gives the whole FFN to the ANE and leaves the GPU idle for its
+// duration, which is the right setting only when the GPU has other work
+// to overlap. The crossing itself is free -- measured at -0.3 to -1.0 ms
+// against a GPU-only control, i.e. the ANE phase overlaps the GPU's
+// commit/wait rather than serialising behind it.
+inline constexpr std::string_view kAneRows = "ane_rows";
+
+// Directory of precompiled ANE module templates. String; default empty.
+// UNUSED by a family whose feed-forward runs on a runtime-weight module
+// (it emits its own graph); kept so the key a graph may carry keeps its
+// meaning for any family that still stamps templates.
+inline constexpr std::string_view kAneTemplates = "ane_templates";
+
+// A CAP on how many of a model's blocks use the ANE feed-forward.
+// Integer; default 0, meaning every eligible block. NOT a memory setting:
+// the blocks share one runtime-weight module whose cost is fixed however
+// many use it, and whether that module fits at all is the resource plan's
+// decision. Set it only to cover fewer blocks on purpose.
+inline constexpr std::string_view kAneLayers = "ane_layers";
+
+// The fused q|k|v projection on the ANE too, as a SECOND module beside
+// the feed-forward's, split the same way and sharing the one ANE worker.
+// Bool; default false.
+//
+// REQUIRES kAneFfn, and not by accident: the plan books both modules as
+// ONE CoreML unit, so they are granted together or not at all. A tier
+// that could be granted alone would need a unit of its own, and nothing
+// asks for that yet.
+//
+// It is a SEPARATE cost, which is the reason this is a key rather than
+// something kAneFfn implies: the qkv module holds its own weight slots
+// and staging, so a family that books only the feed-forward under-reports
+// the moment a graph turns this on.
+inline constexpr std::string_view kAneQkv = "ane_qkv";
+
+// The ANE tiers in ROTATED INT8 (W8A8) rather than fp16: each staged
+// weight row Walsh-Hadamard rotated per 256-block and quantized to its own
+// step, each projection's input rotated and quantized per token inside
+// the module -- the GPU token tier's arithmetic on the ANE's rows. Bool;
+// default false. LOSSY, hence a key: 2.5-9x the fp16 tier's error on a
+// MiniMax-H3 feed-forward's output (0.6-2.1e-2 against 2.2-2.5e-3), for
+// ~1.5x the ANE's rate. Needs macOS 26 (CoreML's int8 arrays); a module
+// that cannot run it keeps fp16. Meaningful only with kAneFfn. A plugin
+// family on ane::Tier passes it on as the spec's ane::kInt8.
+inline constexpr std::string_view kAneInt8 = "ane_int8";
+
+// WHICH int8 kAneInt8 runs, named as the GPU's kI8GemmTier names it: text,
+// kI8TierToken ("token", the default: rotated per 256-block, quantized
+// per token -- the arithmetic above) or kI8TierTokenPlain ("token_plain":
+// no rotation -- ~3x the error on a block's output, ~1.7x on MiniMax-H3's
+// video, at token's speed: the GPU token_plain tier's arithmetic, e.g.
+// beside it on a native i8x file).
+// Meaningful only with kAneInt8. A plugin on ane::Tier passes it on as
+// the spec's ane::kInt8Tier.
+inline constexpr std::string_view kAneInt8Tier = "ane_int8_tier";
+
+// Whether a model's KERNEL TUNERS measure. Bool; default true. Many
+// families choose a kernel, a tile, a route or a split by timing the
+// candidates when they load or first run (shared/kernel-autotune.h): the
+// i8 GEMMs' split-K, MiniMax-H3's GEMM routes and attention tile, its
+// video VAE's tiles, a VAE's 3x3 conv route and mid-block attention, a
+// Qwen backbone's attention sets and GEMV ladder. The candidates are not
+// numerically interchangeable, and a timing that lands the other way
+// makes the next run differ: two identical MiniMax-H3 runs measured 21 dB
+// apart. False: nothing is timed, nothing is read from the session's kept
+// answers (they were measured), and each takes the choice believed
+// fastest on this GPU -- which may be what a tune would pick, or not: the
+// price of a run that repeats. With kAneRows pinned too, a generation
+// repeats bit for bit (the ANE's balancer moves its split by timing).
+// A host passes it to every stage that builds such a model -- the
+// generating stages, the VAE and conditioning stages -- and the families
+// key a model kept warm by it, so a tuned one is not reused untuned.
+inline constexpr std::string_view kAutotune = "autotune";
+
+}  // namespace accel
+}  // namespace genai
+}  // namespace vpipe
+
+VPIPE_API_END
+
+#endif

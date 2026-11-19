@@ -1,5 +1,8 @@
 #include "stages/gpu-telemetry.h"
 
+#include "common/soc-activity.h"
+#include "common/soc-energy-channel.h"
+
 #import <Foundation/Foundation.h>
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -588,6 +591,8 @@ struct GpuTelemetrySampler::Impl {
   CFDictionaryRef        pwr_prev    = nullptr;
   std::chrono::steady_clock::time_point pwr_t{};
   bool pwr_ready = false;
+  // Whether each GPU energy source is live -- see sample_power_().
+  SocEnergyGate block_gate, twin_gate;
 
   // IOReport GPU-stats (frequency) subscription.
   CFMutableDictionaryRef frq_desired = nullptr;
@@ -602,7 +607,7 @@ struct GpuTelemetrySampler::Impl {
   std::thread        worker;
   std::atomic<bool>  running{false};
 
-  Acc         a_freq, a_temp, a_util, a_pwr, a_mem;
+  Acc         a_freq, a_temp, a_util, a_pwr, a_mem, a_active;
   std::string thermal;
 
   Impl()
@@ -670,8 +675,34 @@ struct GpuTelemetrySampler::Impl {
     }
     CFArrayRef arr = static_cast<CFArrayRef>(arr_raw);
     const CFIndex n = CFArrayGetCount(arr);
-    double energy_J = 0.0;
-    bool   got      = false;
+    // Two sources for the same energy, read separately and NEVER summed:
+    //   block  "GPU" (macOS 26 and earlier) or "GPU<n>" (macOS 27 indexes
+    //          every block). NOT a prefix match, which is what this used
+    //          to be: the same group carries "GPU SRAM" -- a component
+    //          already inside the block's figure -- and the twin below.
+    //   twin   "GPU Energy", the SAME energy republished in nanojoules.
+    //          MEASURED on an M4 Pro: GPU 376284 J against GPU Energy
+    //          375695 J, 0.16% apart, so summing them reported close to
+    //          double and an idle box read ~48 W.
+    // The block is the reading where it is live. On macOS 27 it is not --
+    // MEASURED on an M5 Pro, GPU0 sits at zero for minutes and then
+    // publishes all of it at once -- while the twin moves every second
+    // under load (~27 J/s). So each source has its own gate, and the twin
+    // is the fallback when the block has never been seen to move twice
+    // running.
+    double block_J = 0.0, twin_J = 0.0;
+    bool   block_seen = false, twin_seen = false;
+    bool   block_moved = false, twin_moved = false;
+    auto joules = [&](CFDictionaryRef ch, std::int64_t raw) {
+      const std::string unit =
+          cf_string_to_utf8_(api.channel_get_unit_label(ch));
+      double scale = 1.0;
+      if      (unit.find("mJ") != std::string::npos) { scale = 1e-3; }
+      else if (unit.find("uJ") != std::string::npos) { scale = 1e-6; }
+      else if (unit.find("nJ") != std::string::npos) { scale = 1e-9; }
+      else if (unit.find("J")  != std::string::npos) { scale = 1.0;  }
+      return static_cast<double>(raw) * scale;
+    };
     for (CFIndex i = 0; i < n; ++i) {
       CFDictionaryRef ch = static_cast<CFDictionaryRef>(
           CFArrayGetValueAtIndex(arr, i));
@@ -680,25 +711,51 @@ struct GpuTelemetrySampler::Impl {
           != "Energy Model") { continue; }
       const std::string name =
           cf_string_to_utf8_(api.channel_get_channel_name(ch));
-      if (name.rfind("GPU", 0) != 0) { continue; }
-      const std::string unit =
-          cf_string_to_utf8_(api.channel_get_unit_label(ch));
+      const bool block = soc_block_energy_channel(name, "GPU");
+      const bool twin  = name == "GPU Energy";
+      if (!block && !twin) { continue; }
       const std::int64_t raw = api.simple_get_integer_value(ch, 0);
-      double scale = 1.0;
-      if      (unit.find("mJ") != std::string::npos) { scale = 1e-3; }
-      else if (unit.find("uJ") != std::string::npos) { scale = 1e-6; }
-      else if (unit.find("nJ") != std::string::npos) { scale = 1e-9; }
-      else if (unit.find("J")  != std::string::npos) { scale = 1.0;  }
-      energy_J += static_cast<double>(raw) * scale;
-      got = true;
+      if (block) {
+        block_J += joules(ch, raw);
+        block_seen = true;
+        if (raw != 0) { block_moved = true; }
+      } else {
+        twin_J += joules(ch, raw);
+        twin_seen = true;
+        if (raw != 0) { twin_moved = true; }
+      }
     }
     CFRelease(delta);
-    if (!got) { return std::nullopt; }
-    return energy_J / elapsed_s;
+    // Both gates are fed every sample, whichever is read, so each keeps an
+    // honest history. A source that is not known to be live is not read:
+    // its zeros are silence rather than an idle GPU, and its one move in
+    // minutes is a lump -- divided by an ~85 ms interval, kilowatts.
+    const bool block_live =
+        block_gate.feed(block_moved) == SocEnergyGate::Verdict::kLive;
+    const bool twin_live =
+        twin_gate.feed(twin_moved) == SocEnergyGate::Verdict::kLive;
+    std::optional<double> watts;
+    if (block_seen && block_live)     { watts = block_J / elapsed_s; }
+    else if (twin_seen && twin_live)  { watts = twin_J / elapsed_s; }
+    // A second, independent guard: no GPU this reads draws anywhere near
+    // this, and a lump that slipped past the gates always would.
+    if (watts && *watts > 400.0) { return std::nullopt; }
+    return watts;
   }
 
-  // Residency-weighted GPU active frequency (MHz) over the interval.
-  std::optional<double> sample_freq_()
+  // Residency-weighted GPU active frequency (MHz) over the interval,
+  // and the share of the interval the GPU spent OUT of the idle state.
+  //
+  // Both come from one histogram because both are the same read, and
+  // the second is the reason the first is interpretable. IOAccelerator
+  // publishes a "Device Utilization %" that reads a flat 0 on this OS
+  // -- MEASURED, over a sustained metal_compute run where this
+  // residency moved from 3% to 70% -- so the pstate histogram is the
+  // busy signal, not a second opinion about it.
+  // `mhz` is absent when the GPU never left its idle state: an idle
+  // interval has a busy share (zero) but no active clock to weight.
+  struct FreqSample { std::optional<double> mhz; double active_pct; };
+  std::optional<FreqSample> sample_freq_()
   {
     if (!frq_ready) { return std::nullopt; }
     const auto& api = ioreport::resolve();
@@ -717,7 +774,20 @@ struct GpuTelemetrySampler::Impl {
     }
     CFArrayRef arr = static_cast<CFArrayRef>(arr_raw);
     const CFIndex n = CFArrayGetCount(arr);
-    std::optional<double> result;
+    // The pstate residency histogram is "GPUPH" -- the one whose states
+    // the voltage-states table indexes. The group also carries
+    // "BSTGPUPH", the boost controller's, on both the M4 Pro (macOS 26)
+    // and the M5 Pro (macOS 27), so a substring match on "PH" could land
+    // on either. The exact name is taken when this machine publishes it;
+    // the substring is the fallback for one that does not.
+    bool have_exact = false;
+    for (CFIndex i = 0; i < n && !have_exact; ++i) {
+      CFDictionaryRef ch = static_cast<CFDictionaryRef>(
+          CFArrayGetValueAtIndex(arr, i));
+      have_exact = ch &&
+          cf_string_to_utf8_(api.channel_get_channel_name(ch)) == "GPUPH";
+    }
+    std::optional<FreqSample> result;
     for (CFIndex i = 0; i < n && !result; ++i) {
       CFDictionaryRef ch = static_cast<CFDictionaryRef>(
           CFArrayGetValueAtIndex(arr, i));
@@ -726,24 +796,39 @@ struct GpuTelemetrySampler::Impl {
           != "GPU Stats") { continue; }
       const std::string name =
           cf_string_to_utf8_(api.channel_get_channel_name(ch));
-      // The pstate residency histogram (commonly "GPUPH").
-      if (name.find("PH") == std::string::npos) { continue; }
+      if (have_exact ? name != "GPUPH"
+                     : name.find("PH") == std::string::npos) {
+        continue;
+      }
       const int count = api.state_get_count(ch);
       if (count <= 1) { continue; }
       double wsum = 0.0;
       double rsum = 0.0;
+      double all  = 0.0;   // including the idle state, for the share
       const int lim = std::min(
           count, static_cast<int>(mhz_table.size()));
       for (int s = 0; s < lim; ++s) {
-        const double f = mhz_table[static_cast<std::size_t>(s)];
-        if (f <= 0.0) { continue; }   // idle state
         const double r =
             static_cast<double>(api.state_get_residency(ch, s));
+        if (r > 0.0) { all += r; }
+        const double f = mhz_table[static_cast<std::size_t>(s)];
+        if (f <= 0.0) { continue; }   // idle state: counted in `all` only
         if (r <= 0.0) { continue; }
         wsum += r * f;
         rsum += r;
       }
-      if (rsum > 0.0) { result = wsum / rsum; }
+      // A histogram with residency ONLY in the idle state is an idle GPU,
+      // and says so: 0% busy, no clock. Treating it as no reading made a
+      // quiet GPU come out "unknown" rather than "idle" -- MEASURED on an
+      // M5 Pro with nothing on the display, where the idle state takes
+      // the whole window. A histogram with no residency at all this
+      // interval is silent, which is not the same thing, and stays absent.
+      if (rsum > 0.0) {
+        result = FreqSample{wsum / rsum,
+                            all > 0.0 ? 100.0 * rsum / all : 0.0};
+      } else if (all > 0.0) {
+        result = FreqSample{std::nullopt, 0.0};
+      }
     }
     CFRelease(delta);
     return result;
@@ -755,7 +840,10 @@ struct GpuTelemetrySampler::Impl {
   {
     while (running.load(std::memory_order_relaxed)) {
       if (auto w = sample_power_()) { a_pwr.add(*w); }
-      if (auto f = sample_freq_())  { a_freq.add(*f); }
+      if (auto f = sample_freq_()) {
+        if (f->mhz) { a_freq.add(*f->mhz); }
+        a_active.add(f->active_pct);
+      }
       const GpuInfo g = query_gpu_iokit_();
       if (g.util_ok) { a_util.add(g.util_pct); }
       if (auto t = sample_temp_()) { a_temp.add(*t); }
@@ -783,6 +871,7 @@ GpuTelemetrySampler::start()
   Impl& im = *_impl;
   if (im.running.load()) { im.join_(); }
   im.a_freq = im.a_temp = im.a_util = im.a_pwr = im.a_mem = Acc{};
+  im.a_active = Acc{};
   im.thermal.clear();
   // Seed the running deltas with a baseline sample.
   const auto& api = ioreport::resolve();
@@ -810,9 +899,15 @@ GpuTelemetrySampler::stop()
   t.freq_mhz      = im.a_freq.done();
   t.temp_c        = im.a_temp.done();
   t.util_pct      = im.a_util.done();
+  t.active_pct    = im.a_active.done();
   t.power_w       = im.a_pwr.done();
   t.footprint_mb  = im.a_mem.done();
   t.thermal_state = thermal_state_label_();
+  // Max of the DVFS table, not table.back(): the ladder is published in
+  // ascending order today, and a max costs nothing to be sure.
+  for (double f : im.mhz_table) {
+    if (f > t.ceiling_mhz) { t.ceiling_mhz = f; }
+  }
   return t;
 }
 
@@ -826,6 +921,20 @@ std::uint64_t
 GpuTelemetrySampler::gpu_core_count()
 {
   return query_gpu_iokit_().core_count;
+}
+
+GpuTelemetry
+GpuTelemetrySampler::sample_once(int window_ms)
+{
+  // Clamped rather than trusted. Below ~100 ms the residency delta is
+  // small enough that a single scheduling hiccup dominates it; above a
+  // couple of seconds a caller polling on a timer would overlap itself.
+  if (window_ms < 100)  { window_ms = 100; }
+  if (window_ms > 5000) { window_ms = 5000; }
+  GpuTelemetrySampler s;
+  s.start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
+  return s.stop();
 }
 
 }  // namespace vpipe

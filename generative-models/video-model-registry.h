@@ -2,6 +2,7 @@
 #define VPIPE_GENERATIVE_MODELS_VIDEO_MODEL_REGISTRY_H
 
 #include "common/flex-data.h"
+#include "generative-models/gen-input.h"
 #include "pipeline/memory-plan.h"
 #include "pipeline/resource-plan.h"
 
@@ -10,9 +11,14 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace vpipe {
 class SessionContextIntf;
@@ -107,6 +113,22 @@ struct VideoGenRequest {
   int              n_ref_audio_rows = 0;
   int              ref_audio_dim    = 0;
 
+  // ---- reference LATENTS, as many as the graph supplies ---------------
+  //
+  // Subject, style or identity references -- the multi-reference
+  // conditioning newer video models take -- one entry each, in the order
+  // the graph gave them, each a latent as vae-encode emits it (see
+  // ImageGenRequest::references for the format and the rules). Distinct
+  // from `ref` / `ref_last`, which are KEYFRAMES pinned to a position in
+  // the clip, and from the encoder rows above, which are one family's
+  // own packing.
+  //
+  // Nothing fills it yet: generate-video has no port for it. It is here
+  // so the first family that wants references reads them through a field
+  // every plugin in the window already has, rather than one that moves
+  // this layout. Empty means none.
+  std::span<const NamedTensor> references;
+
   // ---- the family's own knobs (iport9), UNPARSED --------------------
   // Passed down exactly as the config source emitted it, so a knob added
   // later needs no change in generate-video. Null / non-object means the
@@ -142,6 +164,46 @@ struct VideoGenRequest {
   // ABORTS, so a family that calls this also gets cancellation inside a
   // step rather than only between steps.
   std::function<bool(int done, int total)> block_progress;
+
+  // The same acceleration settings VideoModelCreateArgs carries, repeated
+  // per generation. A family that decides at LOAD (building a kernel
+  // variant, sizing int8 scratch) reads them there; one that decides per
+  // forward reads them here, and the two are the same object -- the
+  // stage fills both from one config.
+  //
+  // ONE POINTER, and it stays one pointer. See
+  // generative-models/shared/accel-settings.h for the keys, the readers
+  // and why this is a bag: typed fields here put the host's vocabulary
+  // into the plugin ABI, so adding a tier invalidated every family's
+  // binary including the ones that implement none of them.
+  //
+  // Owned by the stage and valid for the call. Null is legitimate and
+  // reads as every default.
+  const FlexData* accel = nullptr;
+
+  // ---- the growth seam ----------------------------------------------
+  //
+  // NEW INPUTS GO HERE, NOT IN A NEW FIELD. See gen-input.h for the
+  // argument, and read this struct's own typed fields as the evidence:
+  // `cond`, then `neg`, then `audio_cond`, then `ref`, then `ref_last`,
+  // then the two reference-row triples. Each arrived with a capability,
+  // each moved this layout, and each invalidated every family binary
+  // including the ones that ignore it.
+  //
+  // `input` looks up anything with a SHAPE by name; `borrowed_extra`
+  // carries scalars the host wants to state and no family has to read.
+  // Both are legitimately absent -- a null `input` and a null
+  // `borrowed_extra` are what a graph that wired neither produces, and a
+  // family must work then.
+  vpipe::genai::NamedInputFn input;
+  const FlexData*            borrowed_extra = nullptr;
+
+  // Named OUTPUTS, mid-generation -- the input seam's mirror, and where
+  // the next thing a family hands back goes. See gen-input.h; the first
+  // name is kOutputPreviewX0 (a live preview's clean estimate, shaped
+  // like VideoGenResult::video). Always installed by the host.
+  vpipe::genai::OutputWantedFn output_wanted;
+  vpipe::genai::NamedOutputFn  output;
 };
 
 // What a generation produced. A family that generates no audio simply
@@ -152,6 +214,11 @@ struct VideoGenResult {
   std::vector<float> audio;        // f32 [stereo, channels, latents]
   std::vector<int>   audio_shape;
   double latents_per_second = 0.0; // stamped on the audio beat
+  // WHAT THE FAMILY WANTS SAID BACK, for anything this struct has no
+  // field for -- realized sparsity, a chosen variant, a per-step
+  // statistic. The stage forwards it onto the beat's sideband and reads
+  // none of it, so a family adding one costs nobody a rebuild.
+  FlexData sideband;
 };
 
 // ONE resident checkpoint of a family. Built by VideoModelFamily::load()
@@ -186,6 +253,19 @@ public:
   // itself against a checkpoint it cannot see. See
   // docs/MODEL-MEMORY.md, "Declarations".
   virtual std::uint64_t resident_bytes() const { return 0; }
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // Everything a family's `load` receives. Mirrors ModelExecCreateArgs.
@@ -220,6 +300,43 @@ struct VideoModelCreateArgs {
   // FlexData. A family that wants it later must copy it.
   const FlexData*              model_config = nullptr;
 
+  // THE CROSS-FAMILY ACCELERATION SETTINGS, as the graph asked for them.
+  //
+  // These are not built-in knobs the host applies on a family's behalf --
+  // nothing outside the family touches its forward. They are here
+  // because every DiT in this tree, in-tree or not, runs the same steel
+  // flash kernel and the same GEMM kernels, so a plugin family that
+  // wants them has the same three decisions to make and no way to learn
+  // what the graph asked without being told.
+  //
+  // A family that implements none of this ignores them, which is what
+  // the defaults mean. A family that implements SOME should say which
+  // in its own log line: silence is indistinguishable from a knob that
+  // did nothing, and the numbers get believed either way.
+  //
+  // Every tier here is DRIVEABLE from a plugin, and each one costs
+  // exactly the header it needs and no more: `i8_gemm` through
+  // I8GemmContext, `sage_attn` through MetalSageAttention, `sol_attn`
+  // through MetalSolAttention -- which takes the head-major q/k/v an
+  // unfused attention already has and needs nothing else from the family
+  // but the head count, the row count and the scale.
+  //
+  // accel-settings.h gives the keys and the readers; each tier's own
+  // header gives a `config_from_flex` that returns its typed Config, so
+  // a family that wants one writes
+  //
+  //   const sol::Config c = sol::config_from_flex(args.accel);
+  //
+  // and a family that wants none includes nothing at all. That is the
+  // point of the bag: the cost of a tier falls on its users.
+  //
+  // Sol's Config carries a SINK that is NOT in the bag and cannot be:
+  // the rows the routing must read exactly are where a family's own
+  // sequence stops being the modality being summarised, and only the
+  // family knows that. H3 fills it from its packed layout; a per-stream
+  // self-attention over one modality leaves it at zero.
+  const FlexData*              accel = nullptr;
+
   // The clip the graph INTENDS to generate, already through the family's
   // own align_frames / size_grid. 0 when the stage could not settle it.
   //
@@ -233,6 +350,32 @@ struct VideoModelCreateArgs {
   // family that cares must re-check. What it buys is a load-time
   // decision made against the right order of magnitude instead of none.
   int width = 0, height = 0, frames = 0;
+
+  // ---- what the graph pointed at, and the growth seam ---------------
+  //
+  // The DiT the graph NAMED, resolved, when it named one -- the
+  // `dit_dir` config, which points a run at a quantized or fused DiT
+  // beside the checkpoint rather than the one inside it. EMPTY means
+  // the graph named none and the family finds its own weights under
+  // `root`, which is what every family did before this existed.
+  //
+  // It is a typed field rather than a `borrowed_extra` key because it is not
+  // an optional capability: it is the same resolved path the built-in
+  // families have always been handed, and a family that ignores it
+  // silently loads weights the operator did not ask for.
+  //
+  // NOTE WHAT IT DOES NOT REACH. The planning calls -- declare_resources,
+  // declare_holdings, latent_bytes -- are asked about the ROOT, and are
+  // asked before this struct exists. So a graph that names a smaller
+  // quantized DiT is sized against the checkpoint's own, which
+  // over-declares. That is the safe direction: a streaming model revises
+  // down once it knows what it holds, where under-declaring is a box
+  // admitted to a graph it cannot run.
+  std::string dit_dir;
+
+  // NEW ARGUMENTS GO IN HERE, NOT IN A NEW FIELD. See gen-input.h.
+  // Null is what a host with nothing to add produces.
+  const FlexData* borrowed_extra = nullptr;
 };
 
 // A video model FAMILY: process-wide, stateless, one per architecture.
@@ -336,6 +479,28 @@ public:
     return 0;
   }
 
+  // Bytes a generation of this geometry ALLOCATES beyond the weights
+  // declare_resources() claims -- activation scratch, per-clip caches --
+  // which the stage declares as scratch in the denoise phase. 0, the
+  // default, means "cannot say", and nothing is declared.
+  //
+  // For a family whose largest allocation is not its checkpoint.
+  // FlashVSR's key/value window at 1920x1152 is three times its weights;
+  // a plan that sees only the weights admits a graph the box cannot run,
+  // and on a 16 GB M5 that is a kernel panic rather than a refusal.
+  //
+  // `model_config` is the family's own model-config beat when the graph
+  // wired one as a constant, so a knob that changes the size is honoured;
+  // null means the family's defaults. The geometry is already through
+  // size_grid and align_frames.
+  virtual std::size_t
+  denoise_scratch_bytes(const std::string& /*root*/, int /*width*/,
+                        int /*height*/, int /*frames*/,
+                        const FlexData* /*model_config*/) const
+  {
+    return 0;
+  }
+
   // The soundtrack terms, for a family that generates one alongside the
   // video. False -- the default -- means this family emits no audio, and
   // the stage declares none.
@@ -357,6 +522,19 @@ public:
   // leaves the stage inert rather than taking the pipeline down.
   virtual std::unique_ptr<VideoGenerator>
   load(const VideoModelCreateArgs& args) = 0;
+
+public:
+  // EXTENSION POINT (plugin ABI; docs/PLUGINS.md, "Versioning"). A host
+  // newer than the plugin asks for a capability this interface did not
+  // have when the plugin was built, by name ("vpipe.<what>/<rev>"); null
+  // means "not provided" and the host keeps the older behaviour. A new
+  // virtual added here instead would move this vtable under every plugin
+  // in the support window.
+  virtual void* query_extension(std::string_view id) noexcept
+  {
+    (void)id;
+    return nullptr;
+  }
 };
 
 // Process-wide family set. Same singleton discipline as StageRegistry
@@ -364,6 +542,7 @@ public:
 // shared so it registers into THIS instance rather than forking a
 // second one.
 class VideoModelRegistry {
+  VPIPE_ABI_OPAQUE;   // host-owned: see vpipe/export.h
 public:
   static VideoModelRegistry& get() noexcept;
 
@@ -392,5 +571,7 @@ private:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

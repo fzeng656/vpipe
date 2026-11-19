@@ -47,7 +47,7 @@ public:
     // smart_resize pixel bounds (preprocessor_config.json size.shortest_edge /
     // size.longest_edge). The defaults are the Qwen2/3-VL processor defaults
     // the LM path has always used; a repo that ships its own bounds (e.g.
-    // Mage-Flow's 65536 / 16777216) must set them or a small / very wide
+    // 65536 / 16777216) must set them or a small / very wide
     // reference image is left un-upscaled where the reference upscales it.
     int min_pixels     = 56 * 56;
     int max_pixels     = 28 * 28 * 1280;
@@ -79,8 +79,8 @@ public:
     // on this tower: bf16 has 8 mantissa bits to f16's 11, and its range
     // advantage buys nothing when the tower peaks near 2238 against f16's
     // 65504 ceiling). Set it when the point is to REPRODUCE a reference that
-    // runs bf16 -- Mage-Flow's pipeline casts its whole text encoder, tower
-    // included, so its conditioning carries bf16 tower noise that an f16
+    // runs bf16 -- a pipeline that casts its whole text encoder, tower
+    // included, has conditioning that carries bf16 tower noise an f16
     // tower cannot match no matter how accurate it is.
     // NOTE: the steel / NAX flash-attention kernels are f16-only, so a bf16
     // tower falls back to the scalar (or matmul2d) SDPA and is slower.
@@ -144,6 +144,20 @@ public:
 
   // Encode one RGB image: rgb is [3, H, W] U8 channel-first contiguous.
   Result encode(const std::uint8_t* rgb, int H, int W);
+  // The same with the picture held under `max_pixels` as well as the
+  // checkpoint's bound (a live frame's budget: realtime-vqa); <= 0 is the
+  // checkpoint's alone.
+  Result encode(const std::uint8_t* rgb, int H, int W,
+                std::int64_t max_pixels);
+  // What one encode allocates at its largest (a picture at `max_pixels`,
+  // <= 0 for the config's own bound): the GPU scratch the forward holds
+  // at once plus the host-side pixels and patches. For a memory plan.
+  static std::size_t encode_scratch_bytes(const Config& c,
+                                          std::int64_t max_pixels = 0);
+  // The same for encode_video() of `n_frames` frames of H x W: its
+  // grid, by the video rule, and every frame's pixels on the host.
+  static std::size_t encode_video_scratch_bytes(const Config& c,
+                                                int n_frames, int H, int W);
 
   // Encode a CLIP: `rgb` is `n_frames` consecutive [3, H, W] U8 planes.
   //
@@ -179,7 +193,7 @@ private:
   // `n_frames == 1` is the image path: the single frame is tiled across
   // the temporal patch, which is what the reference does too.
   Result encode_(const std::uint8_t* rgb, int n_frames, int H, int W,
-                 bool video);
+                 bool video, std::int64_t max_pixels = 0);
 
   struct Block {
     metal_compute::SharedBuffer n1w, n1b, qkvw, qkvb, ow, ob;

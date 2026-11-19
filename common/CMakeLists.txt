@@ -3,6 +3,7 @@ set(LOCAL_SOURCES
   console-writer.cc
   credential-store.cc
   db-log-delegate.cc
+  diagnostic-capture.cc
   ffmpeg-libraries.cc
   ffmpeg-log-tap.cc
   flex-data.cc
@@ -15,14 +16,18 @@ set(LOCAL_SOURCES
   lmdb-db.cc
   lmdb-env.cc
   lmdb-txn.cc
+  av-filter-graph.cc
   media-decode.cc
   image-metadata.cc
   media-line.cc
+  memory-owner.cc
   mini-http.cc
   onvif-soap.cc
   os-sandbox.cc
   path-sandbox.cc
   perf-buffer.cc
+  perf-flops.cc
+  perf-flops-doc.cc
   compare-image-channel.cc
   mask-editor-channel.cc
   preview-channel.cc
@@ -64,6 +69,7 @@ set(LOCAL_HEADERS
   lmdb-db.h
   lmdb-env.h
   lmdb-txn.h
+  av-filter-graph.h
   media-decode.h
   image-metadata.h
   media-line.h
@@ -74,6 +80,8 @@ set(LOCAL_HEADERS
   path-sandbox.h
   perf-buffer.h
   perf-event.h
+  perf-flops.h
+  perf-flops-doc.h
   compare-image-channel.h
   mask-editor-channel.h
   preview-channel.h
@@ -82,6 +90,7 @@ set(LOCAL_HEADERS
   session-config.h
   session-member.h
   plugins-root.h
+  kernel-tuning-cache.h
   session.h
   static-file-server.h
   stdio-ui-delegate.h

@@ -9,11 +9,15 @@
 // Each LoadedLanguageModel ContextId maps to one metal context.
 
 #include "generative-models/qwen3/metal-qwen-model.h"
+#include "generative-models/context-io.h"
 #include "generative-models/model-exec.h"
+#include "generative-models/prefill-progress.h"
+#include "generative-models/speculative-decode.h"
 
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -24,7 +28,9 @@ namespace vpipe::metal_compute { class MetalCompute; }
 
 namespace vpipe::genai {
 
-class MetalQwenModelExec : public ModelExec {
+class MetalQwenModelExec : public ModelExec, private SpecDecodeExt,
+                           private ContextIoExt,
+                           private PrefillProgressExt {
 public:
   MetalQwenModelExec(const std::string&            model_dir,
                      metal_compute::MetalCompute*  mc,
@@ -32,6 +38,23 @@ public:
                      const SessionContextIntf*     session);
 
   bool valid() const noexcept override { return _model != nullptr; }
+  // A hyper-connection model (Qwen3.8-Flash-Next): its spliced prefills
+  // carry the token ids (prefill_hc_spliced) -- the n-gram PLE hashes them.
+  bool hc() const noexcept
+  {
+    return _model != nullptr && _model->config().hc();
+  }
+  std::int32_t prefill_hc_spliced(ContextId ctx,
+                                  const std::vector<float>& emb,
+                                  const std::vector<std::int32_t>& ids,
+                                  const std::vector<std::int32_t>& pos, int n);
+
+  // What the model fills after its load returns (the n-gram table held
+  // in memory: MetalQwenModel::ple_table_bytes).
+  std::size_t filled_after_load_bytes() const
+  {
+    return _model != nullptr ? _model->ple_table_bytes() : 0;
+  }
 
   // The metal exec owns its own KV-page pool keyed by ContextId.
   bool owns_kv() const noexcept override { return true; }
@@ -140,13 +163,50 @@ public:
   // to the metal model (see MetalQwenModel::set_i8_gemm).
   void set_i8_gemm(bool on) override;
 
+  // spec_decode::kExtensionId -> the speculative decode below.
+  void* query_extension(std::string_view id) noexcept override;
+
 private:
+  // ---- SpecDecodeExt: DFlash when a drafter is attached, else MTP ----
+  std::string_view drafter() const noexcept override;
+  bool attach_drafter(const std::string& dir, int bits,
+                      std::string* err) override;
+  bool generate(const SpecDecodeRequest& rq, SpecDecodeResult* out) override;
+
+  // ---- PrefillProgressExt: each piece of a prefill read in pieces -----
+  void set_prefill_progress(prefill_progress::Fn fn) override
+  {
+    if (_model != nullptr) { _model->set_prefill_progress(std::move(fn)); }
+  }
+
+  // ---- ContextIoExt: a context written out and read back --------------
+  bool export_context(ContextId ctx,
+                      const ContextManager::ByteSink& out) override;
+  bool import_context(ContextId ctx,
+                      const ContextManager::ByteSource& in) override;
+
   struct CtxState { ContextId metal_cid; };
   CtxState* state_for_(ContextId ctx);
+  // The metal context behind `ctx`, or an invalid id: looked up under
+  // _ctx_mu, for a caller that only needs the id.
+  ContextId metal_cid_(ContextId ctx) const;
 
   std::unique_ptr<MetalQwenModel>             _model;
+  // _ctxmap is reached from more than the thread generating on this
+  // model: a context parked with a warm model is saved, read back and
+  // released on the model manager's threads (its reaper, a launch's
+  // planner, a host dropping a conversation) while another context of
+  // the same model decodes. Every access holds _ctx_mu. A CtxState is
+  // fixed once inserted and the map's nodes never move, so a pointer
+  // state_for_ hands out stays valid with the lock dropped; the
+  // ContextManager behind it locks its own state.
+  mutable std::mutex                          _ctx_mu;
   std::unordered_map<std::uint32_t, CtxState> _ctxmap;
   std::vector<float>                          _logits;
+  // For attach_drafter: the drafter's weights go through the session's
+  // model manager like the model's own.
+  metal_compute::MetalCompute*                _mc = nullptr;
+  const SessionContextIntf*                   _session = nullptr;
 };
 
 }  // namespace vpipe::genai

@@ -89,6 +89,9 @@ private:
   std::vector<ResourceClaim> decide_resources() const override;
 
   std::string _hf_dir;
+  // `vae_dir`: the audio VAE's WEIGHTS when they are not the model's own
+  // (a Draw Things .ckpt); the config is still the model's. Empty: none.
+  std::string _vae_weights;
   std::string _family;              // "minimax-h3"
   std::uint64_t _clips = 0;
 
@@ -117,6 +120,11 @@ private:
   void unload_vae_();
   void reload_vae_();
 #endif
+  // The acceleration settings as a BAG, for a registered VAE family.
+  // See generative-models/shared/accel-settings.h. Every tier in it is
+  // off unless a graph asks: a codec's output is looked at directly, so
+  // an approximation here has nowhere to be absorbed.
+  FlexData _accel{};
 };
 
 }  // namespace vpipe

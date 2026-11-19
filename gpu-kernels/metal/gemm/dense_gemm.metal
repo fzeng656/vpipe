@@ -95,7 +95,7 @@ kernel void dense_gemm_bias_f16(
 // steel mma.h has a complex64_t BlockMMA specialization (unused here but
 // must parse); complex.h references their bfloat16_t wrapper for an unused
 // ctor -- alias it to the native type (we never touch bf16 or complex).
-typedef metal::bfloat16 bfloat16_t;
+typedef bfloat bfloat16_t;
 #include "mlx/backend/metal/kernels/complex.h"
 #include "mlx/backend/metal/kernels/steel/gemm/mma.h"
 #include "mlx/backend/metal/kernels/steel/gemm/loader.h"
@@ -126,6 +126,32 @@ struct BiasAddEpilogue {
   template <typename AccumT, typename CT>
   METAL_FUNC AccumT apply(AccumT x, CT c) const {
     return x + static_cast<AccumT>(c);
+  }
+};
+
+// max(x, 0) on the fp32 accumulator, before the one store rounds it.
+struct ReluEpilogue {
+  template <typename AccumT>
+  METAL_FUNC AccumT apply(AccumT x) const {
+    return max(x, static_cast<AccumT>(0));
+  }
+};
+
+// SiLU on the fp32 accumulator (RelayVSR's decoder: its frame encoder's
+// convs are nn.Conv2d then nn.SiLU).
+struct SiluEpilogue {
+  template <typename AccumT>
+  METAL_FUNC AccumT apply(AccumT x) const {
+    return x / (static_cast<AccumT>(1) + metal::exp(-x));
+  }
+};
+
+// LeakyReLU(0.2) on the fp32 accumulator (RIFE's IFNet: every conv's
+// activation is nn.LeakyReLU(0.2)).
+struct LeakyRelu02Epilogue {
+  template <typename AccumT>
+  METAL_FUNC AccumT apply(AccumT x) const {
+    return x >= static_cast<AccumT>(0) ? x : x * static_cast<AccumT>(0.2f);
   }
 };
 
@@ -163,7 +189,20 @@ template <
     // buffer. A runtime LoRA needs exactly this: its second factor has to
     // land ON TOP of the base projection, and materializing the delta in
     // its own [M, N] buffer would cost 817 MB at H3's qkv width.
-    const bool ACC = false>
+    const bool ACC = false,
+    // BAND reads x as a WINDOW of a wider matrix: x is [M, ldx] and the
+    // tile at output column y_col contracts over columns
+    // [p*K, p*K + K) of it, p = (y_col / band_group) % band_parts. It is
+    // how a runtime LoRA whose output rows belong to SEVERAL adapters
+    // (q, k, v fused into one projection) runs its second factor without
+    // a block-diagonal B: each output row has only its own part's rank
+    // to contract over, so B is stored [N, K] with no zeros and the tile
+    // picks the matching window of t = x A^T. The caller guarantees a
+    // BN-wide tile never straddles a group (band_group % BN == 0).
+    const bool BAND = false,
+    // RELU applies max(., 0) to the accumulator after the bias, before
+    // the one rounding store: a 1x1 conv followed by a ReLU in one pass.
+    const bool RELU = false>
 METAL_FUNC void dense_gemm_t_impl(
     const device T* x,
     const device T* W,
@@ -180,7 +219,10 @@ METAL_FUNC void dense_gemm_t_impl(
     uint3 tid,
     uint  simd_gid,
     uint  simd_lid,
-    const float acc_scale = 1.0f) {
+    const float acc_scale = 1.0f,
+    const int ldx = 0,
+    const int band_group = 1,
+    const int band_parts = 1) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
   static_assert(BK % SIMD_SIZE == 0, "BK should be divisible by SIMD_SIZE");
   constexpr int WM = 2;
@@ -218,13 +260,21 @@ METAL_FUNC void dense_gemm_t_impl(
       k0 = (lo > 0) ? (lo / BK) * BK : 0;
     }
   }
-  x += y_row * static_cast<int64_t>(K);
+  // x's row stride: K, or the full width of the matrix a BAND tile
+  // reads its window of. Compile-time for every other instantiation, so
+  // they are unchanged.
+  int x_ld = K;
+  if (BAND) {
+    x_ld = ldx;
+    x += ((y_col / band_group) % band_parts) * K;
+  }
+  x += y_row * static_cast<int64_t>(x_ld);
   W += y_col * static_cast<int64_t>(K);
   y += y_row * static_cast<int64_t>(N) + y_col;
 
   const short num_els = min(BM, M - y_row);
   const short num_outs = min(BN, N - y_col);
-  loader_x_t loader_x(x + k0, K, Xs, simd_gid, simd_lid);
+  loader_x_t loader_x(x + k0, x_ld, Xs, simd_gid, simd_lid);
   loader_w_t loader_w(W + k0, K, Ws, simd_gid, simd_lid);
   mma_t mma_op(simd_gid, simd_lid);
 
@@ -270,6 +320,7 @@ METAL_FUNC void dense_gemm_t_impl(
       ScaleAddEpilogue op{acc_scale};
       mma_op.apply_epilogue_safe(y, N, 1, short2(num_outs, num_els), op);
     }
+    if (RELU) { mma_op.apply_epilogue(ReluEpilogue()); }
     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
   } else {
     if (has_bias) {
@@ -280,6 +331,7 @@ METAL_FUNC void dense_gemm_t_impl(
       ScaleAddEpilogue op{acc_scale};
       mma_op.apply_epilogue(y, N, 1, op);
     }
+    if (RELU) { mma_op.apply_epilogue(ReluEpilogue()); }
     mma_op.store_result(y, N);
   }
 }
@@ -365,6 +417,42 @@ kernel void dense_gemm_t_bm64_acc_f16(
                     float, /*ACC=*/true>(
       x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
       tid, simd_gid, simd_lid, scale);
+}
+
+// BANDED twin of dense_gemm_t_bm64_acc_f16: y += scale * (t_p @ B^T),
+// where t_p is the rank window of t = x A^T that output column n's part
+// owns (see BAND in dense_gemm_t_impl). For a runtime LoRA that fuses
+// several separate adapters into one projection -- q, k and v into H3's
+// qkv_proj -- without the block-diagonal B that would multiply zeros for
+// two thirds of its rank. BN = 32, so any group that is a multiple of 32
+// keeps every tile inside one part.
+//
+//   9: ldx (t's row stride, the stacked rank)  10: group  11: parts
+kernel void dense_gemm_t_bm64_acc_band_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    const constant float& scale  [[buffer(8)]],
+    const constant int& ldx      [[buffer(9)]],
+    const constant int& group    [[buffer(10)]],
+    const constant int& parts    [[buffer(11)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/0,
+                    float, /*ACC=*/true, /*BAND=*/true>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid, scale, ldx, group, parts);
 }
 
 // FP16-pipe (AccumT=half) twin of dense_gemm_t_bm64_f16 (see the AccumT
@@ -677,6 +765,25 @@ kernel void dense_gemv_t_f16(
       x, W, y, K, N, tid, simd_gid, simd_lid);
 }
 
+// The same GEMV for a few rows in ONE dispatch: row r = tid.x (grid.x =
+// 32 * M), each computed exactly as dense_gemv_t_f16 computes it alone --
+// a speculative verify's router rows are its decode's, without a dispatch
+// (and a dispatch's latency) a row.
+kernel void dense_gemv_rows_t_f16(
+    const device VPIPE_ELT* x        [[buffer(0)]],   // [M, K]
+    const device VPIPE_ELT* W        [[buffer(1)]],
+    device VPIPE_ELT*       y        [[buffer(2)]],   // [M, N]
+    const constant int&     K        [[buffer(3)]],
+    const constant int&     N        [[buffer(4)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  dense_gemv_t_impl<VPIPE_ELT, /*RPS=*/4, /*VPT=*/8, /*NSG=*/2>(
+      x + (int64_t)tid.x * K, W, y + (int64_t)tid.x * N, K, N, tid,
+      simd_gid, simd_lid);
+}
+
 // ---- Dense f16 Mixture-of-Experts gather GEMVs (raw-HF bf16 MoE) ---------
 // The dense twins of affine_gather_qmv_swiglu_w4g64 / affine_gather_down /
 // affine_moe_gate: same on-GPU routing contract (pair_eid selects the expert
@@ -835,6 +942,148 @@ kernel void dense_moe_gather_down_f16(
   const device VPIPE_ELT* xr = x + (int64_t)p * (int64_t)K;
   dense_gemv_t_impl<VPIPE_ELT, /*RPS=*/4, /*VPT=*/8, /*NSG=*/2>(
       xr, we, y + (int64_t)p * (int64_t)N, K, N, tid, simd_gid, simd_lid);
+}
+
+// ---- Block-FP8 routed experts (Fish Audio Drama 3) ------------------------
+// The checkpoint keeps each routed expert's gate / up / down as E4M3 codes
+// with one f32 scale per 128x128 block (DeepSeek's layout; vLLM's
+// "bsgemm-moe"). They are read as codes and widened in registers, so a
+// token reads one byte a weight -- the experts are 32 of the model's 40 GB.
+//
+// An E4M3 byte (s eeee mmm, exponent bias 7) is EXACTLY the half whose bits
+// are s << 15 | eeeemmm << 7, times 2^8: the half's five-bit exponent field
+// then holds 0eeee, eight below the half's own bias of 15, and an E4M3
+// subnormal (eeee = 0) lands on a half subnormal scaled by the same 2^8.
+// The loader folds that 256 into the block scales, so the widening is two
+// masks and two shifts a byte, and the product is the fp32 reference's
+// (code * scale) to the last bit. 0x7F / 0xFF (E4M3's NaN) never occur in
+// a weight.
+//
+// Contract shared by both kernels: K % 512 == 0 (a lane reads 16 codes, one
+// uint4, per 512-wide step, so its 16 always sit inside one 128-column
+// block), rows % 128 == 0, the codes slab 16-byte aligned.
+inline float4 fp8x4_(uint u)
+{
+  const uint a = ((u & 0x80u) << 8) | ((u & 0x7Fu) << 7) |
+                 ((u & 0x8000u) << 16) | ((u & 0x7F00u) << 15);
+  const uint b = ((u & 0x800000u) >> 8) | ((u & 0x7F0000u) >> 9) |
+                 (u & 0x80000000u) | ((u & 0x7F000000u) >> 1);
+  const half2 ha = as_type<half2>(a);
+  const half2 hb = as_type<half2>(b);
+  return float4((float)ha.x, (float)ha.y, (float)hb.x, (float)hb.y);
+}
+
+// sum over a lane's 16 codes of x * w (x already widened).
+inline float fp8_dot16_(const device uchar* w, const thread float4* xv)
+{
+  const uint4 q = *reinterpret_cast<const device uint4*>(w);
+  return dot(fp8x4_(q.x), xv[0]) + dot(fp8x4_(q.y), xv[1]) +
+         dot(fp8x4_(q.z), xv[2]) + dot(fp8x4_(q.w), xv[3]);
+}
+
+inline void fp8_load_x16_(const device VPIPE_ELT* x, thread float4* xv)
+{
+  for (int i = 0; i < 4; ++i) {
+    xv[i] = float4((float)x[4 * i], (float)x[4 * i + 1],
+                   (float)x[4 * i + 2], (float)x[4 * i + 3]);
+  }
+}
+
+// Gather gate|up + fused SwiGLU over block-FP8 codes: per pair p, expert
+// e = pair_eid[p], x row = p / top_k; the slab's rows are interleaved like
+// dense_moe_gather_swiglu_f16's (row 2g = gate g, 2g+1 = up g), its scales
+// stay per tensor: s[e][0] gate, s[e][1] up, each [inner/128, K/128].
+// grid {32, inner/2, npair} threads, tg {32, 2, 1}: 8 interleaved rows (4
+// features) a threadgroup, RPS 4 a simdgroup.
+//   0:codes[E,2I,K] 1:scales[E,2,I/128,K/128] (x256) 2:x[M,K] 3:y[np,I]
+//   4:K 5:N=2I 6:pair_eid[np] 7:top_k
+kernel void dense_moe_gather_swiglu_fp8(
+    const device uchar*     w        [[buffer(0)]],
+    const device float*     s        [[buffer(1)]],
+    const device VPIPE_ELT* x        [[buffer(2)]],
+    device VPIPE_ELT*       y        [[buffer(3)]],
+    const constant int&     K        [[buffer(4)]],
+    const constant int&     N        [[buffer(5)]],
+    const device int*       pair_eid [[buffer(6)]],
+    const constant int&     top_k    [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int RPS = 4, NSG = 2;
+  const int p = (int)tid.z;
+  const int e = pair_eid[p];
+  const int inner = N / 2, KB = K / 128, IB = inner / 128;
+  const device uchar* we = w + (int64_t)e * (int64_t)N * (int64_t)K;
+  const device float* se = s + (int64_t)e * 2 * IB * KB;
+  const device VPIPE_ELT* xr = x + (int64_t)(p / top_k) * (int64_t)K;
+  const int out_row = (int)tid.y * (NSG * RPS) + (int)simd_gid * RPS;
+  float result[RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int k = 0; k < K; k += 512) {
+    const int c = k + (int)simd_lid * 16;
+    float4 xv[4];
+    fp8_load_x16_(xr + c, xv);
+    const int kb = c >> 7;
+#pragma clang loop unroll(full)
+    for (int row = 0; row < RPS; ++row) {
+      const int r = out_row + row;
+      const float sc = se[((r & 1) * IB + ((r >> 1) >> 7)) * KB + kb];
+      result[row] += sc * fp8_dot16_(we + (int64_t)r * K + c, xv);
+    }
+  }
+  for (int row = 0; row < RPS; ++row) { result[row] = simd_sum(result[row]); }
+  if (simd_lid == 0) {
+    device VPIPE_ELT* yo = y + (int64_t)p * (int64_t)inner + (out_row >> 1);
+    const float g0 = result[0], u0 = result[1];
+    const float g1 = result[2], u1 = result[3];
+    yo[0] = (VPIPE_ELT)((g0 / (1.0f + metal::exp(-g0))) * u0);
+    yo[1] = (VPIPE_ELT)((g1 / (1.0f + metal::exp(-g1))) * u1);
+  }
+}
+
+// Gather down over block-FP8 codes: per pair p, expert e = pair_eid[p];
+// partials[p, H] = down[e] . act[p] (UN-weighted; moe_combine applies the
+// routing weight). grid {32, H/4, npair} threads, tg {32, 2, 1}.
+//   0:codes[E,H,I] 1:scales[E,H/128,I/128] (x256) 2:act[np,I] 3:y[np,H]
+//   4:K=I 5:N=H 6:pair_eid[np]
+kernel void dense_moe_gather_down_fp8(
+    const device uchar*     w        [[buffer(0)]],
+    const device float*     s        [[buffer(1)]],
+    const device VPIPE_ELT* x        [[buffer(2)]],
+    device VPIPE_ELT*       y        [[buffer(3)]],
+    const constant int&     K        [[buffer(4)]],
+    const constant int&     N        [[buffer(5)]],
+    const device int*       pair_eid [[buffer(6)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int RPS = 4, NSG = 2;
+  const int p = (int)tid.z;
+  const int e = pair_eid[p];
+  const int KB = K / 128;
+  const device uchar* we = w + (int64_t)e * (int64_t)N * (int64_t)K;
+  const device float* se = s + (int64_t)e * (N / 128) * KB;
+  const device VPIPE_ELT* xr = x + (int64_t)p * (int64_t)K;
+  const int out_row = (int)tid.y * (NSG * RPS) + (int)simd_gid * RPS;
+  float result[RPS] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (int k = 0; k < K; k += 512) {
+    const int c = k + (int)simd_lid * 16;
+    float4 xv[4];
+    fp8_load_x16_(xr + c, xv);
+    const int kb = c >> 7;
+#pragma clang loop unroll(full)
+    for (int row = 0; row < RPS; ++row) {
+      const int r = out_row + row;
+      const float sc = se[(r >> 7) * KB + kb];
+      result[row] += sc * fp8_dot16_(we + (int64_t)r * K + c, xv);
+    }
+  }
+  for (int row = 0; row < RPS; ++row) { result[row] = simd_sum(result[row]); }
+  if (simd_lid == 0) {
+    device VPIPE_ELT* yo = y + (int64_t)p * (int64_t)N + out_row;
+    for (int row = 0; row < RPS; ++row) { yo[row] = (VPIPE_ELT)result[row]; }
+  }
 }
 
 // ---- Raw simdgroup-MMA ALU rate probes ------------------------------
@@ -1263,8 +1512,32 @@ kernel void dense_moe_gate_f16(
 //   0:in[H*W,Cin] 1:W[Cout,9*Cin] 2:bias[Cout] 3:out[OH*OW,Cout]
 //   4:H 5:W 6:Cin 7:Cout 8:OH 9:OW 10:has_bias
 //   dispatch {ceil(Cout/BN)*32, ceil(OH*OW/BM)*2, 2}, tg {32,2,2}
+//
+// FUSED FORMS, for a decoder that would otherwise pay a whole memory pass
+// per op around every conv (the tiny autoencoders: measured 20-45% of a
+// preview in ReLU / residual / upsample passes that each read and wrote a
+// full activation at one element per thread):
+//   UP == 2   the input is NEAREST-UPSAMPLED 2x on the fly: H/Wi are the
+//             SOURCE dims, OH/OW = 2H/2Wi, and a tap at upsampled (iy, ix)
+//             reads source (iy/2, ix/2) -- the 4x-larger intermediate is
+//             never written. Stride 1 only.
+//   EPI == 1  y = relu(conv + bias)
+//   EPI == 2  y = relu(conv + bias + res), `res` an [OH*OW, Cout] map
+//   CAT == 1  the input is the channel CONCAT of two maps, `inp` then
+//             `inp2`, each Cin/2 wide -- read in place, so the [H*W, Cin]
+//             concat is never materialized (a TAEHV MemBlock's [x, past]).
+//             Cin/2 must be a multiple of 4, and of BK for the fast gather.
+//   EPI == 3  y = leaky_relu(conv + bias, 0.2)
+//   EPI == 4  y = leaky_relu(conv + bias + res, 0.2)
+//   EPI == 5  y = silu(conv + bias)
+//   S2PAD == 1  a stride-2 conv padded SYMMETRICALLY, torch's
+//             Conv2d(k3, s2, p1): iy = 2*oy + ky - 1 (RIFE's IFNet). The
+//             default 0 is the encoders' (0,1,0,1) pad above.
+// all on the fp32 accumulator, so the fused output is rounded once where
+// the unfused chain rounded after every op.
 template <typename T, const int BM, const int BK, const int BN,
-          const int STRIDE>
+          const int STRIDE, const int UP = 1, const int EPI = 0,
+          const int CAT = 0, const int S2PAD = 0>
 METAL_FUNC void conv3x3_gemm_impl(
     const device T* inp,
     const device T* Wt,
@@ -1279,15 +1552,25 @@ METAL_FUNC void conv3x3_gemm_impl(
     const constant int& OH,
     const constant int& OW,
     const constant int& has_bias,
+    const device T* res,
+    const device T* inp2,
     uint3 tid,
     uint  simd_gid,
     uint  simd_lid,
     uint  lid) {
   static_assert(BK >= SIMD_SIZE, "BK should be larger than SIMD_SIZE");
+  static_assert(UP == 1 || (UP == 2 && STRIDE == 1),
+                "the fused upsample is stride-1 only");
   constexpr int WM = 2;
   constexpr int WN = 2;
   constexpr int BK_padded = (BK + 16 / sizeof(T));
   constexpr int THREADS = WM * WN * SIMD_SIZE;
+  // The bounds a tap is checked against: the UPSAMPLED map's when UP == 2,
+  // before the tap is folded back onto the source pixel it duplicates.
+  const int LH = H * UP, LW = Wi * UP;
+  // The row stride of the map a channel is read from: each concat half
+  // holds Cin/2 channels per pixel.
+  const int CS = CAT ? Cin / 2 : Cin;
 
   using mma_t = mlx::steel::BlockMMA<
       T, T, BM, BN, BK, WM, WN, false, true, BK_padded, BK_padded, float>;
@@ -1352,12 +1635,18 @@ METAL_FUNC void conv3x3_gemm_impl(
         const int i = rl + n * RPP;
         vec<T, 4> v = vec<T, 4>(T(0));
         if (i < num_els) {
-          const int iy = (STRIDE == 2) ? (oyv[n] * 2 + ky) : (oyv[n] + ky - 1);
-          const int ix = (STRIDE == 2) ? (oxv[n] * 2 + kx) : (oxv[n] + kx - 1);
-          if (iy >= 0 && iy < H && ix >= 0 && ix < Wi) {
-            // Cin and ci are multiples of 4, so this is 8-byte aligned.
+          const int iy = (STRIDE == 2) ? (oyv[n] * 2 + ky - S2PAD)
+                                       : (oyv[n] + ky - 1);
+          const int ix = (STRIDE == 2) ? (oxv[n] * 2 + kx - S2PAD)
+                                       : (oxv[n] + kx - 1);
+          if (iy >= 0 && iy < LH && ix >= 0 && ix < LW) {
+            // Cin and ci are multiples of 4, so this is 8-byte aligned; a
+            // concat half is too (CS % 4 == 0), and a quad never straddles
+            // the two.
+            const bool hi = CAT && ci >= CS;
             v = *reinterpret_cast<const device vec<T, 4>*>(
-                inp + ((int64_t)iy * Wi + ix) * Cin + ci);
+                (hi ? inp2 : inp) +
+                ((int64_t)(iy / UP) * Wi + ix / UP) * CS + (hi ? ci - CS : ci));
           }
         }
         *reinterpret_cast<threadgroup vec<T, 4>*>(Xs + i * BK_padded + cl) = v;
@@ -1375,10 +1664,12 @@ METAL_FUNC void conv3x3_gemm_impl(
           const int kk = k + j;
           const int tap = kk / Cin, ci = kk - tap * Cin;
           const int ky = tap / 3, kx = tap - ky * 3;
-          const int iy = (STRIDE == 2) ? (oy * 2 + ky) : (oy + ky - 1);
-          const int ix = (STRIDE == 2) ? (ox * 2 + kx) : (ox + kx - 1);
-          if (iy >= 0 && iy < H && ix >= 0 && ix < Wi) {
-            v = inp[((int64_t)iy * Wi + ix) * Cin + ci];
+          const int iy = (STRIDE == 2) ? (oy * 2 + ky - S2PAD) : (oy + ky - 1);
+          const int ix = (STRIDE == 2) ? (ox * 2 + kx - S2PAD) : (ox + kx - 1);
+          if (iy >= 0 && iy < LH && ix >= 0 && ix < LW) {
+            const bool hi = CAT && ci >= CS;
+            v = (hi ? inp2 : inp)[((int64_t)(iy / UP) * Wi + ix / UP) * CS +
+                                  (hi ? ci - CS : ci)];
           }
         }
         Xs[i * BK_padded + j] = v;
@@ -1396,18 +1687,37 @@ METAL_FUNC void conv3x3_gemm_impl(
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
   device T* yp = y + y_row * static_cast<int64_t>(Cout) + y_col;
+  const device T* rp = res + y_row * static_cast<int64_t>(Cout) + y_col;
   if (num_els < BM || num_outs < BN) {
     if (has_bias) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue_safe(bias + y_col, 0, 1, short2(num_outs, num_els),
                                  op);
     }
+    if (EPI == 2 || EPI == 4) {
+      BiasAddEpilogue op;
+      mma_op.apply_epilogue_safe(rp, Cout, 1, short2(num_outs, num_els), op);
+    }
+    if (EPI == 1 || EPI == 2) { mma_op.apply_epilogue(ReluEpilogue()); }
+    if (EPI == 3 || EPI == 4) {
+      mma_op.apply_epilogue(LeakyRelu02Epilogue());
+    }
+    if (EPI == 5) { mma_op.apply_epilogue(SiluEpilogue()); }
     mma_op.store_result_safe(yp, Cout, short2(num_outs, num_els));
   } else {
     if (has_bias) {
       BiasAddEpilogue op;
       mma_op.apply_epilogue(bias + y_col, 0, 1, op);
     }
+    if (EPI == 2 || EPI == 4) {
+      BiasAddEpilogue op;
+      mma_op.apply_epilogue(rp, Cout, 1, op);
+    }
+    if (EPI == 1 || EPI == 2) { mma_op.apply_epilogue(ReluEpilogue()); }
+    if (EPI == 3 || EPI == 4) {
+      mma_op.apply_epilogue(LeakyRelu02Epilogue());
+    }
+    if (EPI == 5) { mma_op.apply_epilogue(SiluEpilogue()); }
     mma_op.store_result(yp, Cout);
   }
 }
@@ -1435,8 +1745,43 @@ METAL_FUNC void conv3x3_gemm_impl(
     threadgroup VPIPE_ELT Xs[BM_ * BK_padded];                                \
     threadgroup VPIPE_ELT Ws[BN_ * BK_padded];                                \
     conv3x3_gemm_impl<VPIPE_ELT, BM_, BK, BN_, STRIDE_>(                      \
-        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias, tid,    \
-        simd_gid, simd_lid, lid);                                             \
+        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias,         \
+        (const device VPIPE_ELT*)nullptr, (const device VPIPE_ELT*)nullptr,   \
+        tid, simd_gid, simd_lid, lid);                                        \
+  }
+
+// The fused forms (see conv3x3_gemm_impl). Their own entry points, so the
+// plain ones keep their exact signature for every caller that exists:
+// buffer 11 is the residual, read only when EPI == 2, and buffer 12 the
+// concat's second half, read only when CAT == 1 (bind anything valid
+// otherwise). OH/OW are the OUTPUT dims -- 2H x 2Wi when UP == 2.
+#define VPIPE_CONV3X3_GEMM_FUSED_ENTRY(NAME, BM_, BN_, UP_, EPI_, CAT_)      \
+  kernel void NAME(                                                           \
+      const device VPIPE_ELT* inp  [[buffer(0)]],                             \
+      const device VPIPE_ELT* Wt   [[buffer(1)]],                             \
+      const device VPIPE_ELT* bias [[buffer(2)]],                             \
+      device VPIPE_ELT*       y    [[buffer(3)]],                             \
+      const constant int& H        [[buffer(4)]],                             \
+      const constant int& Wi       [[buffer(5)]],                             \
+      const constant int& Cin      [[buffer(6)]],                             \
+      const constant int& Cout     [[buffer(7)]],                             \
+      const constant int& OH       [[buffer(8)]],                             \
+      const constant int& OW       [[buffer(9)]],                             \
+      const constant int& has_bias [[buffer(10)]],                            \
+      const device VPIPE_ELT* res  [[buffer(11)]],                            \
+      const device VPIPE_ELT* inp2 [[buffer(12)]],                            \
+      uint3 tid      [[threadgroup_position_in_grid]],                        \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint  simd_lid [[thread_index_in_simdgroup]],                           \
+      uint  lid      [[thread_index_in_threadgroup]])                         \
+  {                                                                           \
+    constexpr int BK = 32;                                                    \
+    constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));                  \
+    threadgroup VPIPE_ELT Xs[BM_ * BK_padded];                                \
+    threadgroup VPIPE_ELT Ws[BN_ * BK_padded];                                \
+    conv3x3_gemm_impl<VPIPE_ELT, BM_, BK, BN_, 1, UP_, EPI_, CAT_>(           \
+        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias, res,    \
+        inp2, tid, simd_gid, simd_lid, lid);                                  \
   }
 
 // BN=128: the activation tile is re-read once per CHANNEL tile, so total
@@ -1450,3 +1795,169 @@ VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s1_bn64_f16, 64, 64, 1)
 VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s1_bn32_f16, 64, 32, 1)
 VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s2_bn64_f16, 64, 64, 2)
 VPIPE_CONV3X3_GEMM_ENTRY(conv3x3_gemm_s2_bn32_f16, 64, 32, 2)
+
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_relu_f16, 64, 64, 1, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_relu_f16, 64, 32, 1, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_addrelu_f16,
+                               64, 64, 1, 2, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_addrelu_f16,
+                               64, 32, 1, 2, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn64_f16, 64, 64, 2, 0, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn32_f16, 64, 32, 2, 0, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn64_relu_f16, 64, 64, 2, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_up2_bn32_relu_f16, 64, 32, 2, 1, 0)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn64_cat_relu_f16,
+                               64, 64, 1, 1, 1)
+VPIPE_CONV3X3_GEMM_FUSED_ENTRY(conv3x3_gemm_s1_bn32_cat_relu_f16,
+                               64, 32, 1, 1, 1)
+
+// RIFE's IFNet (generative-models/rife/): every conv activates with
+// LeakyReLU(0.2), its ResConv adds its input back before that, and its
+// stride-2 convs pad symmetrically (torch's p1). The FUSED entry's
+// buffers (11 the residual, 12 unused), any STRIDE.
+#define VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(NAME, BM_, BN_, STRIDE_, EPI_, S2PAD_) \
+  kernel void NAME(                                                           \
+      const device VPIPE_ELT* inp  [[buffer(0)]],                             \
+      const device VPIPE_ELT* Wt   [[buffer(1)]],                             \
+      const device VPIPE_ELT* bias [[buffer(2)]],                             \
+      device VPIPE_ELT*       y    [[buffer(3)]],                             \
+      const constant int& H        [[buffer(4)]],                             \
+      const constant int& Wi       [[buffer(5)]],                             \
+      const constant int& Cin      [[buffer(6)]],                             \
+      const constant int& Cout     [[buffer(7)]],                             \
+      const constant int& OH       [[buffer(8)]],                             \
+      const constant int& OW       [[buffer(9)]],                             \
+      const constant int& has_bias [[buffer(10)]],                            \
+      const device VPIPE_ELT* res  [[buffer(11)]],                            \
+      uint3 tid      [[threadgroup_position_in_grid]],                        \
+      uint  simd_gid [[simdgroup_index_in_threadgroup]],                      \
+      uint  simd_lid [[thread_index_in_simdgroup]],                           \
+      uint  lid      [[thread_index_in_threadgroup]])                         \
+  {                                                                           \
+    constexpr int BK = 32;                                                    \
+    constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));                  \
+    threadgroup VPIPE_ELT Xs[BM_ * BK_padded];                                \
+    threadgroup VPIPE_ELT Ws[BN_ * BK_padded];                                \
+    conv3x3_gemm_impl<VPIPE_ELT, BM_, BK, BN_, STRIDE_, 1, EPI_, 0, S2PAD_>(  \
+        inp, Wt, bias, y, Xs, Ws, H, Wi, Cin, Cout, OH, OW, has_bias, res,    \
+        (const device VPIPE_ELT*)nullptr, tid, simd_gid, simd_lid, lid);      \
+  }
+
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn64_lrelu_f16, 64, 64, 1, 3, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn32_lrelu_f16, 64, 32, 1, 3, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn64_addlrelu_f16,
+                               64, 64, 1, 4, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn32_addlrelu_f16,
+                               64, 32, 1, 4, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn64_lrelu_f16,
+                               64, 64, 2, 3, 1)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn32_lrelu_f16,
+                               64, 32, 2, 3, 1)
+// RelayVSR (generative-models/relayvsr/): the decoder's frame encoder --
+// Conv2d(k3, s2, p1) + SiLU twice, Conv2d(k3, s1, p1) + SiLU -- and the
+// keyframe DiT's source projection, a plain Conv2d(k3, s2, p1) whose
+// output is normed before it activates. The same entry shape (buffer 11
+// unread at EPI 0 and 5; bind anything valid).
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn64_silu_f16,
+                               64, 64, 2, 5, 1)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s1_bn64_silu_f16,
+                               64, 64, 1, 5, 0)
+VPIPE_CONV3X3_GEMM_LEAKY_ENTRY(conv3x3_gemm_s2p1_bn128_f16,
+                               64, 128, 2, 0, 1)
+
+// ---- the tiny autoencoders' ConvNeXt-style block ---------------------------
+//
+// TAESD's SuperBlock (taeqi2_1_tinier's low-resolution stages):
+//   y = x + W_down relu(W_up dw7x7(x) + b_up)
+// over a channel-LAST [H * W, C] map. The two 1x1s are the GEMMs above
+// (the up projection with its ReLU in the epilogue, the down one
+// accumulating onto y); this is the depthwise conv in front of them.
+
+// The 1x1 conv + ReLU twins of dense_gemm_t_bm64_f16 / _bm64bn64_f16:
+// relu(x @ W^T + bias), one rounding. Same buffers, grid and tile.
+kernel void dense_gemm_t_bm64_relu_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 32;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/0,
+                    float, /*ACC=*/false, /*BAND=*/false, /*RELU=*/true>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid);
+}
+
+kernel void dense_gemm_t_bm64bn64_relu_f16(
+    const device VPIPE_ELT*  x        [[buffer(0)]],
+    const device VPIPE_ELT*  W        [[buffer(1)]],
+    const device VPIPE_ELT*  bias     [[buffer(2)]],
+    device VPIPE_ELT*        y        [[buffer(3)]],
+    const constant int& K        [[buffer(4)]],
+    const constant int& N        [[buffer(5)]],
+    const constant int& M        [[buffer(6)]],
+    const constant int& has_bias [[buffer(7)]],
+    uint3 tid      [[threadgroup_position_in_grid]],
+    uint  simd_gid [[simdgroup_index_in_threadgroup]],
+    uint  simd_lid [[thread_index_in_simdgroup]])
+{
+  constexpr int BM = 64, BK = 32, BN = 64;
+  constexpr int BK_padded = (BK + 16 / sizeof(VPIPE_ELT));
+  threadgroup VPIPE_ELT Xs[BM * BK_padded];
+  threadgroup VPIPE_ELT Ws[BN * BK_padded];
+  dense_gemm_t_impl<VPIPE_ELT, /*aligned_N=*/false, BM, BK, BN, /*CAUSAL=*/0,
+                    float, /*ACC=*/false, /*BAND=*/false, /*RELU=*/true>(
+      x, W, bias, y, Xs, Ws, K, N, M, has_bias, /*q_offset=*/0, /*window=*/0,
+      tid, simd_gid, simd_lid);
+}
+
+// Depthwise 7x7, zero padding 3, no bias: y[p, c] = sum over the 49 taps
+// of w[tap, c] * x[p + tap offset, c], in f32 with one rounding. `w` is
+// TAP-major [49, C], so a tap's weights for neighbouring channels are
+// neighbours, as the activation's are. One thread a (pixel, channel),
+// the channels fastest: a simdgroup reads 32 consecutive halves of each
+// neighbour row. With `copy` set it also writes x itself into `xc` --
+// the block's residual, which the down projection then accumulates onto
+// (it reads the centre tap here anyway).
+//
+//   0:x[H*W, C]  1:w[49, C]  2:y[H*W, C]  3:xc[H*W, C]
+//   4:H  5:W  6:C  7:copy
+// grid (C, W, H) threads.
+kernel void dwconv7x7_hwc_f16(
+    const device VPIPE_ELT* x    [[buffer(0)]],
+    const device VPIPE_ELT* w    [[buffer(1)]],
+    device VPIPE_ELT*       y    [[buffer(2)]],
+    device VPIPE_ELT*       xc   [[buffer(3)]],
+    const constant int&     H    [[buffer(4)]],
+    const constant int&     W    [[buffer(5)]],
+    const constant int&     C    [[buffer(6)]],
+    const constant int&     copy [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+  const int c = (int)gid.x, px = (int)gid.y, py = (int)gid.z;
+  if (c >= C || px >= W || py >= H) { return; }
+  float acc = 0.0f;
+  for (int ky = 0; ky < 7; ++ky) {
+    const int iy = py + ky - 3;
+    if (iy < 0 || iy >= H) { continue; }
+    for (int kx = 0; kx < 7; ++kx) {
+      const int ix = px + kx - 3;
+      if (ix < 0 || ix >= W) { continue; }
+      acc = fma((float)x[((ulong)iy * W + ix) * C + c],
+                (float)w[(ulong)(ky * 7 + kx) * C + c], acc);
+    }
+  }
+  const ulong o = ((ulong)py * W + px) * C + c;
+  y[o] = (VPIPE_ELT)acc;
+  if (copy != 0) { xc[o] = x[o]; }
+}

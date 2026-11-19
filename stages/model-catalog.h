@@ -1,15 +1,27 @@
 #ifndef STAGES_MODEL_CATALOG_H
 #define STAGES_MODEL_CATALOG_H
 
+#include "common/flex-data.h"
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 
 class FlexData;
+
+// Keys of ModelCatalogEntry::extra. What each means is documented on
+// the field.
+namespace catalog_extra {
+inline constexpr std::string_view kUrlFiles = "url_files";
+inline constexpr std::string_view kLocalSubdir = "local_subdir";
+}  // namespace catalog_extra
 
 // One downloadable model in the internal HuggingFace catalogue.
 //
@@ -76,6 +88,8 @@ struct ModelCatalogEntry {
     std::string repo;  // an hf_path, e.g. "MiniMaxAI/MiniMax-H3"
     std::string file;  // path within `repo`
     std::string dest;  // where it lands under this entry's local dir
+    // Anything this struct has no field for: see common/flex-bag.h.
+    FlexData    extra;
   };
   std::vector<Companion> companion_files;
   // On-disk weight format, when it is NOT the upstream diffusers/HF
@@ -96,6 +110,41 @@ struct ModelCatalogEntry {
   // user who is choosing between two copies of one model.
   std::string weight_format;
   bool        needs_tokenizer_json = false;
+  // ---- the growth seam ----------------------------------------------
+  //
+  // NEW PACKAGING FACTS GO HERE, NOT IN A NEW FIELD. This struct is
+  // built BY VALUE inside plugins -- all three of this tree's do -- and
+  // it has grown four times already (`name`, `weight_format`,
+  // `companion_files`, `extract_archive`). Each of those moved a layout
+  // a plugin had already compiled, for metadata most entries do not set.
+  //
+  // A FlexData rather than a span of string pairs, unlike the spec
+  // structs: an entry is a value with strings and vectors in it
+  // already, so it has no aggregate or static-storage constraint to
+  // protect, and packaging facts are as likely to be lists or numbers
+  // as strings.
+  //
+  // Keys are the host's, lower_snake, added and never repurposed.
+  // Defined so far:
+  //
+  //   url_files  [[url, dest], ...] -- the model's files are fetched
+  //              VERBATIM from these absolute URLs into the entry's
+  //              directory, instead of from a Hub repo. For weights
+  //              published somewhere model-fetch cannot walk (a GitHub
+  //              repo's raw files). Registered as a MODEL, unlike
+  //              `dataset_files`; `files` should name the same `dest`s
+  //              so the registry record pins them. Build it with
+  //              catalog_url_files_extra(); read it with
+  //              catalog_url_files().
+  //   local_subdir  string -- the record points INTO the download: the
+  //              registered local_path is <repo dir>/<local_subdir>, and
+  //              `files` are still relative to the repo. For a repository
+  //              that publishes several models as FOLDERS beside files
+  //              they share (FlashVSR+'s turbo/ and base/ around one VAE),
+  //              where the folder is the model and a consumer handed the
+  //              repository root could not tell which one was meant.
+  FlexData extra;
+
   std::string name;         // registration key + extract subdir (when several
                             // entries share one hf_path); empty -> key=hf_path
   bool        extract_archive = false;  // unpack fetched .tar(s); local_path
@@ -175,6 +224,36 @@ const ModelCatalogEntry* catalog_by_path(const std::string& hf_path);
 std::vector<const ModelCatalogEntry*>
 catalog_all_by_path(const std::string& hf_path);
 
+// WHICH of those a `model_variant` string selects, or nullptr when it does
+// not come down to exactly one.
+//
+// The rule, and it is a rule rather than a search because guessing here
+// downloads the wrong model and registers it under the right name:
+//
+//   * `variant` is matched case-insensitively against each candidate's
+//     version, variant, name and model_type;
+//   * an EXACT hit on any of those beats a substring hit on any of them,
+//     so "fl2va" takes the FL2VA entry even where another entry's
+//     description happens to contain the word;
+//   * the answer must be exactly ONE entry. Zero and two are both
+//     nullptr -- ambiguity is refused, never resolved by order;
+//   * an empty `variant` selects only when there is a single candidate.
+//
+// `matched` (optional) receives the entries the string actually hit, so a
+// caller refusing the request can say how many and which. It is the hit
+// set, not the candidate set: on a miss it is empty, and on an ambiguous
+// hit it holds the tied entries.
+//
+// SHARED because it was duplicated. model-fetch-stage owns the only
+// production caller, and a test that re-implemented "match a variant" as
+// a plain substring scan agreed with it on every shipped pipeline while
+// disagreeing on the two things above -- which is a test that stops
+// tracking the thing it checks the moment either moves.
+const ModelCatalogEntry*
+catalog_pick_variant(const std::vector<const ModelCatalogEntry*>& cands,
+                     const std::string& variant,
+                     std::vector<const ModelCatalogEntry*>* matched = nullptr);
+
 // Look up a catalogue entry by its `name` (the registration key used when
 // several entries share ONE hf_path -- the vpipe-supplement CoreML models).
 // catalog_by_path can't disambiguate those (they share hf_path), so the
@@ -184,6 +263,15 @@ const ModelCatalogEntry* catalog_by_name(const std::string& name);
 // Derived category of an entry: "dataset" (carries dataset_files),
 // "supplement" (has a parent_model_type -- a tower / LoRA), else "model".
 std::string catalog_category(const ModelCatalogEntry& e);
+
+// The `url_files` packaging fact (see ModelCatalogEntry::extra): the
+// {url, dest} pairs, empty when the entry has none.
+std::vector<std::pair<std::string, std::string>>
+catalog_url_files(const ModelCatalogEntry& e);
+// An `extra` holding `url_files`, for a catalogue entry's initialiser.
+FlexData
+catalog_url_files_extra(
+    std::vector<std::pair<std::string, std::string>> files);
 
 // Default input / output modalities for a runtime `model_type`, each a
 // subset of {"text","image","audio","video"}. This is the table the
@@ -207,6 +295,14 @@ FlexData catalog_entry_to_flex(const ModelCatalogEntry& e);
 //   "owner/repo/"                           -> "owner/repo"
 // Query/fragment and any path beyond the first two segments are dropped.
 // Returns "" when the input has no owner/repo pair.
+//
+// HuggingFace SPELLINGS ONLY. For anything a user might have pasted, the
+// host uses `normalize_model_ref` (model-source-host.h) instead: it
+// handles the mirror hosts too, and a modelscope.cn URL run through THIS
+// function yields "models/<owner>" -- a repo that does not exist --
+// because ModelScope's web URL carries a "models/" segment that
+// HuggingFace's does not. This one is kept for callers that are already
+// working in HuggingFace terms.
 std::string normalize_hf_path(const std::string& input);
 
 // One file listed by the HuggingFace tree API.
@@ -226,6 +322,9 @@ struct HfFile {
   // it can be rebuilt from deduplicated chunks instead of streamed
   // whole. Empty for a file the store does not hold.
   std::string   xet_hash;
+
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData extra;
 };
 
 // Extract the downloadable files (type == "file") from a HuggingFace
@@ -234,5 +333,7 @@ struct HfFile {
 std::vector<HfFile> hf_tree_files(const FlexData& tree_json);
 
 }
+
+VPIPE_API_END
 
 #endif

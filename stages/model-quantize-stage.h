@@ -37,7 +37,8 @@ namespace genai { struct QuantArchInfo; }
 // Registry-aware:
 //   * src_model may be a models-DB key (registered by model-fetch) OR a path.
 //   * output_name names the result: a bare name (or "org/name") -> the output
-//     dir is inferred as <cwd>/models/<output_name> and the result is
+//     dir is inferred as models/<output_name> beside the session database
+//     (see default_models_dir) and the result is
 //     registered in the models DB under that key. An absolute/relative path
 //     ("/..", "./..") is used verbatim and NOT registered.
 //   * arch / n_layers / layer_prefix are auto-detected from the source
@@ -46,10 +47,25 @@ namespace genai { struct QuantArchInfo; }
 //
 // Config (FlexData object):
 //   src_model     (string, required) -- source model: a models-DB key or a
-//                  bf16/f16 safetensors directory path.
-//   output_name   (string, required) -- result name (-> <cwd>/models/<name>,
+//                  path: a bf16/f16/fp8 safetensors directory, or ONE
+//                  .safetensors file -- a Comfy-Org component, or a Krea-2
+//                  DiT in Krea's own layout (the single file community
+//                  fine-tunes ship), which is translated to the diffusers
+//                  layout on the way through. FP8 tensors (F8_E4M3 /
+//                  F8_E5M2) are read as the bf16 they decode to exactly;
+//                  SCALED FP8 (ComfyUI's scaled_fp8 / comfy_quant, a
+//                  scale per tensor or per row) as code * scale, and its
+//                  scale tensors are not written out. MXFP8, NVFP4, int8
+//                  and block-scaled encodings are refused by name.
+//   output_name   (string, required) -- result name (-> models/<name> beside
+//                  the session database,
 //                  registered) or an explicit path ("/..", "./..").
-//   bits          (uint, default 8)  -- backbone affine bit-width (4 | 8).
+//   bits          (uint, default 8)  -- backbone affine bit-width (4 | 8),
+//                  or 16: a DENSE output that quantizes nothing -- FP8
+//                  decoded to bf16, everything else copied. That is the
+//                  dequantization of an FP8 checkpoint (lossless), and for
+//                  a native-layout file also its conversion to diffusers
+//                  names. An affine-quantized source is refused.
 //   group_size    (uint, default 64) -- affine group size (32 | 64).
 //   arch          (string, default "") -- model family tag; empty => auto-
 //                  detect from the source config.json model_type.
@@ -116,12 +132,45 @@ public:
   const std::string& output_name() const noexcept { return _output_name; }
   int  bits() const noexcept { return _bits; }
   int  group_size() const noexcept { return _group_size; }
+  const std::string& run_dtype() const noexcept { return _run_dtype; }
   bool skip_existing() const noexcept { return _skip_existing; }
   bool awq() const noexcept { return _awq; }
   bool mixed() const noexcept { return _mixed; }
   float mixed_frac() const noexcept { return _mixed_frac; }
   const std::string& calib_dir() const noexcept { return _calib_dir; }
   int n_layers() const noexcept { return _n_layers; }
+
+  // Test seam: which DiT directory a `src_model` path resolves to, and
+  // which family it belongs to ("" for neither).
+  //
+  // Exposed because this is the THIRD resolver of that question -- the
+  // DiT loader and the text encoder each have their own -- and it is the
+  // one no test could reach. Both times it has drifted behind the other
+  // two, the symptom was the same: the stage decided the source was not
+  // a diffusion pipeline and fell through to the LANGUAGE-model
+  // quantizer, which then reported an unknown architecture. That reads
+  // as "unsupported family" and is really "resolver missed a rung".
+  //
+  // `partition` is MiniMax-H3's fl2va / ref2va, which the caller takes
+  // from the models-DB record rather than from the directory.
+  // The PIPELINE root to quantize, given the source that was named and
+  // the DiT the resolver found under it. Normally the source itself --
+  // but MiniMaxAI publishes both MiniMax-H3 partitions from ONE repo, so
+  // the runnable root is <repo>/FL2VA and the components to copy sit
+  // beside the DiT rather than beside the repo.
+  //
+  // Exposed for the same reason as the resolver below: the two answers
+  // have to agree, and the one that decides WHERE TO COPY FROM had no
+  // test at all -- a source that resolved its DiT correctly still failed
+  // with "root ... has no 'transformer' component to quantize", which
+  // reads as a broken download rather than a resolver that stopped one
+  // directory short.
+  static std::string pipeline_root_for(const std::string& src_dir,
+                                       const std::string& dit_dir);
+
+  static std::string resolve_source_dit_dir(const std::string& src_dir,
+                                            std::string* family,
+                                            const std::string& partition = {});
 
   // Test seam: run the quantization once. Returns true on success (or when
   // skipped because the output already exists). Logs + returns false on
@@ -214,6 +263,7 @@ private:
   std::string _target;   // krea2 component to quantize: dit|text_encoder|vae
   int         _bits{};
   int         _group_size{};
+  std::string _run_dtype;   // "" (as before) | bf16 | f16
   bool        _skip_existing{};
   // AWQ + mixed precision.
   bool        _awq{};

@@ -103,9 +103,12 @@ than supplying one that is merely small.
 | 8 | Parking | May somebody else have my idle bytes? | per weight set | at an idle point |
 | 9 | The removable pool | May the *next launch* have what I finished with? | per weight set | at release |
 | 10 | The memory cap | What does the process insist on holding? | process-wide | from config |
+| 11 | The expert cache | Which of a mixture-of-experts model's experts do I keep? | per (layer, expert) | at load; refilled every step |
+| 12 | Ownership | Whose are these bytes, and what are they for? | per buffer | at allocation, from the thread's owner |
 
 Mechanisms 1–4 are mandatory for every model. 5–7 apply to models too big
-for the machine. 8–10 are how idle weights stop being dead weight.
+for the machine, and 11 is their counterpart for a mixture of experts.
+8–10 are how idle weights stop being dead weight.
 
 They are layers, not independent knobs: each answers a different question,
 and a model that wires one and skips another tends to behave correctly on
@@ -201,10 +204,11 @@ second is the one that decides whether a small box survives:
   exactly the pressure that squeezes out the blocks a resident set is
   trying to keep.
 
-> **Trap: `F_NOCACHE` only bypasses the cache on a PAGE-ALIGNED file
-> offset, and a read that misses the alignment does not fail — it
-> silently falls back to the buffered path.** MEASURED with a clean
-> control, 4096 MB read from one file with `F_NOCACHE` set throughout:
+> **Trap: `F_NOCACHE` only bypasses the cache when the file offset AND
+> the destination address are both 4 KB-aligned, and a read that misses
+> either does not fail — it silently falls back to the buffered path.**
+> MEASURED with a clean control, 4096 MB read from one file with
+> `F_NOCACHE` set throughout:
 >
 > | file offset | file-backed pages gained |
 > |---|---|
@@ -212,16 +216,31 @@ second is the one that decides whether a small box survives:
 > | + 8 bytes | **+1813 MB** |
 > | + 4096 bytes | +0 MB |
 >
+> The destination counts as much as the file. MEASURED with `mincore`
+> over the file's own pages, 1 GB read at a page-aligned file offset: a
+> destination 8, 2048 or 4016 bytes off a page put **896 MB** of it in
+> the cache, one 4096 or 12288 bytes off none. The same misalignment on
+> both sides does not help (+80 / +80 cached 7/8 of it).
+>
 > A safetensors data section starts at `8 + header_len`, so its alignment
 > is whatever the header length happened to be, and every tensor in the
-> shard inherits it. MEASURED through the real loader on a misaligned
-> checkpoint: 6233 MB read grew the file cache by **6212 MB** — one for
-> one, on a path that sets `F_NOCACHE` on every read.
+> shard inherits it — and since a tensor's offset from its destination
+> is fixed by where it lies, a misaligned tensor can never be read
+> straight into page-aligned memory. MEASURED through the real loader on
+> a misaligned checkpoint: 6233 MB read grew the file cache by **6212
+> MB** — one for one, on a path that sets `F_NOCACHE` on every read.
 >
-> The read now stages through page boundaries and copies out, so the
-> same 6233 MB grows the cache by **1 MB**. You do not have to do
-> anything to get this; it is in the accessor. What you *do* have to do
-> is not build a second read path that skips it.
+> The read stages through 4 KB boundaries and copies out, so the same
+> 6233 MB grows the cache by **1 MB**. You do not have to do anything to
+> get this; it is in the accessor. What you *do* have to do is not build
+> a second read path that skips it.
+
+A read is also split into **1 MB pieces, four in flight**: one read at a
+time leaves a drive short of its rate. MEASURED on an M4 Pro, uncached,
+misaligned checkpoints: the internal SSD 3.9 → 4.8 GB/s, a Thunderbolt 5
+SSD 3.7–3.9 → 5.3–5.4 GB/s, near what either gives any read shape; a
+50-block MiniMax-H3 forward streamed from the latter, 61.6 GB of blocks,
+15.5–15.9 → 12.7–13.0 s. Eight in flight never beat four.
 
 ### Alignment, and the two costs of a misaligned pack
 
@@ -301,7 +320,9 @@ return { model_memory::weight_claim_streamable(_dit_dir, floor_bytes) };
 
 The floor is what a block-streaming DiT holds when it streams — its trunk
 plus the in-flight slots, not the checkpoint. The planner reports both
-columns (`N MB preloaded / M MB if every streamable component streams`),
+columns — everything held whole, and everything streamable at its floor
+(`N MB preloaded / M MB if every streamable component streams`, as the
+log words it),
 and a floor above the checkpoint's own size is clamped. Declaring one
 matters more than it looks: the refusal check in mechanism 7 runs against
 the floor column, so a streamable component that declares none is counted
@@ -427,6 +448,16 @@ stage. That is the race the planning phase exists to remove, reintroduced
 inside it. Pass 1 writes and does not read; pass 2 reads and does not
 write. Refinements are buffered and applied together at the end, so one
 stage's decision can never move the box another stage is deciding against.
+
+**Which pass a phase belongs in follows from whether it is CONDITIONAL,
+not from the phase field itself.** `ResourceClaim::phase` is a
+declaration field and is honoured wherever it is set, so a lifetime that
+is a fixed property of the stage — a VAE is loaded when a latent arrives
+and dropped after, in every graph — is stated in `declare_resources()`,
+where it reads nothing and cannot depend on visiting order. It is the
+phase whose validity depends on a *decision* (will this stage really
+release its encoder?) that has to wait for pass 2, because deciding is
+what needs the completed picture.
 
 **Two conditions on a phase claim, and neither is checkable by the
 planner.**
@@ -608,10 +639,13 @@ Coverage, and what each family's plan-time bound is actually worth:
 
 | family | declares from | revised by | bound vs truth |
 |---|---|---|---|
-| FLUX.2 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
+| FLUX.2, FLUX.3, Fibo 2.0 | `AutoencoderKLFlux2`, `block_out` ×14 | generate-image, vae-decode | exact |
 | Boogu | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
+| Z-Image | `AutoencoderKL`, `block_out` ×14 | generate-image, vae-decode | exact |
+| MOSS-Image | `AutoencoderKLFlux2`, `decoder_block_out` ×14 (its small decoder) | generate-image, vae-decode | exact |
 | Krea-2 | `AutoencoderKLQwenImage`, `base_dim` ×27 | generate-image, vae-decode | exact |
 | Qwen-Image-Edit | `AutoencoderKLQwenImage`, `base_dim` ×27 | vae-decode | exact |
+| an RGBA `AutoencoderKLQwenImage` (`input_channels` 4, scalar `scaling_factor`) | `base_dim` ×27 | generate-image, vae-decode | as above (4 channels change only `conv_out`) |
 | LTX-2.5 | rounded config geometry | vae-decode (family path) | exact |
 | MiniMax-H3 | rounded config geometry | vae-decode (video path) | exact |
 | wan | rounded config geometry | vae-decode (video path) | exact |
@@ -670,6 +704,121 @@ MEASURED, FLUX.2 klein-9B-4bit at a simulated 16 GB (peers 10059 MB):
 | 1024² | 3584 MB | keep | keep |
 | 2048² | 14336 MB | **keep** — wrong | **unload** |
 
+### CoreML residency — bytes no other ledger can see
+
+A third claim kind, `model_memory::kCoreMLKind`, exists for one reason:
+a CoreML model's memory is held by CoreML. It is not in a weight set, not
+a `SharedBuffer`, and not a Metal allocation — so `weight_footprint()`
+cannot see it, `revise_declaration()` cannot report it, the wired pool
+cannot protect it, and `MetalCompute::memory_budget().headroom` cannot
+count it either, since that is a *Metal device* figure. Only the
+physical-RAM reading sees it at all, and that is the backstop, not the
+plan.
+
+How much it is depends on the module's design, and the two designs an
+accelerated feed-forward can take differ by an order of magnitude:
+
+- **Weights baked per block.** Each block's module holds its weights in
+  wired memory for the run — ~0.84 GB a block on a 6144×16384 FFN — so
+  the cost scales with depth and a 28-block model asks for more than its
+  checkpoint.
+- **Weights as runtime inputs, one shared module.** The graph holds no
+  weights; the model stages its inputs into wired memory once, and the
+  caller refills IOSurface weight buffers per block. The cost is fixed —
+  ~1.4 GB for the same FFN — however many blocks share it.
+
+So the claim is in **units**, not bytes. A per-block design claims one
+unit per block and can be granted fewer; a shared module claims one:
+
+```cpp
+return model_memory::coreml_claims(
+    label, module_bytes, /*units=*/1, model_memory::kPhaseDenoise);
+```
+
+and the stage reads back, at load, what the plan granted:
+
+```cpp
+if (model_memory::coreml_grant(session(), label, module_bytes, 1) <= 0) {
+  // keep the GPU path
+}
+```
+
+**A family with more than one tier must book every one of them.** The
+feed-forward is rarely the only thing worth moving: a q|k|v projection is
+the same shape of work, and a family that runs both holds *two* modules,
+each with its own weight slots and staging. `module_bytes` has to be the
+sum — one unit covering both, granted together or not at all — because
+the two are armed by one decision and there is no useful state where the
+plan grants half.
+
+Getting this wrong is silent in a particular way, so it is worth naming.
+The tier that is *not* booked still allocates: CoreML hands it the
+memory, the process holds it, and no ledger in the plan knows. The graph
+then looks like it fits right up until the box is already short. MEASURED
+on Krea-2 at 1024², where the second tier is not a rounding error: the
+claim is **1440 MB for the feed-forward alone and 2080 MB with the q|k|v
+module beside it**. A booking that named only the first understated what
+the process would hold by 640 MB.
+
+The same applies to `revise_scratch()` after the first forward, where a
+tier reports whether it actually armed: ask *every* tier, and when only
+one did, book high rather than low. Releasing memory the modules are
+still holding is the failure worth avoiding; over-booking merely keeps a
+reservation nobody else needed.
+
+Two properties make this kind different from the other two, and both
+follow from what an accelerator *is*:
+
+- **It never refuses a launch.** A shortfall of weights means the graph
+  cannot run; a shortfall of accelerator means it runs slower. The
+  planner grants what fits — possibly zero, which the caller reads as
+  "keep the GPU path" — and returns true regardless.
+- **A partial grant is a real answer, not a degraded one**, for a claim
+  that has more than one unit: the speedup is proportional to the blocks
+  covered, so *k* of *n* is a linear trade rather than a cliff.
+
+A grant is judged **in its claim's own phase**. A unit that lives only
+in the denoise is compared against what the denoise already holds, and
+granted as far as that phase stays within the larger of two limits:
+
+- **the graph's current peak** — a graph that already has to survive a
+  higher moment elsewhere is made no tighter by filling a lower phase up
+  to it. A 1024×1024 Krea-2 graph peaks at 14.6 GB in its decode and holds
+  12.0 GB in its denoise; its 1.4 GB module lifts the denoise to 13.4 GB
+  and moves the peak not at all, so refusing it would refuse memory the
+  run already has to have;
+- **believed RAM less a headroom** of a quarter of RAM, at most
+  `kStreamHeadroom` — the ordinary rule, for a unit that does raise the
+  peak. A flat 8 GB is right on a 64 GB box and reserves half of a 16 GB
+  one.
+
+Everything is read at floors, with the activation scratch included. When
+no phase order has been set — a caller outside a launch — one flat reading
+at floors stands in for both.
+
+What is granted is then **declared into the scratch ledger**, so it
+reaches `phase_peak()` and every peer that sizes after it. A grant
+nobody could see would be the same bug one layer further in.
+
+### Reading the box right after a free
+
+A transient that frees one model to make room for another — a DiT dropped
+for its VAE decode — and then reads `memory_budget()` reads too early.
+macOS returns a released Metal buffer's pages **asynchronously**: the
+device's allocated size drops at once, the process's graphics footprint
+tens to hundreds of milliseconds later, and the system's free and wired
+counts after that. MEASURED on a 16 GB M5: 2 GB back in ~45 ms, 8 GB in
+~1.1 s. A decode sized in that window sees none of what was freed — after
+a 4096² FLUX.3 denoise, 284 MB of a box that had ~8 GB coming.
+
+Read it with `memory_budget_settled()` instead. It returns at once when
+nothing is on its way back (the graphics footprint is within 256 MB of
+the allocated size), and otherwise waits — at most `timeout_ms`, 3 s by
+default — for the footprint to stop falling and the system's wired count
+to fall by what it gave back. Waiting for the footprint to reach the
+allocated size would be wrong: graphics memory that is not a Metal
+buffer (a CoreML model, a video frame's IOSurface) never returns.
+
 ---
 
 ## 4. The memory plan — derived from the graph, not from phase names
@@ -716,7 +865,8 @@ MyStage::declare_memory() const
 
 Four things a stage says, and one it does not:
 
-- **`preload`** — what this holding costs when the box has room.
+- **`preload`** — what this holding comes to held whole: a streaming
+  DiT's whole checkpoint, which it converges on when the box has room.
 - **`floor`** — the least it can be held at while still being held: a
   streaming DiT's trunk plus its slots. Zero reads as `preload`.
 - **`releases`** — gone when this stage finishes, rather than held for the
@@ -816,17 +966,78 @@ accounting. Implement both; they are a few lines each, and the numbers
 they produce should agree — when they do not, that disagreement is the
 most useful diagnostic on the page.
 
+> **Trap: a streaming FLOOR must be on the CLAIM, not only in the plan.**
+> Both ledgers take one, and they look interchangeable. They are not:
+> `StageMemory::hold(source, preload, floor)` is what a run *reports*,
+> while `ResourceClaim::floor_bytes` is what `phase_footprint_floor()`
+> and `phase_peak()` read — and those are the only place a graph is
+> turned away. A model claimed with `weight_claims()` instead of
+> `weight_claim_streamable()` is judged at its full on-disk size however
+> carefully the plan describes its floor, so "everything streamable at
+> its floor" reads identically to "everything held whole". MEASURED on a
+> two-model image graph: **15064 MB / 15064 MB before, 15064 MB / 2902 MB
+> after**, same graph, same box.
+>
+> The error over-states, so it warns about graphs that would run rather
+> than admitting ones that cannot. That makes it quiet — the number is
+> merely large, never obviously wrong.
+
 ---
 
 ## 5. Block streaming — the irreversible one
 
 A model that cannot fit reads its blocks from disk per forward, keeping
-only a pinned prefix. This is an argument to the transformer's `load()`,
-so it must be right at construction — changing it later means destroying
-and rebuilding the model.
+back only whatever block residency (mechanism 6) later grows into. This
+is an argument to the transformer's `load()`, so it must be right at
+construction — changing it later means destroying and rebuilding the
+model.
 
 Take the decision from `plan_streaming()`, never by hand. It also records
 the fact that streaming was chosen, which peers depend on (below).
+
+### Stream, then retain — on every box
+
+`plan_streaming()`'s `stream` is a verdict on the BOX: it is tight. The
+mechanism is a separate choice, `stream_blocks_by_default(plan)`, and it
+streams on a box with room too. The first forward reads each block as it
+needs it and block residency (mechanism 6) keeps it — with the wired pool
+on, the schedule's probe is the whole stack, so every block the first pass
+reads is kept. One forward in, the model holds its whole stack, having
+measured the box rather than trusted an estimate, without reading the
+checkpoint before the first step, and without holding it beside a text
+encoder that lets go after the prompt.
+
+Keep the two apart in a stage. What only a TIGHT box wants keys on the
+verdict: deferring the load past the conditioning, revising the
+declaration down to the trunk, releasing the forward's scratch after a
+generation, and the streaming signal peers read. On a box with room the
+declaration stays at the whole checkpoint (`preload`), which is what the
+model converges to; the per-generation correction books it as it grows.
+
+**A streamed block must BE the block it is when kept** — the same weight
+layout, so the same kernels and the same bytes out. Where the kept block
+holds a transform of its weights (an int8 layout quantized from a dense
+weight, a w4 pack's layout held), the slot keeps the raw source as its
+refill target and converts after every refill, and a promotion keeps
+what the kept block keeps — the source dropped, a held layout converted. Ask
+admission and
+the wired pool for that KEPT size, not the slot's. And run that keep step
+after EVERY promotion, not only inside the slot's clone: without slots
+(or when a slot cannot be allocated) `promote_into` MOVES the per-block
+read into the resident set, source and all, and nothing a clone does
+happens. Once the whole stack is resident the slot pair has
+nothing left to serve and is given back
+(`BlockSlots::release_if_saturated`, at the top of a forward or between
+generations; an eviction later rebuilds it).
+
+MEASURED on an M5 Ultra (256 GB), Qwen-Image-2.1 bf16 at 1024^2: a
+steady forward 562.1 ms streamed-then-kept against 561.5 with the whole
+checkpoint read before the first step, bit-identical, both holding 13571
+MB; load + first forward 0.09 + 1.97 s against 4.5-5.0 + 0.57 s; a
+20-step generation 18.85 s wall against 18.0-19.6, at a peak RSS of 16.3
+GB against 28.3. On the token int8
+tier, the bf16 checkpoint and a w4 pack holding its layout are
+pixel-identical both ways (13.4 s against 14.2; 12.5-12.6 against 12.8).
 
 `dit_retires` is what the model will **release** after load and before the
 denoise — weights it reads once and then drops, so they are never part of
@@ -836,8 +1047,30 @@ checkpoint, and without this the irreversible decision is taken against a
 model 39% of which is about to stop existing. Pass it **only** when the
 release is certain; zero is always safe.
 
+**In-memory quantization is the same argument.** A loader that quantizes
+an unquantized checkpoint as it builds each layer never holds the bf16
+bytes it reads, so what it sheds is `retires` exactly as a bake's is. A
+text-to-speech backbone held as affine w8 group-64 keeps ~53% of its
+projections' bf16 bytes: MEASURED on an 8B, 9983 MB held against
+16193 MB on disk, with its logits as close to an fp32 reference as the
+reference's own bf16 run (rel-L2 0.0075 against 0.0070). Book the held
+size in `StageMemory::hold()` from the start — the plan's `preload` column
+is a stage's own statement — while the claims ledger, which sizes from
+disk, is corrected by `revise_declaration()` once the model has loaded.
+
 A streaming model must then call `revise_declaration()` down to what it
-actually pins, so peers do not size against weights that are never there.
+actually holds, so peers do not size against weights that are never
+there.
+
+> **Trap: name EVERY stack, not the first one.** `streaming_floor_bytes()`
+> takes a list of block stems, and a model with two stacks streams both
+> and keeps a slot pair for each — so a list naming one leaves the other
+> in the trunk. The result is a floor that is technically an
+> over-estimate and practically useless. MEASURED on a 17316 MB
+> two-stack DiT: naming one stem gave **12324 MB**, naming both gave
+> **3172 MB**. Across four image DiTs the complete list reduces the
+> declared floor to between a fifth and a twenty-eighth of the
+> checkpoint; an incomplete one reported close to the whole of it.
 
 > **Trap: the revision erases the evidence.** A streaming model correctly
 > reports a small number, and that small number reads as *roominess* to
@@ -855,14 +1088,105 @@ actually pins, so peers do not size against weights that are never there.
 > keeping anything resident. It is a record of a decision that was taken,
 > not a prediction.
 
-`StreamPlan::pin_frac` is **language-model layer pinning only.** Every DiT
-that used it is retired: the block-streaming families grow a resident set
-by measuring instead (mechanism 6), which is what a fraction of total RAM
-decided before the run could never do. The LMs keep it because they have
-nothing to grow into — they pin a prefix of layers with no residency
-policy behind it, so removing the fraction would leave the text encoders
-streaming everything with no way back. Give them a `BlockResidency` and
-the field goes too.
+`StreamPlan::pin_frac` is **language-model layer pinning, for the
+encoders nothing better serves.** The block-streaming DiTs grow a
+resident set by measuring instead (mechanism 6), which is what a fraction
+of total RAM decided before the run could never do — and so does every
+text encoder whose backbone the raw-source slots below can stream. A
+prefill-only encoder they cannot build (a backbone with attention biases,
+a pack of another width, a plug-in's hidden-state encoder) still pins a
+prefix of layers, with no residency policy behind it.
+
+**An autoregressive decoder streams like a DiT.** A dense full-attention
+backbone whose layers are built from the raw checkpoint (quantized in
+memory or kept bf16) streams with the same machinery the DiTs use — two
+pread-refilled slots, the next streamed layer read under the current
+one's GPU work, measured residency, the wired pool — through DECODE as
+well as prefill. Two things differ, and both follow from decode:
+
+* **A forward is a token.** Residency's probe-and-double runs per decode
+  step, so a model reaches the resident set the box will hold within a
+  handful of tokens, and the schedule is sized from the token budget.
+* **A streamed layer is rebuilt where it runs.** The slot holds the raw
+  tensors; the products (quantized codes, fused projections) are built
+  in the same command buffer that runs the layer, by the same function
+  that builds a resident layer at load. Streamed and resident output are
+  then byte-identical by construction, which is the bar — not closeness.
+
+What streaming costs a decoder is a disk read per streamed layer per
+TOKEN, so it is the answer to "cannot fit" and never to "would rather
+not": a box that needs it gets slower, a box that pages makes no
+progress at all.
+
+**Stream the bytes you hold, not the bytes you build from.** A decoder
+held as w8 but streamed from its bf16 checkpoint reads twice what it
+keeps for every streamed layer of every token, and its slot carries a
+bf16 copy of the layer beside the w8 one. An affine w8 group-64 pack of
+the same checkpoint streams as it sits: the slot holds the pack's
+tensors (most of them ARE the products) plus the two fusions the forward
+reads, q|k|v by rows and gate|up interleaved, made by row copies in the
+command buffer that runs the layer. MEASURED on an 8B text-to-speech
+backbone: 196 MB read per streamed layer against 368, a slot of 323 MB
+against 563. Write the pack with the in-memory build's own kernel
+(scales in the compute dtype, codes fit to the rounded scale and bias)
+and the streamed pack is byte-identical to the in-memory build of the
+raw checkpoint; a pack whose scales are F16 for a bf16 model is rounded
+again at load, which on that model doubled the error against an fp32
+reference.
+
+**The trunk is weights too.** A decoder's embedding table and output
+head are read every token and are often a quarter of the checkpoint:
+2.4 GB of bf16 on that 8B. Holding them at w8 as well took the whole
+model from 9983 MB to 8843 MB. Keep exact the rows read on every step
+(control tokens in, the tokens a constrained step ranks out), so the
+quantization reaches only what varies.
+
+**A conditioning encoder streams the same way.** A text encoder that only
+ever prefills — read for a stack of hidden states, never decoded — takes
+the same slots and the same measured residency through its tap forwards.
+Three things are its own:
+
+* **A forward ends at its deepest tap**, and the read issued under its
+  last layer wraps to the next forward's first streamed layer rather than
+  reading on past the tap into a layer nothing runs. The next forward is
+  the negative prompt, or the next prompt of an encoder kept between
+  them.
+* **Its floor is the slot PAIR.** What it holds at its least is the trunk
+  plus two slots, each a layer's sources plus the products built beside
+  them (in bf16, the fused q|k|v alone: the rest are the sources as
+  read). That is what its streamable claim states, read off the
+  checkpoint — and where the stack is one the slots cannot build, the
+  floor is the layer-at-a-time path's instead. The floor promised and the
+  slots held agree to the byte; check that in a test.
+* **Its reserve is the other phases' arenas.** It runs in the condition
+  phase, and what may allocate while it holds its set is the widest
+  scratch the plan books for any OTHER phase — a DiT forward and a VAE
+  decode of an earlier prompt run beside the next prompt's conditioning.
+  Its schedule tells one pass from several: a prompt with a negative is
+  two passes, an encoder kept past its prompt more, and a single pass
+  keeps nothing it will read again.
+
+Once every layer the taps run is resident, the slot pair is given back —
+at the top of the next forward, or when the encoder is handed to a warm
+hold.
+
+**A hybrid's two kinds of layer share one pair.** A stack that interleaves
+linear-attention (gated-DeltaNet) layers with full-attention ones holds
+different tensors in each kind, and a slot laid out for one kind would be
+rebuilt every time the other arrived — with the slots alternating and one
+layer in four full attention, every other read. So a hybrid's slot is a
+POOL laid out from the checkpoint: each projection takes a buffer of
+exactly its byte size (the k-th of a size in its layer, the k-th such
+buffer), so the pool holds the most of each size any layer needs; each
+small tensor (a norm, the convolution, the recurrence's parameters) has a
+buffer of its own role; and the fused projection is built into one arena
+of the wider kind's size. Either kind refills it in place. What the
+resident load derives rather than reads — a zero-centred norm with its 1
+folded in, the recurrence's parameters widened to f32 — is rebuilt on
+each refill through the same converters, so a streamed layer is the
+resident one byte for byte. The pool is what the floor counts: for a
+9B-class hybrid about 530 MiB a slot, against ~2 GiB for a pair per
+kind.
 
 ### Reading a streamed block
 
@@ -911,7 +1235,260 @@ immediately dropped.
 A model that is not ready to restructure who owns its buffers can still
 change only the *fill* and keep the per-block allocation. That is most of
 the win — of the mapped path's cost above, the allocation was roughly a
-fifth and the faulting the rest.
+fifth and the faulting the rest. What it does **not** get is the
+prefetch: a read ahead needs a destination the current block is not
+using, and a per-block allocation has exactly one. See the trap at the
+end of the next section.
+
+### Two slots and a prefetch
+
+Keeping the destinations is worth more than the refill alone, because it
+makes a **prefetch** free: the buffer a reader thread fills is already
+allocated, so issuing the next block's read costs no memory and asks no
+growth question. Between the commit that hands block *i* to the GPU and
+the wait for it, this thread has nothing to do — that window is the
+whole opportunity.
+
+`generative-models/shared/block-slots.h` is that policy, so a model
+supplies only what the policy cannot know:
+
+```cpp
+BlockSlots<Block>::Ops ops;
+ops.each        = ...;  // every (name, destination, Placement) of block i
+ops.rebuild_one = ...;  // one tensor a raw read could not place
+ops.build       = ...;  // allocate and fill from scratch
+ops.clone       = ...;  // allocate dst like src, optionally copying
+ops.bytes       = ...;
+ops.empty       = ...;
+ops.post_refill = ...;      // OPTIONAL, see "derived tensors" below
+ops.fill_unservable = ...;  // OPTIONAL, for an f32 source
+ops.same_layout = ...;      // OPTIONAL, see "blocks of more than one layout"
+slots.set_weight_set(ws.get());
+slots.configure(mc, std::move(ops), "MyModel", "VPIPE_MYMODEL_NO_SLOTS");
+```
+
+and the forward becomes:
+
+```cpp
+slots.begin_forward();
+for (int i = 0; i < n; ++i) {
+  if (resident(i)) { ...; continue; }
+  const Block* b = slots.acquire(i);
+  if (b == nullptr) { return fail(...); }
+  ... encode ...
+  Fence f = stream.commit();
+  slots.prefetch(next_streamed_after(i));   // under the GPU's work
+  f.wait();
+  // Ask with what promotion KEEPS -- see the trap below.
+  if (admit(kept_bytes(*b))) { slots.promote_into(resident[i]); }
+}
+```
+
+**How much this is worth depends on the drive, and on a slow one it is
+nothing.** MEASURED cold over four image and video DiT checkpoints, four
+arms interleaved with byte-balanced groups and the arm-to-group
+assignment rotated:
+
+| | internal SSD | ONE external SSD |
+|---|---:|---:|
+| allocate per block, fill from the mapping | 3.1–4.0 GB/s | 0.77–0.78 GB/s |
+| `pread` into a buffer that already exists | 4.5–6.3 GB/s | 0.78–0.82 GB/s |
+| map and fault, no copy at all | 0.7–1.0 GB/s | 0.24–0.29 GB/s |
+
+**The right-hand column is one device, not the interface.** Thunderbolt 4
+carries 40 Gbps — a 5 GB/s ceiling — so an external enclosure is not
+obliged to land anywhere near these figures, and a fast one will not.
+What the column shows is what a slow drive does to the comparison, which
+is the case worth designing for; measure the drive you actually have.
+
+At 0.84 GB/s that device is so far the slowest term that every arm ties.
+So this is a win on the drive a checkpoint should be on and no loss
+anywhere — and the third row is the reminder that a zero-copy mapping is
+not a saving: it copies nothing and is still four times slower than
+copying, because the kernel tracks residency at 4 KB granularity over a
+file of tens of gigabytes.
+
+End to end, one streamed forward, checkpoint on internal SSD,
+byte-for-byte identical output in every case:
+
+| stack | without | with | |
+|---|---:|---:|---:|
+| 8 + 24 blocks, 17 GB, bf16 | 6.6 / 6.7 s | 4.5 / 4.6 s | **1.47x** |
+| 60 blocks, 38 GB, bf16 | 12.9 / 12.9 / 12.9 s | 9.6 / 10.0 / 9.7 s | **1.31x** |
+| 8 + 32 blocks, 19 GB, bf16 | 6.2 / 6.2 s | 4.5 / 5.2 s | **1.19-1.38x** |
+| 28 blocks, 24 GB, bf16 | 7.9 / 7.6 s | 7.3 / 7.5 s | ~1.0x |
+
+The last is a reminder that this is not free money. It ties, and the
+most likely reason is the page cache again: 24 GB on a 64 GB box is
+mostly warm for the mapped arm while `pread_into`'s `F_NOCACHE` goes to
+the device every time. The first, at the other end, is a 17 GB
+checkpoint that cannot be cached on any box it would ever stream on —
+its read alone went 2.97-2.99 to 4.81-5.03 GB/s. **Adopt it for the
+equality and the prefetch; expect the read gain only where the
+checkpoint is large against the box.**
+
+> **Measure the model, not the read.** A synthetic A/B of the read alone,
+> on a checkpoint SMALLER than the box, gave ratios from 0.97 to 1.30
+> across five runs of the same binary: the mapped arm was reading mostly
+> warm page cache and was stable, while `pread_into`'s `F_NOCACHE` went
+> to the device every time. The end-to-end number above is stable
+> because that checkpoint does not fit the cache and because the
+> prefetch has real GPU work to hide behind. If your A/B swings, check
+> whether the file fits in RAM before believing either end of it.
+
+> **Trap: book what promotion KEEPS, not what the slot holds.** A slot
+> that carries a raw source alongside the products built from it is
+> bigger than the block promotion will keep, because promotion drops the
+> source. Ask admission and the wired pool for the KEPT size. Getting
+> this wrong is quiet and expensive: a grant smaller than the ask is how
+> the pool learns the box refused more, so a slot-sized ask books a
+> refusal that never happened and growth stops at the first promoted
+> block. MEASURED on a 32-block stack: 9 of 32 kept before, 32 of 32
+> after, same box, same run.
+
+**Promotion COPIES out of the slot.** The slot has to stay put for the
+next read, so a block being kept resident is cloned rather than moved.
+That is not the waste it looks like — the resident block needs its own
+allocation either way, so what the clone adds is one memcpy, against a
+read that is faster for every block that is *not* promoted.
+`promote_into()` makes the choice for you, because it is also the case
+where getting it wrong is a use-after-free rather than a slowdown.
+
+**...and it can run under the NEXT block.** The copy and the wiring are
+host work. Done between a block's wait and the next block's encode,
+they leave the GPU idle for both: ~60 ms for a 735 MB block on an M5
+Ultra, ~3 s of a first forward that keeps 50 blocks — a quarter of
+that forward at a small geometry. So commit the next block first and
+promote under its GPU work. Two orders then decide whether it is still
+correct:
+
+- **The copy empties the slot the next read wants.** Either move the
+  block into a spare first (the slot takes the spare's buffers, and the
+  read starts at once — one block of memory, for the forward), or copy
+  before any read is issued into that slot. Copying first puts the copy
+  in front of every read, which costs exactly where the read is the
+  bottleneck.
+- **Keep what the slot shares with the next block AT THE WAIT.** A
+  streamed adapter's factors live in one set that the next block's fill
+  overwrites; kept after that fill, the block is kept without its
+  adapter, silently.
+
+MiniMax-H3 promotes this way (`VPIPE_H3_PROMOTE_INLINE=1` is the A/B);
+`promote_into()`'s callers still promote in line.
+
+> **Trap: join before every early return.** A read may be in flight into
+> a slot, and freeing or reading that slot while a reader thread writes
+> into it is a use-after-free. A forward returns from many places — a
+> stop request, a GPU error, an allocation that failed — so use a scope
+> guard rather than auditing them:
+>
+> ```cpp
+> struct SlotJoin { BlockSlots<Block>* s; ~SlotJoin() { s->join(); } }
+>     guard{&_slots};
+> ```
+
+**Derived tensors — the ones with no single checkpoint name.** A block
+that fuses two projections into one interleaved matrix, splits one into
+two, or folds a norm at load has a tensor a refill cannot address.
+There are three answers, in increasing cost:
+
+* **Transform the destination IN PLACE after a raw read.** Available
+  whenever the product is a permutation of one source tensor into a
+  buffer of the same size — an interleave of gate and up rows is the
+  common case. The read stays on the fast path and the slot costs
+  nothing extra. Do this where you can.
+* **Keep the raw SOURCE in the slot and build the products out of it**
+  in `post_refill`. Needed when one tensor has several products (a fused
+  qkv+mlp projection sliced into two) or several tensors have one. It
+  costs each slot a copy of that tensor; have promotion drop the source,
+  so the price is paid by the two slots and not by the resident set.
+* **Rebuild it per refill** (`Placement::kDerived`), which allocates.
+  Right for a handful of small tensors — a folded norm — and wrong for
+  anything that is a meaningful share of a block's bytes.
+
+Whichever you pick, **enumerate every tensor**: a destination skipped in
+`ops.each` and not rebuilt in `post_refill` keeps the FIRST block's
+values for the whole run, which is the quietest possible way to be
+wrong. And resist the alternative of moving the fuse to promotion
+instead: that changes which kernel a *streamed* block runs through,
+which is a numerics change wearing a performance change's clothes.
+
+### Blocks of more than one layout
+
+A slot's layout -- its buffer sizes, each weight's format and width, the
+products `post_refill` derives -- is decided by the block that BUILT it,
+and a refill places bytes, not that description. A checkpoint whose
+blocks are not all laid out alike breaks the assumption: a MIXED pack
+(`model-quantize` `mixed`: whole blocks at w8, the rest at w4), or an
+FP8 file with a dense block. Refilled across widths, a block's codes
+land at the right size (a size mismatch rebuilds the buffer) and are
+then read at the SLOT's width, through the slot's derived products --
+or a derived product of the wrong size makes the refill fail, and the
+slots turn themselves off for the run. The first is a wrong answer and
+the second a lost speed-up; neither announces itself, and no
+single-width checkpoint can show either.
+
+`ops.same_layout(index, slot)` is the answer: say whether block `index`
+is stored as `slot` was built, and when it is not, the slot is BUILT for
+the block -- exactly as its first fill was -- instead of refilled.
+`stored_affine_bits(ws, stem, group)` reads a quantized weight's stored
+width off its shapes, so the usual check is one comparison per weight:
+
+```cpp
+ops.same_layout = [this](int i, const Block& slot) {
+  for (const auto& [w, stem] : weights_of(slot, i)) {
+    if (stored_affine_bits(*ws, stem, group) !=
+        (w->quantized ? w->bits : 0)) {
+      return false;
+    }
+  }
+  return true;
+};
+```
+
+Compare every weight a block holds that can differ, its modulation
+included. Test it with a hold test on a mixed pack whose widths change
+WITHIN a slot pair -- a ranking can keep a whole stack at one width --
+and assert `slots.relaid() > 0` in the streamed arm: holds that agree
+prove nothing if the slots turned themselves off.
+
+> **State the placement per tensor, and get it right.** `Placement`
+> says whether a destination takes the checkpoint's own words
+> (`kRaw`), is read as bf16 with f16 converted in place (`kBf16`), or
+> is never addressable at all (`kDerived`). A wrong answer is silent:
+> the buffer ends up the right size and full of plausible numbers.
+
+**The fallback is sticky and says so once.** A checkpoint the slots
+cannot serve — a block whose shapes disagree with block 0 — turns them
+off for the run and logs it at debug. A fallback that came and went
+would read as an unexplained slowdown rather than a property of the
+checkpoint. The `env_off` name passed to `configure()` is the kill
+switch, read once, on the first streamed block.
+
+**Two stacks means two slot pairs, and both stay allocated.** A model
+with a double and a single stack keeps four slots for its whole life,
+even though only one pair is in use at a time — they exist precisely to
+survive between forwards, and rebuilding a pair costs two block reads.
+On a large stack that is gigabytes held idle while the other half runs;
+it is a real cost and it has not been traded off against the rebuild,
+so size the box against four slots, not two.
+
+**A second slot is not guaranteed.** It is refused when the box will not
+take a durable block-sized allocation, and the run is then single-slot:
+no prefetch, but the read shape and the absence of per-block allocation —
+the larger half of the win — are unaffected.
+
+> **Trap: a prefetch needs a destination the current block is not
+> using.** The read runs under the GPU work of the block just committed
+> — that is the entire point — so it must not land in that block's
+> buffers, and a build assigns fresh handles over the old ones, freeing
+> them underneath the GPU. Only a slot PAIR has a free destination;
+> with one slot, or with the mechanism off, the honest answer is to read
+> serially. `prefetch()` enforces this, so a caller cannot get it wrong
+> — but a model rolling its own must. The failure mode is a GPU fault
+> partway down the stack, not a wrong answer, and it only appears on
+> the paths a normal run never takes: **run the `env_off` A/B on every
+> port.**
 
 ---
 
@@ -1028,6 +1605,13 @@ only in the accounting.
 The fix is mechanism 7. With the same blocks wired into the pool, the same
 run reached **49 of 50**.
 
+This is why the two mechanisms are one contract in practice: a model that
+implements residency without wiring has built the accounting and not the
+thing being accounted for. `BlockResidency::set_schedule()` says the same
+in code — with wiring on it removes the per-forward growth cap entirely,
+because `mlock` is a *synchronous* answer (the block is taken or refused
+before it is kept) where the page walk is one that arrives a forward late.
+
 Be honest about what that buys. On the same run the GPU spends ~4146 ms
 per block against ~22 ms of exposed read, with the prefetch hiding 49 of
 49 — so a perfect resident set hides at most ~0.5% of that pass. The gains
@@ -1092,12 +1676,109 @@ actually granted and callers stop asking for more. So the figure is a
 ceiling on ambition, never a promise. `0` turns wiring off entirely, which
 is the right answer on a shared machine.
 
-**A refusal must not be rolled back.** `SharedBuffer::set_wired(false)`
-also flips the buffer to purgeable *volatile*, which is the one state a
-block still in use must never be in. When the pool refuses mid-block,
-**stop and keep what is already wired**: a partly wired block is merely
-partly protected, where a rolled-back one can be reclaimed under the
-model's feet.
+**A refusal must not be rolled back.** When the pool refuses mid-block,
+**stop and keep what is already wired**. A partly wired block is partly
+protected, which is strictly better than none — and giving the protection
+back on the way out only means competing for it again on the next block,
+against a pool that has just said no.
+
+**A language model's load is wired within the pool's room.** Asked with
+`wire_weights` (text-chat's), the manager wires what the load allocates as
+it allocates it (`WireOnAlloc`: weights read into fresh memory are
+compressed as they land otherwise) and charges it to the pool. The scope
+is opened with the pool's free ROOM -- its limit less what is in use -- and
+a buffer past it is left unwired, as a refused one is, and said in the
+load's line: `N MB left unwired -- the wired pool had M MB of room`. On
+the loading thread the pool counts what the load holds so far, so a model
+wiring the rest of itself mid-load (an expert cache's pass) does not take
+the room twice. Before, the load was charged whole whatever the pool said:
+a host's `wired_pool_mb` of 8 GB under a 16 GB helper was overdrawn with
+nothing said. `wired_pool_pct` 0 now wires nothing here either.
+
+### The model's side of the pool
+
+`WiredPool` (`generative-models/shared/wired-pool.h`) is the per-model
+window onto it, and it is the piece a loader actually calls. It holds the
+budget, decides whether one more block may be kept, books what the pool
+granted, and knows when to ask again:
+
+```cpp
+// at load, BEFORE the first weight is read -- it decides how they are read
+_wire.open(mc);
+const bool mapped = weights_may_be_mapped(stream_blocks, _wire.on());
+
+// where the run's schedule is set
+_wire.new_run();
+
+// top of each forward
+if (_wire.on()) {
+  if (_wire.retry(mc, block_bytes)) { _resid.note_landscape_changed(); }
+  wire_fixed_(true);                    // scratch, then trunk
+}
+
+// per block, after the commit that retires its GPU work
+if (_wire.wirable(nb) && _resid.admit(mc, nb)) {
+  keep_the_block();                     // finish every write to it first
+  _wire.note_wired(mc, wire_block_(b, true), nb);
+  _resid.note_admitted(nb);
+}
+
+// on eviction, and on destruction
+_wire.note_unwired(wire_block_(b, false));
+```
+
+`wire_block_` / `wire_fixed_` are the model's own enumerations of its
+buffers; hand them to `_wire.wire_set(buffers, on)`, which wires in the
+order given, skips buffers too small to be a pool question, and stops at
+the first real refusal (arming the retry) — the loop every model otherwise
+writes for itself. `_wire.info()` reports the pool and this model's window
+onto it (booked bytes, pool used / limit / configured ask, refusals,
+reopens, the bytes the last pass left unwired) for logging.
+
+**`wirable()` gates ADMISSION, not just wiring.** Past the budget there is
+nothing to gain from keeping the block: it would be held unprotected, the
+compressor would take it — it is the coldest memory in the process — and
+the next residency walk would shed a block and ratchet the ceiling over
+the whole resident set. Better not to hold it at all.
+
+**The gate reads the pool as it is now.** The pool is shared by every
+model and ANE tier in the process, so `wirable()` asks the manager on each
+call rather than trusting a figure taken at load: a peer that frees its
+share hands the room over at once, and one that arrives later takes it
+back.
+
+**A shortfall is not always a refusal.** Buffers below the pool's minimum
+(`GenerativeModelManager::kMinWiredBytes`) are never wired, and every block
+carries some, so a fully wired block reports less than its resident size.
+`note_wired()` treats the shortfall as a refusal only when the pool cannot
+take the missing bytes. A model that compares the two itself will stop
+growing after its first block.
+
+**A collapsed ceiling is asked about again — by whoever is running.** A
+refusal collapses the process-wide ceiling, and the model that met it
+retries once the box has freed a block's worth. A model that did NOT meet
+it — one loaded later, or one whose pool was collapsed by an ANE tier —
+has no reading from the moment of that refusal, so `retry()` reopens such
+a ceiling once per run (`new_run()`). If the box really is full the mlock
+refuses again, which makes it that model's own refusal and puts it on the
+gated path.
+
+**Mapping and wiring are one decision.** A mapped tensor aliases the
+weight set's shard `mmap`, so it can be neither wired (`mlock` on
+file-backed pages is refused well before the pool's ceiling — MEASURED at
+~4 GB) nor parked. `weights_may_be_mapped()` is the rule: **Copied
+whenever the model streams, or whenever the pool is on.** Getting it
+backwards is silent — the load succeeds, the `mlock` refuses, and the run
+reads as merely slow.
+
+**A buffer that is reallocated must be unwired BEFORE the assignment that
+drops it.** Destroying a wired buffer unwires it in the kernel but does
+NOT decrement the pool's counter; only `unwire_from_pool()` does. A
+geometry change that replaces the scratch therefore leaks a scratch's
+worth per change, and a pool that has lost budget to bytes nothing holds
+wires less of whatever comes next — for a reason nothing in the log
+names. The same applies on destruction: a DiT freed for the VAE decode and
+reloaded per prompt leaks its whole share of the budget per prompt.
 
 ### The refusal check — and why it is off by default
 
@@ -1129,15 +1810,57 @@ change something — and a percentage target is only offered when there is
 one at or below 95. Above that there is no such setting, and saying
 "raise it to 723%" reads like one.
 
-A peak above **believed RAM** is the reading that warns, because that is
-the graph no setting holds:
+A peak above **believed RAM** is the other reading that warns:
 
 ```
-resource-plan: this graph needs at least 10833 MB resident at its peak --
-  phase 'decode', with everything streamable at its floor -- and this
-  machine has 8192 MB. It does not fit at any setting -- use a smaller
-  model, a smaller geometry, or a quantized checkpoint.
+resource-plan: estimated peak 10833 MB -- phase 'decode', with every
+  streamable component already at its floor -- is above this machine's
+  8192 MB. START WITH unload_when_idle: this is the widest PHASE, so a
+  model still charged to phases it does not run in is the usual cause,
+  and 'destroy' is what shortens it ('park' does not -- a parked model
+  is still resident). Only once the phases are as tight as they go is it
+  worth a smaller geometry or a more heavily quantized checkpoint. The
+  estimate is what stages DECLARE and is deliberately conservative, so
+  this often still completes, and what going over costs is SPEED rather
+  than correctness: past the wired pool's ceiling a block nothing can
+  protect is not kept at all, so the resident set falls back toward its
+  streaming floor and every forward re-reads its weights from storage --
+  with whatever is still allocated left unwired and reclaimable rather
+  than protected.
 ```
+
+**Read it as a forecast, not a verdict.** The number is built from what
+stages *declare*, and a declaration is an upper bound a component may
+never reach: an activation-scratch claim is a bound revised down per
+beat, and two components charged to one phase need not peak together
+inside it. Graphs reported here complete routinely.
+
+**Going over does not thrash first — it gets slow first.** These models
+hold their weights in mlock-wired buffers, and the pool has a ceiling.
+Past it `wire_into_pool()` refuses, and `WiredPool::wirable()` gates
+**admission** rather than merely wiring: a block nothing can protect is
+not kept at all, because holding it unprotected only feeds the
+admit-compress-shed-readmit cycle wiring exists to break. So the
+resident set collapses toward the streaming floor and each forward
+re-reads its weights from storage — bit-identical output, at streamed
+speed.
+
+Nothing fails to *allocate*. A refused buffer is still allocated, just
+unwired, which the log calls "stays reclaimable"; an unwired resident
+block is the coldest memory in the process, so the compressor takes it
+first and the run loses the protection it was configured for. That is
+the second-order cost, and it is why the remedies are ordered:
+
+1. **`unload_when_idle`.** The number is the *widest phase*, so the usual
+   cause is a model still charged to phases it does not run in — a
+   declaration problem, not a size problem, and free to fix. Use
+   `destroy`; `park` does not shorten a lifetime, because a parked model
+   is still resident.
+2. **Geometry, then a coarser quantization.** Real, but they trade output
+   for room, so they come after the free fix.
+
+Turning on streaming is never the advice here — it is already in the
+number, which is the floor reading.
 
 **`wired_pool_enforce` is FALSE by default**, so a graph the pool cannot
 hold is reported and not refused. A refusal is only as good as the
@@ -1238,7 +1961,7 @@ Two things fall out of that:
   sets until `want` bytes have been given back.
 
 In plan terms (mechanism 4) this is what `reclaimable` means: floor zero,
-preload full. On a tight box it costs nothing; on a roomy one it costs
+`preload` full. On a tight box it costs nothing; on a roomy one it costs
 `preload` and saves the reload.
 
 > **Trap: pool BEFORE you drop the last reference.** `pool_weights()`
@@ -1282,6 +2005,47 @@ parking for its memory story must not assume the cap is set.
 Mapped weights and K/V cannot be parked, so the cap is a target on the
 dominant term, not a process-wide guarantee.
 
+### The swap allowance — the opposite knob to the wired pool
+
+`set_swap_allowance_bytes(bytes)` — config key `swap_allowance_mb`,
+`VPIPE_SWAP_ALLOWANCE_MB`, or `--swap-allowance-mb N` on `vpipe` /
+`vpipe-web-ui`, and editable at run time from the web UI's Settings
+panel. **Default 4096 MB.**
+
+A preflight sizes itself against `available_physical` — free + purgeable
++ file-backed pages. Dirty anonymous memory is excluded *by design*,
+because reclaiming it costs swap. That exclusion is right for a decision
+held for a whole run and too strict for a single clip: it refuses work
+the box can do, merely slower. The allowance is how much of that
+anonymous memory one forward may plan to displace.
+
+The two knobs are opposites and are set independently:
+
+| | wired pool | swap allowance |
+|---|---|---|
+| bounds | what the process makes **unswappable** | what a run may push **out** |
+| failure if wrong | the machine goes down | the box gets slower |
+| reserves anything? | yes — the bytes are mlock'd | no |
+| lower it mid-run? | **refused** (409) | accepted, both directions |
+
+That asymmetry is the whole design. Wired bytes cannot be given back
+without unwiring buffers a model is still reading, so the pool keeps its
+cushion and refuses a shrink while a pipeline runs. The allowance holds
+nothing, so it can move freely — it only widens the arithmetic of the
+next gate.
+
+`GenerativeModelManager::swappable_other_bytes()` reports the *supply*,
+and a caller spends `min(allowance, supply)`. It is deliberately
+under-counted: purgeable pages come off (already in
+`available_physical`), the whole system-wide wired figure comes off
+(including its file-backed part), and **this process's own anonymous
+bytes come off** — swapping vpipe to make room for vpipe buys nothing.
+Self-*wired* bytes are not subtracted again; they are unswappable and
+already inside the system wired figure.
+
+**Scope: the video preflight honours it. The image stage does not** — it
+still gates on the unwidened figure.
+
 ### K/V grows during the run
 
 K/V is the one large allocation that grows *while running*, so a
@@ -1289,6 +2053,316 @@ weights-only accounting reads as healthy right until a long context
 exhausts the box. `ContextManager::resident_bytes()` → `ModelExec::kv_bytes()`
 → `GenerativeModelManager::resident_kv_bytes()` reports what the pools grew
 to. **A new exec that owns its K/V must override `kv_bytes()`.**
+
+**Book the pool's capacity, for the whole run.** The paged pool grows by
+DOUBLING — its capacity is the next power of two of the pages in use —
+and nothing shrinks it when a context is released. So a generator that
+decodes a long sequence is still holding that capacity while everything
+downstream of it runs. Two consequences for a stage's claims:
+
+* size it as capacity, not tokens × bytes per token: a 12,000-token song
+  on a 3B decoder needs 47 pages and holds 64, and a guided decode (CFG,
+  two contexts) holds 128;
+* claim it UNPHASED (alive for the whole run), not in the phase that
+  allocated it — the decode that follows still has it beside its own
+  arena. The same goes for any grow-only scratch a model keeps between
+  items.
+
+What is freed inside one item (a copy made for one pass, the pool's old
+buffers during a doubling) is the phased part. A generator also books
+the decode it feeds when only it knows the length — the VAE's arena and
+the samples it produces — as a video generator does for its soundtrack.
+
+**The host's language-model stages book a model's whole run this way.**
+`text-chat`, `visual-qa` and `realtime-vqa` claim, beside the weights and
+the vision tower, what the model allocates to RUN — its K/V at the
+capacity the stage's pool reaches, each context's recurrent state and
+sliding rings, a prefill's activations at the largest forward it takes
+(a piece of a long prompt, or the whole prompt where the family prefills
+in one pass), and the decode scratch — as one unphased arena per
+checkpoint, since the stages that name one directory share its loaded
+model. The stage says how it runs the model (its pool, how many contexts
+it keeps, whether they branch from one shared prefix and how many tokens
+each branch adds) and the family's own figure turns that into bytes.
+Measured against the device's peak allocation over a prompt that fills
+one 8,192-row prefill piece and a few decode steps, on an M4 Pro: a
+4-billion-parameter hybrid 1.06x, a 35-billion-parameter mixture of
+experts 1.06x (1.04x on an M5 with its experts cached), a 14-billion
+dense decoder 1.10x, a Gemma-4 e4b 1.24x (its persistent scratch is
+built by the load's warm-up, so the measurement starts after it). A
+mixture-of-experts model sizes its expert cache beside that same arena
+and does not count it a second time among its peers'.
+
+---
+
+## 11. The expert cache — a mixture of experts on a smaller box
+
+A mixture-of-experts layer reads only the experts its router picks — 8 of
+256 a token in the Qwen3.5 / Qwen3.6 MoE family and in Drama 3 — so most
+of a 35B model is idle at any moment. The expert cache runs such a model
+on a box too small for all of it: **everything but the routed experts is
+held and wired**, and the experts live in a cache refilled from disk on a
+miss.
+
+**It is the host's, not the SDK's.** The cache is part of the host's Qwen
+MoE stack, and every model built on that stack takes it (see "What it
+covers"); a plugin's own mixture-of-experts model cannot use it through
+the SDK today. The one piece of it the SDK carries is the in-place sync
+it is built on, `CommandStream::sync_and_reopen`. The rest of this
+section is how it decides and how to read its numbers.
+
+It is the opposite design to block residency (mechanism 6), and on
+purpose. A forward is a cyclic scan of its blocks, so recency predicts
+nothing there; a router is SKEWED — some experts are picked far more often
+than others, and which ones follows the content — so a cache kept by
+**selection frequency** gets far more than its share of hits.
+
+**A host may give it less than the box.** `memory_limit_mb` on text-chat
+(`load_spec::kMemoryLimitMb`) is the most the model may hold in all; the
+cache is what the limit leaves after the rest of the model and its run
+state, at least the floor below, so an agent's model on a 256 GB box can
+keep 64 GB and leave the rest to picture and video models. The stage's
+claim books the checkpoint at that size (the claim's `held_bytes`, which
+the weights planner takes over the size on disk, never under the floor),
+so the peers sizing against the plan see the room the limit leaves, and
+the cache, sized beside the plan, leaves out exactly what the plan counts
+for its own checkpoint. It sizes a load; a model kept warm is handed over
+at the size it loaded at.
+
+**Or name the cache.** The limit leaves the cache what the run does not
+take, so a host booking a long context gets a smaller cache, and one that
+wants its model to stay loaded beside picture models has to find the
+limit by subtraction. `expert_cache_mb` on text-chat
+(`load_spec::kExpertCacheMb`) asks for the cache itself: it is at most
+that, within the limit and the box as above -- never more than the
+model's own sizing would take, since a cache past the GPU's working set
+is ruinous (`MetalDeepseekV41ModelExec::lm_expert_cache_bytes`) -- every
+expert resident only where all of them fit in it, and the floor below it
+as ever. The claim books the checkpoint at the rest of the model and that
+cache (under a limit, the smaller of the two). The trade it makes is the
+host's to offer: a smaller cache leaves room for a longer conversation
+and for the models beside it, a larger one reads prompts and decodes
+faster (DeepSeek-V4.1 on an M5 Ultra: 9.1 tok/s warm with a 30,517 MB
+cache, 17.3 with 61,035 MB, 32.5 with the box's 175 GB --
+docs/DEEPSEEK-V41.md).
+
+**A table read by row can be held too.** Qwen3.8-Flash-Next's n-gram
+embedding table (38 GB in the oQ5e pack) is never held by default: a
+prompt reads its rows from disk, a few hundred thousand small reads.
+`ngram_resident` on text-chat (`load_spec::kNgramResident`) asks for it in
+memory. The loader takes it only where the rest of the model, EVERY
+routed expert and the table fit what the cache above is sized in -- the
+box beside the plan, the irreversible headroom, the host's limit, and a
+cache asked for that holds every expert (`MetalQwenModel::
+lm_ngram_resident`): the experts come first, since a cached expert costs a
+read on every token and a row of the table only once a prompt. Held, the
+table is filled AFTER the load, a shard at a time, each tensor a derived
+entry of the weight set read by `pread` uncached (through the shard's
+mmap the pages would sit in the page cache beside the copy, tens of GB at
+once); a row whose shard is in is read from memory, the rest from disk, so
+loading takes no longer and the rows are the same bytes either way. The
+claim books the table with the rest under a limit or a cache asked for
+(`held_bytes`) -- not under a cache that cannot hold every expert, where
+the loader never takes it; a model kept warm is handed over as it loaded,
+and is weighed with its table (below): the table is filled on a thread of
+its own, so the wired load's count of what it allocated leaves it out,
+and the manager adds it (`LoadedLanguageModel::filled_after_load_bytes`).
+It is held UNWIRED: the wired pool is not charged for it.
+
+Kept warm (text-chat's `keep_loaded`), such a model is weighed at what
+it HOLDS when a launch that does not claim it asks whether it fits beside
+it, not at its checkpoint -- DeepSeek under that 30,517 MB cache holds 41
+GB of a 432 GB checkpoint, and weighed at the checkpoint no box would keep
+it beside a picture. What it holds is what its load left live
+(`GenerativeModelManager::warm_held_bytes`: wired, or kept unwired by a
+full pool) and what its runs keep beside the weights and the K/V
+(`warm_run_bytes`: the forward's scratch, grown to the largest piece a
+turn needed -- the model's own figure where it reports one, else the run
+arena the plan booked for it). A load that was not wired measured
+nothing, and is weighed at its checkpoint. Three more rules follow from
+the model staying loaded:
+
+- **It must leave the wired pool room.** Its load stays wired, charged
+  to the pool, so a launch can fit the RAM beside it and still find no
+  room to keep its own weights resident. The model is released when its
+  wired bytes and the launch's weights do not fit the pool together:
+  DeepSeek under the box's own cache, 185 GB wired of the Ultra's 192 GB
+  pool, would otherwise sit beside a Krea-2 picture that then streams
+  every block (measured: the picture 2.4x slower; released, it runs at
+  its speed and the model's next turn loads it again -- a host's session
+  around one picture 139 s against 102 kept, so a host that would rather
+  keep it names a smaller cache).
+- **A launch that claims it books what it holds.** Neither the limit nor
+  the cache asked for is in the manager's cache key, so a warm model is
+  handed over at the size it loaded at. The weights planner books it at
+  the larger of the claim's figure and `warm_held_bytes` -- a relaunch
+  asking a smaller cache would otherwise book 41 GB beside 185 held.
+- **A load under other settings lets it go first.** What IS in the key --
+  the folder, the dtype, the page size and count (the context), the
+  drafters -- decides whether a load is handed the warm model, while a
+  launch claims a warm model by its folder. So a load of the same folder
+  under another key lets the warm one go before it loads, its
+  conversations saved as its expiry saves them: a host that changed the
+  context it asks for held both copies resident until the old hold ran
+  out (two of an 88 GB model on a 256 GB box). The one the key is handed
+  stays, and so does one still in use -- a peer stage on the folder under
+  its own settings: letting it go would free nothing and lose the
+  conversations parked on it. Test
+  `metal_lm_smoke.a_warm_model_under_other_settings_is_let_go`.
+
+### How it decides
+
+- **Slots, laid out as the model's own expert slab.** Part *k* of slot *s*
+  sits at `s * part_bytes[k]`, so the model's expert kernels run unchanged:
+  they index the pool by slot as they index a layer's slab by expert.
+  `resolve()` turns a step's routed ids into slot ids in place.
+- **A score per (layer, expert).** Each step adds the fraction of its rows
+  that routed there (a decode token adds 1 per pick, a prefill of *n* rows
+  what one token would), and every `half_life` steps every score halves,
+  so the cache follows the text being generated.
+- **Admission.** A miss is admitted to the resident set while there is
+  room, or when it scores above the least-selected resident expert that
+  this step does NOT need — which it then replaces. Otherwise it goes to a
+  SPARE slot (one layer's worth of them beyond the resident set), so a
+  one-off pick never evicts a hot expert.
+- **Slots are fungible.** At most the resident count of them form the
+  resident set; a spare keeps what it was last read with until it is
+  taken again, least recently used first, so an expert read for one step
+  is still a hit a few steps later. An expert found in a spare is admitted
+  by the same rule as a miss: the roles move, the bytes do not.
+- **Reading ahead.** A decode step also runs the NEXT layer's router over
+  this layer's input — the residual stream moves little from one layer to
+  the next — and the cache reads the likeliest of that layer's experts it
+  does not hold, behind this step's own misses and without waiting for
+  them. The next step takes what has arrived, waits only for the reads it
+  picks that are still under way, and drops those that have not started.
+  A read ahead never lands in a slot the current step uses. A model may
+  read ahead for a step of a few rows as well -- a speculative verify,
+  each row's likeliest experts in turn (`Options::ahead_rows`, which
+  also counts those steps when widths are compared).
+- **How many to read ahead is measured.** It depends on the drive and the
+  hit rate: where a decode's misses leave the drive idle, reading ahead
+  hides most of each step's wait; where they keep it busy, every guess
+  not picked is a read the next step waits behind. So the cache compares
+  candidate widths (none, half of `top_k`, `top_k`) on the steps it is
+  running, by the time each decode step BLOCKED on reads — the only time
+  the width changes. A round draws a width for each short block of
+  steps and charges a step to its width when the step before took the
+  same one (a step's reads answer both its own width and its
+  predecessor's, and the two do not add). Widths must be compared over
+  the same text: a step's cost moves 2–4× from one passage to the next,
+  which is more than the width moves it. The cheapest is kept for a while
+  (a smaller width within 3% of it wins), then the round runs again.
+  `VPIPE_MOE_EXPERT_AHEAD=<n>` pins the width for an A/B.
+
+  It is an estimate with a known lean: a width's effects outlast its
+  block (reads still under way slow the next one, experts read ahead stay
+  as hits a frame later), so on a busy drive it rates reading ahead a
+  little better than it is. The 3% rule absorbs that in every case
+  measured; the chooser never ran slower than reading nothing ahead.
+- **Reads.** Misses are read concurrently by a small thread pool, with
+  `pread` on descriptors opened `F_NOCACHE` — the cache is the copy, and
+  the file cache keeping a second one would compete with it for the same
+  memory. A reader keeps a descriptor a shard; a model can name the
+  tensors it serves so that only their shards open, and opening raises
+  the process's soft limit toward its hard one where the shards need it
+  (a process starts on macOS with room for 256 descriptors, and a
+  checkpoint can have nearly as many shards). Page-aligned staging (an
+  unaligned `F_NOCACHE` read silently takes the cached path), and an
+  expert whose tensors lie together in its file is one read, not six. An
+  expert whose pieces lie apart (an MLX pack's stacked tensors: six
+  ranges in six places) reads them at once, not in turn -- on an M5
+  Ultra's internal SSD 1.7 ms against 2.5 for one expert -- because what a
+  stalled step waits for is mostly a read already under way: its latency,
+  not the drive's bandwidth, is the cost.
+- **The sync.** The routes are on the GPU and the CPU has to see them: the
+  model commits after the route kernel, waits, resolves, and reopens the
+  stream in place (`CommandStream::sync_and_reopen`). That wait is also
+  what makes overwriting a slot safe — the GPU has finished everything
+  before it. A commit and wait costs ~280 µs of an idle GPU, once a layer.
+  Where the GPU sees the CPU's stores while a command buffer runs (an M5
+  Ultra does; an M4 Pro and a base M5 do not, so it is probed at load), a
+  model can instead hand the picks over **inside** the running buffer: a
+  one-threadgroup kernel posts them to a mailbox and waits for the
+  resolved slots (~3 µs a layer). Every wait gives up when the CPU's
+  heartbeat stops (a process that is gone costs one wait, not the GPU),
+  both mailboxes are checksummed, and a forward the GPU gave up on is done
+  again the plain way. The CPU must never encode more than a few layers
+  ahead of the turns it has answered: a queue holds 64 command buffers in
+  flight, and a CPU blocked on the 65th while the GPU waits for its answer
+  is a deadlock that outlives the process.
+
+**Bit-identical to resident**: the arithmetic is the same, only the
+addressing changes. Every model wired to the cache is tested that way
+(logits, decode and sampled runs, memcmp).
+
+### Sizing — the engine decides
+
+The cache's size is the engine's unless the host names it
+(`expert_cache_mb`, above), and then at most that. The loader applies the
+same rule `plan_streaming()` applies to a DiT, against TOTAL RAM so every stage
+answers the same way: when this whole model, its peers and its
+scratch (its run, as the stage's plan booked it — see "K/V grows during
+the run") fit with the irreversible cushion (`kStreamHeadroom`), every
+expert stays resident; otherwise the cache is the experts' bytes minus
+the shortfall, and never less than one layer's worth. The stages that
+hold such a model and the LM loader apply it inside the host; it is not
+a call in the SDK.
+
+The claim follows: `weight_claim_streamable(dir, floor)` with the floor at
+the whole model less its experts plus one layer of them, since that is
+the smallest cache the model runs with. `VPIPE_RAM_LIMIT_MB` simulates a
+smaller box;
+`VPIPE_MOE_EXPERT_CACHE_MB` overrides the size for an A/B (0 = resident).
+
+### What it covers
+
+The Qwen MoE stack (`MetalQwenModel`) in the formats whose experts it can
+read one at a time: block-FP8 per-expert tensors, GPTQ int4 per-expert
+tensors (converted to the affine layout on the read), and MLX affine
+stacked `switch_mlp` weights read as ranges of the stacked tensor (one
+bit width across the experts). A dense bf16 MoE, k-quant GGUF, a
+mixed-width stack and the layer-streaming mode stay resident, and the
+load line says why. Every model built on that stack takes it: the MoE
+LLMs through the LM loader (`text-chat` and the other LLM stages) and
+Drama 3 through `text-to-speech`. DeepSeek-V4.1-Flash, a model of its
+own, takes the same cache for its FP4 experts (E2M1 codes with an E8M0
+scale per 32), read from the release's per-expert tensors or as ranges
+of an MLX pack's stacked ones; its cache is also held under 85% of the
+GPU's recommended working set, since past it the device pages the
+pools in and out of every command buffer.
+
+A pool is one buffer the kernels index by slot, so the slot count is
+capped where their offsets stop: the affine kernels take 32-bit expert
+offsets (no part past 2^33 bytes), the block-FP8 ones 64-bit (the
+device's buffer limit). The load line reports the slots actually made.
+
+### What it costs
+
+A miss is a read from the drive in the middle of a token, so speed is a
+property of the DRIVE and of the HIT RATE, and the hit rate of the
+cache's share of the experts. Measured on an M4 Pro, checkpoints on its
+internal SSD, smaller boxes simulated with `VPIPE_RAM_LIMIT_MB`, the
+engine choosing the size and the read-ahead:
+
+| model | box | experts cached | hits | speed (no read-ahead / resident) | process peak |
+|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B 4-bit (text-chat) | 16 GB | 20% (4.0 GB) | 92% | 17.0 tok/s (10.0 / 85) | 7.0 GB |
+| Drama 3 release (block FP8) | 16 GB | 5% (2.2 GB) | 38% | 3.4 frames/s (3.4 / 33) | 8.7 GB |
+| Drama 3 release (block FP8) | 32 GB | 58% (18.6 GB) | 89% | 9.4 frames/s (8.5 / 33) | 25.1 GB |
+| Drama 3 int4 (GPTQ) | 16 GB | 8% (1.8 GB) | 40% | 5.4 frames/s (— / 35) | 8.4 GB |
+
+(The int4 row predates the spares and the read-ahead.) A hit counts an
+expert found in any slot, so it includes the spares and the reads
+ahead. The two regimes show in the read-ahead: the LLM at 16 GB reads
+1.6 GB/s from a drive that does 4.5, and reading the next layer's 8
+likeliest experts ahead hides most of each wait (1.7×); Drama 3's release
+at 16 GB already keeps the drive near its limit, and the chooser reads
+nothing ahead. On an external drive at under 1 GB/s every row is several
+times slower again (the LLM: 4.5 tok/s, read-ahead held at half width
+for no change). Read the line a model prints when it unloads —
+`expert cache: N% hits over P picks, ... MB read, T ms of it waited for;
+... read ahead` — before concluding anything about a box.
 
 ---
 
@@ -1305,6 +2379,21 @@ Model-holding stages accept `unload_when_idle`:
 
 `always` and `never` are accepted as legacy spellings of `destroy` and
 `keep`.
+
+**`park` is not implemented by every stage that takes the key.** Today
+only `diffusion-conditioner` acts on it; the others resolve a two-way
+decision (destroy or keep, else from the box) and a `park` reaches their
+`auto` branch, so it means "resolve from the box" rather than "purgeable".
+Their config dropdowns therefore offer `auto` / `destroy` / `keep` only,
+and their key docs say so.
+
+The reason is not an oversight to tidy away. Parking is the **manager's**
+act, not a stage's: it refuses to park a checkpoint anything is still
+borrowing, so a stage has to end its borrow first and then ask — which is
+what `park_encoder_()` does. And a stage whose loader reads uncached
+parks **0 bytes** whatever it asks for (see "Parking cannot reach uncached
+weights"), which is why `video-ref-encoder` would gain nothing from it
+even if the policy reached the call.
 
 `auto` resolves **after the init barrier**, at the first `process()`, when
 every peer has loaded and real bytes are authoritative — not at
@@ -1365,6 +2454,85 @@ whose release never arrived (mechanism 2), a claim whose kind has no
 planner, and a graph that does not fit the pool while `wired_pool_enforce`
 is off (mechanism 7). At **error**, only the last of those with the veto
 turned on.
+
+**To a host, as numbers.** The same figures reach an embedding host as
+documents, so it can show what a run asked for without parsing the
+log's English (`SessionIntf::reports()`, `common/host-report.h`): a
+`memory-plan` report with the resource plan's peak by phase, RAM and the
+wired pool; and, when a stage refuses -- generate-video's forward
+preflight, vae-decode's output preflight -- a `memory` report with what
+the step needed part by part (the transformer, the VDN branch, Sol,
+Sage, the ANE; the decoded frames) and each gate's need and room in the
+units the gate applies, margins included. A host reads
+`reports_version()` before it launches and the items above it after.
+
+**What is held, as numbers.** Between runs a host can ask what the
+session holds now and by what (`SessionIntf::memory_report()`): each
+model KEPT WARM -- a language model kept loaded, its wired weights and
+its K/V with its parked conversations; a DiT, an encoder or a VAE a
+stage built, under the kind the stage kept it as, with the bytes it
+gave -- and the seconds each has left (the manager's `warm_report()`);
+each checkpoint resident through the manager, what holds it (the models
+using it and those kept warm alike) and whether it is parked; every
+language model's K/V; the checkpoints nothing holds, which the manager
+can drop at once (`pooled_bytes` -- a model kept warm holds its own, so
+letting it go frees its warm bytes, not these); the wired pool's use and
+limit; and this process's Metal allocations, which take in everything
+above and the stages' scratch. A language model's weights are counted
+only where its load WIRED them (`wire_weights`): read into the model's
+own members, they are in no weight set. Such a load's entry also carries
+`held_bytes`, all that hold keeps as a launch weighs it beside itself --
+its wired bytes, what a full wired pool left unwired, and what it filled
+after loading (an n-gram table held in memory, which is never wired) --
+each hold its own, so two loads of one model under other settings are
+two figures; an unwired load carries none. A stage that keeps a model
+with no bytes -- vae-decode does -- reports 0 for it.
+
+The figures OVERLAP, and only the Metal allocations are a total. A model
+a stage built keeps part of its checkpoint through the manager's weight
+set -- a DiT's trunk, for one -- so those bytes are in its warm entry and
+in its checkpoint's entry both; a language model's `held_bytes` likewise
+takes in what it keeps through its set (that n-gram table); and the K/V
+of the language models kept warm is in the session-wide K/V figure too.
+Show each list for what it is; do not add them up.
+
+**Whose it is, while it runs.** The Metal total is everything; the lists
+above name only what is kept between runs. What a model holds while it
+RUNS -- a streaming DiT's kept blocks, an expert cache, a context's K/V,
+a forward's activations -- was the total less those, nobody's: 100.7 GB
+of 106.8 on a 128 GB Mac making a MiniMax H3 clip. So every buffer
+`MetalCompute::make_shared_buffer` makes is counted under the OWNER in
+force on its thread as it is made, and counted out there when its owning
+handle goes (`common/memory-owner.h`; the handle carries its slot in a
+reserved word, so its size is the same). An owner is a checkpoint's
+directory and what holds it:
+
+| Who sets it | Owner | Use |
+|---|---|---|
+| the thread pool, on each resume of a stage's coroutine | the stage's largest declared checkpoint (`declare_memory`) and its type -- registered by the runtime at launch, cleared at stop | scratch, unless marked below |
+| the model manager, around a language model's load | its directory, `language-model` | weights |
+| a weight set, around a read | its directory, `weights` | weights (`tensor`, `derived`: kept; `read`, a language model's weights read into its own members) or blocks (`stream_tensor`, `stream_derived`, and `read` inside a block's load) |
+| a DiT's block loader (`load_block_`, `keep_block_`, `clone_block_`, `rebuild_one_`, in every family that streams) | the stage's | blocks -- its conversions too (int8 codes, dequantized copies) |
+| `MoeExpertCache::create` | the load's | experts |
+| a context's K/V and recurrent state (`ContextManager`) | the run's | kv |
+
+A Job a stage awaits takes its caller's tag (`Job::Awaiter`), so a resume
+of it after it waited is still the stage's -- for the profiler as for its
+memory. A buffer made on a thread no scope covers (a model's own reader
+threads; a host calling in) is no one's (`unowned_bytes`). Mapped tensors
+and wrapped memory are not allocations and are not counted. The report's
+`owned` lists each owner's live bytes by use: additive among themselves,
+and the same bytes as `warm` and `weights` where those name them -- one
+model's memory is its directories' `owned` entries, with the warm and
+weight lists for what is kept and parked. The counters are the
+process's, every session's together. Its cost on a resume: a map
+lookup under a shared lock (none while no stage is registered).
+MEASURED on a 24 GB M5 Pro, `owned` read mid-run: a Krea 2 Turbo 1024²
+picture 13.8 of 14.5 GB its own -- 11.6 GB blocks, 1.3 GB weights, 0.9
+GB scratch -- 0.67 GB no one's; a MiniMax H3 FL2VA clip, 832x480x39,
+15.8 of 15.9 GB -- 12.5 GB blocks, 1.7 GB weights, 1.6 GB scratch -- and
+its VAE's 4.7 GB as it decodes; Qwen3.5 9B writing, 8.4 GB weights, 212
+MB of K/V, 0.3 GB scratch.
 
 ---
 
@@ -1436,6 +2604,23 @@ accounts for what it *cached*; weights read with `read()` into your own
 members are invisible to it. Answer with what you are actually holding,
 or the graph sizes itself against a checkpoint it cannot see. This is the
 single most consequential default on this page.
+
+**When the host reads it, and what it does with the answer.** The host
+reads it once right after `load()` and again after every generation. For
+a family that declares exactly one holding, each read corrects that
+holding in the memory plan:
+
+- **The floor** is set at load: the larger of what you report and the
+  floor you declared. It stays there for the rest of the launch.
+- **`preload`** follows each later read, as the resident set grows or
+  sheds. It never goes below that floor.
+
+A block-streaming family usually builds its slot pair on the first
+forward, so an answer read at load leaves the slots out. The declared
+floor already counts them, and that floor is what stops the load-time
+answer from under-counting. `revise_declaration()` follows the same rule
+on the manager's side: a nonzero revision below the declared floor is
+raised to it, and 0 still withdraws.
 
 **`release_idle()` is a request, not a contract.** It means "drop what
 you can", and a family with nothing droppable legitimately does nothing.
@@ -1530,6 +2715,13 @@ For a stage that holds one:
 - [ ] Buffers handed downstream are declared with `payload_claims()`,
       spanning from the phase that writes them to the last that reads them.
 - [ ] Streaming decided by `plan_streaming()`, with `kStreamHeadroom`.
+- [ ] Anything that can stream is claimed with `weight_claim_streamable()`
+      — a floor in `declare_memory()` alone is invisible to the refusal.
+      And the stem list names EVERY block stack, not the first.
+- [ ] A component declared with a floor can actually REACH it. A floor is
+      a promise the resource phase may admit a graph on; declaring one
+      for a model that then loads resident is the one error in this
+      section that admits a graph instead of refusing it.
 - [ ] `revise_declaration()` and `revise_memory()` after load if it keeps
       less than it declared; `revise_scratch()` per beat once the geometry
       is known.
@@ -1541,10 +2733,30 @@ For a stage that holds one:
 If it streams blocks:
 
 - [ ] Blocks are read into destinations the model keeps, refilled in place
-      — not allocated and mapped-copied per block. State the destination
-      dtype (`kRaw` / `kBf16`) rather than taking a default; there is none.
+      — not allocated and mapped-copied per block.
+- [ ] **Every** tensor of a block is accounted for: enumerated in
+      `ops.each`, or rebuilt in `ops.post_refill`. One that is neither
+      keeps the FIRST block's values for the whole run.
+- [ ] Each one states its `Placement` (`kRaw` / `kBf16` / `kDerived`)
+      rather than taking a default; there is none, because the wrong
+      answer is silent.
+- [ ] A checkpoint whose blocks differ in layout -- a mixed pack, an FP8
+      file with a dense block -- is answered by `ops.same_layout`, and a
+      hold test on a mixed pack asserts the slots rebuilt (`relaid()`).
 - [ ] The refill fallback is decided **per tensor**, not latched for the
       block.
+- [ ] Admission and the wired pool are asked for what promotion **keeps**,
+      which is smaller than the slot whenever the slot holds a raw source
+      alongside products built from it.
+- [ ] Every early return from the forward joins outstanding reads first —
+      with a scope guard, not by auditing the returns.
+- [ ] The `env_off` A/B has actually been RUN. It is the only thing that
+      exercises the no-slot path, and a defect there is a GPU fault
+      partway down the stack rather than a wrong answer.
+- [ ] Streamed output is **byte-identical** to the output with every
+      block kept. Every
+      transform after a read — a permutation, a split, a fold — is silent
+      when it is wrong, so closeness is not a bar.
 - [ ] `set_residency_reserve()` is actually called — with a real figure, or
       with an explicit `0`.
 - [ ] `note_reserve_allocated()` if activations are allocated before the

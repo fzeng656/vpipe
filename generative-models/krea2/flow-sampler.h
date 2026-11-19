@@ -76,10 +76,21 @@ struct FlowSchedulerSpec {
   bool        dynamic_shift  = false;
   double      base_shift     = 0.5;
   double      max_shift      = 0.9;
+  // Stretches the shifted schedule so its last nonzero sigma lands on
+  // it -- with dynamic_shift or without, as diffusers applies it.
   double      shift_terminal = 0.0;         // 0 = no terminal stretch
   int         base_seq       = 256;
   int         max_seq        = 8192;
   int         num_train      = 1000;        // num_train_timesteps
+  // The RAW base sigmas -- the diffusers pipeline's `sigmas=` argument
+  // -- in place of the base grid, each then time-shifted and
+  // terminal-stretched as that grid is: by the per-image mu when
+  // dynamic_shift, else by the static `shift` (shift_type "linear" is
+  // diffusers' static s' = shift*s / (1 + (shift-1)*s), so shift 1 uses
+  // them as written). Their number IS the step count, and `steps` must
+  // equal it. Empty = the default grid. What a few-step adapter or a
+  // distilled checkpoint ships its schedule as.
+  std::vector<double> base_sigmas;
   // Per-image RUNTIME binding (packed grid_h*grid_w) -- NOT a config
   // choice: excluded from operator== and (de)serialization. The caller
   // sets it before constructing the FlowSampler when dynamic_shift is on.
@@ -104,6 +115,7 @@ struct FlowSchedulerSpec {
            dynamic_shift == o.dynamic_shift && base_shift == o.base_shift &&
            max_shift == o.max_shift && shift_terminal == o.shift_terminal &&
            base_seq == o.base_seq && max_seq == o.max_seq &&
+           base_sigmas == o.base_sigmas &&
            num_train == o.num_train && seq_len == o.seq_len;
   }
 };
@@ -222,6 +234,26 @@ private:
   bool                            _uni_have_last = false;
   int                             _uni_order     = 0;   // warmed-up order
 };
+
+// The flow-matching shift a diffusers checkpoint states in its OWN
+// `scheduler/scheduler_config.json`, given the model root. 0 when the
+// file is absent or says nothing, which a caller reads as "use the
+// family's default".
+//
+// Most families here can hardcode their schedule because it is a
+// property of the architecture. IT IS NOT ALWAYS: Z-Image ships two
+// checkpoints with byte-identical transformer configs that differ in
+// this number alone (3.0 distilled, 6.0 undistilled), so a graph with
+// no scheduler-select stage would take FlowSchedulerSpec's own 1.15
+// default -- which is neither, and produces a picture rather than an
+// error.
+//
+// `dynamic` reports `use_dynamic_shifting`: a checkpoint that says
+// true wants a per-image mu computed from the token count instead of
+// this constant, and a caller applying the constant anyway should at
+// least know.
+double flow_shift_from_config(const std::string& model_root,
+                              bool* dynamic = nullptr);
 
 }  // namespace genai
 }  // namespace vpipe

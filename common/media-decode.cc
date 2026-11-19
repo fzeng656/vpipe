@@ -1,6 +1,7 @@
 #include "common/media-decode.h"
 
 #include "common/ffmpeg-libraries.h"
+#include "common/ffmpeg-log-tap.h"
 
 #include <algorithm>
 #include <cstring>
@@ -22,7 +23,7 @@ constexpr size_t kMaxAudioSeconds = 20 * 60;
 // planar RGB is 6 MB a 1080p frame, so a whole-file decode of a long
 // clip is measured in gigabytes. Callers that know their bound pass
 // `max_seconds`; these are the backstop for the ones that do not.
-constexpr int64_t kMaxVideoFrames          = 4096;
+constexpr int64_t kMaxVideoFrames          = kMaxDecodedVideoFrames;
 constexpr int64_t kMaxVideoPixelsPerFrame  = 4096LL * 4096LL;
 
 string
@@ -178,6 +179,9 @@ open_input_(const FFmpegLibraries*  libs,
             string*                 error)
 {
   in->libs = libs;
+  // A refusal's reason in FFmpeg's own words ("Invalid sample rate: 0"),
+  // which it states through av_log and not in its return code.
+  FfmpegLogCapture said;
   int rc = 0;
   if (path) {
     rc = libs->avformat().api.open_input(&in->fctx, path->c_str(),
@@ -212,12 +216,14 @@ open_input_(const FFmpegLibraries*  libs,
   }
   if (rc < 0) {
     // On failure open_input freed the AVFormatContext and nulled it.
-    set_err_(error, "open_input failed: " + av_err_(libs, rc));
+    set_err_(error, "open_input failed: " + av_err_(libs, rc) +
+                        said.suffix());
     return false;
   }
   rc = libs->avformat().api.find_stream_info(in->fctx, nullptr);
   if (rc < 0) {
-    set_err_(error, "find_stream_info failed: " + av_err_(libs, rc));
+    set_err_(error, "find_stream_info failed: " + av_err_(libs, rc) +
+                        said.suffix());
     return false;
   }
   return true;
@@ -260,9 +266,11 @@ open_decoder_(const FFmpegLibraries* libs,
     cctx.reset();
     return CctxPtr(nullptr, CctxDeleter{libs});
   }
+  FfmpegLogCapture said;
   rc = libs->avcodec().api.open2(cctx.get(), codec, nullptr);
   if (rc < 0) {
-    set_err_(error, "avcodec_open2 failed: " + av_err_(libs, rc));
+    set_err_(error, "avcodec_open2 failed: " + av_err_(libs, rc) +
+                        said.suffix());
     cctx.reset();
     return CctxPtr(nullptr, CctxDeleter{libs});
   }
@@ -459,17 +467,24 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
       return true;
     }
     swr.reset();
-    AVChannelLayout in_layout = AV_CHANNEL_LAYOUT_MONO;
-    if (f->ch_layout.nb_channels == 2) {
-      in_layout = AV_CHANNEL_LAYOUT_STEREO;
-    } else if (f->ch_layout.nb_channels > 2) {
-      in_layout.nb_channels = f->ch_layout.nb_channels;
-    }
-    AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
-    if (out_channels == 2) {
-      const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
-      out_layout = stereo;
-    }
+    // Past two channels the frame's own layout (ffmpeg_channel_layout):
+    // MONO with its count overwritten was refused, so a 5.1 source never
+    // decoded.
+    AVChannelLayout in_layout =
+        ffmpeg_channel_layout(f->ch_layout.nb_channels, &f->ch_layout);
+    AVChannelLayout out_layout = ffmpeg_channel_layout(out_channels);
+    // What swr was handed, and why it refused in FFmpeg's own words.
+    FfmpegLogCapture said;
+    auto refused = [&](const char* call, int code) {
+      const char* fname = libs->avutil().api.get_sample_fmt_name(ffmt);
+      return string(call) + " failed: " + av_err_(libs, code) + " -- in " +
+             std::to_string(f->sample_rate) + " Hz, " +
+             std::to_string(f->ch_layout.nb_channels) + " channel(s), " +
+             (fname != nullptr ? fname : "?") + "; out " +
+             std::to_string(target_sample_rate) + " Hz, " +
+             std::to_string(out_channels) + " channel(s), flt" +
+             said.suffix();
+    };
     SwrContext* sw = nullptr;
     int rc = libs->swresample().api.alloc_set_opts2(
         &sw,
@@ -477,13 +492,14 @@ decode_audio_impl_(const FFmpegLibraries*  libs,
         &in_layout,  ffmt,              f->sample_rate,
         0, nullptr);
     if (rc < 0 || !sw) {
-      set_err_(error, "swr_alloc_set_opts2 failed");
+      if (sw) { libs->swresample().api.free(&sw); }
+      set_err_(error, refused("swr_alloc_set_opts2", rc));
       return false;
     }
     rc = libs->swresample().api.init(sw);
     if (rc < 0) {
       libs->swresample().api.free(&sw);
-      set_err_(error, "swr_init failed: " + av_err_(libs, rc));
+      set_err_(error, refused("swr_init", rc));
       return false;
     }
     swr.reset(sw);
@@ -737,6 +753,7 @@ decode_video_impl_(const FFmpegLibraries* libs,
       if (out.num_frames >= frame_cap) { stop = true; break; }
     }
   }
+  out.cut_short = stop;
   if (out.num_frames == 0) {
     set_err_(error, "no frames decoded");
     return nullopt;
@@ -886,6 +903,110 @@ decode_audio_bytes(const FFmpegLibraries*  libs,
 {
   return decode_audio_impl_(libs, nullptr, bytes, target_sample_rate,
                             channels, error);
+}
+
+bool
+resample_pcm(const FFmpegLibraries* libs, const float* pcm, int channels,
+             int samples, int in_sample_rate, int out_sample_rate,
+             int out_channels, vector<float>* out, int* out_samples,
+             string* error)
+{
+  if (libs == nullptr || !libs->valid() || pcm == nullptr || out == nullptr) {
+    set_err_(error, "resample_pcm: null argument");
+    return false;
+  }
+  if (channels < 1 || channels > 2 || out_channels < 1 || out_channels > 2) {
+    set_err_(error, "resample_pcm: mono or stereo only");
+    return false;
+  }
+  if (samples <= 0 || in_sample_rate <= 0 || out_sample_rate <= 0) {
+    set_err_(error, "resample_pcm: needs positive geometry");
+    return false;
+  }
+  if (static_cast<size_t>(samples) / max(1, in_sample_rate) >
+      kMaxAudioSeconds) {
+    set_err_(error, "resample_pcm: longer than the "
+             + to_string(kMaxAudioSeconds) + " s cap");
+    return false;
+  }
+
+  AVChannelLayout in_layout = AV_CHANNEL_LAYOUT_MONO;
+  if (channels == 2) {
+    const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    in_layout = stereo;
+  }
+  AVChannelLayout out_layout = AV_CHANNEL_LAYOUT_MONO;
+  if (out_channels == 2) {
+    const AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+    out_layout = stereo;
+  }
+  // PLANAR both ways, which is what makes this a pointer hand-off: the
+  // caller's planes go in as they are and the result needs no
+  // de-interleave afterwards.
+  SwrContext* sw = nullptr;
+  int rc = libs->swresample().api.alloc_set_opts2(
+      &sw,
+      &out_layout, AV_SAMPLE_FMT_FLTP, out_sample_rate,
+      &in_layout,  AV_SAMPLE_FMT_FLTP, in_sample_rate,
+      0, nullptr);
+  if (rc < 0 || sw == nullptr) {
+    set_err_(error, "swr_alloc_set_opts2 failed");
+    return false;
+  }
+  SwrPtr swr(sw, SwrDeleter{libs});
+  rc = libs->swresample().api.init(sw);
+  if (rc < 0) {
+    set_err_(error, "swr_init failed: " + av_err_(libs, rc));
+    return false;
+  }
+
+  // Ceiling plus the resampler's own delay, which it gives back on the
+  // flush pass below. Slack rather than an exact count: a short read is
+  // a truncated soundtrack and nothing reports it.
+  const int64_t cap =
+      (static_cast<int64_t>(samples) * out_sample_rate) / in_sample_rate
+      + 1024;
+  vector<float> buf(static_cast<size_t>(out_channels)
+                    * static_cast<size_t>(cap), 0.0f);
+  const uint8_t* src[2] = {
+      reinterpret_cast<const uint8_t*>(pcm),
+      reinterpret_cast<const uint8_t*>(pcm + static_cast<size_t>(samples))};
+  uint8_t* dst[2] = {
+      reinterpret_cast<uint8_t*>(buf.data()),
+      reinterpret_cast<uint8_t*>(buf.data() + static_cast<size_t>(cap))};
+  int n = libs->swresample().api.convert(swr.get(), dst,
+                                         static_cast<int>(cap), src, samples);
+  if (n < 0) {
+    set_err_(error, "swr_convert failed: " + av_err_(libs, n));
+    return false;
+  }
+  // Drain the filter's tail. Without it a short clip loses its last
+  // few milliseconds, which is inaudible and still shortens the latent
+  // count a model was told to expect.
+  if (n < cap) {
+    uint8_t* tail[2] = {dst[0] + static_cast<size_t>(n) * sizeof(float),
+                        dst[1] + static_cast<size_t>(n) * sizeof(float)};
+    const int m = libs->swresample().api.convert(
+        swr.get(), tail, static_cast<int>(cap - n), nullptr, 0);
+    if (m > 0) { n += m; }
+  }
+  if (n <= 0) {
+    set_err_(error, "resample_pcm: the conversion produced nothing");
+    return false;
+  }
+
+  // Compact: plane 1 was written at `cap`, and the planes have to end up
+  // adjacent at the LENGTH that came back.
+  out->assign(static_cast<size_t>(out_channels) * static_cast<size_t>(n),
+              0.0f);
+  for (int c = 0; c < out_channels; ++c) {
+    const float* p = buf.data() + static_cast<size_t>(c)
+                                    * static_cast<size_t>(cap);
+    copy(p, p + n, out->data() + static_cast<size_t>(c)
+                                     * static_cast<size_t>(n));
+  }
+  if (out_samples != nullptr) { *out_samples = n; }
+  return true;
 }
 
 optional<DecodedVideo>

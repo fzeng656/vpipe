@@ -162,3 +162,186 @@ TEST(thread_pool, worker_id_does_not_leak_across_pools) {
   EXPECT_TRUE(from_a < pool_a.num_workers());
   EXPECT_TRUE(from_b == vpipe::ThreadPool::not_a_worker);
 }
+
+// ---- Job::quiescent() -------------------------------------------------
+//
+// The signal a peer thread uses to decide it may destroy a coroutine
+// frame. `done()` cannot serve: the frame flips into the done state
+// BEFORE FinalAwaiter::await_suspend runs, and await_suspend reads the
+// promise -- so a destroyer released by done() frees the frame one
+// access too early. That race is what ThreadSanitizer caught between
+// PipelineRuntime's driver teardown and a pool worker.
+//
+// The ordering itself is a race and cannot be observed reliably from a
+// test, so what is pinned here is the CONTRACT the fix rests on:
+// quiescent() is false until the coroutine has actually reached
+// final_suspend, and true afterwards.
+
+namespace {
+
+// Suspends once, so the test can observe a started-but-unfinished
+// coroutine before letting it run to completion.
+vpipe::Job
+suspend_then_finish(atomic<bool>* ran)
+{
+  ran->store(true, memory_order_release);
+  co_await std::suspend_always{};
+  co_return;
+}
+
+}
+
+// An UNSTARTED Job has not reached final_suspend, so it is not
+// quiescent -- and neither is it done. Destroying one is safe only
+// because its owner is the only thread that has ever touched it.
+TEST(thread_pool, job_unstarted_is_not_quiescent) {
+  atomic<bool> ran{false};
+  vpipe::Job j = suspend_then_finish(&ran);
+  EXPECT_TRUE(j.valid());
+  EXPECT_FALSE(ran.load(memory_order_acquire));   // initial_suspend
+  EXPECT_FALSE(j.done());
+  EXPECT_FALSE(j.quiescent());
+}
+
+// Mid-flight (started, suspended, not finished) is likewise not
+// quiescent: the coroutine still owns its frame.
+TEST(thread_pool, job_midflight_is_not_quiescent) {
+  atomic<bool> ran{false};
+  vpipe::Job j = suspend_then_finish(&ran);
+  j.handle().resume();                            // runs to the co_await
+  EXPECT_TRUE(ran.load(memory_order_acquire));
+  EXPECT_FALSE(j.done());
+  EXPECT_FALSE(j.quiescent());
+  j.handle().resume();                            // now runs to completion
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(j.quiescent());
+}
+
+// A completed coroutine is quiescent, and quiescence implies done --
+// the whole point being that the converse does NOT hold.
+TEST(thread_pool, job_completed_is_quiescent) {
+  atomic<unsigned> n{0};
+  vpipe::Job j = inc_counter(&n);
+  EXPECT_FALSE(j.quiescent());
+  j.handle().resume();
+  EXPECT_TRUE(n.load(memory_order_relaxed) == 1);
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(j.quiescent());
+}
+
+// An empty Job owns no frame, so there is nothing to wait for: both
+// predicates say "go ahead". A waiter that skipped this would spin
+// forever on a default-constructed Job.
+TEST(thread_pool, job_empty_is_quiescent) {
+  vpipe::Job j;
+  EXPECT_FALSE(j.valid());
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(j.quiescent());
+}
+
+// Quiescence survives a move: the flag lives in the coroutine FRAME,
+// not in the Job handle, so moving the handle cannot lose it. A
+// PipelineRuntime that moved its drivers into place after they ran
+// would otherwise wait on a flag that reset itself.
+TEST(thread_pool, job_quiescence_follows_the_frame) {
+  atomic<unsigned> n{0};
+  vpipe::Job j = inc_counter(&n);
+  j.handle().resume();
+  EXPECT_TRUE(j.quiescent());
+  vpipe::Job moved = std::move(j);
+  EXPECT_TRUE(moved.quiescent());
+  EXPECT_TRUE(j.quiescent());        // empty now -- nothing to wait for
+  EXPECT_FALSE(j.valid());
+}
+
+// ---- Job::Awaiter's tag -----------------------------------------------
+//
+// An untagged Job awaited by a Job takes its caller's tag (so a resume
+// of it after a wait is still the caller's stage); awaited by a
+// coroutine of another promise type it stays untagged -- that caller's
+// promise is never read as a Job's.
+
+namespace {
+
+// Hands the awaiting coroutine its own handle and goes straight on.
+struct OwnHandle {
+  std::coroutine_handle<>* out;
+
+  bool await_ready() const noexcept { return false; }
+
+  bool
+  await_suspend(std::coroutine_handle<> h) const noexcept
+  {
+    *out = h;
+    return false;
+  }
+
+  void await_resume() const noexcept {}
+};
+
+vpipe::Job
+read_own_tag(std::uint32_t* tag)
+{
+  std::coroutine_handle<> self;
+  co_await OwnHandle{&self};
+  *tag = vpipe::perf_tag_of(self);
+}
+
+vpipe::Job
+job_awaiting(std::uint32_t* tag)
+{
+  co_await read_own_tag(tag);
+}
+
+// Not a Job. Its promise is laid out as a Job's, so a reader taking it
+// for one would find 42 where the tag sits.
+struct OtherCoroutine {
+  struct promise_type {
+    void*         not_a_continuation = nullptr;
+    void*         not_an_exception   = nullptr;
+    std::uint32_t not_a_tag          = 42;
+
+    OtherCoroutine
+    get_return_object() noexcept
+    {
+      return OtherCoroutine{
+          std::coroutine_handle<promise_type>::from_promise(*this)};
+    }
+
+    std::suspend_never  initial_suspend() noexcept { return {}; }
+    std::suspend_always final_suspend() noexcept { return {}; }
+    void                return_void() noexcept {}
+    void                unhandled_exception() noexcept {}
+  };
+
+  std::coroutine_handle<promise_type> h;
+
+  ~OtherCoroutine()
+  {
+    if (h) { h.destroy(); }
+  }
+};
+
+OtherCoroutine
+other_awaiting(std::uint32_t* tag)
+{
+  co_await read_own_tag(tag);
+}
+
+}
+
+TEST(thread_pool, an_awaited_job_takes_a_job_callers_tag_only) {
+  std::uint32_t tag = 0;
+  vpipe::Job j = job_awaiting(&tag);
+  j.set_perf_tag(5);
+  j.handle().resume();
+  EXPECT_TRUE(j.done());
+  EXPECT_TRUE(tag == 5);
+
+  tag = 0;
+  {
+    OtherCoroutine c = other_awaiting(&tag);  // runs at once
+    EXPECT_TRUE(c.h.done());
+  }
+  EXPECT_TRUE(tag == vpipe::kNoPerfTag);
+}

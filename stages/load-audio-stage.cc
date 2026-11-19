@@ -47,12 +47,26 @@ constexpr ConfigKey kAttrs[] = {
           "included), not the Nth audio stream; -1 (default) takes the first "
           "audio stream in the file",
    .def_int = -1},
+  {.key = "start_s", .type = ConfigType::Real, .required = false,
+   .doc = "seek to this media time (seconds from the start of the file) "
+          "before reading the first packet; 0 (default) starts at the "
+          "beginning. PACKET-accurate: the first sample lands within one "
+          "packet of what was asked for",
+   .def_real = 0.0},
+  {.key = "duration_s", .type = ConfigType::Real, .required = false,
+   .doc = "stop this many seconds past start_s; 0 (default) reads to the "
+          "end of the file. The packet straddling the end is emitted "
+          "whole, so the window may overshoot by one packet",
+   .def_real = 0.0},
   {.key = "read_timeout_ms", .type = ConfigType::Int, .required = false,
    .doc = "network open/read timeout in milliseconds; 0 = none",
    .def_int = 0},
   {.key = "options", .type = ConfigType::Object, .required = false,
    .doc = "extra av_dict options passed to the demuxer open"},
 };
+
+// Packets the reader may run ahead of its consumer.
+constexpr unsigned kOportDepth = 64;
 
 const PortSpec kOports[] = {
   {.name = "audio",
@@ -89,7 +103,23 @@ LoadAudioStage::LoadAudioStage(const SessionContextIntf* s,
   _input_url       = attr_path("input_url", false);
   _stream_index    = static_cast<int>(attr_int("stream_index"));
   _read_timeout_ms = static_cast<int>(attr_int("read_timeout_ms"));
+  _start_s         = attr_real("start_s");
+  _duration_s      = attr_real("duration_s");
   _open_options    = attr("options");
+
+  if (_start_s < 0.0) {
+    fail_config(fmt("LoadAudioStage('{}'): start_s must be >= 0, got {}",
+                    this->id(), _start_s));
+  }
+  if (_duration_s < 0.0) {
+    fail_config(fmt("LoadAudioStage('{}'): duration_s must be >= 0 (0 = to "
+                    "the end of the file), got {}", this->id(), _duration_s));
+  }
+  _start_us = static_cast<std::int64_t>(_start_s * 1e6);
+  _has_stop = _duration_s > 0.0;
+  _stop_us  = _has_stop
+                  ? _start_us + static_cast<std::int64_t>(_duration_s * 1e6)
+                  : 0;
 
   // Deferred validation: the ctor never throws, so a graph can be built
   // and edited before the file exists.
@@ -98,6 +128,14 @@ LoadAudioStage::LoadAudioStage(const SessionContextIntf* s,
                     this->id()));
   }
   allocate_oports(spec().oports.size());
+  // A FILE READER WAITS FOR ITS CONSUMER. Left at the default depth it
+  // demuxed thousands of packets a second into a buffer that throws at
+  // 2048, so a long track feeding anything slower than the disk -- a
+  // resample, then a model taking seconds a chunk -- ran a song's worth
+  // ahead, tripped it, and drained: the separation of a 3:34 song came
+  // out 29 s short. A packet is a few KB, so 64 ahead keeps the decoder
+  // fed and costs nothing.
+  set_oport_policy(0, {kOportDepth, OverrunPolicy::Backpressure});
 }
 
 LoadAudioStage::~LoadAudioStage()
@@ -114,6 +152,19 @@ const StageSpec&
 LoadAudioStage::spec() const noexcept
 {
   return kSpec;
+}
+
+// The configured window, for the open log. Empty when the whole file is
+// being read, so the common case says nothing extra.
+std::string
+LoadAudioStage::window_doc_() const
+{
+  if (_start_us <= 0 && !_has_stop) { return std::string(); }
+  if (!_has_stop) {
+    return fmt(", from {:.3f}s to the end", _start_s)();
+  }
+  return fmt(", window [{:.3f}s, {:.3f}s)", _start_s,
+             _start_s + _duration_s)();
 }
 
 std::string
@@ -171,6 +222,16 @@ LoadAudioStage::open_input_()
           st->codecpar->extradata,
           st->codecpar->extradata + st->codecpar->extradata_size);
     }
+    // The encoder's priming: samples the decoder emits before the first
+    // real one. The container knows this much on its own.
+    _skip_head = st->codecpar->initial_padding > 0
+                     ? (std::int64_t)st->codecpar->initial_padding
+                     : 0;
+    // The TRUE length, which the container does not know -- an mp4's
+    // audio duration counts the padding too. A file vpipe wrote carries
+    // the real count in a metadata tag; anything else leaves it 0 and
+    // only the head is trimmed.
+    _total_samples = read_true_sample_count_(st);
     break;
   }
   if (_idx < 0) {
@@ -185,10 +246,81 @@ LoadAudioStage::open_input_()
             : std::string()));
     return;
   }
+  // Seek AFTER the stream is chosen: the target is expressed in that
+  // stream's time base, and AVSEEK_FLAG_BACKWARD asks for the packet at
+  // or before it so nothing between the seek point and `start_s` is
+  // lost. process() drops what precedes the window; here we only get
+  // near it.
+  if (_start_us > 0) {
+    const AVRational us = {1, 1000000};
+    const std::int64_t ts =
+        _libs->avutil().api.rescale_q(_start_us, us, _tb);
+    const int rc = _libs->avformat().api.seek_frame(_fctx, _idx, ts,
+                                                    AVSEEK_FLAG_BACKWARD);
+    if (rc < 0) {
+      // Not fatal. A stream with no index (a raw bitstream, some live
+      // URLs) refuses the seek, and reading from the start is the
+      // honest fallback -- process() still drops everything before
+      // `start_s`, so the WINDOW is right and only the work to reach it
+      // is wasted.
+      session()->warn(fmt(
+          "LoadAudioStage('{}'): seek to {:.3f}s failed ({}); reading from "
+          "the start and skipping forward instead", this->id(), _start_s,
+          av_err_(rc)));
+    }
+  }
+  _last_us = _start_us;
+
   session()->info(fmt(
       "LoadAudioStage('{}'): '{}' stream {} -- codec_id {}, {} Hz, {} "
-      "channel(s), {} bytes of extradata", this->id(), _input_url, _idx,
-      _codec_id, _sample_rate, _channels, _extradata.size()));
+      "channel(s), {} bytes of extradata{}", this->id(), _input_url, _idx,
+      _codec_id, _sample_rate, _channels, _extradata.size(),
+      window_doc_()));
+}
+
+void
+LoadAudioStage::reset_run_state()
+{
+  if (_pkt != nullptr && _libs != nullptr) {
+    _libs->avcodec().api.packet_free(&_pkt);
+  }
+  if (_fctx != nullptr && _libs != nullptr) {
+    _libs->avformat().api.close_input(&_fctx);
+  }
+  _pkt     = nullptr;
+  _fctx    = nullptr;
+  _idx     = -1;
+  _eof     = false;
+  _packets = 0;
+  // Back to the window's start, not to 0: open_input_() sets it again
+  // after the seek, and a launch that fails before then should still
+  // stamp a packet with no pts inside the window it was asked for.
+  _last_us = _start_us;
+}
+
+
+std::int64_t
+LoadAudioStage::read_true_sample_count_(AVStream* st) const
+{
+  // Written by save-video; see kAudioSamplesMetaKey. Look on the STREAM
+  // first and then the container, because a muxer is free to put a tag
+  // in either place and mp4 puts ours in the file-level `mdta` box.
+  const auto& avu = _libs->avutil().api;
+  for (AVDictionary* d : {st != nullptr ? st->metadata : nullptr,
+                          _fctx != nullptr ? _fctx->metadata : nullptr}) {
+    if (d == nullptr) { continue; }
+    AVDictionaryEntry* e =
+        avu.dict_get(d, kAudioSamplesMetaKey, nullptr, 0);
+    if (e != nullptr && e->value != nullptr) {
+      errno = 0;
+      char* end = nullptr;
+      const long long v = std::strtoll(e->value, &end, 10);
+      if (errno == 0 && end != e->value && v > 0) {
+        return (std::int64_t)v;
+      }
+    }
+  }
+  return 0;
 }
 
 Job
@@ -238,19 +370,13 @@ LoadAudioStage::process(RuntimeContext& ctx)
     co_return;
   }
 
-  auto seg = std::make_unique<EncodedSegmentPayload>();
-  seg->kind        = EncodedSegment::Kind::Audio;
-  seg->path        = _input_url;
-  seg->codec_id    = _codec_id;
-  seg->sample_rate = _sample_rate;
-  seg->channels    = _channels;
-  seg->extradata   = _extradata;
-  seg->data.assign(_pkt->data, _pkt->data + _pkt->size);
-
   // MEDIA time, from the start of the file -- see the header. A packet
   // with no pts (some raw formats stamp none) repeats the previous
   // one's, which keeps the stream monotonic; leaving it at zero would
   // make time jump back to the start of the file mid-clip.
+  //
+  // Computed BEFORE the segment is built so a packet outside the window
+  // costs no copy of its bytes.
   const AVRational us = {1, 1000000};
   std::int64_t t = _last_us;
   if (_pkt->pts != AV_NOPTS_VALUE) {
@@ -261,6 +387,40 @@ LoadAudioStage::process(RuntimeContext& ctx)
     d = _libs->avutil().api.rescale_q(_pkt->duration, _tb, us);
   }
   _last_us = t + d;
+
+
+  // Past the window: done. Tested on the packet's START, so the packet
+  // straddling the end is emitted whole rather than truncated -- this
+  // stage does not decode and so cannot cut inside one.
+  if (_has_stop && t >= _stop_us) {
+    _libs->avcodec().api.packet_unref(_pkt);
+    _eof = true;
+    session()->info(fmt(
+        "LoadAudioStage('{}'): reached {:.3f}s of '{}' after {} packet(s)",
+        this->id(), _start_s + _duration_s, _input_url, _packets));
+    ctx.signal_done();
+    co_return;
+  }
+  // Before it: the seek landed at or before `start_s`, so drop what
+  // ends at or before the window opens. Safe here and NOT in
+  // load-video, whose video packets depend on the keyframe ahead of
+  // them (see that header).
+  if (t + d <= _start_us) {
+    _libs->avcodec().api.packet_unref(_pkt);
+    co_return;
+  }
+
+  auto seg = std::make_unique<EncodedSegmentPayload>();
+  seg->kind        = EncodedSegment::Kind::Audio;
+  seg->path        = _input_url;
+  seg->codec_id    = _codec_id;
+  seg->sample_rate = _sample_rate;
+  seg->channels    = _channels;
+  seg->extradata   = _extradata;
+  seg->skip_head     = _skip_head;
+  seg->total_samples = _total_samples;
+  seg->data.assign(_pkt->data, _pkt->data + _pkt->size);
+
   seg->duration_us = d;
   seg->start_utc =
       std::chrono::system_clock::time_point(std::chrono::microseconds(t));

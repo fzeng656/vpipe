@@ -1,9 +1,15 @@
 #ifndef VPIPE_APPLE_SILICON_METAL_COMPUTE_SHARED_BUFFER_H
 #define VPIPE_APPLE_SILICON_METAL_COMPUTE_SHARED_BUFFER_H
 
+#include "common/flex-data.h"
 #include "apple-silicon/metal-compute/buffer-view.h"
 
 #include <cstddef>
+#include <cstdint>
+
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
 
 namespace MTL { class Buffer; }
 
@@ -198,6 +204,14 @@ private:
   // subviews heavily would report several times its real footprint.
   bool         _accounted = false;
   bool         _inactive  = false;   // parked via mark_inactive
+  // Whose these bytes are (common/memory-owner.h): the owner and use
+  // they are counted under, set by the handle that put them on the books
+  // and given back with them. Taken from the reserved slots below.
+  std::uintptr_t _owner_slot = 0;
+  // RESERVED for the next field (plugin ABI): a plugin holds this type BY
+  // VALUE, so its size is compiled into every plugin in the support
+  // window. A new member takes a reserved slot instead of growing it.
+  std::uintptr_t _reserved[1] = {};
 };
 
 // ---- Process-wide SharedBuffer accounting -------------------------------
@@ -217,6 +231,8 @@ struct MemoryStats {
   std::size_t total_bytes = 0;   // cumulative, never decremented
   std::size_t live_count  = 0;
   std::size_t total_count = 0;
+  // Anything this struct has no field for: see common/flex-bag.h.
+  FlexData    extra;
 };
 
 // Snapshot the counters. Cheap (relaxed atomic loads); safe from any thread.
@@ -232,5 +248,7 @@ void account_free_(std::size_t bytes) noexcept;
 void shared_buffer_reset_peak() noexcept;
 
 }  // namespace vpipe::metal_compute
+
+VPIPE_API_END
 
 #endif

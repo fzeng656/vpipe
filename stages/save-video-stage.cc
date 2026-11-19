@@ -4,6 +4,7 @@
 #include "common/vpipe-format.h"
 #include "interfaces/session-context-intf.h"
 #include "interfaces/session-services-intf.h"
+#include "common/encoded-segment.h"
 #include "stages/model-provenance.h"
 #include <algorithm>
 #include <cstring>
@@ -92,11 +93,21 @@ SaveVideoStage::SaveVideoStage
   // Flat attribute defaults live in kSpec.attrs; attr_* resolves the
   // configured value else that default.
   _output_url   = attr_path("output_url", true);
+  _no_overwrite = attr_bool("no_overwrite");
   _format       = attr_str("format");
   _enable_video = attr_bool("enable_video");
   _enable_audio = attr_bool("enable_audio");
 
   const FlexData& cfg = this->config();
+  // Whether a key was WRITTEN, as opposed to resolving to its default.
+  // The flat keys have to override the superseded nesting only where
+  // they were actually set, or a graph using the old spelling would
+  // have every setting overwritten by a default it never asked for.
+  const auto written = [this](const char* k) {
+    const FlexData& c = this->config();
+    if (!c.is_object()) { return false; }
+    return c.as_object().contains(k);
+  };
   if (cfg.is_object()) {
     auto root = cfg.as_object();
     if (root.contains("video")) {
@@ -144,14 +155,57 @@ SaveVideoStage::SaveVideoStage
     if (root.contains("muxer_options")) {
       _muxer_options = root.at("muxer_options");
     }
+    if (root.contains("video") || root.contains("audio")) {
+      session()->warn(fmt(
+          "SaveVideoStage('{}'): the nested `video` / `audio` config "
+          "objects are superseded by flat keys (video_codec, "
+          "video_bitrate, video_preset, video_crf, video_gop_size, "
+          "video_options; audio_codec, audio_bitrate, audio_options). "
+          "Still honoured, so this graph runs unchanged -- but only the "
+          "flat keys carry a default and a description an editor can "
+          "show", this->id()));
+    }
   }
+
+  // The flat keys LAST, so an explicitly-set one wins over the same
+  // setting arriving through the superseded nesting. Read through
+  // `written` rather than unconditionally: attr_* cannot distinguish a
+  // configured value from the spec default, and applying the default
+  // here would silently undo a nested setting.
+  if (written("video_codec"))   { _video_codec   = attr_str("video_codec"); }
+  if (written("video_bitrate")) { _video_bitrate = attr_int("video_bitrate"); }
+  if (written("video_preset"))  { _video_preset  = attr_str("video_preset"); }
+  if (written("video_gop_size")) {
+    _video_gop_size = static_cast<int>(attr_int("video_gop_size"));
+  }
+  if (written("video_crf")) {
+    // NEGATIVE means unset, and that distinction is load-bearing: crf 0
+    // is lossless, a legal request, so absence cannot be spelled as 0.
+    const std::int64_t v = attr_int("video_crf");
+    _video_has_crf = v >= 0;
+    if (_video_has_crf) { _video_crf = static_cast<int>(v); }
+  }
+  if (written("video_options")) { _video_options = attr("video_options"); }
+  if (written("audio_codec"))   { _audio_codec   = attr_str("audio_codec"); }
+  if (written("audio_bitrate")) { _audio_bitrate = attr_int("audio_bitrate"); }
+  if (written("audio_options")) { _audio_options = attr("audio_options"); }
 
   // Validation is deferred to launch (see Stage::fail_config).
   if (_output_url.empty()) {
     fail_config(fmt(
       "SaveVideoStage('{}'): config.output_url is required",
       this->id()));
+  } else {
+    // Checked at CONFIG time so a misspelt token reaches the editor
+    // rather than the log of a run that has already opened a file.
+    const string bad = outpath::check(_output_url, &_tok);
+    if (!bad.empty()) {
+      fail_config(fmt(
+        "SaveVideoStage('{}'): config.output_url '{}': {}",
+        this->id(), _output_url, bad));
+    }
   }
+  _seq.configure(_no_overwrite);
   if (!_enable_video && !_enable_audio) {
     fail_config(fmt(
       "SaveVideoStage('{}'): at least one of enable_video / "
@@ -187,22 +241,88 @@ SaveVideoStage::SaveVideoStage
 }
 
 namespace {
+// The width of the "-NNNNNN" suffix an output_url with no sequence
+// conversion of its own gets from the SECOND file onward. This stage
+// writes one file per launch, so under no_overwrite that is the second
+// RUN -- see stages/output-path.h.
+constexpr int kSeqPad = 6;
+
 constexpr ConfigKey kAttrs[] = {
   {.key = "output_url", .type = ConfigType::String, .required = true,
-   .doc = "output file path / URL",
+   .doc = "output file path / URL. A printf integer conversion "
+          "(clip-%03d.mp4) numbers the launches and %t stamps the local "
+          "time (%t{...} takes a strftime format)",
    .is_path = true, .path_write = true, .path_filter = "video"},
+  {.key = "no_overwrite", .type = ConfigType::Bool,
+   .doc = "never write over a file that already exists: the number "
+          "starts past every name on disk instead of at 0, so a second "
+          "run does not erase the first one's clip. Off by default; "
+          "ignored for a network URL", .def_bool = false},
   {.key = "format", .type = ConfigType::String,
    .doc = "container format; \"\" = inferred", .def_str = ""},
   {.key = "enable_video", .type = ConfigType::Bool,
    .doc = "encode a video stream", .def_bool = true},
   {.key = "enable_audio", .type = ConfigType::Bool,
    .doc = "encode an audio stream", .def_bool = true},
-  {.key = "video", .type = ConfigType::Object,
-   .doc = "video opts: codec/bitrate/preset/crf/gop_size/options"},
-  {.key = "audio", .type = ConfigType::Object,
-   .doc = "audio opts: codec/bitrate/options"},
+  // FLAT, one key per setting, because an editor can only show a default
+  // and a doc for something the spec names. These lived in a `video` /
+  // `audio` Object whose doc was a slash-separated list of sub-keys --
+  // readable in source, and nothing the web-ui could turn into a form:
+  // an Object is one opaque field, so every default and every
+  // explanation below was invisible to whoever was filling it in.
+  {.key = "video_codec", .type = ConfigType::String,
+   .doc = "video encoder. The default is part of macOS, hardware "
+          "accelerated, and carries no licence obligation -- libx264 is "
+          "GPL and cannot ship in an FFmpeg build this project "
+          "redistributes. A non-Apple build falls back to libx264 at "
+          "init. Anything the linked libavcodec provides is accepted",
+   .def_str = "h264_videotoolbox"},
+  {.key = "video_bitrate", .type = ConfigType::Int,
+   .doc = "target video bitrate in bits per second. Ignored by an "
+          "encoder run in constant-quality mode -- see video_crf",
+   .def_int = 2000000},
+  {.key = "video_preset", .type = ConfigType::String,
+   .doc = "encoder speed/size preset (ultrafast .. veryslow), for the "
+          "encoders that take one; ignored by those that do not",
+   .def_str = "medium"},
+  {.key = "video_crf", .type = ConfigType::Int,
+   .doc = "constant-quality target instead of a bitrate: lower is "
+          "better, 0 is lossless, ~18-28 is the usual range. -1 (the "
+          "default) leaves it UNSET, and video_bitrate decides. Set by "
+          "the encoders that support crf; ignored by the others",
+   .def_int = -1},
+  {.key = "video_gop_size", .type = ConfigType::Int,
+   .doc = "keyframe interval in frames. Smaller seeks and recovers "
+          "faster and costs size",
+   .def_int = 60},
+  {.key = "video_options", .type = ConfigType::Object,
+   .doc = "extra av_dict options passed to the video encoder, for "
+          "anything the keys above do not name"},
+  {.key = "audio_codec", .type = ConfigType::String,
+   .doc = "audio encoder", .def_str = "aac"},
+  {.key = "audio_bitrate", .type = ConfigType::Int,
+   .doc = "target audio bitrate in bits per second", .def_int = 128000},
+  {.key = "audio_options", .type = ConfigType::Object,
+   .doc = "extra av_dict options passed to the audio encoder"},
   {.key = "muxer_options", .type = ConfigType::Object,
-   .doc = "av_dict string opts for the muxer"},
+   .doc = "av_dict string opts for the muxer. NOT flattened: unlike the "
+          "encoder settings above these have no fixed set of names -- "
+          "they are whatever the chosen container takes"},
+
+  // The superseded nesting. Still READ, so a pipeline written against it
+  // keeps working, and warned about so it does not keep working
+  // silently: an unknown key is not an error anywhere in this runtime,
+  // which is what makes a quiet removal the wrong way to do this. Kept
+  // in the spec rather than dropped so an editor showing an old
+  // pipeline can say what the field is instead of leaving it unnamed.
+  {.key = "video", .type = ConfigType::Object,
+   .doc = "SUPERSEDED by video_codec / video_bitrate / video_preset / "
+          "video_crf / video_gop_size / video_options. Still read, and "
+          "warned about; a flat key set alongside it wins"},
+  {.key = "audio", .type = ConfigType::Object,
+   .doc = "SUPERSEDED by audio_codec / audio_bitrate / audio_options. "
+          "Still read, and warned about; a flat key set alongside it "
+          "wins"},
 };
 // Canonical iports (video first, audio second); either may be disabled
 // via config, so the live count comes from the wiring. Each port
@@ -269,6 +389,7 @@ SaveVideoStage::release_media_()
     _libs->avutil().api.frame_free(&_apcm_frame);
     _apcm_frame = nullptr;
   }
+  free_held_video_();
   _vstream = nullptr;
   _astream = nullptr;
 }
@@ -288,8 +409,23 @@ SaveVideoStage::reset_run_state()
   _finalized         = false;
   _audio_pcm         = false;
   _audio_pts         = 0;
+  _apcm_carry.clear();
+  _apcm_carry_n      = 0;
   _next_port         = 0;
+  _vdts_shift        = 0;
+  _vdts_settled      = false;
+  _vlast_dts         = 0;
+  _vlast_valid       = false;
+  _vdts_guessed      = false;
   _model_name.clear();
+  // A fresh name for the next launch. Without `no_overwrite` the
+  // template resolves to the same thing again and the run rewrites its
+  // predecessor, which is what every graph has always done; with it the
+  // scan starts past whatever run 1 left behind, which is the whole
+  // point of the flag.
+  _resolved_url.clear();
+  _url_resolved = false;
+  _seq.reset();
 }
 
 string
@@ -301,15 +437,41 @@ SaveVideoStage::av_err_(int rc) const
 }
 
 void
+SaveVideoStage::resolve_output_url_()
+{
+  if (_url_resolved) { return; }
+  _url_resolved = true;
+  // ONE file per run, so ONE name per run: resolved here, at the first
+  // thing that needs it, and held for the whole launch. Resolving per
+  // use would let a %t tick between alloc_output_context2 (which reads
+  // the extension) and avio_open (which creates the file), and the two
+  // would disagree about which file this is.
+  _resolved_url = _seq.take(_output_url, kSeqPad);
+  if (_resolved_url.empty()) {
+    session()->error(fmt(
+      "SaveVideoStage('{}'): no_overwrite is set and '{}' has no free "
+      "sequence number left; nothing written",
+      this->id(), _output_url));
+    return;
+  }
+  if (_resolved_url != _output_url) {
+    session()->info(fmt(
+      "SaveVideoStage('{}'): writing '{}'", this->id(), _resolved_url));
+  }
+}
+
+void
 SaveVideoStage::ensure_output_format_()
 {
   if (_ofctx) {
     return;
   }
+  resolve_output_url_();
+  if (_resolved_url.empty()) { return; }   // already reported
   AVFormatContext* ofctx = nullptr;
   const char* fmt_name = _format.empty() ? nullptr : _format.c_str();
   int rc = _libs->avformat().api.alloc_output_context2(
-    &ofctx, nullptr, fmt_name, _output_url.c_str());
+    &ofctx, nullptr, fmt_name, _resolved_url.c_str());
   if (rc < 0 || !ofctx) {
     session()->error(fmt(
         "SaveVideoStage('{}'): alloc_output_context2 failed: "
@@ -360,6 +522,16 @@ SaveVideoStage::init_video_encoder_(const VideoStreamParams& p)
   _venc->width     = p.width;
   _venc->height    = p.height;
   _venc->pix_fmt   = static_cast<AVPixelFormat>(p.pix_fmt);
+  // TAG the stream with what the producer says it wrote. Untagged, the
+  // file is read by convention, and a convention that disagrees with
+  // the producer costs 219/255 of the contrast plus a hue tilt -- which
+  // is invisible on one decode and compounds in a graph that re-reads
+  // its own output.
+  _venc->color_range = static_cast<AVColorRange>(p.color_range);
+  _venc->colorspace  = static_cast<AVColorSpace>(p.colorspace);
+  _venc->color_primaries =
+      static_cast<AVColorPrimaries>(p.color_primaries);
+  _venc->color_trc = static_cast<AVColorTransferCharacteristic>(p.color_trc);
   _venc->bit_rate  = _video_bitrate;
   _venc->gop_size  = _video_gop_size;
 
@@ -391,9 +563,34 @@ SaveVideoStage::init_video_encoder_(const VideoStreamParams& p)
   int rc = _libs->avcodec().api.open2(_venc, codec, &opts);
   _libs->avutil().api.dict_free(&opts);
   if (rc < 0) {
+    // NAME THE LIKELY CAUSE when the frames are not 4:2:0. An encoder
+    // that cannot take the pixel format it is handed fails here as a
+    // bare "Invalid argument", which says nothing about the encoder OR
+    // the format -- and since rgb-to-video can now emit 4:2:2 and 4:4:4
+    // while the default encoder (h264_videotoolbox) is 4:2:0 only, that
+    // is the first thing most people will hit on reaching for them.
+    //
+    // A GUESS, and phrased as one: this does not interrogate the codec
+    // (AVCodec::pix_fmts is deprecated and its replacement is too new to
+    // rely on), so it must not claim to know. Saying "may not accept"
+    // and naming the two that do is enough to act on.
+    const int pf = p.pix_fmt;
+    const bool subsampled_or_odd =
+        pf != AV_PIX_FMT_YUV420P && pf != AV_PIX_FMT_NV12;
+    const char* pf_name =
+        _libs->avutil().api.get_pix_fmt_name(
+            static_cast<AVPixelFormat>(pf));
     session()->error(fmt(
-        "SaveVideoStage('{}'): avcodec_open2 (video) failed: "
-        "{}", this->id(), av_err_(rc)));
+        "SaveVideoStage('{}'): avcodec_open2 (video) failed: {}{}",
+        this->id(), av_err_(rc),
+        subsampled_or_odd
+            ? fmt(" -- the frames are {} and '{}' may not accept it "
+                  "(h264_videotoolbox is yuv420p only). Set video_codec "
+                  "to libx264 or ffv1, or pix_fmt to yuv420p on the "
+                  "rgb-to-video stage",
+                  pf_name ? pf_name : "an unnamed pixel format",
+                  _video_codec)()
+            : std::string()));
   }
 
   _vstream = _libs->avformat().api.new_stream(_ofctx, codec);
@@ -447,15 +644,59 @@ SaveVideoStage::init_audio_encoder_(const AudioStreamParams& p)
     _aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
   }
 
-  AVDictionary* opts = nullptr;
-  fill_dict_from_options_(_audio_options, _libs->avutil(), &opts);
-
-  int rc = _libs->avcodec().api.open2(_aenc, codec, &opts);
-  _libs->avutil().api.dict_free(&opts);
-  if (rc < 0) {
-    session()->error(fmt(
-        "SaveVideoStage('{}'): avcodec_open2 (audio) failed: "
-        "{}", this->id(), av_err_(rc)));
+  // ASK THE ENCODER which sample format it takes, by trying. The PCM
+  // arrives planar f32 and AAC accepts that as it stands, so this stage
+  // handed the incoming format straight over -- and every LOSSLESS codec
+  // then failed the open with a bare EINVAL, because ALAC and FLAC want
+  // s16/s32. A table of what each codec accepts is the other way to do
+  // it, but FFmpeg 8 removed `AVCodec::sample_fmts` in favour of a
+  // query, so trying is both simpler and more honest than a list this
+  // file would have to keep true. It costs one open per candidate, once
+  // per run, and only when the first choice is refused.
+  static constexpr AVSampleFormat kCandidates[] = {
+    AV_SAMPLE_FMT_S32P, AV_SAMPLE_FMT_S32,
+    AV_SAMPLE_FMT_S16P, AV_SAMPLE_FMT_S16,
+    AV_SAMPLE_FMT_FLT,
+  };
+  int rc = 0;
+  for (int attempt = 0; ; ++attempt) {
+    AVDictionary* opts = nullptr;
+    fill_dict_from_options_(_audio_options, _libs->avutil(), &opts);
+    rc = _libs->avcodec().api.open2(_aenc, codec, &opts);
+    _libs->avutil().api.dict_free(&opts);
+    if (rc >= 0) { break; }
+    if (attempt >= (int)(sizeof kCandidates / sizeof *kCandidates)) {
+      session()->error(fmt(
+          "SaveVideoStage('{}'): avcodec_open2 (audio) failed for every "
+          "sample format '{}' was offered: {}", this->id(), _audio_codec,
+          av_err_(rc)));
+      break;
+    }
+    // A refused open can leave the context unusable, so each attempt
+    // gets a fresh one carrying the same stream parameters.
+    _libs->avcodec().api.free_context(&_aenc);
+    _aenc = _libs->avcodec().api.alloc_context3(codec);
+    if (!_aenc) {
+      session()->error(fmt(
+          "SaveVideoStage('{}'): alloc_context3 (audio) failed",
+          this->id()));
+      break;
+    }
+    _aenc->sample_rate = p.sample_rate;
+    _aenc->sample_fmt  = kCandidates[attempt];
+    _aenc->ch_layout   = p.ch_layout;
+    _aenc->bit_rate    = _audio_bitrate;
+    _aenc->time_base   = AVRational{1, p.sample_rate};
+    if (_ofctx->oformat
+        && (_ofctx->oformat->flags & AVFMT_GLOBALHEADER)) {
+      _aenc->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+    }
+  }
+  if (rc >= 0 && _aenc->sample_fmt != (AVSampleFormat)p.sample_fmt) {
+    session()->info(fmt(
+        "SaveVideoStage('{}'): '{}' takes {}, converting the planar f32 "
+        "PCM into it", this->id(), _audio_codec,
+        _libs->avutil().api.get_sample_fmt_name(_aenc->sample_fmt)));
   }
 
   _astream = _libs->avformat().api.new_stream(_ofctx, codec);
@@ -580,21 +821,163 @@ SaveVideoStage::encode_pcm_(const TensorBeatPayload& t)
   }
 
   const float* src = t.as_f32();
-  for (int64_t off = 0; off < samples; off += frame_size) {
-    const int n =
-      static_cast<int>(std::min<int64_t>(frame_size, samples - off));
+
+  // WHOLE FRAMES ONLY, and the remainder is CARRIED to the next beat.
+  //
+  // A block codec takes a short frame only as the stream's LAST: FFmpeg
+  // pads it, latches `last_audio_frame`, and answers the next
+  // send_frame with EINVAL ("frame_size was not respected for a
+  // non-last frame"). This used to end every BEAT with a short frame,
+  // which a one-beat-per-clip graph never notices because its only
+  // short frame really is the last. A beat boundary is not the end of
+  // the stream, though: `audio-to-pcm` emits one per chunk and a joined
+  // `load-video` one per file. MEASURED on the 5-part 896x512 story --
+  // 5 x 324000 samples is 317 frames each, 1585 in all, and the encoder
+  // took 627 then refused 958, writing 20 s of audio under 50 s of
+  // video and still exiting 0.
+  //
+  // Carrying also keeps the old fix that motivated the short frame:
+  // nothing is zero-padded mid-stream, so no silence is welded into a
+  // seam. Only `flush_pcm_tail_` may send a partial frame.
+  // Carry ++ beat, as one planar block. The carry is almost always
+  // empty -- a graph that sends one beat per clip never fills it -- and
+  // then the beat is encoded in place with no copy; `_apcm_join` is
+  // touched only on the joined path that needs it. Note the channel
+  // stride CHANGES when the two are spliced, so this cannot be done by
+  // growing `_apcm_carry` in place: channel c moves.
+  const int64_t have   = _apcm_carry_n + samples;
+  const float*  base   = src;
+  int64_t       stride = samples;
+  if (_apcm_carry_n > 0) {
+    _apcm_join.resize((size_t)channels * (size_t)have);
     for (int c = 0; c < channels; ++c) {
-      auto* dst = reinterpret_cast<float*>(_apcm_frame->data[c]);
-      const float* s = src + static_cast<size_t>(c) * samples + off;
-      std::memcpy(dst, s, static_cast<size_t>(n) * sizeof(float));
-      if (n < frame_size) {
-        std::memset(dst + n, 0,
-                    static_cast<size_t>(frame_size - n) * sizeof(float));
+      float* d = _apcm_join.data() + (size_t)c * have;
+      std::memcpy(d, _apcm_carry.data() + (size_t)c * _apcm_carry_n,
+                  (size_t)_apcm_carry_n * sizeof(float));
+      std::memcpy(d + _apcm_carry_n, src + (size_t)c * samples,
+                  (size_t)samples * sizeof(float));
+    }
+    base   = _apcm_join.data();
+    stride = have;
+  }
+
+  // `whole` is 0 when the two together still do not fill a frame, which
+  // is the short-beat case and needs no branch of its own.
+  const int64_t whole = (have / frame_size) * frame_size;
+  emit_pcm_frames_(base, stride, channels, 0, whole, frame_size);
+
+  const int64_t left = have - whole;
+  std::vector<float> keep((size_t)channels * (size_t)left);
+  for (int c = 0; c < channels; ++c) {
+    std::memcpy(keep.data() + (size_t)c * left,
+                base + (size_t)c * stride + whole,
+                (size_t)left * sizeof(float));
+  }
+  _apcm_carry.swap(keep);
+  _apcm_carry_n = left;
+}
+
+void
+SaveVideoStage::emit_pcm_frames_(const float* src, int64_t samples,
+                                 int channels, int64_t off, int64_t count,
+                                 int frame_size)
+{
+  for (int64_t i = 0; i < count; i += frame_size) {
+    _apcm_frame->nb_samples = frame_size;
+    write_pcm_frame_(src, samples, channels, off + i, frame_size);
+    _apcm_frame->pts = _audio_pts;
+    _audio_pts += frame_size;
+    encode_and_mux_(static_cast<unsigned>(_audio_port), _apcm_frame);
+  }
+}
+
+// The stream's one legitimate short frame. `_audio_pts` still counts
+// only REAL samples, so the true-length metadata the seam fix relies on
+// stays exact even though this frame is padded on the way out.
+void
+SaveVideoStage::flush_pcm_tail_()
+{
+  if (_aenc == nullptr || _apcm_frame == nullptr || _apcm_carry_n <= 0) {
+    return;
+  }
+  const int channels = _aenc->ch_layout.nb_channels;
+  const int n        = (int)_apcm_carry_n;
+  _apcm_frame->nb_samples = n;
+  write_pcm_frame_(_apcm_carry.data(), _apcm_carry_n, channels, 0, n);
+  _apcm_frame->pts = _audio_pts;
+  _audio_pts += n;
+  encode_and_mux_(static_cast<unsigned>(_audio_port), _apcm_frame);
+  _apcm_carry.clear();
+  _apcm_carry_n = 0;
+}
+
+// Planar f32 -- the layout every generative graph in this tree carries
+// PCM in -- into whatever the chosen encoder accepts. AAC takes fltp as
+// it stands; the LOSSLESS codecs do not, and they are the reason a
+// multi-part graph can join its parts without a seam.
+void
+SaveVideoStage::write_pcm_frame_(const float* src, std::int64_t samples,
+                                 int channels, std::int64_t off, int n)
+{
+  const auto fmt = static_cast<AVSampleFormat>(_apcm_frame->format);
+  auto ch_src = [&](int c) { return src + (size_t)c * samples + off; };
+  // Scale to the integer range as FFmpeg does: full-scale float 1.0 maps
+  // to the type's maximum, and everything is clamped rather than wrapped
+  // -- a sample a hair over 1.0 must clip, not invert.
+  auto clampf = [](float v, double peak) {
+    const double x = (double)v * peak;
+    return x >  peak - 1 ?  peak - 1 : (x < -peak ? -peak : x);
+  };
+  switch (fmt) {
+  case AV_SAMPLE_FMT_FLTP:
+    for (int c = 0; c < channels; ++c) {
+      std::memcpy(_apcm_frame->data[c], ch_src(c), (size_t)n * sizeof(float));
+    }
+    break;
+  case AV_SAMPLE_FMT_S32P:
+    for (int c = 0; c < channels; ++c) {
+      auto* d = reinterpret_cast<std::int32_t*>(_apcm_frame->data[c]);
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) { d[i] = (std::int32_t)clampf(s[i], 2147483648.0); }
+    }
+    break;
+  case AV_SAMPLE_FMT_S16P:
+    for (int c = 0; c < channels; ++c) {
+      auto* d = reinterpret_cast<std::int16_t*>(_apcm_frame->data[c]);
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) { d[i] = (std::int16_t)clampf(s[i], 32768.0); }
+    }
+    break;
+  case AV_SAMPLE_FMT_FLT: {
+    auto* d = reinterpret_cast<float*>(_apcm_frame->data[0]);
+    for (int c = 0; c < channels; ++c) {
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) { d[(size_t)i * channels + c] = s[i]; }
+    }
+    break;
+  }
+  case AV_SAMPLE_FMT_S32: {
+    auto* d = reinterpret_cast<std::int32_t*>(_apcm_frame->data[0]);
+    for (int c = 0; c < channels; ++c) {
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) {
+        d[(size_t)i * channels + c] = (std::int32_t)clampf(s[i], 2147483648.0);
       }
     }
-    _apcm_frame->pts = _audio_pts;
-    _audio_pts += n;
-    encode_and_mux_(static_cast<unsigned>(_audio_port), _apcm_frame);
+    break;
+  }
+  case AV_SAMPLE_FMT_S16: {
+    auto* d = reinterpret_cast<std::int16_t*>(_apcm_frame->data[0]);
+    for (int c = 0; c < channels; ++c) {
+      const float* s = ch_src(c);
+      for (int i = 0; i < n; ++i) {
+        d[(size_t)i * channels + c] = (std::int16_t)clampf(s[i], 32768.0);
+      }
+    }
+    break;
+  }
+  default:
+    break;   // refused at open, so unreachable
   }
 }
 
@@ -619,7 +1002,21 @@ SaveVideoStage::write_provenance_(AVDictionary** mux_opts)
   // transcode must not come out claiming vpipe authored the footage --
   // and saying nothing also leaves the container's metadata layout
   // exactly as it would have been.
-  if (_model_name.empty() || _ofctx == nullptr) {
+  if (_ofctx == nullptr) {
+    return;
+  }
+  // The audio sample count is an arbitrary key too, and it is written
+  // at TRAILER time -- so the mdta form has to be asked for here, up
+  // front, even when there is no provenance string to write.
+  const bool want_mdta = _audio_port >= 0;
+  if (_model_name.empty() && !want_mdta) {
+    return;
+  }
+  if (_model_name.empty()) {
+    if (is_mov_family_(_ofctx->oformat)) {
+      _libs->avutil().api.dict_set(mux_opts, "movflags",
+                                   "+use_metadata_tags", AV_DICT_APPEND);
+    }
     return;
   }
   const string sw = provenance::software_string(_model_name);
@@ -655,13 +1052,15 @@ SaveVideoStage::open_output_and_write_header_()
   if (_ofctx->oformat
       && !(_ofctx->oformat->flags & AVFMT_NOFILE))
   {
+    resolve_output_url_();
+    if (_resolved_url.empty()) { return; }   // already reported
     int rc = _libs->avformat().api.avio_open(&_ofctx->pb,
-                                             _output_url.c_str(),
+                                             _resolved_url.c_str(),
                                              AVIO_FLAG_WRITE);
     if (rc < 0) {
       session()->error(fmt(
           "SaveVideoStage('{}'): avio_open('{}') failed: {}",
-          this->id(), _output_url, av_err_(rc)));
+          this->id(), _resolved_url, av_err_(rc)));
     }
   }
 
@@ -679,21 +1078,122 @@ SaveVideoStage::open_output_and_write_header_()
   }
 }
 
+// Packets a reordering video encoder hands out before its dts shift is
+// settled: enough to see a few mini-GOPs of any B-frame structure.
+constexpr std::size_t kReorderWindow = 16;
+
+bool
+SaveVideoStage::video_reorders_() const
+{
+  return _venc != nullptr
+      && (_venc->max_b_frames > 0 || _venc->has_b_frames > 0);
+}
+
+// THE DTS A REORDERING ENCODER STAMPS CAN RUN AHEAD OF ITS PTS, and the
+// muxer refuses such a packet ("Invalid argument") -- the frame is gone.
+// h264_videotoolbox does it with B-frames on (bf > 0): VideoToolbox
+// builds a B-pyramid that reorders two frames deep while libavcodec's
+// wrapper offsets dts for one, so one B-frame per mini-GOP is stamped
+// pts < dts. MEASURED: 33 frames in, 29 in the file, 4 refusals. (The
+// ffmpeg CLI patches the same packets with a guess; see
+// write_video_packet_.)
+//
+// The fix that keeps every timestamp: hold the first kReorderWindow
+// packets, shift ALL dts down by the worst pts < dts among them, write.
+// A constant shift keeps dts increasing; an encoder whose dts are
+// already sound (libx264) gets a shift of 0 and an unchanged file.
+void
+SaveVideoStage::settle_video_dts_()
+{
+  std::int64_t need = 0;
+  for (AVPacket* p : _vheld) {
+    if (p->pts != AV_NOPTS_VALUE && p->dts != AV_NOPTS_VALUE) {
+      need = std::max(need, p->dts - p->pts);
+    }
+  }
+  _vdts_shift = need;
+  _vdts_settled = true;
+  if (need > 0) {
+    session()->log_verbose(fmt(
+      "encoder('{}'): the video encoder's dts run {} tick(s) ahead of "
+      "pts; shifting them back", this->id(), need));
+  }
+  for (AVPacket*& p : _vheld) {
+    write_video_packet_(p);
+    _libs->avcodec().api.packet_free(&p);
+  }
+  _vheld.clear();
+}
+
+void
+SaveVideoStage::write_video_packet_(AVPacket* pkt)
+{
+  if (pkt->dts != AV_NOPTS_VALUE) { pkt->dts -= _vdts_shift; }
+  // A packet the window did not foresee still cannot go in as it is.
+  // The ffmpeg CLI's own repair, last resort: pts and dts both become
+  // the middle of (pts, dts, previous dts + 1) -- a tick off in the
+  // muxer's time base, rather than a frame lost.
+  if (pkt->pts != AV_NOPTS_VALUE && pkt->dts != AV_NOPTS_VALUE
+      && pkt->dts > pkt->pts) {
+    if (!_vdts_guessed) {
+      session()->warn(fmt(
+        "encoder('{}'): video packet with dts {} > pts {}; guessing "
+        "its timestamps", this->id(), pkt->dts, pkt->pts));
+      _vdts_guessed = true;
+    }
+    const std::int64_t floor = _vlast_valid ? _vlast_dts + 1 : pkt->pts;
+    const std::int64_t a = pkt->pts, b = pkt->dts;
+    pkt->pts = pkt->dts = std::max(std::min(a, b),
+                                   std::min(std::max(a, b), floor));
+  }
+  if (pkt->dts != AV_NOPTS_VALUE) {
+    _vlast_dts = pkt->dts;
+    _vlast_valid = true;
+  }
+  int rc = _libs->avformat().api.interleaved_write_frame(_ofctx, pkt);
+  if (rc < 0) {
+    session()->warn(fmt(
+      "encoder('{}'): interleaved_write_frame: {}",
+      this->id(), av_err_(rc)));
+  }
+}
+
+void
+SaveVideoStage::free_held_video_()
+{
+  for (AVPacket*& p : _vheld) {
+    _libs->avcodec().api.packet_free(&p);
+  }
+  _vheld.clear();
+}
+
 void
 SaveVideoStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
 {
+  const bool reorders = enc == _venc && video_reorders_();
   while (true) {
-    int rc = _libs->avcodec().api.receive_packet(enc, _enc_pkt);
+    // A packet to hold is received straight into its own allocation.
+    AVPacket* pkt = _enc_pkt;
+    if (reorders && !_vdts_settled) {
+      pkt = _libs->avcodec().api.packet_alloc();
+      if (pkt == nullptr) {
+        settle_video_dts_();
+        pkt = _enc_pkt;
+      }
+    }
+    int rc = _libs->avcodec().api.receive_packet(enc, pkt);
     if (rc == AVERROR(EAGAIN) || rc == AVERROR_EOF) {
+      if (pkt != _enc_pkt) { _libs->avcodec().api.packet_free(&pkt); }
       break;
     }
     if (rc < 0) {
       session()->warn(fmt(
         "encoder('{}'): receive_packet: {}",
         this->id(), av_err_(rc)));
+      if (pkt != _enc_pkt) { _libs->avcodec().api.packet_free(&pkt); }
       break;
     }
-    _enc_pkt->stream_index = st->index;
+    pkt->stream_index = st->index;
     // An encoder that leaves duration at 0 costs the LAST sample its
     // length: the mov muxer derives every other sample's duration from
     // the next packet's dts, and there is no next packet for the final
@@ -702,25 +1202,33 @@ SaveVideoStage::drain_encoder_(AVCodecContext* enc, AVStream* st)
     // the final frame -- a 33-frame clip plays back 32. Fill it in
     // from the encoder's own rate before the rescale, which carries
     // duration across with the timestamps.
-    if (_enc_pkt->duration <= 0) {
+    if (pkt->duration <= 0) {
       if (enc->codec_type == AVMEDIA_TYPE_VIDEO
           && enc->framerate.num > 0 && enc->framerate.den > 0)
       {
-        _enc_pkt->duration = _libs->avutil().api.rescale_q(
+        pkt->duration = _libs->avutil().api.rescale_q(
             1, av_inv_q(enc->framerate), enc->time_base);
       } else if (enc->codec_type == AVMEDIA_TYPE_AUDIO
                  && enc->frame_size > 0 && enc->sample_rate > 0)
       {
-        _enc_pkt->duration = _libs->avutil().api.rescale_q(
+        pkt->duration = _libs->avutil().api.rescale_q(
             enc->frame_size, AVRational{1, enc->sample_rate},
             enc->time_base);
       }
     }
-    _libs->avcodec().api.packet_rescale_ts(_enc_pkt,
+    _libs->avcodec().api.packet_rescale_ts(pkt,
                                           enc->time_base,
                                           st->time_base);
-    rc = _libs->avformat().api.interleaved_write_frame(_ofctx,
-                                                      _enc_pkt);
+    if (pkt != _enc_pkt) {
+      _vheld.push_back(pkt);
+      if (_vheld.size() >= kReorderWindow) { settle_video_dts_(); }
+      continue;
+    }
+    if (reorders) {
+      write_video_packet_(pkt);
+      continue;
+    }
+    rc = _libs->avformat().api.interleaved_write_frame(_ofctx, pkt);
     if (rc < 0) {
       session()->warn(fmt(
         "encoder('{}'): interleaved_write_frame: {}",
@@ -765,10 +1273,29 @@ SaveVideoStage::finalize_()
     if (_venc) {
       _libs->avcodec().api.send_frame(_venc, nullptr);
       drain_encoder_(_venc, _vstream);
+      // A clip shorter than the window: its packets are all held.
+      if (!_vheld.empty()) { settle_video_dts_(); }
     }
     if (_aenc) {
+      // The samples that never filled a frame. HERE is the one place a
+      // short frame is legal, and it has to go in before the drain or
+      // the tail of the last beat is simply lost.
+      flush_pcm_tail_();
       _libs->avcodec().api.send_frame(_aenc, nullptr);
       drain_encoder_(_aenc, _astream);
+    }
+    // RECORD THE TRUE AUDIO LENGTH. `_audio_pts` counted the real
+    // samples handed to the encoder, which is the one number the
+    // container will not otherwise carry: a block codec rounds the tail
+    // up to a whole frame and primes its decoder with another, so an
+    // mp4's audio duration is the PADDED count. A reader that trims to
+    // this can join two parts without the gap those two paddings would
+    // otherwise weld into the seam. Set before the trailer because that
+    // is when the mov muxer writes moov.
+    if (_aenc != nullptr && _audio_pts > 0) {
+      const std::string n = std::to_string((long long)_audio_pts);
+      _libs->avutil().api.dict_set(&_ofctx->metadata,
+                                   kAudioSamplesMetaKey, n.c_str(), 0);
     }
     int rc = _libs->avformat().api.write_trailer(_ofctx);
     if (rc < 0) {

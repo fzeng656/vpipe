@@ -1,6 +1,7 @@
 #ifndef VPIPE_GENERATIVE_MODELS_MODEL_LOADER_H
 #define VPIPE_GENERATIVE_MODELS_MODEL_LOADER_H
 
+#include "common/flex-data.h"
 #include "common/session-member.h"
 
 
@@ -10,12 +11,69 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/vpipe-api.h"
+
+VPIPE_API_BEGIN
+
 namespace vpipe {
 class SessionContextIntf;
 class FlexData;
 }
 
 namespace vpipe::genai {
+
+// ModelConfig::extra keys: what config.json says that the struct has no
+// field for. An absent key means the model does not use it.
+namespace model_config {
+// object: the text model's `rope_parameters` exactly as config.json
+// spells it (text_config's when the LM is nested), kept when its
+// rope_type is anything but "default" -- e.g. Ministral-3's YaRN
+// {factor, original_max_position_embeddings, beta_fast, beta_slow,
+// mscale, mscale_all_dim} and its llama_4_scaling_beta. The member
+// names inside are Hugging Face's, not vpipe's.
+inline constexpr std::string_view kRopeParameters = "rope_parameters";
+// int: the vision tower's largest input edge in pixels (Pixtral's
+// vision_config.image_size). Absent: the tower's own default.
+inline constexpr std::string_view kVisionImageSize = "vision.image_size";
+// int: the pixel-count bounds a Qwen-VL processor resizes a still
+// picture into -- preprocessor_config.json `size.shortest_edge` /
+// `size.longest_edge`, which that processor spells as AREAS (or its
+// older top-level `min_pixels` / `max_pixels`). Absent: the tower's own
+// defaults.
+inline constexpr std::string_view kVisionMinPixels = "vision.min_pixels";
+inline constexpr std::string_view kVisionMaxPixels = "vision.max_pixels";
+// int: the same for a clip, from video_preprocessor_config.json -- a
+// budget the frame count multiplies into.
+inline constexpr std::string_view kVisionVideoMinPixels =
+    "vision.video_min_pixels";
+inline constexpr std::string_view kVisionVideoMaxPixels =
+    "vision.video_max_pixels";
+// string: the system message the checkpoint's own chat template puts in
+// when the conversation brings none (Mistral's `default_system_message`),
+// verbatim -- placeholders such as {today} are left for the renderer.
+inline constexpr std::string_view kDefaultSystemPrompt =
+    "default_system_prompt";
+// bool: whether the checkpoint's own chat template takes a reasoning
+// effort (Qwen3.8's `reasoning_effort`; Qwen3.5 and 3.6 -- the same
+// architecture and model_type -- take none). Set whenever a chat
+// template was read (chat_template.jinja, or a GGUF's
+// tokenizer.chat_template); absent, none was, and it is unknown.
+inline constexpr std::string_view kReasoningEffortControl =
+    "reasoning_effort_control";
+// object: the language model's section of config.json exactly as it is
+// spelled -- `text_config` when the LM is nested, else the root -- for a
+// family whose fields the struct has no member for (Qwen3.8-Flash-Next's
+// hyper-connections, n-gram embedding and token indexer). The member
+// names inside are Hugging Face's.
+inline constexpr std::string_view kTextConfig = "text_config";
+// object: config.json's `quantization` section exactly as it is spelled --
+// MLX affine's `bits` and `group_size`, and an entry per module that
+// departs from them (an object of its own, or `false` for a module left
+// unquantized) -- for a family that needs the per-module layout before it
+// reads a tensor (Qwen3.8-Flash-Next picks its kernels' group by it).
+// Absent when the config has none.
+inline constexpr std::string_view kQuantization = "quantization";
+}  // namespace model_config
 
 // Parsed view of a Hugging Face `config.json`. Holds the subset of
 // fields the LLM subsystem cares about; unknown keys are ignored.
@@ -306,6 +364,12 @@ struct ModelConfig {
     std::vector<int>  layer_n_kv_heads;
   };
   Gemma4 gemma4;
+
+  // Anything this struct -- or one of the configs nested in it -- has no
+  // field for: see common/flex-bag.h. A nested config's future field is
+  // a key here, prefixed with its name ("vision.<key>"), because
+  // growing the nested struct would move every member after it.
+  FlexData extra;
 };
 
 // Result of a successful ModelLoader::load(). Tensors are keyed by
@@ -371,5 +435,7 @@ public:
 };
 
 }
+
+VPIPE_API_END
 
 #endif

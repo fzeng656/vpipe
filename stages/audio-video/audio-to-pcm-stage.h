@@ -1,6 +1,7 @@
 #ifndef VIDEO_AUDIO_TO_PCM_STAGE_H
 #define VIDEO_AUDIO_TO_PCM_STAGE_H
 
+#include "common/encoded-segment.h"
 #include "apple-silicon/tensor-beat.h"
 #include "common/ffmpeg-libraries.h"
 #include "common/job.h"
@@ -83,8 +84,19 @@ struct EncodedSegment;
 //                                                   the encoder's
 //                                                   max_source_positions
 //                                                   ceiling.
-//   oport_capacity       (int,   default 4)      -- oport buffer depth
-//                                                   in chunks.
+//   oport_capacity       (int,   default 0)      -- chunks written
+//                                                   ahead of the
+//                                                   slowest reader, at
+//                                                   most: the writer
+//                                                   waits for it
+//                                                   (backpressure). 0:
+//                                                   the default depth,
+//                                                   which never waits
+//                                                   and fails past
+//                                                   2048 -- 65 s of
+//                                                   32 ms chunks a
+//                                                   voice detector has
+//                                                   not read yet.
 //   flush_on_eos         (bool,  default true)   -- emit a partial
 //                                                   chunk on drain
 //                                                   when the source
@@ -132,6 +144,14 @@ public:
   double max_chunk_duration_s() const noexcept { return _max_chunk_duration_s; }
 
 private:
+
+  // Drop the encoder's priming samples at the head of a stream and stop
+  // at its true length, for a source that told us both. `at` / `n` are
+  // the samples just appended to _chunk_buf, `ch` the channel count.
+  void trim_decoded_(std::size_t at, std::size_t n, std::size_t ch,
+                     const EncodedSegment& seg);
+  std::int64_t _out_samples_emitted = 0;   // per source stream
+  unsigned     _trim_part = 0;             // which joined part that counts
   // Decode a single AAC frame's worth of bytes through the FFmpeg
   // decoder + swresample pipeline; appends mono-f32-at-output_sr
   // samples to `_chunk_buf`. Returns false on hard decoder error;
@@ -144,9 +164,12 @@ private:
   // Returns true on success.
   bool ensure_decoder_(const EncodedSegment& seg);
   // (Re-)allocate the swr context when input format changes.
+  // `in_layout` is the frame's own channel layout (may be null): taken
+  // past two channels where it is well-formed (ffmpeg_channel_layout).
   bool ensure_resampler_(int             in_sample_rate,
                          int             in_channels,
-                         enum AVSampleFormat in_fmt);
+                         enum AVSampleFormat in_fmt,
+                         const AVChannelLayout* in_layout);
   void teardown_decoder_();
   void teardown_resampler_();
 
@@ -173,12 +196,42 @@ private:
   int             _last_in_channels     = 0;
   enum AVSampleFormat _last_in_sample_fmt = AV_SAMPLE_FMT_NONE;
 
-  // Rolling chunk buffer (mono f32 at _output_sample_rate).
+  int      _channels = 1;
+
+  // Rolling chunk buffer: PACKED f32 at _output_sample_rate, so
+  // `_channels` floats per sample frame. The de-interleave to the planar
+  // [2, N] the oport promises happens once, at emit.
   std::vector<float> _chunk_buf;
+  // Sample frames currently buffered -- floats / channels. The chunk
+  // boundaries are seconds, so they count frames and never floats.
+  std::size_t chunk_frames_() const
+  {
+    return _channels > 0 ? _chunk_buf.size() / (std::size_t)_channels : 0;
+  }
   // UTC microseconds of the FIRST sample in `_chunk_buf`. Set on the
-  // first appended packet of a chunk; reset to 0 after emit.
+  // first appended packet of a chunk; after an emit it advances to the
+  // first RETAINED sample (see `_chunk_overlap_s`), or resets to 0 when
+  // nothing is retained.
   std::uint64_t      _chunk_first_ts_us = 0;
   bool               _chunk_has_ts      = false;
+
+  // Seconds of the emitted chunk kept in the buffer so the NEXT chunk
+  // begins with them. 0 (the default) is the old behaviour exactly: the
+  // buffer is cleared and consecutive chunks share no samples.
+  double             _chunk_overlap_s   = 0.0;
+  // The overlap in sample frames, clamped to what was emitted. Zero
+  // when there is no overlap, which is the path that clears.
+  std::size_t overlap_frames_(std::size_t emitted) const
+  {
+    if (_chunk_overlap_s <= 0.0 || _output_sample_rate <= 0) { return 0; }
+    const std::size_t want = (std::size_t)(_chunk_overlap_s
+                                           * _output_sample_rate);
+    // Never the whole chunk: retaining everything would leave the
+    // buffer at or past the emit threshold with no new samples, and the
+    // stage would emit the same window forever. The ctor refuses an
+    // overlap >= chunk_duration_s, so this is the belt to that braces.
+    return want >= emitted ? (emitted > 0 ? emitted - 1 : 0) : want;
+  }
 
   // Bookkeeping for test / log.
   std::uint64_t      _chunks_emitted    = 0;

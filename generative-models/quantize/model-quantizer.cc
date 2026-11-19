@@ -1,5 +1,8 @@
 #include "generative-models/quantize/model-quantizer.h"
 
+#include "apple-silicon/metal-compute/command-stream.h"
+#include "apple-silicon/metal-compute/compute-encoder.h"
+#include "apple-silicon/metal-compute/compute-library.h"
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
@@ -7,6 +10,7 @@
 #include "interfaces/ui-delegate-intf.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/quantize/affine-quantizer.h"
+#include "generative-models/quantize/quant-source.h"
 #include "generative-models/quantize/safetensors-writer.h"
 #include "generative-models/minimax-h3/metal-minimax-h3-transformer.h"
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
@@ -59,6 +63,42 @@ narrow_f32_bf16_(metal_compute::MetalCompute* mc,
     d[i] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
   }
   return out;
+}
+
+// bf16 [N, K] -> affine w8 group-64 with BF16 scales and biases, the codes
+// fit to the rounded pair: the kernel a bf16 model's in-memory w8 build
+// runs (affine_quant_rows_w8g64, bf16 library), so a pack written this way
+// holds exactly what that model would have built. False on any failure.
+bool
+quant_rows_bf16_(metal_compute::MetalCompute* mc,
+                 const metal_compute::SharedBuffer& in, int N, int K,
+                 metal_compute::SharedBuffer& w, metal_compute::SharedBuffer& s,
+                 metal_compute::SharedBuffer& b)
+{
+  if (mc == nullptr || K % 64 != 0 || N <= 0) { return false; }
+  metal_compute::ComputeLibrary lib = mc->load_library("affine_dequant_bf16");
+  metal_compute::ComputeFunction fn = lib.function("affine_quant_rows_w8g64");
+  if (!fn.valid()) { return false; }
+  w = mc->make_shared_buffer((std::size_t)N * K);
+  s = mc->make_shared_buffer((std::size_t)N * (K / 64) * 2);
+  b = mc->make_shared_buffer((std::size_t)N * (K / 64) * 2);
+  if (w.empty() || s.empty() || b.empty()) { return false; }
+  metal_compute::CommandStream st = mc->make_command_stream();
+  {
+    metal_compute::ComputeEncoder enc = st.begin_compute();
+    const int one = 1, zero = 0;
+    enc.set_function(fn);
+    enc.set_buffer(0, in);
+    enc.set_buffer(1, w);
+    enc.set_buffer(2, s);
+    enc.set_buffer(3, b);
+    enc.set_constant(4, K);
+    enc.set_constant(5, N);
+    enc.set_constant(6, one);
+    enc.set_constant(7, zero);
+    enc.dispatch({(unsigned)(K / 64), (unsigned)N, 1}, {32, 8, 1});
+  }
+  return st.commit().wait_ok();
 }
 
 }  // namespace
@@ -278,6 +318,88 @@ load_calib_(const std::string& dir, const std::string& tap, int nL, int ch)
   return v;
 }
 
+// Write the output's config.json: the source's own, the one a translated
+// layout synthesized (a native Krea-2 file has none), or the one a
+// Comfy-Org single-file component carries in its `__metadata__`.
+// `quantized` adds the top-level `quantization` block the loaders read to
+// decide the checkpoint is affine; a dense pass must not have one.
+bool
+write_output_config_(const std::string& in_dir, const std::string& out_dir,
+                     const QuantSource& src, const QuantizeOptions& opt,
+                     bool quantized, std::string* err)
+{
+  namespace fs = std::filesystem;
+  auto fail = [&](const std::string& m) { if (err) { *err = m; }
+                                          return false; };
+  FlexData cfg;
+  std::error_code fe;
+  if (src.config() != nullptr) {
+    cfg = *src.config();
+  } else if (fs::is_regular_file(fs::path(in_dir), fe) && !fe) {
+    // A Comfy-Org single-file source: there is no config.json to copy,
+    // the config lives in the safetensors `__metadata__`. Lift it out
+    // and write it as one, so the output is an ordinary directory
+    // checkpoint that every loader here already reads.
+    //
+    // `qkv_per_head` is the part that MUST survive: Comfy-Org's
+    // MiniMax-H3 conversion reorders the fused qkv projection, this
+    // pass copies that order through verbatim, and the tensor names
+    // and shapes are the same either way -- so an output that does not
+    // SAY which order it is in gets read as the released one and
+    // computes nonsense. Recording it is what keeps a quantized
+    // Comfy-Org DiT loadable at all.
+    if (!comfy_output_config(in_dir, cfg, err)) { return false; }
+  } else {
+    std::string cfg_txt;
+    const std::string cfg_in = (fs::path(in_dir) / "config.json").string();
+    if (!read_file_(cfg_in, &cfg_txt)) {
+      return fail("model-quantize: cannot read config.json");
+    }
+    try { cfg = FlexData::from_json(cfg_txt); }
+    catch (...) { return fail("model-quantize: bad config.json"); }
+    if (!cfg.is_object()) {
+      return fail("model-quantize: config not object");
+    }
+  }
+  if (quantized) {
+    FlexData qb = FlexData::make_object();
+    {
+      auto o = qb.as_object();
+      o.insert_or_assign("group_size", FlexData::make_int(opt.group));
+      o.insert_or_assign("bits", FlexData::make_int(opt.bits));
+    }
+    cfg.as_object().insert_or_assign("quantization", std::move(qb));
+  }
+  if (!opt.component_tag.empty()) {
+    cfg.as_object().insert_or_assign(
+        "_vpipe_component", FlexData::make_string(opt.component_tag));
+  }
+  if (!write_file_((fs::path(out_dir) / "config.json").string(),
+                   cfg.to_json(true))) {
+    return fail("model-quantize: cannot write config.json");
+  }
+  return true;
+}
+
+// Copy sidecar files (tokenizer, processor, etc.) -- everything that is
+// not a weight file or config.json (already rewritten). A single-file
+// source has no sidecars, and iterating it as a directory would fail.
+void
+copy_sidecars_(const std::string& in_dir, const std::string& out_dir)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (!fs::is_directory(fs::path(in_dir), ec)) { return; }
+  for (const auto& de : fs::directory_iterator(in_dir, ec)) {
+    if (!de.is_regular_file()) { continue; }
+    const std::string fn = de.path().filename().string();
+    if (fn == "config.json" || fn.find(".safetensors") != std::string::npos) {
+      continue;
+    }
+    fs::copy_file(de.path(), fs::path(out_dir) / fn,
+                  fs::copy_options::overwrite_existing, ec);
+  }
+}
 
 }  // namespace
 
@@ -291,9 +413,14 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                                           return false; };
 
   if (_mc == nullptr) { return fail("model-quantize: null MetalCompute"); }
-  if ((opt.bits != 4 && opt.bits != 8) ||
-      (opt.group != 32 && opt.group != 64)) {
-    return fail("model-quantize: bits must be 4|8, group 32|64");
+  const bool dense = opt.bits == 16;
+  if (!dense && ((opt.bits != 4 && opt.bits != 8) ||
+                 (opt.group != 32 && opt.group != 64))) {
+    return fail("model-quantize: bits must be 4|8 (or 16), group 32|64");
+  }
+  if (dense && (opt.mixed || opt.smoothquant || opt.dit_awq)) {
+    return fail("model-quantize: bits=16 quantizes nothing, so mixed / awq "
+                "do not apply");
   }
   if (opt.mixed && (opt.bits != 4 || opt.high_bits != 8 || opt.group != 64)) {
     // The mixed-affine decode kernels are w4g64 + w8g64 only.
@@ -305,12 +432,40 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   vpipe::UiProgress bar;
   if (S) { bar = S->open_progress("quantize"); }
   AffineQuantizer q(_mc);
+  // How every quantized tensor's scales are written (QuantizeOptions::
+  // run_dtype), and in which dtype.
+  using Scales = AffineQuantizer::Scales;
+  const Scales sc = opt.run_dtype == QuantizeOptions::RunDtype::kBf16
+                        ? Scales::kFitBf16
+                    : opt.run_dtype == QuantizeOptions::RunDtype::kF16
+                        ? Scales::kFitF16
+                        : Scales::kF16;
+  const char* sdt = AffineQuantizer::scale_dtype(sc);
   if (!q.valid()) {
     return fail("model-quantize: affine quant kernels unavailable");
   }
-  auto src = MetalLlamaWeights::open_model(in_dir);
-  if (!src.has_value()) {
-    return fail("model-quantize: cannot open source model: " + in_dir);
+  // Through QuantSource, not MetalLlamaWeights directly: it decodes FP8
+  // tensors to BF16 and presents a native-layout checkpoint under the
+  // names below, so none of this function has to know about either.
+  std::string open_err;
+  auto src = QuantSource::open(in_dir, &open_err);
+  if (!src.has_value()) { return fail(open_err); }
+  if (S != nullptr && (src->n_fp8() > 0 || !src->layout().empty())) {
+    S->info(fmt(
+        "model-quantize: source {}{}{}{}", in_dir,
+        src->layout().empty() ? std::string()
+                              : " is a " + src->layout() + " checkpoint",
+        src->n_fp8() > 0
+            ? (src->n_scaled() > 0
+                   ? fmt("; {} FP8 tensors read as BF16, {} of them scaled",
+                         src->n_fp8(), src->n_scaled())()
+                   : fmt("; {} FP8 tensors read as BF16 (exact)",
+                         src->n_fp8())())
+            : std::string(),
+        src->n_ignored() > 0
+            ? fmt("; {} tensors outside the DiT ignored",
+                  src->n_ignored())()
+            : std::string()));
   }
 
   std::error_code ec;
@@ -337,6 +492,66 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     }
   }
 
+  // ---- bits = 16: DENSE. Quantize nothing -------------------------------
+  // Every tensor is written as the source view presents it: an FP8 one as
+  // the BF16 it decodes to exactly, everything else byte for byte. What
+  // this is for is the FP8 checkpoint that has to become an ordinary one
+  // -- a dequantization, not a rounding -- and the native-layout file
+  // that has to become a diffusers-named directory; a source that is
+  // neither comes out as a copy.
+  //
+  // An AFFINE-quantized source is refused: its codes would pass through
+  // as codes, and an output called dense that is still 4-bit is worse
+  // than no output.
+  if (dense) {
+    std::vector<std::string> dn = src->tensor_names();
+    std::sort(dn.begin(), dn.end());
+    for (const auto& name : dn) {
+      const std::string kSc = ".scales";
+      if (name.size() > kSc.size() &&
+          name.compare(name.size() - kSc.size(), kSc.size(), kSc) == 0) {
+        const auto* w = src->info(name.substr(0, name.size() - kSc.size()) +
+                                  ".weight");
+        if (w != nullptr && w->dtype == "U32") {
+          return fail("model-quantize: bits=16 writes a dense checkpoint, "
+                      "and '" + in_dir + "' is already affine-quantized ('" +
+                      name + "') -- dequantizing affine codes back is not "
+                      "supported");
+        }
+      }
+    }
+    if (S) {
+      S->log_normal(fmt("model-quantize: {} tensors -> dense ({} -> {})",
+                        dn.size(), in_dir, out_dir));
+    }
+    SafetensorsWriter dwr(out_dir, opt.shard_max_bytes);
+    std::size_t done = 0;
+    for (const auto& name : dn) {
+      if (stop()) { return fail("model-quantize: stopped"); }
+      const auto* ti = src->info(name);
+      SharedBuffer in = src->load(name, _mc);
+      if (ti == nullptr || in.empty()) {
+        return fail("model-quantize: load failed: " + name);
+      }
+      if (!dwr.add(name, ti->dtype, ti->shape, in.contents(), ti->nbytes)) {
+        return fail("model-quantize: write failed: " + name);
+      }
+      ++done;
+      bar.update((std::uint64_t)done, (std::uint64_t)dn.size(), "dense");
+    }
+    bar.finish();
+    if (!dwr.close()) { return fail("model-quantize: finalize shards failed"); }
+    if (!write_output_config_(in_dir, out_dir, *src, opt, false, err)) {
+      return false;
+    }
+    copy_sidecars_(in_dir, out_dir);
+    if (S) {
+      S->info(fmt("model-quantize: {} -> {} (dense): {} tensors, {} decoded "
+                  "from FP8", in_dir, out_dir, dn.size(), src->n_fp8()));
+    }
+    return true;
+  }
+
   std::unordered_set<std::string> quant_set;
   for (const auto& s :
        (opt.quant_linears.empty() ? default_quant_linears()
@@ -356,8 +571,13 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
   std::sort(names.begin(), names.end());
   if (S) {
     S->log_normal(fmt(
-        "model-quantize: {} tensors -> {}-bit g{} ({} -> {})",
-        names.size(), opt.bits, opt.group, in_dir, out_dir));
+        "model-quantize: {} tensors -> {}-bit g{}, scales {} ({} -> {})",
+        names.size(), opt.bits, opt.group,
+        sc == Scales::kFitBf16  ? "BF16 fit for a bf16 run"
+        : sc == Scales::kFitF16 ? "F16 fit for an f16 run"
+        : opt.bf16_scales       ? "F16 (BF16 where the w8 build applies)"
+                                : "F16",
+        in_dir, out_dir));
   }
 
   SafetensorsWriter wr(out_dir, opt.shard_max_bytes);
@@ -416,16 +636,16 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     for (std::size_t i = 0; i < W.size(); ++i) { d[i] = (_Float16)W[i]; }
     SharedBuffer w, s, b;
     if (!q.quantize_linear(in, false, N, K, bits, opt.group, opt.clip,
-                           w, s, b)) {
+                           w, s, b, sc)) {
       return false;
     }
     const std::int64_t wcols = (std::int64_t)K * bits / 32;
     const std::int64_t gcols = (std::int64_t)K / opt.group;
     return wr.add(pfx + ".weight", "U32", {N, wcols}, w.contents(),
                   w.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {N, gcols}, s.contents(),
+           wr.add(pfx + ".scales", sdt, {N, gcols}, s.contents(),
                   s.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {N, gcols}, b.contents(),
+           wr.add(pfx + ".biases", sdt, {N, gcols}, b.contents(),
                   b.byte_size());
   };
   auto norm_write = [&](const std::string& nm, const std::vector<float>& v)
@@ -577,6 +797,15 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                                     RS);
       layer_gain[(std::size_t)L] += std::max(e_lo - e_hi, 0.0f);
       layer_names[(std::size_t)L].push_back(name);
+    }
+    // A prefix that matches no tensor ranks NOTHING: every gain is 0, no
+    // layer is promoted, and the pack comes out uniform under a log line
+    // that calls it mixed. Refuse rather than write that.
+    std::size_t ranked = 0;
+    for (const auto& v : layer_names) { ranked += v.size(); }
+    if (ranked == 0) {
+      return fail("mixed: no quantizable linear under layer_prefix '" +
+                  opt.layer_prefix + "'");
     }
     std::vector<int> order((std::size_t)opt.n_layers);
     for (int L = 0; L < opt.n_layers; ++L) { order[(std::size_t)L] = L; }
@@ -1233,6 +1462,24 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                                                  : dtype_raw;
     SharedBuffer w, s, b;
     bool ok;
+    const bool bf16_fit =
+        sc == Scales::kFitBf16 ||
+        (sc == Scales::kF16 && opt.bf16_scales);
+    if (bf16_fit && bits == 8 && opt.group == 64 && dtype == "BF16" &&
+        col_scale == nullptr) {
+      // The in-memory w8 build's own kernel (bf16 library): bf16 scales,
+      // codes fit to them -- the arithmetic of affine_quant_fit_*'s, rows
+      // in place. See QuantizeOptions::bf16_scales / run_dtype.
+      if (!quant_rows_bf16_(_mc, in, N, K, w, s, b)) { return false; }
+      const std::int64_t wcols = (std::int64_t)K / 4;
+      const std::int64_t gcols = (std::int64_t)K / 64;
+      return wr.add(pfx + ".weight", "U32", {N, wcols}, w.contents(),
+                    w.byte_size()) &&
+             wr.add(pfx + ".scales", "BF16", {N, gcols}, s.contents(),
+                    s.byte_size()) &&
+             wr.add(pfx + ".biases", "BF16", {N, gcols}, b.contents(),
+                    b.byte_size());
+    }
     if (col_scale != nullptr) {
       SharedBuffer f = _mc->make_shared_buffer((std::size_t)N * K * 2);
       if (f.empty()) { return false; }
@@ -1256,19 +1503,19 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
         }
       }
       ok = q.quantize_linear(f, false, N, K, bits, opt.group, opt.clip,
-                             w, s, b);
+                             w, s, b, sc);
     } else {
       ok = q.quantize_linear(in, dtype == "BF16", N, K, bits, opt.group,
-                             opt.clip, w, s, b);
+                             opt.clip, w, s, b, sc);
     }
     if (!ok) { return false; }
     const std::int64_t wcols = (std::int64_t)K * bits / 32;
     const std::int64_t gcols = (std::int64_t)K / opt.group;
     return wr.add(pfx + ".weight", "U32", {N, wcols}, w.contents(),
                   w.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {N, gcols}, s.contents(),
+           wr.add(pfx + ".scales", sdt, {N, gcols}, s.contents(),
                   s.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {N, gcols}, b.contents(),
+           wr.add(pfx + ".biases", sdt, {N, gcols}, b.contents(),
                   b.byte_size());
   };
 
@@ -1518,7 +1765,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
                   (std::size_t)rows * K * 2);
       SharedBuffer w, s, b;
       if (!q.quantize_linear(slab, /*src_bf16=*/true, rows, K, bits, opt.group,
-                             opt.clip, w, s, b)) {
+                             opt.clip, w, s, b, sc)) {
         return false;
       }
       std::memcpy((char*)W.contents() + (std::size_t)e * we,
@@ -1530,9 +1777,9 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     }
     return wr.add(pfx + ".weight", "U32", {E, rows, wcols}, W.contents(),
                   W.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {E, rows, gcols}, S.contents(),
+           wr.add(pfx + ".scales", sdt, {E, rows, gcols}, S.contents(),
                   S.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {E, rows, gcols}, B.contents(),
+           wr.add(pfx + ".biases", sdt, {E, rows, gcols}, B.contents(),
                   B.byte_size());
   };
   // As quant_experts, but each expert's f32 [rows,K] slab is produced by a
@@ -1561,7 +1808,7 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
       for (std::size_t i = 0; i < tmp.size(); ++i) { sd[i] = (_Float16)tmp[i]; }
       SharedBuffer w, s, b;
       if (!q.quantize_linear(slab, /*src_bf16=*/false, rows, K, bits,
-                             opt.group, opt.clip, w, s, b)) {
+                             opt.group, opt.clip, w, s, b, sc)) {
         return false;
       }
       std::memcpy((char*)W.contents() + (std::size_t)e * we,
@@ -1573,9 +1820,9 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
     }
     return wr.add(pfx + ".weight", "U32", {E, rows, wcols}, W.contents(),
                   W.byte_size()) &&
-           wr.add(pfx + ".scales", "F16", {E, rows, gcols}, S.contents(),
+           wr.add(pfx + ".scales", sdt, {E, rows, gcols}, S.contents(),
                   S.byte_size()) &&
-           wr.add(pfx + ".biases", "F16", {E, rows, gcols}, B.contents(),
+           wr.add(pfx + ".biases", sdt, {E, rows, gcols}, B.contents(),
                   B.byte_size());
   };
   // Quantize a 2D fp linear [N,K] at a forced bit width (router mlp.gate +
@@ -1959,66 +2206,10 @@ ModelQuantizer::run(const std::string& in_dir, const std::string& out_dir,
 
   // Rewrite config.json with the top-level quantization block (the loader
   // reads outer.quantization.{bits,group_size}); copy everything else.
-  {
-    FlexData cfg;
-    std::error_code fe;
-    if (fs::is_regular_file(fs::path(in_dir), fe) && !fe) {
-      // A Comfy-Org single-file source: there is no config.json to copy,
-      // the config lives in the safetensors `__metadata__`. Lift it out
-      // and write it as one, so the output is an ordinary directory
-      // checkpoint that every loader here already reads.
-      //
-      // `qkv_per_head` is the part that MUST survive: Comfy-Org's
-      // MiniMax-H3 conversion reorders the fused qkv projection, this
-      // pass copies that order through verbatim, and the tensor names
-      // and shapes are the same either way -- so an output that does not
-      // SAY which order it is in gets read as the released one and
-      // computes nonsense. Recording it is what keeps a quantized
-      // Comfy-Org DiT loadable at all.
-      if (!comfy_output_config(in_dir, cfg, err)) { return false; }
-    } else {
-      std::string cfg_txt;
-      const std::string cfg_in = (fs::path(in_dir) / "config.json").string();
-      if (!read_file_(cfg_in, &cfg_txt)) {
-        return fail("model-quantize: cannot read config.json");
-      }
-      try { cfg = FlexData::from_json(cfg_txt); }
-      catch (...) { return fail("model-quantize: bad config.json"); }
-      if (!cfg.is_object()) {
-        return fail("model-quantize: config not object");
-      }
-    }
-    FlexData qb = FlexData::make_object();
-    {
-      auto o = qb.as_object();
-      o.insert_or_assign("group_size", FlexData::make_int(opt.group));
-      o.insert_or_assign("bits", FlexData::make_int(opt.bits));
-    }
-    cfg.as_object().insert_or_assign("quantization", std::move(qb));
-    if (!opt.component_tag.empty()) {
-      cfg.as_object().insert_or_assign(
-          "_vpipe_component", FlexData::make_string(opt.component_tag));
-    }
-    if (!write_file_((fs::path(out_dir) / "config.json").string(),
-                     cfg.to_json(true))) {
-      return fail("model-quantize: cannot write config.json");
-    }
+  if (!write_output_config_(in_dir, out_dir, *src, opt, true, err)) {
+    return false;
   }
-
-  // Copy sidecar files (tokenizer, processor, etc.) -- everything that is
-  // not a weight file or config.json (already rewritten). A single-file
-  // source has no sidecars, and iterating it as a directory would fail.
-  if (fs::is_directory(fs::path(in_dir), ec)) {
-    for (const auto& de : fs::directory_iterator(in_dir, ec)) {
-      if (!de.is_regular_file()) { continue; }
-      const std::string fn = de.path().filename().string();
-      if (fn == "config.json" || fn.find(".safetensors") != std::string::npos) {
-        continue;
-      }
-      fs::copy_file(de.path(), fs::path(out_dir) / fn,
-                    fs::copy_options::overwrite_existing, ec);
-    }
-  }
+  copy_sidecars_(in_dir, out_dir);
 
   if (_mc->session() != nullptr) {
     _mc->session()->info(fmt(

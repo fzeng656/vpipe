@@ -1,17 +1,26 @@
 #include "generative-models/minimax-h3/minimax-h3-text-encoder.h"
 
-#include "generative-models/shared/stream-pin.h"
+#include "generative-models/shared/stream-sizing.h"
 
 #include "common/flex-data.h"
 #include "common/vpipe-format.h"
 #include "generative-models/context-manager.h"
 #include "generative-models/minimax-h3/minimax-h3-layout.h"
+#include "generative-models/minimax-h3/p-h3-image.h"
 #include "generative-models/llama3/metal-llama-weights.h"
 #include "generative-models/shared/comfy-checkpoint.h"
+#include "generative-models/shared/fp8-expand.h"
+#include "generative-models/shared/fp8-layout.h"
+#include "generative-models/shared/fp8.h"
 #include "generative-models/tokenizer.h"
 #include "generative-models/weight-set.h"
 #include "interfaces/session-context-intf.h"
 
+#define ACCELERATE_NEW_LAPACK
+#include <Accelerate/Accelerate.h>
+
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -92,6 +101,27 @@ h3_vision_defaults_(MetalQwenVisionEncoder::Config& v)
 // The file is also PRUNED to the tap: 50 layers, not 64. So the layer
 // count read here is both `total_layers` and `tap` -- there is nothing
 // past it to tap at.
+// A single file of the encoder ComfyUI's tooling wrote WITHOUT the tap
+// in its header -- Comfy-Org's NVFP4 AWQ repack carries no __metadata__
+// at all -- told by its tensors: the text stack under "model.", its
+// vision tower under "visual.", no config beside it.
+bool
+comfy_te_by_shape_(const std::string& path)
+{
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec) ||
+      fs::path(path).extension() != ".safetensors" ||
+      fs::exists(fs::path(path).parent_path() / "config.json", ec)) {
+    return false;
+  }
+  auto w = MetalLlamaWeights::open(path);
+  return w.has_value() && w->has("model.embed_tokens.weight") &&
+         w->has("model.layers.0.self_attn.q_proj.weight") &&
+         w->has("model.layers.0.self_attn.q_norm.weight") &&
+         w->has("visual.patch_embed.proj.weight");
+}
+
 bool
 comfy_config_(const std::string& file, MiniMaxH3TextEncoder::Config& out,
               std::string* err)
@@ -153,6 +183,76 @@ comfy_config_(const std::string& file, MiniMaxH3TextEncoder::Config& out,
   return true;
 }
 
+// P-H3-Image's connector beside the encoder (`text_connector/`, a
+// PH3ImageTextConnector): the taps it reads and the width it writes. No
+// such directory is no connector -- MiniMax-H3's own conditioning -- and
+// true; a connector this encoder cannot feed is false, with `err`.
+bool
+connector_config_(const std::filesystem::path& cd,
+                  MiniMaxH3TextEncoder::Config& out, std::string* err)
+{
+  auto fail = [&](std::string m) {
+    if (err != nullptr) { *err = std::move(m); }
+    return false;
+  };
+  std::ifstream in(cd / "config.json");
+  if (!in) { return true; }
+  FlexData cfg;
+  try {
+    cfg = FlexData::from_json(in);
+  } catch (...) {
+    return fail("cannot parse " + (cd / "config.json").string());
+  }
+  if (!cfg.is_object()) { return true; }
+  auto o = cfg.as_object();
+  {
+    const FlexData c =
+        o.contains("_class_name") ? o.at("_class_name") : FlexData();
+    if (!c.is_string() || c.as_string("") != ph3::kConnectorClass) {
+      return true;
+    }
+  }
+  std::vector<int> taps = {13, 19, 25, 31, 36};   // the class's default
+  if (o.contains("hidden_state_indices")) {
+    FlexData a = o.at("hidden_state_indices");
+    if (a.is_array()) {
+      taps.clear();
+      for (auto e : a.as_array()) { taps.push_back((int)e.as_int(-1)); }
+    }
+  }
+  const int hidden = o.contains("text_hidden_size")
+                         ? (int)o.at("text_hidden_size").as_int(0)
+                         : out.lm.hidden;
+  const int width = o.contains("out_channels")
+                        ? (int)o.at("out_channels").as_int(0)
+                        : 5120;
+  if (taps.empty() || hidden != out.lm.hidden || width <= 0) {
+    return fail(cd.string() + ": the connector reads " +
+                std::to_string(taps.size()) + " taps of " +
+                std::to_string(hidden) + " where the encoder is " +
+                std::to_string(out.lm.hidden) + " wide");
+  }
+  for (std::size_t i = 0; i < taps.size(); ++i) {
+    const int t = taps[i];
+    // 0 is the embedding output, which the taps forward does not give;
+    // the forward takes its layers in order, once each.
+    if (i > 0 && t <= taps[i - 1]) {
+      return fail(cd.string() + ": the connector's taps are not strictly "
+                  "increasing");
+    }
+    if (t < 1 || t > out.total_layers) {
+      return fail(cd.string() + ": tap " + std::to_string(t) +
+                  " is outside the encoder's 1 .. " +
+                  std::to_string(out.total_layers));
+    }
+  }
+  out.taps      = taps;
+  out.tap       = *std::max_element(taps.begin(), taps.end());
+  out.text_dim  = width;
+  out.connector = cd.string();
+  return true;
+}
+
 }  // namespace
 
 std::size_t
@@ -173,9 +273,20 @@ MiniMaxH3TextEncoder::streaming_floor_bytes(const std::string& enc_dir)
   // at 64201 MB -- a peak reported against a graph that then ran to
   // completion, because the encoder had been streaming its layers all
   // along.
+  // And a third spelling, the bare `language_model.layers.` of the
+  // Qwen3-VL / Qwen3.5 encoders Krea-2 and MOSS-Image ship: matching
+  // neither of the above gave both NO floor, so their encoders -- which
+  // always stream their layers -- were planned whole (MOSS-Image's 16 GB
+  // against a ~2.8 GB floor put a 16 GB box's conditioning phase over
+  // its RAM).
+  //
+  // The floor the LOADER keeps, which depends on how it streams: a stack
+  // the raw-source path serves holds a slot pair of sources and products,
+  // anything else the prefill path's layer at a time
+  // (MetalQwenModel::stream_floor_bytes).
   for (const char* stem : {"model.language_model.layers.",
-                           "model.layers."}) {
-    const std::size_t f = stream_floor_bytes(*wts, stem);
+                           "model.layers.", "language_model.layers."}) {
+    const std::size_t f = MetalQwenModel::stream_floor_bytes(*wts, stem);
     if (f > 0) { return f; }
   }
   return 0;
@@ -239,7 +350,8 @@ MiniMaxH3TextEncoder::config_from_json(const std::string& enc_dir, Config& out,
   // The Comfy-Org single file: no config.json, and its `__metadata__`
   // carries only the tap -- so the geometry is measured off the tensor
   // shapes instead. See comfy_config_.
-  if (comfy::is_component(dir.string(), kComfyKey)) {
+  if (comfy::is_component(dir.string(), kComfyKey) ||
+      comfy_te_by_shape_(dir.string())) {
     MiniMaxH3TextEncoder::Config c;
     if (!comfy_config_(dir.string(), c, err)) { return false; }
     // The invariant fields, shared with the diffusers path below: a
@@ -334,6 +446,11 @@ MiniMaxH3TextEncoder::config_from_json(const std::string& enc_dir, Config& out,
       if (b == 4 || b == 8) { c.quant_bits = b; out.quantized = true; }
     }
   }
+  // P-H3-Image: a connector beside the encoder names its taps (and the
+  // width the DiT reads). The encoder is a stock Qwen3-VL either way.
+  if (!connector_config_(dir.parent_path() / "text_connector", out, err)) {
+    return false;
+  }
   if (out.tap <= 0 || out.tap > out.total_layers) {
     return fail("tap layer " + std::to_string(out.tap) + " is outside the "
                 "checkpoint's " + std::to_string(out.total_layers) +
@@ -387,7 +504,8 @@ MiniMaxH3TextEncoder::load_vision(const std::string& enc_dir, MetalCompute* mc,
     return nullptr;
   };
   if (mc == nullptr) { return fail("no metal compute"); }
-  const std::string dir = resolve_encoder_dir(enc_dir);
+  const std::string dir =
+      cfg.weights.empty() ? resolve_encoder_dir(enc_dir) : cfg.weights;
   auto ws = WeightSet::open(dir, mc->session());
   if (!ws) { return fail("cannot open " + dir); }
 
@@ -429,7 +547,8 @@ MiniMaxH3TextEncoder::load(const std::string& enc_dir, MetalCompute* mc,
   }
   m->_cfg.lm.n_layers = m->_cfg.tap;
 
-  m->_ws = open_weight_set(dir, session);
+  m->_ws = open_weight_set(cfg.weights.empty() ? dir : cfg.weights,
+                           session);
   if (!m->_ws) { return nullptr; }
   m->_lm = MetalQwenModel::load(m->_ws, mc, m->_cfg.lm);
   if (!m->_lm) { return nullptr; }
@@ -439,9 +558,64 @@ MiniMaxH3TextEncoder::load(const std::string& enc_dir, MetalCompute* mc,
   // shares the bytes rather than mapping a second copy. Two spellings:
   // the diffusers checkpoint nests the text stack under
   // `model.language_model.`, Comfy-Org's conversion drops that segment.
+  //
+  // Its rows are copied straight into the backbone's bf16 input, so the
+  // table must BE bf16: a Draw Things .ckpt stores f16, whose rows read
+  // as bf16 are noise. Such a table is converted once (rounded; the f16
+  // came from a bf16 original, so this gives that original back).
   for (const char* nm : {"model.language_model.embed_tokens.weight",
                          "model.embed_tokens.weight"}) {
-    m->_embed = m->_ws->tensor(nm, mc, WeightSet::Residency::Copied);
+    const auto* ti = m->_ws->src().info(nm);
+    if (ti == nullptr) { continue; }
+    if (ti->dtype == "BF16") {
+      m->_embed = m->_ws->tensor(nm, mc, WeightSet::Residency::Copied);
+    } else if (ti->dtype == "I8" || ti->dtype == "U8" ||
+               fp8::format_of(ti->dtype) != fp8::Format::kNone) {
+      // ComfyUI's int8 table (a record, a scale a row: the NVFP4 AWQ
+      // repack's) or FP8: decoded once, to the bf16 a dense conversion of
+      // the file holds.
+      WeightSet& ws = *m->_ws;
+      m->_embed = ws.derived(std::string(kComfyKey) + "/embed-bf16/" + nm,
+                             [&]() -> SharedBuffer {
+        const std::size_t n = fp8::logical_numel(ws.src(), nm);
+        SharedBuffer out = mc->make_shared_buffer(n * 2);
+        if (out.empty() ||
+            !fp8::decode_tensor_bf16(
+                ws.src(), nm, static_cast<std::uint16_t*>(out.contents()), n,
+                nullptr)) {
+          return {};
+        }
+        return out;
+      });
+    } else if (ti->dtype == "F16" || ti->dtype == "F32") {
+      WeightSet& ws = *m->_ws;
+      m->_embed = ws.derived(std::string(kComfyKey) + "/embed-bf16/" + nm,
+                             [&]() -> SharedBuffer {
+        SharedBuffer raw = ws.read(nm, mc, WeightSet::Residency::Copied);
+        std::size_t n = 1;
+        for (auto d : ti->shape) { n *= (std::size_t)d; }
+        const bool f32 = ti->dtype == "F32";
+        if (raw.empty() || raw.byte_size() < n * (f32 ? 4 : 2)) { return {}; }
+        SharedBuffer out = mc->make_shared_buffer(n * 2);
+        if (out.empty()) { return {}; }
+        const auto* src = static_cast<const std::uint8_t*>(raw.contents());
+        auto* d = static_cast<std::uint16_t*>(out.contents());
+        for (std::size_t i = 0; i < n; ++i) {
+          float f;
+          if (f32) {
+            std::memcpy(&f, src + i * 4, 4);
+          } else {
+            _Float16 h;
+            std::memcpy(&h, src + i * 2, 2);
+            f = (float)h;
+          }
+          std::uint32_t u;
+          std::memcpy(&u, &f, 4);
+          d[i] = (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+        }
+        return out;
+      });
+    }
     if (!m->_embed.empty()) { break; }
   }
   if (m->_embed.empty()) { return nullptr; }
@@ -479,6 +653,68 @@ MiniMaxH3TextEncoder::load(const std::string& enc_dir, MetalCompute* mc,
     return nullptr;
   }
 
+  // P-H3-Image's connector, every tensor f32 as stored and cached in the
+  // connector's own set (the manager sees them), and the encoder's final
+  // norm when a tap is the normed state -- read, not kept as a tensor:
+  // the normed tap is a host pass.
+  if (!m->_cfg.connector.empty()) {
+    const auto& cc = m->_cfg;
+    m->_conn_ws = open_weight_set(cc.connector, session);
+    if (!m->_conn_ws) { return nullptr; }
+    const std::size_t in = cc.taps.size() * (std::size_t)cc.lm.hidden;
+    const std::size_t outw = (std::size_t)cc.text_dim;
+    auto f32 = [&](const char* nm, std::size_t n) -> SharedBuffer {
+      const auto* ti = m->_conn_ws->src().info(nm);
+      if (ti == nullptr || ti->dtype != "F32" ||
+          (std::size_t)ti->nbytes != n * 4) {
+        if (session != nullptr) {
+          session->warn(fmt("MiniMaxH3TextEncoder: the connector's '{}' is "
+                            "missing or not {} f32 values", nm, n));
+        }
+        return {};
+      }
+      return m->_conn_ws->tensor(nm, mc, WeightSet::Residency::Copied);
+    };
+    m->_in_mean  = f32("input_mean", in);
+    m->_in_std   = f32("input_std", in);
+    m->_proj     = f32("proj.weight", in * outw);
+    m->_out_mean = f32("output_mean", outw);
+    m->_out_std  = f32("output_std", outw);
+    m->_sink     = f32("sink_embedding", outw);
+    if (m->_in_mean.empty() || m->_in_std.empty() || m->_proj.empty() ||
+        m->_out_mean.empty() || m->_out_std.empty() || m->_sink.empty()) {
+      return nullptr;
+    }
+    if (std::find(cc.taps.begin(), cc.taps.end(), cc.total_layers) !=
+        cc.taps.end()) {
+      for (const char* nm : {"model.language_model.norm.weight",
+                             "model.norm.weight"}) {
+        const auto* ti = m->_ws->src().info(nm);
+        if (ti == nullptr) { continue; }
+        SharedBuffer raw = m->_ws->read(nm, mc, WeightSet::Residency::Copied);
+        const std::size_t H = (std::size_t)cc.lm.hidden;
+        if (raw.empty() || ti->dtype != "BF16" || raw.byte_size() < H * 2) {
+          break;
+        }
+        const auto* b = static_cast<const std::uint16_t*>(raw.contents());
+        m->_final_norm.resize(H);
+        for (std::size_t i = 0; i < H; ++i) {
+          const std::uint32_t u = (std::uint32_t)b[i] << 16;
+          std::memcpy(&m->_final_norm[i], &u, 4);
+        }
+        break;
+      }
+      if (m->_final_norm.empty()) {
+        if (session != nullptr) {
+          session->warn(fmt("MiniMaxH3TextEncoder: the connector reads the "
+                            "normed last state and the encoder has no bf16 "
+                            "final norm"));
+        }
+        return nullptr;
+      }
+    }
+  }
+
   if (session != nullptr) {
     session->log_debug(
         fmt("MiniMaxH3TextEncoder: Qwen3-VL hidden {} x {} heads ({} kv), "
@@ -495,7 +731,11 @@ MiniMaxH3TextEncoder::tokenize(std::string_view prompt) const
   if (!_tok) { return {}; }
   // Tokenizer::encode adds no BOS/EOS of its own, which IS the
   // reference's `add_special_tokens=False`.
-  return _tok->encode(prompt);
+  std::vector<std::int32_t> ids = _tok->encode(prompt);
+  if (_cfg.max_tokens > 0 && (int)ids.size() > _cfg.max_tokens) {
+    ids.resize((std::size_t)_cfg.max_tokens);
+  }
+  return ids;
 }
 
 SharedBuffer
@@ -535,15 +775,141 @@ MiniMaxH3TextEncoder::encode_ids(const std::vector<std::int32_t>& ids,
   // The tap is 0-INDEXED over layers; HF's output_hidden_states[k] is
   // the residual after layer k-1. So conditioning on hidden_states[50]
   // means tapping after 0-indexed layer 49.
-  const std::vector<int> taps{_cfg.tap - 1};
+  const std::vector<int> taps = tap_layers_();
   ContextManager* cm = _lm->context_manager();
   if (cm == nullptr) { return fail("encoder has no context manager"); }
   const ContextId cid = cm->acquire_root();
   SharedBuffer h = _lm->forward_embeddings_taps(cid, x, n, taps);
   cm->release(cid);
   if (h.empty()) { return fail("encoder forward failed"); }
-  return h;
+  return finish_(std::move(h), n, err);
 }
+
+std::vector<int>
+MiniMaxH3TextEncoder::tap_layers_() const
+{
+  if (_cfg.taps.empty()) { return {_cfg.tap - 1}; }
+  // HF index t is the output of 0-indexed layer t - 1; the normed state
+  // (t == total_layers) is the last layer's output, normed afterwards.
+  std::vector<int> out;
+  for (int t : _cfg.taps) { out.push_back(t - 1); }
+  return out;
+}
+
+SharedBuffer
+MiniMaxH3TextEncoder::finish_(SharedBuffer h, int n, std::string* err) const
+{
+  if (!has_connector()) { return h; }
+  return connect(h, n, err);
+}
+
+// PH3ImageTextConnector.forward, in its own precision: the taps (bf16,
+// as the encoder emits them) widened to f32 and concatenated per row,
+// standardized, projected by one f32 GEMM, destandardized, the first
+// row replaced by the sink, rounded to bf16 once -- the reference's
+// `.to(text_encoder.dtype)`. The normed tap is the encoder's own
+// Qwen3VLTextRMSNorm: f32 statistics, the normed value rounded to bf16,
+// times the bf16 weight, rounded again. No FMA contraction anywhere a
+// reference op rounds between a multiply and an add.
+#pragma clang fp contract(off)
+SharedBuffer
+MiniMaxH3TextEncoder::connect(const SharedBuffer& taps, int n,
+                              std::string* err) const
+{
+  auto fail = [&](std::string m) -> SharedBuffer {
+    if (err != nullptr) { *err = std::move(m); }
+    return {};
+  };
+  if (!has_connector() || _proj.empty()) {
+    return fail("this encoder has no connector");
+  }
+  const std::size_t T = _cfg.taps.size();
+  const std::size_t H = (std::size_t)_cfg.lm.hidden;
+  const std::size_t IN = T * H, OUT = (std::size_t)_cfg.text_dim;
+  if (n <= 0 || taps.byte_size() < T * (std::size_t)n * H * 2) {
+    return fail("the taps are smaller than " + std::to_string(T) + " x " +
+                std::to_string(n) + " x " + std::to_string(H));
+  }
+  auto bf = [](std::uint16_t b) {
+    const std::uint32_t u = (std::uint32_t)b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+  };
+  auto rne = [](float f) {
+    std::uint32_t u;
+    std::memcpy(&u, &f, 4);
+    return (std::uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+  };
+  const auto* src = static_cast<const std::uint16_t*>(taps.contents());
+  const float eps = _cfg.lm.rms_eps;
+  for (std::size_t t = 0; t < T; ++t) {
+    if (_cfg.taps[t] == _cfg.total_layers && _final_norm.size() != H) {
+      return fail("the normed tap needs the encoder's final norm");
+    }
+  }
+  SharedBuffer out = _mc->make_shared_buffer((std::size_t)n * OUT * 2);
+  if (out.empty()) { return fail("conditioning allocation failed"); }
+  const float* mu = static_cast<const float*>(_in_mean.contents());
+  const float* sd = static_cast<const float*>(_in_std.contents());
+  const float* om = static_cast<const float*>(_out_mean.contents());
+  const float* os = static_cast<const float*>(_out_std.contents());
+  const float* sk = static_cast<const float*>(_sink.contents());
+  auto* d = static_cast<std::uint16_t*>(out.contents());
+  // A BLOCK of rows at a time: the concatenated input is 51 KB a row and
+  // the projection's output 20 KB, so a whole edit presentation (~10k
+  // rows) held at once was ~0.7 GB of host memory no plan books. Rows are
+  // independent; the block changes nothing but the footprint.
+  constexpr int kBlock = 256;
+  std::vector<float> x((std::size_t)kBlock * IN);
+  std::vector<float> y((std::size_t)kBlock * OUT);
+  for (int r0 = 0; r0 < n; r0 += kBlock) {
+    const int nb = std::min(kBlock, n - r0);
+    for (std::size_t t = 0; t < T; ++t) {
+      const bool normed = _cfg.taps[t] == _cfg.total_layers;
+      for (int j = 0; j < nb; ++j) {
+        const std::uint16_t* row =
+            src + (t * (std::size_t)n + (std::size_t)(r0 + j)) * H;
+        float* dst = x.data() + (std::size_t)j * IN + t * H;
+        if (!normed) {
+          for (std::size_t i = 0; i < H; ++i) { dst[i] = bf(row[i]); }
+          continue;
+        }
+        double ss = 0.0;
+        for (std::size_t i = 0; i < H; ++i) {
+          const double v = bf(row[i]);
+          ss += v * v;
+        }
+        const float var = (float)(ss / (double)H);
+        const float rs = 1.0f / std::sqrt(var + eps);
+        for (std::size_t i = 0; i < H; ++i) {
+          const float v = bf(rne(bf(row[i]) * rs));
+          dst[i] = bf(rne(_final_norm[i] * v));
+        }
+      }
+    }
+    for (int j = 0; j < nb; ++j) {
+      float* row = x.data() + (std::size_t)j * IN;
+      for (std::size_t i = 0; i < IN; ++i) {
+        row[i] = (row[i] - mu[i]) / sd[i];
+      }
+    }
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, nb, (int)OUT,
+                (int)IN, 1.0f, x.data(), (int)IN,
+                static_cast<const float*>(_proj.contents()), (int)IN, 0.0f,
+                y.data(), (int)OUT);
+    for (int j = 0; j < nb; ++j) {
+      const int r = r0 + j;
+      for (std::size_t o = 0; o < OUT; ++o) {
+        const float scaled = y[(std::size_t)j * OUT + o] * os[o];
+        const float v = r == 0 ? sk[o] : scaled + om[o];
+        d[(std::size_t)r * OUT + o] = rne(v);
+      }
+    }
+  }
+  return out;
+}
+#pragma clang fp contract(on)
 
 std::vector<float>
 MiniMaxH3TextEncoder::video_block_seconds(int num_sampled_frames,
@@ -580,10 +946,10 @@ MiniMaxH3TextEncoder::build_presentation(const std::vector<Reference>& refs,
   };
   if (out == nullptr) { return fail("null output"); }
   if (!_tok) { return fail("encoder has no tokenizer"); }
-  if (refs.empty()) {
-    return fail("ref2va needs at least one reference; use encode() for a "
-                "text-only prompt");
-  }
+  // No references is the prompt-only form, and it needs no special
+  // case: the loop below emits nothing, so the presentation is the
+  // prompt verbatim, tagged text, on a plain 1-D rotary layout -- which
+  // is exactly what encode() tokenizes.
 
   const std::int32_t vs = _tok->special_token_id("<|vision_start|>");
   const std::int32_t ve = _tok->special_token_id("<|vision_end|>");
@@ -597,7 +963,9 @@ MiniMaxH3TextEncoder::build_presentation(const std::vector<Reference>& refs,
   std::vector<std::int32_t>& ids = P.ids;
   std::vector<int>&          tags = P.tags;
   auto emit_text = [&](const std::string& str) {
-    const std::vector<std::int32_t> t = _tok->encode(str);
+    // tokenize(): the label or prompt alone, truncated as the encoder's
+    // config says (MiniMax-H3-Image: each at most 4096 tokens).
+    const std::vector<std::int32_t> t = tokenize(str);
     ids.insert(ids.end(), t.begin(), t.end());
     tags.insert(tags.end(), t.size(), minimax_h3::kTextTag);
   };
@@ -638,7 +1006,10 @@ MiniMaxH3TextEncoder::build_presentation(const std::vector<Reference>& refs,
     }
     if (r.kind == Reference::Kind::kImage) {
       if (gt != 1) { return fail("an image reference has more than one cell"); }
-      emit_text("<Picture " + std::to_string(++n_image) + ">: ");
+      ++n_image;
+      emit_text(_cfg.bare_picture_labels
+                    ? "Picture " + std::to_string(n_image) + ": "
+                    : "<Picture " + std::to_string(n_image) + ">: ");
       emit_vision(ip, per_cell, r.vision, 0, mh, mw);
     } else {
       if ((int)r.block_seconds.size() != gt) {
@@ -716,6 +1087,18 @@ MiniMaxH3TextEncoder::encode_references(const std::vector<Reference>& refs,
 
   Presentation P;
   if (!build_presentation(refs, prompt, &P, err)) { return {}; }
+  // NO VISION BLOCK is plain text, and plain text is what encode_ids()
+  // runs: the prompt-only form of a `ref2va` request then conditions
+  // BYTE-IDENTICALLY to the `t2va` workflow, rather than to within
+  // whatever the 3-axis rotary path rounds differently from the 1-D one
+  // when all three axes carry the same position.
+  if (P.runs.empty()) {
+    SharedBuffer h = encode_ids(P.ids, err);
+    if (h.empty()) { return {}; }
+    if (token_tags != nullptr) { *token_tags = std::move(P.tags); }
+    if (n_tokens != nullptr) { *n_tokens = P.size(); }
+    return h;
+  }
   const std::vector<std::int32_t>& ids = P.ids;
   const std::vector<Presentation::Run>& runs = P.runs;
   const int n = P.size();
@@ -835,7 +1218,7 @@ MiniMaxH3TextEncoder::encode_references(const std::vector<Reference>& refs,
   }
 
   // ---- 5. the tap ------------------------------------------------------
-  const std::vector<int> taps{_cfg.tap - 1};
+  const std::vector<int> taps = tap_layers_();
   ContextManager* cm = _lm->context_manager();
   if (cm == nullptr) { return fail("encoder has no context manager"); }
   const ContextId cid = cm->acquire_root();
@@ -844,6 +1227,8 @@ MiniMaxH3TextEncoder::encode_references(const std::vector<Reference>& refs,
       ds.feats.empty() ? nullptr : &ds);
   cm->release(cid);
   if (h.empty()) { return fail("encoder forward failed"); }
+  h = finish_(std::move(h), n, err);
+  if (h.empty()) { return {}; }
 
   if (token_tags != nullptr) { *token_tags = std::move(P.tags); }
   if (n_tokens != nullptr) { *n_tokens = n; }

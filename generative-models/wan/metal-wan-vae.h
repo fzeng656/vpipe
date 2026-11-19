@@ -3,10 +3,12 @@
 
 #include "apple-silicon/metal-compute/metal-compute.h"
 #include "apple-silicon/metal-compute/shared-buffer.h"
+#include "generative-models/shared/dit-flops.h"
 #include "generative-models/shared/kernel-sets/vae-mid-attn-tune.h"
 
 #include <functional>
 #include <memory>
+#include <unordered_map>
 #include <string>
 #include <vector>
 
@@ -69,12 +71,26 @@ class MetalWanVae {
     // used by unwhiten(); the pipeline applies latents = latents*std + mean.
     std::vector<float> latents_mean;
     std::vector<float> latents_std;
+    // Whether its mid-block attention is chosen by timing: false takes the
+    // member believed fastest on this GPU -- the accel key `autotune`.
+    bool autotune = true;
   };
 
   // Read a Config out of a diffusers `vae/config.json`. False when the
   // file is missing or is not an AutoencoderKLWan config.
   static bool config_from_json(const std::string& vae_dir, Config& out,
                                std::string* err = nullptr);
+
+  // A Config for a natively-named Wan 2.1 VAE that has NO config of its
+  // own -- FlashVSR publishes `Wan2.1_VAE.pth` bare, with nothing beside
+  // it. The TENSORS decide: native names (`conv1`, `decoder.conv1`, not
+  // diffusers' `quant_conv` / `conv_in`) and a 32-wide `conv1`, which is
+  // z_dim 16 -- the Wan 2.2 VAE is a different, wider net and is refused.
+  // The geometry is then Wan 2.1's fixed one and the whitening statistics
+  // its published ones. False, `out` untouched, for anything else.
+  static bool config_for_native_checkpoint(const std::string& path,
+                                           Config& out,
+                                           std::string* err = nullptr);
 
   // `with_encoder` also loads the encoder weights (the image-to-video
   // conditioning path needs them); a decode-only graph leaves it false so
@@ -145,6 +161,26 @@ class MetalWanVae {
   bool decode(const metal_compute::SharedBuffer& z, int T, int h8, int w8,
               const FrameSink& on_frame, std::string* err = nullptr);
 
+  // A decode that CONTINUES across calls. The causal carries one call
+  // leaves are where the next one starts, so a latent cut into pieces
+  // decodes to exactly the frames the whole latent does: the first
+  // piece's first latent frame is one frame, every later latent frame
+  // four, and `frame0` keeps counting. Owned by the caller; a fresh one
+  // starts a stream, and the geometry may not change inside one.
+  //
+  // A continued decode runs WHOLE-PLANE. A tiled one keeps only a tile's
+  // carries, and the next piece would need all of them -- so a stream
+  // holds the plane's carries between calls (~10 GB at 1920x1152; see
+  // decode_carry_bytes) and a box that cannot hold them must not stream.
+  struct DecodeStream;
+  bool decode(const metal_compute::SharedBuffer& z, int T, int h8, int w8,
+              const FrameSink& on_frame, std::string* err,
+              DecodeStream* stream);
+  // What a whole-plane decode's causal carries weigh at this latent size:
+  // what a DecodeStream holds between calls.
+  static std::size_t decode_carry_bytes(const Config& cfg, int h8, int w8,
+                                        bool frame_split = true) noexcept;
+
   // Single-frame convenience: decode a [z_dim, 1, h8, w8] latent to one
   // RGB frame [3, h8*8, w8*8]. This is the call that reduces to exactly
   // what MetalKrea2Vae::decode does, and the test that holds the two to
@@ -163,20 +199,155 @@ class MetalWanVae {
 
   bool has_encoder() const { return _has_encoder; }
 
+  // The GPU arithmetic decode() and encode() have credited to the
+  // achieved-FLOP/s meter (common/perf-flops.h): every conv, 1x1 and
+  // the per-frame mid attention, counted as encoded and credited as
+  // each command buffer retires. A causal conv counts its LIVE temporal
+  // taps -- a tap before the sequence is zero padding, which only the
+  // gather route multiplies -- so the figure is the same on every GPU.
+  // For a test to hold against shapes.
+  const GpuFlopsTally& gpu_flops() const noexcept { return _flops; }
+
   // In-place per-channel un-whiten of a channel-first latent video
   // [z_dim, T, h8, w8]: z[c] = z[c]*latents_std[c] + latents_mean[c].
   // Returns a fresh buffer.
   metal_compute::SharedBuffer
   unwhiten(const metal_compute::SharedBuffer& z, int T, int h8, int w8);
 
-  // Conservative estimate of the peak GPU memory (bytes) one decode CHUNK
-  // at the given latent size needs. Per chunk, not per clip -- the clip is
-  // streamed. For a preflight memory_budget() check.
+  // The GPU memory (bytes) a decode at this latent size holds at its peak,
+  // for the preflight and for the plan. NOT per chunk, although the clip
+  // streams: the causal carries -- two input frames of every 3x3x3 conv,
+  // seven of them at full resolution -- are allocated by the first chunk
+  // and held to the last, and they are the largest term. The im2col band
+  // is not in it; the band takes whatever headroom this leaves.
+  // `frame_split` is whether the post-temporal tail runs a frame at a time
+  // (the default; VPIPE_WAN_VAE_NO_FRAME_SPLIT turns it off).
+  //
+  // `tail_frac` is the share of the plane the TILED tail carries at once --
+  // 1.0 untiled, and (tile + halo) / whole for a spatial tiling. It scales
+  // only what runs below the last temporal upsample, because that is what
+  // tiles: the blocks above it, and the mid attention among them, keep the
+  // whole plane. See decode_tile_outer_() and choose_tail_tiles_().
+  //
+  // `tail_frac` < 1 is the TILE-OUTER decode, which holds the clip's split-
+  // plane frames and RGB and so grows with its length: `latent_frames` is
+  // that length, and is read only then.
+  //
+  // `deep` is the tiling that starts below the MID ATTENTION rather than
+  // below the last temporal upsample: a wider halo, a far smaller store
+  // and head, for a box the shallow one does not fit.
   std::size_t decode_peak_bytes(int h8, int w8) const noexcept;
+  static std::size_t decode_peak_bytes(const Config& cfg, int h8, int w8,
+                                       bool frame_split = true,
+                                       double tail_frac = 1.0,
+                                       int latent_frames = 1,
+                                       bool deep = false) noexcept;
+
+  // How many tiles the TAIL (everything below the last temporal upsample)
+  // is split into so a decode fits `headroom`, and the plane share one
+  // tile then holds. {1, 1} when the whole plane already fits, which is
+  // every geometry small enough to have worked before this existed.
+  //
+  // Tiling BELOW the attention is what makes it exact: the mid-block
+  // attention is the only layer here whose receptive field is the whole
+  // plane, and it runs above the split. Everything under it is convs, a
+  // nearest upsample, and a per-pixel RMS over channels -- all local -- so
+  // a tile carrying `halo` pixels of real neighbourhood produces interior
+  // pixels that do not know they were tiled.
+  //
+  // Two depths. SHALLOW tiles the tail below the last temporal upsample, on
+  // the split plane, with a halo of a few pixels. DEEP tiles everything
+  // below the mid attention, on the LATENT plane: the halo is wider (~12
+  // latent pixels of reach, 16 aligned) and so is the recompute, but the
+  // head shrinks to the mid block and the store to one latent frame of it
+  // per chunk -- what a box too small for the shallow floor needs.
+  struct TailTiles {
+    int    ty    = 1;
+    int    tx    = 1;
+    int    bh    = 0;     // tile height in tile-plane pixels, a multiple of 8
+    int    bw    = 0;
+    int    halo  = 0;     // tile-plane pixels of overlap per side, also 8s
+    double frac  = 1.0;   // largest (tile + halo) / whole
+    bool   deep  = false; // tile plane = latent (deep) or split plane
+    // Laid out exactly as given (VPIPE_WAN_VAE_TILE), rather than planned
+    // a band at a time from what is free as the decode goes.
+    bool   forced = false;
+  };
+  // Tiles and halo are rounded UP TO 8 on purpose. The matrix-core 3x3
+  // convolution tiles its destination 8x8 and declines a plane whose H or
+  // W is not a multiple of 8 -- a tile that misses that is still correct,
+  // because the im2col gather picks it up, but it gives away the ~3x that
+  // path is worth on an M5. The split plane is itself a multiple of 8, so
+  // aligned tiles keep every extent aligned, halo included.
+  static int align8_(int v) { return ((v + 7) / 8) * 8; }
+  // `fits` reports whether the returned grid actually gets under
+  // `headroom`. When nothing does, the FINEST grid tried comes back with
+  // `fits` false -- a refusal can then say what was already attempted
+  // instead of quoting the whole-plane figure nobody was going to use.
+  // The `ty` x `tx` grid as the decode would cut it (8-aligned tiles and
+  // halo), or {1, 1} where that grid is all halo. VPIPE_WAN_VAE_TILE forces
+  // one; a test asks for the figure it will be held to.
+  TailTiles tail_tiles_for(int h8, int w8, int ty, int tx,
+                           bool deep = false) const noexcept;
+  TailTiles choose_tail_tiles_(int h8, int w8, std::size_t headroom,
+                               bool frame_split, int latent_frames,
+                               bool* fits = nullptr) const noexcept;
+  // Pixels of halo one tile needs so its interior is bit-exact: one per
+  // 3x3 conv below the split, each counted at its own resolution. The deep
+  // one counts every conv below the mid block, in latent pixels.
+  int tail_halo_() const noexcept;
+  int tail_halo_deep_() const noexcept;
+  // The split-plane size (the tail's input) for a latent of this size.
+  void tail_plane_(int h8, int w8, int* hs, int* ws) const noexcept;
 
   const Config& config() const { return _cfg; }
 
+  // ROWS one matmul2d dispatch may cover here, for an [M, K] source and an
+  // [M, N] destination. Two independent limits, and the chunk is the
+  // smaller:
+  //
+  //   kMmaMaxM   matmul2d corrupts output rows past ~2^19 regardless of
+  //              width (the Krea-2 VAE's grey-bottom at 1024px).
+  //   mma_row_band  no operand's byte span may pass 2^31.
+  //
+  // The row cap alone was the whole rule, and it bounds the DESTINATION --
+  // cout is at most 384 here, so 2^19 rows is 200 MB and never close. The
+  // source is the im2col band, and this VAE is the one in the tree that can
+  // make it large: its causal conv3d has 27 taps where a 2D VAE has 9, so
+  // K = 27 * cin reaches 10368. MEASURED at the decoder's own geometry, the
+  // source span the row cap permits is 2.39 GB at 1280x720 (192-channel
+  // level, K = 5184, 230400 rows per frame) and 2.72 GB at 1920x1080 --
+  // both past the line, while 832x480 stays under it at 1.36 GB.
+  //
+  // VPIPE_WAN_VAE_MMA_MAX_M overrides the row cap only; the span band is
+  // not negotiable, being a property of the kernels rather than a tuning
+  // choice.
+  static constexpr int kMmaMaxM = 1 << 19;
+  static int mma_row_chunk(int M, int N, int K, int max_m = kMmaMaxM);
+
  private:
+  // decode_peak_bytes in TERMS, by region: the mid block (with conv_in),
+  // the up blocks to the last temporal upsample, and the tail below it --
+  // so a whole, shallow-tiled or deep-tiled decode can each sum what it
+  // holds at once. `mode` 0 whole, 1 shallow, 2 deep; `frac` a tile's
+  // share of the plane where that mode tiles.
+  enum { kMid = 0, kUp = 1, kTail = 2 };
+  struct DecodeTerms {
+    std::size_t carries[3] = {0, 0, 0};
+    std::size_t pool[3]    = {0, 0, 0};
+    std::size_t mid_el   = 0;   // one mid-block frame, elements
+    std::size_t split_el = 0;   // one split-plane frame, elements
+    std::size_t out_hw   = 0;   // output pixels per frame
+    std::size_t t        = 1;   // frames in a steady chunk
+  };
+  static DecodeTerms decode_terms_(const Config& cfg, int h8, int w8,
+                                   bool frame_split, double frac,
+                                   int mode) noexcept;
+  // What ONE tile of share `frac` holds while it runs the clip, and the
+  // share of what is free one tile may take on a tight box.
+  static std::size_t tile_working_bytes_(const Config& cfg, int h8, int w8,
+                                         double frac, bool deep) noexcept;
+  static double tile_share_() noexcept;
   MetalWanVae() = default;
 
   // A convolution stored as a dense-GEMM weight [Cout, K] (+ bias [Cout]),
@@ -185,8 +356,17 @@ class MetalWanVae {
   //   plain 3x3    : K =  9*Cin, flattened (ky,kx,cin)     -- kt = 1
   //   time (3,1,1) : K =  3*Cin, flattened (kt,cin)        -- kt = 3, ks = 1
   //   1x1          : K =    Cin                            -- kt = 1, ks = 1
+  // DIFFUSERS name -> the spelling this checkpoint actually uses. Empty
+  // for a diffusers-named one; see wname_() in the .cc.
+  std::unordered_map<std::string, std::string> _names;
+  const std::string& wname_(const std::string& diffusers_name) const;
+
   struct Conv {
     metal_compute::SharedBuffer w, b;
+    // HWIO twin for the hardware conv, [3,3,Cin',Cout] out-channel
+    // fastest, where Cin' is 3*cin for a 3x3x3 conv run over its three
+    // taps CONCATENATED channel-wise. Empty when that route is off.
+    metal_compute::SharedBuffer whwio;
     int cin = 0, cout = 0, k = 0;
     int kt = 1;      // temporal taps
     int ks = 1;      // spatial taps (9 for 3x3, else 1)
@@ -277,6 +457,7 @@ class MetalWanVae {
 
   // ---- encoder (loaded only when with_encoder) ------------------------
   bool _has_encoder = false;
+  GpuFlopsTally _flops;   // see gpu_flops()
   Conv _enc_conv_in;                // causal 3x3x3 3 -> base
   std::vector<DownStage> _enc_down; // 4 stages (3 with a downsample)
   ResBlock _enc_mid_res0, _enc_mid_res1;
@@ -305,11 +486,26 @@ class MetalWanVae {
   // One output FRAME of a convolution, gathering its taps from `taps`
   // (kt frame views, each [hw, cin]) into the shared band scratch and
   // running the GEMM. Handles all four Conv shapes above.
+  // Where gather band `r0` of `rows` starts, so no band of a plane runs
+  // under matmul2d's row floor (see the definition).
+  std::size_t band_start_(std::size_t r0, std::size_t rows,
+                          std::size_t ohw) const noexcept;
   void conv_frame_(Ctx& cx, const Conv& c,
                    const metal_compute::SharedBuffer* const taps[3],
                    const std::size_t tap_off[3],
                    const metal_compute::SharedBuffer& out,
                    std::size_t out_row0, int H, int W, int stride);
+
+  // The same output frame on the gather-free hardware conv: a 3x3x3 conv
+  // concatenates its three taps and runs ONE 2D conv over them. False
+  // when the shape does not tile (grid not a multiple of 8, Cout neither
+  // a multiple of 32 nor at most kSmallCoutMax, an int32 extent) and the
+  // caller gathers instead.
+  bool conv3x3_hw_(Ctx& cx, const Conv& c,
+                   const metal_compute::SharedBuffer* const taps[3],
+                   const std::size_t tap_off[3],
+                   const metal_compute::SharedBuffer& out,
+                   std::size_t out_row0, int H, int W);
 
   // Whole-chunk convolution. `in` is [(t_in)*hw, cin] and `carry` supplies
   // the frames before it; `out` gets t_out frames. The mapping from output
@@ -347,6 +543,37 @@ class MetalWanVae {
   time_down_(Ctx& cx, const Resample& rs, const metal_compute::SharedBuffer& x,
              int& t, std::size_t hw, int C, Carry* carry);
 
+  // The decode's two halves, either side of the last temporal upsample
+  // (`split_index_`): the head of one latent frame to the split plane,
+  // and the tail from there to RGB. Shared by the whole-plane decode and
+  // the tile-outer one, which only runs them in a different order.
+  std::size_t split_index_() const noexcept;
+  // The head in its two parts: the mid block (to the latent plane's one
+  // frame) and the up blocks to the split. A deep tile runs the second
+  // on its own patch of the first's output.
+  const metal_compute::SharedBuffer*
+  mid_chunk_(Ctx& cx, const metal_compute::SharedBuffer& z, int T, int f,
+             int h8, int w8, std::vector<Carry>& carry, std::size_t& ci);
+  const metal_compute::SharedBuffer*
+  up_to_split_(Ctx& cx, const metal_compute::SharedBuffer& in, int& t,
+               int& H, int& W, std::vector<Carry>& carry, std::size_t& ci);
+  const metal_compute::SharedBuffer*
+  head_chunk_(Ctx& cx, const metal_compute::SharedBuffer& z, int T, int f,
+              int h8, int w8, std::vector<Carry>& carry, std::size_t& ci,
+              int& t, int& H, int& W);
+  metal_compute::SharedBuffer*
+  tail_(Ctx& cx, const metal_compute::SharedBuffer& in, int nt, int& th,
+        int& tw, std::vector<Carry>& carry, std::size_t& ci);
+  // The tail over a chunk's `t` split-plane frames, a frame at a time.
+  metal_compute::SharedBuffer*
+  tail_frames_(Ctx& cx, const metal_compute::SharedBuffer& x, int t, int& H,
+               int& W, std::vector<Carry>& carry, std::size_t& ci);
+  // A decode whose tail does not fit whole: the head over the clip into a
+  // store, then each tile through every frame. See the definition.
+  bool decode_tile_outer_(const metal_compute::SharedBuffer& z, int T, int h8,
+                          int w8, const TailTiles& tiles, std::size_t col_cap,
+                          const FrameSink& on_frame, std::string* err);
+
   // Copy the trailing min(2, t) frames of `x` into `carry` for the next
   // chunk. A GPU-side copy: the frames are still only on the GPU timeline.
   void save_carry_(Ctx& cx, Carry& carry, const metal_compute::SharedBuffer& x,
@@ -355,7 +582,8 @@ class MetalWanVae {
   // ---- kernels ---------------------------------------------------------
   metal_compute::ComputeLibrary _lib_gemm, _lib_elt, _lib_rms, _lib_sdpa;
   metal_compute::ComputeFunction _fn_gemm_bias, _fn_rms, _fn_mul_sigmoid,
-      _fn_residual, _fn_clamp, _fn_sdpa, _fn_upsample, _fn_copy;
+      _fn_residual, _fn_clamp, _fn_sdpa, _fn_upsample, _fn_copy,
+      _fn_copy_rect;
   // The 2D im2col twins (the plain-3x3 resample convs) and the 3D one that
   // is this VAE's addition.
   metal_compute::ComputeFunction _fn_im2col_tiled, _fn_im2col_s2_tiled,
@@ -371,7 +599,19 @@ class MetalWanVae {
   bool _use_mma2  = false;
   int  _mma_min_m = 64;
   int  _mma_min_n = 16;
-  int  _mma_max_m = 1 << 19;
+  int  _mma_max_m = kMmaMaxM;
+
+  // The gather-free hardware conv (MPP convolution2d) over a 64- or a
+  // 32-channel destination tile, and the per-pixel small-cout conv for the
+  // head's 3-channel output, which neither tile can serve.
+  // Each has an ACCUMULATING twin (out += conv), so a causal 3x3x3 conv
+  // runs as one call per temporal tap with no three-frame concat.
+  static constexpr int kSmallCoutMax = 32;
+  metal_compute::ComputeLibrary _lib_convhw;
+  metal_compute::ComputeFunction _fn_conv_hw64, _fn_conv_hw32,
+      _fn_conv_small_cout, _fn_conv_hw64_acc, _fn_conv_hw32_acc,
+      _fn_conv_small_cout_acc;
+  bool _use_hwconv = false;
 
   // Mid-block attention, picked by MEASUREMENT at load (vae-mid-attn-tune.h)
   // exactly as in the Qwen-Image VAE -- the attention here is the same
@@ -393,6 +633,21 @@ class MetalWanVae {
   static unsigned attn_threads_(int bq)
   {
     return (bq == 16 ? 4u : bq == 32 ? 8u : 16u) * 32u;
+  }
+};
+
+// Defined here because it holds the class's own carries; a nested class
+// may name them.
+struct MetalWanVae::DecodeStream {
+  std::vector<Carry> carry;
+  long long          frames = 0;   // frames this stream has decoded
+  int                h8 = 0, w8 = 0;
+  std::size_t
+  bytes() const noexcept
+  {
+    std::size_t n = 0;
+    for (const Carry& c : carry) { n += c.buf.byte_size(); }
+    return n;
   }
 };
 
